@@ -89,7 +89,15 @@ async def main():
             response = await route.fetch()
             payload = await response.json()
             payload["data"]["real_enabled"] = True
+            payload["data"]["offline_mode"] = False
             await route.fulfill(response=response, json=payload)
+
+        async def accounts(route):
+            await route.fulfill(json={"data": [{
+                "account_id": "gpu-ui-fixture", "alias": "离线规格测试账号", "enabled": True,
+                "allow_allocation": True, "status": "connected",
+                "authorization": {"colab": {"connected": True}},
+            }]})
 
         async def specs(route):
             await route.fulfill(
@@ -105,6 +113,7 @@ async def main():
             )
 
         await page.route("**/api/gpu/settings", settings)
+        await page.route("**/api/gpu/accounts", accounts)
         await page.route("**/api/gpu/compute/specs?*", specs)
         await page.reload()
         await page.get_by_role("button", name="Colab GPU", exact=False).click()
@@ -128,6 +137,7 @@ async def main():
         print(
             "GPU UI fixtures: L4/A100 only, A100 persisted, confirmation includes GPU, no real GPU submission"
         )
+        await page.unroute_all(behavior='wait')
         await browser.close()
 
 
