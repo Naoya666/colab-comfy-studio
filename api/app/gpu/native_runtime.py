@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -189,7 +190,16 @@ def install_rclone(root, worker):
         (root / "rclone.partial").unlink(missing_ok=True)
 
 
-def mount_drive(root, secret, run):
+def _mount_error(log, secret):
+    text = log.read_text(errors="replace")[-8000:]
+    for value in secret.values():
+        if isinstance(value, str) and value:
+            text = text.replace(value, "[redacted]")
+    text = re.sub(r'(?i)(authorization|(?:access|refresh)[_-]?token|client[_-]?secret|password|api[_-]?key)["\s]*[:=]["\s]*[^\s,}"]+', r'\1=[redacted]', text)
+    return text.strip()[-1200:] or "rclone 未提供错误详情"
+
+
+def mount_drive(root, secret):
     mount = root / "drive"
     mount.mkdir(exist_ok=True)
     if os.path.ismount(mount):
@@ -201,14 +211,38 @@ def mount_drive(root, secret, run):
     _write_secret(config, "[studio]\ntype = drive\nscope = drive.file\n" +
                   f"client_id = {secret['client_id']}\nclient_secret = {secret['client_secret']}\n" +
                   f"root_folder_id = {secret['owner_folder_id']}\ntoken = {token}\n")
-    run([str(root / "rclone"), "mount", "studio:", str(mount), "--config", str(config),
-         "--daemon", "--daemon-wait", "60s", "--vfs-cache-mode", "full", "--vfs-write-back", "0s",
+    args = [str(root / "rclone"), "mount", "studio:", str(mount), "--config", str(config),
+         "--vfs-cache-mode", "full", "--vfs-write-back", "0s",
          "--vfs-cache-max-size", f"{int(secret['cache_gb'])}G", "--vfs-cache-min-free-space", "5G",
          "--cache-dir", str(root / "vfs-cache"), "--dir-cache-time", "30s", "--poll-interval", "15s",
-         "--rc", "--rc-addr", "127.0.0.1:5572", "--rc-no-auth", "--log-level", "ERROR"], timeout=90)
-    if not os.path.ismount(mount):
-        raise RuntimeError("Google Drive mount not available")
-    return mount
+         "--rc", "--rc-addr", "127.0.0.1:5572", "--rc-no-auth", "--log-level", "ERROR"]
+    # rclone 1.70.3 starts RC in both the --daemon parent and child. The parent
+    # holds 5572 while waiting, so the child cannot bind and the mount fails.
+    # Launch one foreground rclone in its own session and supervise readiness.
+    log = root / "rclone.log"
+    _write_secret(log, "")
+    with log.open("ab") as output:
+        process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=output,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError("Google Drive 挂载进程退出：" + _mount_error(log, secret))
+            if os.path.ismount(mount):
+                return mount
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Google Drive 挂载就绪超时：" + _mount_error(log, secret))
+            time.sleep(0.2)
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        raise
 
 
 def prepare_paths(comfy, mount):
@@ -274,7 +308,7 @@ def run(root, payload, stages):
                 binary.chmod(0o700)
             stages.start("native_drive")
             _index_models(secret, worker)
-            mount = mount_drive(ROOT, secret, worker._run)
+            mount = mount_drive(ROOT, secret)
             stages.start("native_models")
             comfy = ROOT / "ComfyUI"
             if not comfy.exists():

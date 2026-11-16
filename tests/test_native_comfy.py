@@ -391,3 +391,84 @@ def test_rclone_install_checks_checksum_and_publishes_atomically(monkeypatch, tm
     binary = runtime.install_rclone(tmp_path, worker)
     assert binary.read_bytes() == b"test-rclone-executable"
     assert binary.stat().st_mode & 0o777 == 0o700
+
+
+def _mount_fixture(monkeypatch, tmp_path, *, exit_code=None, mounted=False, timeout=False, slow_stop=False):
+    import subprocess
+
+    from app.gpu import native_runtime as runtime
+
+    secret = {'access_token': 'fake-access', 'refresh_token': 'fake-refresh',
+              'client_id': 'fake-client', 'client_secret': 'fake-secret',
+              'owner_folder_id': 'fake-folder', 'cache_gb': 20}
+    seen = []
+
+    class Process:
+        stopped = False
+        killed = False
+
+        def poll(self):
+            return exit_code if not self.stopped else 0
+
+        def terminate(self):
+            self.stopped = True
+
+        def wait(self, timeout):
+            if slow_stop and not self.killed:
+                raise subprocess.TimeoutExpired('fake-rclone', timeout)
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    process = Process()
+
+    def launch(args, **kwargs):
+        seen.append(args)
+        assert '--daemon' not in args and '--daemon-wait' not in args
+        assert args[args.index('--rc-addr') + 1] == '127.0.0.1:5572'
+        assert kwargs['start_new_session'] is True
+        assert (tmp_path / 'rclone.conf').stat().st_mode & 0o777 == 0o600
+        assert (tmp_path / 'rclone.log').stat().st_mode & 0o777 == 0o600
+        assert all(value not in args for value in ['fake-access', 'fake-refresh', 'fake-secret'])
+        kwargs['stdout'].write(b'Cannot bind RC port; fake-access fake-refresh fake-secret access_token=fresh-token\n')
+        kwargs['stdout'].flush()
+        return process
+
+    monkeypatch.setattr(runtime.subprocess, 'Popen', launch)
+    checks = iter([False, mounted])
+    monkeypatch.setattr(runtime.os.path, 'ismount', lambda path: next(checks, mounted))
+    clock = iter([0, 61] if timeout else [0])
+    monkeypatch.setattr(runtime.time, 'monotonic', lambda: next(clock, 0))
+    monkeypatch.setattr(runtime.time, 'sleep', lambda _: None)
+    return runtime, secret, process, seen
+
+
+def test_drive_mount_uses_one_rc_process_and_waits_for_actual_fuse_mount(monkeypatch, tmp_path):
+    runtime, secret, process, seen = _mount_fixture(monkeypatch, tmp_path, mounted=True)
+    assert runtime.mount_drive(tmp_path, secret) == tmp_path / 'drive'
+    assert len(seen) == 1 and not process.stopped
+
+
+def test_drive_mount_early_exit_reports_sanitized_child_error(monkeypatch, tmp_path):
+    runtime, secret, _, _ = _mount_fixture(monkeypatch, tmp_path, exit_code=1)
+    with pytest.raises(RuntimeError, match='Cannot bind RC port') as caught:
+        runtime.mount_drive(tmp_path, secret)
+    assert not any(value in str(caught.value) for value in ['fake-access', 'fake-refresh', 'fake-secret', 'fresh-token'])
+
+
+@pytest.mark.parametrize('slow_stop', [False, True])
+def test_drive_mount_timeout_reaps_its_own_process(monkeypatch, tmp_path, slow_stop):
+    runtime, secret, process, _ = _mount_fixture(monkeypatch, tmp_path, timeout=True, slow_stop=slow_stop)
+    with pytest.raises(RuntimeError, match='挂载就绪超时'):
+        runtime.mount_drive(tmp_path, secret)
+    assert process.stopped and process.killed is slow_stop
+
+
+def test_drive_mount_reuses_existing_mount_without_rewriting_credentials(monkeypatch, tmp_path):
+    from app.gpu import native_runtime as runtime
+
+    monkeypatch.setattr(runtime.os.path, 'ismount', lambda _: True)
+    monkeypatch.setattr(runtime.subprocess, 'Popen', lambda *a, **kw: pytest.fail('must not start another RC server'))
+    assert runtime.mount_drive(tmp_path, {}) == tmp_path / 'drive'
+    assert not (tmp_path / 'rclone.conf').exists()
