@@ -478,6 +478,23 @@ class GoogleColabProvider:
             "allocation_reconciliation": "exact_nbh_unassigned_and_absent",
         }, self.owner_id)
 
+    @staticmethod
+    def _assignment_spec(assignment):
+        """Only report provider evidence; an assignment without hardware fields is unknown."""
+        if not all(field in assignment for field in ("variant", "accelerator", "machineShape")):
+            return None
+        variant = assignment["variant"]
+        variant = {0: "VARIANT_CPU", 1: "VARIANT_GPU", 2: "VARIANT_TPU"}.get(variant, variant)
+        variant = _VARIANT_ALIASES.get(variant, variant)
+        accelerator = str(assignment["accelerator"]).upper()
+        if variant not in _VARIANTS or not accelerator or assignment["machineShape"] not in (0, 1, "STANDARD", "SHAPE_STANDARD", "HIGH_RAM", "HIGHMEM", "SHAPE_HIGHMEM"):
+            return None
+        shape = "SHAPE_HIGHMEM" if assignment["machineShape"] in (1, "HIGH_RAM", "HIGHMEM", "SHAPE_HIGHMEM") else "SHAPE_STANDARD"
+        # CLI has no separate high-RAM choice for these accelerators.
+        if accelerator in _HIGH_MEM_ONLY_ACCELERATORS:
+            shape = "SHAPE_STANDARD"
+        return {"variant": variant, "accelerator": accelerator, "shape": shape}
+
     def inspect(self, handle):
         lease = self._owned(handle)
         if self._is_cli_tunnel(lease):
@@ -493,7 +510,7 @@ class GoogleColabProvider:
                 "ready": True,
                 "deleted": False,
                 "runtime_name": handle["runtime_name"],
-                "runtime_spec": lease.get("requested_spec") or {},
+                "runtime_spec": self._assignment_spec(matched),
                 "version": "colab-cli-tunnel",
             }
         operation = self._operation(handle, lease)

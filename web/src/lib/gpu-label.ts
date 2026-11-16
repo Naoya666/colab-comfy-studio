@@ -1,5 +1,6 @@
 type DeviceRecord = {
   gpu_reported?: string | null;
+  gpu_diagnostics?: { devices?: { name: string; memory_mib: number }[] } | null;
   runtime_spec_requested?: { accelerator?: string; variant?: string } | null;
   provider?: string | null;
   prep?: boolean | null;
@@ -8,7 +9,10 @@ type DeviceRecord = {
 /** Measured GPU first; otherwise the requested spec, marked as not measured. */
 export function gpuLabel(value: DeviceRecord): string {
   if (value.provider === 'mock') return '模拟 GPU';
-  if (value.gpu_reported) return `实测 GPU：${value.gpu_reported}`;
+  if (value.gpu_reported) {
+    const memory = value.gpu_diagnostics?.devices?.map(d => `${d.memory_mib} MiB`).join(' / ');
+    return `实测 GPU：${value.gpu_reported}${memory ? ` · ${memory}` : ''}`;
+  }
   if (value.prep) return 'CPU 预热';
   const spec = value.runtime_spec_requested;
   if (spec?.accelerator && spec.accelerator !== 'NONE') return `申请 GPU：${spec.accelerator}（未实测）`;

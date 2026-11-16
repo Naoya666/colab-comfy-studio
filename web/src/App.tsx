@@ -1,6 +1,7 @@
 import { SettingsPanel } from './pages/SettingsPage';
 import { GalleryPanel } from './pages/GalleryPage';
 import { TasksPanel } from './pages/JobsPage';
+import { WorkflowGpuSelection, computeLabel } from './components/WorkflowGpuSelection';
 import { CreatePanel } from './pages/CreatePage';
 import { ComputePage, ThemePicker } from './pages/ComputePage';
 import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
@@ -228,6 +229,12 @@ export default function App() {
   const [presets, setPresets] = useState<GpuPreset[]>([]);
   const [modelId, setModelId] = useState('');
   const [workflowId, setWorkflowId] = useState('');
+  const [gpuChoices, setGpuChoices] = useState<Record<string, Record<string, unknown> | null>>(() => { try { return JSON.parse(localStorage.getItem('studio-workflow-gpus') || '{}'); } catch { return {}; } });
+  const selectedCompute = gpuChoices[workflowId] || null;
+  function chooseGpu(key: Record<string, unknown> | null) {
+    const next = { ...gpuChoices, [workflowId]: key }; setGpuChoices(next); idempotencyKey.current = '';
+    try { localStorage.setItem('studio-workflow-gpus', JSON.stringify(next)); } catch { /* browser storage unavailable */ }
+  }
   const [manifest, setManifest] = useState<GpuManifest | null>(null);
   const [params, setParams] = useState<Record<string, unknown>>({});
   const [gallery, setGallery] = useState<GalleryAsset[]>([]);
@@ -536,6 +543,7 @@ export default function App() {
           : [],
         execution_policy: {
           provider: runtime,
+          ...(runtime === 'colab' && selectedCompute ? { compute_spec: selectedCompute } : {}),
           max_runtime_minutes: maxRuntime,
           allocation: decision.allocation,
           account_id: decision.accountId,
@@ -589,13 +597,13 @@ export default function App() {
     try {
       const value = JSON.parse(raw) as unknown;
       const source = record(value) && record(value.workflow) ? value.workflow : value;
-      if (!record(source) || !record(source.manifest) || !record(source.api_graph) || !record(source.object_info)) {
+      if (!record(source) || (!record(source.image_extraction) && (!record(source.manifest) || !record(source.api_graph) || !record(source.object_info)))) {
         throw new Error('JSON 必须包含 manifest、api_graph、object_info');
       }
       await action('import', async () => {
         const workflow = await importGpuWorkflow(value as never);
         setWorkflows((curr) => [workflow, ...curr.filter((item) => item.id !== workflow.id)]);
-        setError('工作流已作为草稿导入；请校验后发布。');
+        setError(workflow.pending_configuration ? '图片工作流已保存为待配置草稿；请展开草稿补充运行配置，再按原流程审核和发布。' : '工作流已作为草稿导入；请校验后发布。');
       });
     } catch (cause) {
       setError(`导入失败：${apiMessage(cause)}`);
@@ -807,6 +815,7 @@ export default function App() {
       <main className={styles.page}>
         {tab === '创作' && (
           <CreatePanel
+            gpuSelection={runtime === 'colab' ? <WorkflowGpuSelection manifest={manifest} accountId={runtimeChoice.accountId} value={selectedCompute} onChange={chooseGpu} /> : null}
             projectId={projectId}
             models={models}
             workflows={workflows}
@@ -966,6 +975,7 @@ export default function App() {
             <dl className={styles.kv}>
               <dt>工作流</dt><dd>{activeWorkflow.workflow_key} · v{activeWorkflow.workflow_version}</dd>
               <dt>运行方式</dt><dd>{runtime === 'colab' ? 'Colab GPU（会扣 CU）' : '离线模拟（不扣 CU）'}</dd>
+              {runtime === 'colab' && <><dt>GPU 规格</dt><dd>{computeLabel(selectedCompute || manifest?.compute_spec as Record<string, unknown>)}</dd></>}
               <dt>机器</dt><dd>{resolveInstanceSubmission(runtimeChoice, instances).machineLabel}</dd>
               <dt>数量</dt><dd>{batchCount}</dd>
               {runtime === 'colab' && <><dt>最长运行</dt><dd>{maxRuntime} 分钟</dd></>}

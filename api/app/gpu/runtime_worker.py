@@ -618,6 +618,41 @@ def _site_state(site: Path) -> dict[str, int]:
     return {entry.name: entry.stat().st_mtime_ns for entry in site.iterdir()}
 
 
+def _gpu_cache_tag() -> str:
+    """Separate native extensions by GPU architecture and driver, including CPU prep."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,compute_cap,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        identity = result.stdout.strip()
+        if not identity:
+            raise ValueError("empty GPU identity")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # No shared environment cache hit when device identity cannot be read.
+        identity = "unidentified-" + str(os.getpid()) + "-" + str(time.time_ns())
+    return hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
+def _check_compute_hardware(manifest: dict, diagnostics: dict | None, requested: dict | None = None) -> None:
+    gpu = (requested or {}).get("accelerator")
+    if gpu in {"T4", "L4", "A100", "H100"}:
+        devices = (diagnostics or {}).get("devices") or []
+        pattern = rf"(?:^|[^A-Z0-9]){gpu}(?:[^A-Z0-9]|$)"
+        if not devices or not all(re.search(pattern, d["name"].upper()) for d in devices):
+            raise WorkerError(f"实测设备与请求 {gpu} 不一致或无法确认，已停止运行；不会切换其他 GPU")
+    req = manifest.get("compute_requirements") or {}
+    minimum = req.get("min_vram_gb")
+    if minimum:
+        devices = (diagnostics or {}).get("devices") or []
+        if not devices or max(d["memory_mib"] for d in devices) * 1024**2 < float(minimum) * 1e9:
+            raise WorkerError(f"实际 GPU 显存不满足最低 {minimum} GB 要求，已停止运行")
+    if req.get("min_ram_gb"):
+        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+        if ram < float(req["min_ram_gb"]):
+            raise WorkerError("实际系统 RAM 低于工作流最低要求，已停止运行")
+
+
 def _env_key(commit: str, timeout: float, custom_nodes: list[dict] | None = None) -> str:
     """Cache key: ComfyUI commit + Python + hash of the packages already on the image + requirements hash.
 
@@ -630,7 +665,7 @@ def _env_key(commit: str, timeout: float, custom_nodes: list[dict] | None = None
     with urlopen(url, timeout=timeout) as response:
         requirements = hashlib.sha256(response.read(1024 * 1024)).hexdigest()[:12]
     py = f"py{sys.version_info.major}{sys.version_info.minor}"
-    key = f"comfy-{commit[:12]}-{py}-img{image}-req{requirements}"
+    key = f"comfy-{commit[:12]}-{py}-img{image}-req{requirements}-gpu{_gpu_cache_tag()}"
     if custom_nodes:
         pins = "\n".join(sorted(f"{n['repo']}@{n['commit']}" for n in custom_nodes))
         key += "-nodes" + hashlib.sha256(pins.encode()).hexdigest()[:12]
@@ -1385,6 +1420,7 @@ def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
             diagnostics = _probe_gpu()
             if diagnostics:
                 _status(root, "running", gpu_diagnostics=diagnostics)
+            _check_compute_hardware(manifest, diagnostics, snapshot.get("runtime_compute_spec"))
         if snapshot.get("system_smoke") is True:
             if manifest.get("executor") != "cuda-smoke":
                 raise WorkerError("system smoke requires the cuda-smoke executor manifest")

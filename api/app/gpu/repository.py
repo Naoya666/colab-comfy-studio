@@ -355,6 +355,11 @@ class Repository:
                 item.data = {**(item.data or {}), **copy.deepcopy(patch)}
                 item.version += 1
                 item.updated_at = utcnow()
+            event = GpuEventRow(id=str(uuid.uuid4()), owner_id=owner_id, project_id=job.get("project_id"),
+                                state="running", data={"job_id": job["id"], "state": "running",
+                                "message": "实测 GPU：" + ", ".join(f"{d['name']} ({d['memory_mib']} MiB)" for d in clean["devices"])},
+                                created_at=utcnow(), updated_at=utcnow())
+            session.add(event)
             session.flush()
             return self._row(row)
 
@@ -521,12 +526,10 @@ class Repository:
                             provider=data.get("execution_policy", {}).get("provider", "mock"))
                 if data['provider'] not in {'mock', 'colab'}:
                     raise ValueError('batch provider is not authorized')
-                data['compatibility_signature'] = digest({
-                    'provider':data['provider'],
-                    'environment':{k:v for k,v in (data.get('snapshot') or {}).items()
-                                   if k not in {'resolved_params','bound_graph','input_files'}},
-                    'workflow_key':data.get('workflow_key'), 'workflow_version':data.get('workflow_version'),
-                    'requested_spec':data.get('requested_spec')})
+                from .specs import compatibility_signature
+                data['compatibility_signature'] = compatibility_signature(
+                    data['provider'], data.get('snapshot') or {}, data.get('requested_spec'),
+                    data.get('workflow_key'), data.get('workflow_version'))
                 row = GpuJobRow(id=job_id, owner_id=owner_id, project_id=data.get('project_id'),
                                 state='queued', data=data, version=0,
                                 idempotency_key=f'batch:{batch_id}:{index}', body_hash=digest(job),

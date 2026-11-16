@@ -164,6 +164,9 @@ class Registry:
     def import_workflow(self, owner_id, bundle):
         if not isinstance(bundle, dict):
             raise ValueError("workflow bundle必须是对象")  # noqa: TRY004
+        if "image_extraction" in bundle:
+            from .image_import import extraction_bundle
+            bundle = extraction_bundle(bundle)
         source = bundle.get("workflow") if isinstance(bundle.get("workflow"), dict) else bundle
         key, model, manifest, graph, info = (
             source.get("workflow_key") or source.get("key"),
@@ -196,6 +199,7 @@ class Registry:
             "object_info": copy.deepcopy(info),
             "editable_graph": copy.deepcopy(source.get("editable_graph", graph)),
             "sha256": digest({"manifest": manifest, "api_graph": graph, "object_info": info}),
+            **({"image_extraction": source["image_extraction"], "image_import_summary": source["image_import_summary"], "pending_configuration": source["pending_configuration"]} if "image_extraction" in source else {}),
             "state": "draft",
             "smoke_test_passed": False,
             "smoke_test_kind": None,
@@ -225,6 +229,8 @@ class Registry:
             raise KeyError(id)
         if row.get("state") == "published":
             raise ValueError("已发布workflow版本不可重新验证或覆写")
+        if row.get("pending_configuration"):
+            raise ValueError("图片草稿尚待配置：" + "；".join(row["pending_configuration"]))
         manifest = validate_manifest(row["manifest"], row["api_graph"], row["object_info"])
         return self.repo.update(
             "workflows",

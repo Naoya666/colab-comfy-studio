@@ -54,7 +54,7 @@ class InstanceService:
     _SENSITIVE = {"token", "access_token", "refresh_token", "connectioninfo", "connection_info", "handle", "secret", "password", "authorization", "signed_url"}
     _PUBLIC = {
         "id", "owner_id", "project_id", "state", "version", "account_id", "account_alias_snapshot", "provider",
-        "instance_label", "runtime_spec_requested", "runtime_spec_reported", "gpu_reported", "current_job_id",
+        "instance_label", "runtime_spec_requested", "runtime_spec_reported", "gpu_reported", "gpu_diagnostics", "current_job_id",
         "lease_id", "hard_deadline_at", "idle_deadline_at", "retention_mode", "manual_stop_requested",
         "created_at", "updated_at", "last_seen_at", "generation", "selection_reason", "runtime_deleted",
         "allocation_key", "budget_reserved", "retention_reserved", "allocation_requested_at", "deletion_confirmed_at",
@@ -331,10 +331,10 @@ class InstanceService:
         self._check_budget(session, account, units)
         return units
 
-    def _retention_units(self, provider, minutes):
+    def _retention_units(self, provider, minutes, unit_rate=None):
         if provider == "mock":
             return 0.0
-        rate = self._cfg("unit_rate")
+        rate = max(float(unit_rate or 0), float(self._cfg("unit_rate") or 0))
         if not rate or rate <= 0:
             raise BudgetError("real GPU retention requires a positive unit_rate")
         return float(minutes) * rate
@@ -368,6 +368,12 @@ class InstanceService:
             return False
         if instance.state not in self._IDLE_STATES:
             return False
+        requested = job.get("requested_spec") or (job.get("execution_policy") or {}).get("requested_spec")
+        if requested:
+            from .specs import spec_key
+            previous = data.get("runtime_spec_requested")
+            if not previous or spec_key(previous) != spec_key(requested):
+                return False
         signature = job.get("compatibility_signature")
         return not signature or data.get("compatibility_signature") == signature
 
@@ -377,7 +383,7 @@ class InstanceService:
             raise InstanceConflict("实例已被其他任务占用")
         data.update(
             current_job_id=job["id"], account_id=self._account_id(account), allocation_key=key,
-            selection_reason=reason, budget_reserved=units, retention_reserved=0.0,
+            selection_reason=reason, budget_reserved=units, retention_reserved=0.0, unit_rate=job.get("unit_rate"),
             allocation_requested_at=data.get("allocation_requested_at") or self.clock(), last_seen_at=self.clock(),
             manual_stop_requested=False, runtime_deleted=False, idle_deadline_at=None,
         )
@@ -393,6 +399,7 @@ class InstanceService:
         payload = {
             "account_id": self._account_id(account), "provider": self._provider(job), "current_job_id": job["id"],
             "allocation_key": key, "compatibility_signature": job.get("compatibility_signature"),
+            "unit_rate": job.get("unit_rate"),
             "runtime_spec_requested": job.get("requested_spec") or policy.get("requested_spec"),
             "retention_mode": job.get("lifecycle") or policy.get("lifecycle") or "save",
             "selection_reason": reason, "budget_reserved": units, "retention_reserved": 0.0,
@@ -653,7 +660,7 @@ class InstanceService:
             provider = data.get("provider", "mock")
             hard = data.get("hard_deadline_at")
             if mode in {"retain", "smart"}:
-                retention_units = self._retention_units(provider, minutes)
+                retention_units = self._retention_units(provider, minutes, data.get("unit_rate"))
                 if provider != "mock":
                     account = self._account_row(session, data.get("account_id"), owner)
                     if account is None:

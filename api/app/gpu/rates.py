@@ -7,18 +7,24 @@ Budget caps still reserve the max-runtime worst case; this number is only what t
 
 from __future__ import annotations
 
+import os
 import statistics
 
 HOURLY = {"L4": 1.64, "T4": 1.15, "A100": 5.37, "NONE": 0.07}
 T4_HIGHMEM = 1.2
 
 
-def minute_rate(spec_key: dict | None) -> float:
+def minute_rate(spec_key: dict | None, fallback_rate: float | None = None) -> float:
     key = spec_key or {}
     accel = str(key.get("accelerator") or "NONE").upper()
     if accel == "T4" and "HIGHMEM" in str(key.get("shape", "")).upper():
         return T4_HIGHMEM / 60
-    return HOURLY.get(accel, HOURLY["A100"]) / 60
+    if accel in HOURLY:
+        return HOURLY[accel] / 60
+    configured = fallback_rate if fallback_rate is not None else float(os.getenv("GPU_UNIT_RATE") or 0)
+    if configured <= 0:
+        raise ValueError(f"{accel} 无已知估算费率，请管理员设置 GPU_UNIT_RATE（CU/分钟）")
+    return configured
 
 
 def mode_param(manifest: dict) -> tuple[str, dict] | None:
@@ -53,10 +59,10 @@ def expected_minutes(
 
 def estimate(
     repo, owner: str, workflow_key: str | None, manifest: dict, spec_key: dict | None, cap: float,
-    prep: bool = False, mode: str | None = None,
+    prep: bool = False, mode: str | None = None, fallback_rate: float | None = None,
 ) -> tuple[float, float]:
     """Returns (estimated CU, CU per minute)."""
-    rate = minute_rate(spec_key)
+    rate = minute_rate(spec_key, fallback_rate)
     return round(expected_minutes(repo, owner, workflow_key, manifest, cap, prep, mode) * rate, 3), rate
 
 

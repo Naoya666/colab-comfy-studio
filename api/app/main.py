@@ -32,7 +32,7 @@ from .db import Store
 from .gpu import loras as lora_registry
 from .gpu.compute import GpuConfig, MockColabProvider
 from .gpu.google import GoogleError
-from .gpu.manifest import bind_parameters, resolve_parameters, validate_manifest
+from .gpu.manifest import bind_parameters, digest, resolve_parameters, validate_manifest
 from .gpu.rates import estimate as estimate_units
 from .gpu.rates import mode_param
 from .gpu.registry import Registry
@@ -405,6 +405,33 @@ def import_workflow(body: dict, request: Request, user=Depends(current_user), st
     row = registry.import_workflow(user["id"], body)
     row = cloud_sync_workflow(st, user["id"], row)
     return ok(row, request, 201)
+
+
+@router.put("/workflows/{workflow_id}/configuration")
+def configure_image_draft(workflow_id: str, body: dict, request: Request,
+                          user=Depends(current_user), st=Depends(get_store)):
+    admin(user)
+    if len(json.dumps(body)) > 5 * 1024 * 1024:
+        raise APIError("WORKFLOW_TOO_LARGE", "工作流 JSON 过大", 413)
+    repo, _ = repo_registry(st, user)
+    row = own(repo, "workflows", workflow_id, user)
+    if row.get("state") != "draft" or not row.get("image_extraction"):
+        raise APIError("WORKFLOW_IMMUTABLE", "只能配置图片导入的未审核草稿", 409)
+    for name in ("manifest", "api_graph", "object_info"):
+        if not isinstance(body.get(name), dict):
+            raise ValueError(f"缺少 {name} 对象")
+    if not isinstance(body.get("model_id"), str) or not body["model_id"].strip():
+        raise ValueError("请提供 model_id（未关联时填写 unconfigured）")
+    from .gpu.image_import import missing_configuration
+    patch = {name: body[name] for name in ("manifest", "api_graph", "object_info", "model_id")}
+    pending = missing_configuration(patch)
+    if not pending:
+        from .gpu.specs import resolve_compute
+        resolve_compute(patch["manifest"], None)
+    patch.update(pending_configuration=pending, review_approved=False, smoke_test_passed=False,
+                 smoke_test_kind=None, sha256=digest({k: patch[k] for k in ("manifest", "api_graph", "object_info")}))
+    row = repo.update("workflows", workflow_id, patch, user["id"])
+    return ok(row, request)
 
 
 @router.post("/workflows/{workflow_id}/validate")

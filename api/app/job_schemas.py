@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .gpu import loras as lora_registry
 
 _NEW_POLICY_FIELDS = {
+    "compute_spec",
     "allocation",
     "account_id",
     "instance_id",
@@ -34,6 +35,8 @@ class Policy(BaseModel):
     shutdown_after_job: bool = True
     max_runtime_minutes: int = Field(default=60, ge=1, le=1440)
     idle_grace_minutes: int = Field(default=0, ge=0, le=30)
+
+    compute_spec: dict | None = None
 
     allocation: Literal["auto", "existing"] = "auto"
     account_id: str | None = None

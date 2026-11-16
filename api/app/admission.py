@@ -11,6 +11,7 @@ from .gpu.rates import estimate as estimate_units
 from .gpu.rates import length_factor, mode_param
 from .gpu.registry import Registry
 from .gpu.repository import Repository
+from .gpu.specs import compatibility_signature, resolve_compute
 from .job_schemas import normalize_policy
 
 
@@ -29,9 +30,9 @@ def _job_estimate(repo, owner, workflow, policy, cfg, params) -> dict:
     manifest = workflow["manifest"]
     picked = mode_param(manifest)
     mode = params.get(picked[0]) if picked else None
-    units, rate = estimate_units(repo, owner, workflow["workflow_key"], manifest, manifest.get("compute_spec"), cap, mode=mode)
+    units, rate = estimate_units(repo, owner, workflow["workflow_key"], manifest, (policy.get("resolved_compute_spec") or manifest.get("compute_spec")), cap, mode=mode, fallback_rate=cfg.unit_rate)
     units = round(min(units * length_factor(manifest, params), cap * rate), 3)
-    return {"estimated_units": units, "unit_rate": rate, "budget_units": cap * cfg.unit_rate}
+    return {"estimated_units": units, "unit_rate": rate, "budget_units": cap * max(rate, cfg.unit_rate or 0)}
 
 
 def _resource(repo, kind, resource_id, user, code, message):
@@ -140,6 +141,9 @@ def admit_job(st, user, body, key, *, validate_only=False):
     if bool(model.get("is_mock")) != (policy["provider"] == "mock"):
         raise APIError("EXECUTOR_MISMATCH", "模拟模板只能使用 Mock，真实模型不能伪装模拟成功")
     validate_manifest(workflow["manifest"], workflow["api_graph"], workflow["object_info"])
+    requested_spec, compute_warnings = resolve_compute(workflow["manifest"], policy.get("compute_spec"))
+    policy["resolved_compute_spec"] = requested_spec.get("key") if requested_spec else None
+    compute_fields = {"requested_spec": requested_spec, "compute_warnings": compute_warnings}
     preset = own(repo, "presets", body["preset_id"], user) if body.get("preset_id") else None
     if preset and preset["workflow_version_id"] != workflow["id"]:
         raise APIError("PRESET_INCOMPATIBLE", "预设属于不同工作流版本，请先迁移预设")
@@ -165,6 +169,7 @@ def admit_job(st, user, body, key, *, validate_only=False):
         "model_revision": model.get("revision"),
         "dependency_lock": workflow["manifest"].get("dependencies", {}),
     }
+    snapshot["runtime_compute_spec"] = policy["resolved_compute_spec"]
     baseline = None
     if policy["provider"] == "colab":
         if not workflow.get("review_approved") or workflow.get("smoke_test_kind") != "real":
@@ -190,8 +195,9 @@ def admit_job(st, user, body, key, *, validate_only=False):
     # After the published stamp, so the curated LoRA weight files stay in the manifest the runtime restores.
     if body.get("loras"):
         _apply_loras(repo, user, workflow, body["loras"], snapshot, policy["provider"])
+    compute_fields["compatibility_signature"] = compatibility_signature(policy["provider"], snapshot, requested_spec, workflow["workflow_key"], workflow["workflow_version"])
     if validate_only:
-        return {**body, "execution_policy": policy,
+        return {**body, **compute_fields, "execution_policy": policy,
                 "requested_account_id": policy.get("account_id"),
                 "requested_instance_id": policy.get("instance_id"),
                 **({"drive_account_id": _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if policy.get("account_id") else {}),
@@ -204,6 +210,7 @@ def admit_job(st, user, body, key, *, validate_only=False):
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "队列正在同步，请用相同幂等键稍后重试", 503, True)
         job, created = repo.create_job(user["id"], body, key, admitted={
+            **compute_fields,
             "execution_policy": policy,
             "requested_account_id": policy.get("account_id"),
             "requested_instance_id": policy.get("instance_id"),
@@ -217,7 +224,7 @@ def admit_job(st, user, body, key, *, validate_only=False):
             **_job_estimate(repo, user["id"], workflow, policy, cfg, params),
         })
         if created:
-            repo.event(job["id"], user["id"], "queued", "任务已持久化；手机关闭不会中断队列")
+            repo.event(job["id"], user["id"], "queued", "任务已持久化；请求规格：" + str(requested_spec) + "；" + "；".join(compute_warnings))
     return job
 
 

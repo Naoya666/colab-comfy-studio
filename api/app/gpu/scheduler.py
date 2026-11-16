@@ -717,6 +717,8 @@ class Scheduler:
         """Colab runtimespecs are identified by their ``key`` (variant/accelerator/shape)."""
         value = spec.get("key")
         if isinstance(value, dict):
+            from .specs import spec_key
+            value = spec_key({"key": value})
             return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return value or None
 
@@ -735,9 +737,7 @@ class Scheduler:
         snapshot = job.get("snapshot") or {}
         smoke = snapshot.get("system_smoke") is True
         prep = snapshot.get("prep") is True
-        # 官方 runtimespecs 只返回 key(variant/accelerator/shape)。经审查的工作流在
-        # manifest.compute_spec 写明已验证过的规格；普通任务只允许这个规格，
-        # 管理员冒烟任务按其请求的规格运行，缓存准备只用固定的 CPU 规格。
+        # Workflow defaults and runtime overrides remain separate; never fall back to another GPU.
         reviewed_key = self._spec_key({"key": (snapshot.get("manifest") or {}).get("compute_spec")})
         if prep:
             requested_key = reviewed_key = self._spec_key({"key": PREP_SPEC_KEY})
@@ -751,8 +751,11 @@ class Scheduler:
             if spec.get("eligible") is not True or self._has_gpu(spec) == prep:
                 continue
             if requested_key is None or self._spec_key(spec) == requested_key:
+                from .specs import check_requirements
+                if not prep and not smoke:
+                    check_requirements(snapshot.get("manifest") or {}, spec)
                 return spec
-        raise ComputeError("没有符合工作流runtime的GPU规格")
+        raise ComputeError("请求的 GPU 规格无申请资格或当前不可用；未切换其他 GPU：" + str(requested_key))
 
     def _recover_unknown_create(self, job: dict, lease: dict, provider: Any) -> str | bool:
         """Reconcile a create that may have succeeded before its response was lost."""
@@ -955,6 +958,12 @@ class Scheduler:
         if status.get("deleted"):
             return self._begin_failure(job, "gpu_runtime_missing", "GPU runtime disappeared")
         if status.get("ready"):
+            reported = status.get("runtime_spec")
+            if reported and job.get("requested_spec"):
+                if self._spec_key({"key": reported.get("key", reported)}) != self._spec_key(job["requested_spec"]):
+                    return self._begin_failure(job, "gpu_spec_mismatch", "实际分配规格与请求不匹配，已停止执行并释放实例")
+                job = self._update("jobs", job["id"], {"runtime_spec_reported": reported}, job.get("owner_id"))
+                self._event(job, "preparing", "实际分配规格：" + str(reported), None)
             job = self._mark_instance("mark_ready", job)
             return self._set_state(job, "loading", "GPU runtime is ready")
         return job

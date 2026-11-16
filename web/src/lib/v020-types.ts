@@ -8,6 +8,7 @@ export type RetentionMode = 'save' | 'retain' | 'smart';
 export interface GpuExecutionPolicyV020 {
   provider: V020Provider;
   max_runtime_minutes: number;
+  compute_spec?: Record<string, unknown> | null;
   allocation?: GpuAllocation;
   account_id?: string | null;
   instance_id?: string | null;

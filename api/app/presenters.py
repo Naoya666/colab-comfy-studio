@@ -56,6 +56,9 @@ def public_job(job):
         "instance_label",
         "instance_state",
         "gpu_reported",
+        "gpu_diagnostics",
+        "runtime_spec_reported",
+        "compute_warnings",
         "retained_until",
         "selection_reason",
     }

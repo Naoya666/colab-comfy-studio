@@ -54,8 +54,9 @@ export function CreatePanel({
   selectedAssets, setSelectedAssets, uploadProgress, onUpload, setModelId, workflowId, setWorkflowId,
   runtime, setRuntime, maxRuntime, setMaxRuntime, batchCount, setBatchCount, batchMode,
   runtimeChoice, accounts, instances, onRuntimeChoiceChange,
-  loading, error, onSubmit, onApplyPreset, onSavePreset,
+  gpuSelection, loading, error, onSubmit, onApplyPreset, onSavePreset,
 }: {
+  gpuSelection?: import('react').ReactNode;
   projectId: string;
   models: GpuModel[];
   workflows: GpuWorkflow[];
@@ -347,6 +348,7 @@ export function CreatePanel({
         />
         <RuntimeSelection value={runtimeChoice} accounts={accounts} instances={instances} provider={runtime}
           onChange={onRuntimeChoiceChange} />
+        {gpuSelection}
         {batchMode === 'retain' && <p className="muted small">保留机器会继续产生 CU；本站只承诺保留到设定截止，Google 仍可能提前回收。</p>}
         {runtime === 'colab' && (
           <div className="field">

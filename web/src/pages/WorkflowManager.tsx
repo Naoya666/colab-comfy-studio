@@ -1,3 +1,5 @@
+import { ImageWorkflowImport } from '../components/ImageWorkflowImport';
+import { ImageDraftConfiguration } from '../components/ImageDraftConfiguration';
 import { Fragment, useCallback, useMemo, useRef, useState } from 'react';
 import { ChevronDown, Search } from 'lucide-react';
 import type { GpuWorkflow } from '../lib/gpu-api';
@@ -88,6 +90,7 @@ export function WorkflowsPanel({
 
   return (
     <div className={styles.stack}>
+      <ImageWorkflowImport onImport={onImport} />
       <details className="foldable">
         <summary>导入新工作流（高级）</summary>
         <div className="foldContent">
@@ -154,7 +157,7 @@ export function WorkflowsPanel({
                           <span className={styles.versionActions}>
                             <button className="button secondary small" type="button" onClick={() => setPreviewing(wf)}>离线预览</button>
                             {!published && (
-                              <button className="button small" type="button" onClick={() => setActivating(activating === wf.id ? null : wf.id)}>
+                              <button className="button small" type="button" disabled={Array.isArray(wf.pending_configuration) && wf.pending_configuration.length > 0} title={Array.isArray(wf.pending_configuration) && wf.pending_configuration.length ? '请先补充图片草稿配置' : undefined} onClick={() => setActivating(activating === wf.id ? null : wf.id)}>
                                 {activating === wf.id ? '收起启用向导' : watch[wf.id] && ['queued', 'running', 'pending'].includes(watch[wf.id].state.toLowerCase()) ? '查看启用进度' : '一键启用'}
                               </button>
                             )}
@@ -164,6 +167,7 @@ export function WorkflowsPanel({
                             {published && !wf.active && <button className="button secondary small" type="button" onClick={() => onRollback(wf)}>设为当前</button>}
                           </span>
                         </div>
+                        {wf.image_extraction && wf.state === 'draft' ? <ImageDraftConfiguration workflow={wf} onDone={onActivated} /> : null}
                         {activating === wf.id && (
                           <div className={styles.versionDetail}>
                             <WorkflowActivationPanel
