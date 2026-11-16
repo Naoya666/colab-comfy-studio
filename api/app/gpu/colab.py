@@ -322,6 +322,7 @@ class GoogleColabProvider:
         if shape == "SHAPE_HIGHMEM" and accelerator not in _HIGH_MEM_ONLY_ACCELERATORS:
             params["shape"] = "hm"
 
+        self.store.update("leases", lease["id"], {"tunnel_nbh": nbh, "tunnel_assign_params": params}, self.owner_id)
         first = self._tunnel_json(self._tunnel_request("GET", "/tun/m/assign", params=params))
         if "endpoint" in first and isinstance(first.get("runtimeProxyInfo"), dict):
             assigned = first
@@ -438,9 +439,49 @@ class GoogleColabProvider:
             lease = self.store.update("leases", lease["id"], patch, self.owner_id)
         return matched
 
+    def _reconcile_tunnel_intent(self, lease):
+        """Resolve a lost assign response with read-only GETs, never another POST."""
+        if lease.get("tunnel_endpoint") or lease.get("operation_done") or not lease.get("create_attempts"):
+            return lease
+        # Do not interpret an empty list while the original POST may still run.
+        if time.time() - float(lease.get("create_started") or time.time()) < 60:
+            return lease
+        params = lease.get("tunnel_assign_params")
+        if not params:
+            key = (lease.get("selected_spec") or {}).get("key") or lease.get("requested_spec") or {}
+            params = {"nbh": _uuid_to_web_safe_base64(uuid.UUID(lease["request_id"]))}
+            variant = key.get("variant")
+            if variant in {"VARIANT_GPU", "VARIANT_TPU"}:
+                params.update(variant=variant.removeprefix("VARIANT_"), accelerator=key.get("accelerator", "NONE"))
+            if key.get("shape") == "SHAPE_HIGHMEM" and key.get("accelerator") not in _HIGH_MEM_ONLY_ACCELERATORS:
+                params["shape"] = "hm"
+        status = self._tunnel_json(self._tunnel_request("GET", "/tun/m/assign", params=params))
+        endpoint = status.get("endpoint")
+        if isinstance(endpoint, str) and endpoint:
+            return self.store.update("leases", lease["id"], {
+                "tunnel_endpoint": endpoint, "tunnel_nbh": params["nbh"], "operation_done": True,
+            }, self.owner_id)
+        # A valid unassigned response for this exact notebook plus absence from
+        # assignments is required. Empty/malformed replies are not confirmation.
+        if not isinstance(status.get("token"), str) or not status["token"] or status.get("nbh") != params["nbh"]:
+            return lease
+        assignments = self._tunnel_assignments()
+        matched = next((a for a in assignments if a.get("nbh") == params["nbh"]), None)
+        if matched:
+            if not matched.get("endpoint"):
+                return lease
+            return self.store.update("leases", lease["id"], {
+                "tunnel_endpoint": matched["endpoint"], "tunnel_nbh": params["nbh"], "operation_done": True,
+            }, self.owner_id)
+        return self.store.update("leases", lease["id"], {
+            "operation_done": True, "tunnel_nbh": params["nbh"],
+            "allocation_reconciliation": "exact_nbh_unassigned_and_absent",
+        }, self.owner_id)
+
     def inspect(self, handle):
         lease = self._owned(handle)
         if self._is_cli_tunnel(lease):
+            lease = self._reconcile_tunnel_intent(lease)
             endpoint = lease.get("tunnel_endpoint")
             if not endpoint:
                 unknown = int(lease.get("create_attempts", 0)) > 0 and not lease.get("operation_done")
@@ -503,6 +544,7 @@ class GoogleColabProvider:
     def delete(self, handle):
         lease = self._owned(handle)
         if self._is_cli_tunnel(lease):
+            lease = self._reconcile_tunnel_intent(lease)
             endpoint = lease.get("tunnel_endpoint")
             if not endpoint:
                 unknown = int(lease.get("create_attempts", 0)) > 0 and not lease.get("operation_done")

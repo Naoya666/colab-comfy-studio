@@ -11,9 +11,30 @@ import {
   shouldCreateSmoke,
   shouldAcceptSmoke,
   terminalSmokeJobId,
+  smokeIdempotencyKey,
 } from '../src/lib/activation-resume.ts';
 
 const step = (key, done = false) => ({ key, label: key, done });
+
+test('failed smoke retries get a new key while duplicate clicks reuse the same attempt', () => {
+  const values = new Map();
+  const previous = globalThis.sessionStorage;
+  globalThis.sessionStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+  };
+  try {
+    const first = smokeIdempotencyKey('workflow', 'project', ['b', 'a']);
+    assert.equal(smokeIdempotencyKey('workflow', 'project', ['a', 'b']), first);
+    const retry = smokeIdempotencyKey('workflow', 'project', ['a', 'b'], 'failed-1');
+    assert.notEqual(retry, first);
+    assert.equal(smokeIdempotencyKey('workflow', 'project', ['b', 'a'], 'failed-1'), retry);
+    assert.notEqual(smokeIdempotencyKey('workflow', 'project', ['a', 'b'], 'failed-2'), retry);
+  } finally {
+    if (previous === undefined) delete globalThis.sessionStorage;
+    else globalThis.sessionStorage = previous;
+  }
+});
 
 function snapshot(overrides = {}) {
   return {

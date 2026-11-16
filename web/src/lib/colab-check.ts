@@ -63,10 +63,18 @@ export function resolveGpuCheckRequest(
 }
 
 /** Keep the complete official spec object; never stringify its structured key. */
-export function selectEligibleColabGpuSpec(specs: ComputeSpec[]): ComputeSpec | null {
+export function selectEligibleColabGpuSpec(specs: ComputeSpec[], requiredSpec?: unknown): ComputeSpec | null {
+  const required = requiredSpec && typeof requiredSpec === 'object' && !Array.isArray(requiredSpec)
+    ? requiredSpec as Record<string, unknown> : null;
+  const normalized = (key: Record<string, unknown>) => [
+    String(key.variant || '').toUpperCase().replace(/^VARIANT_/, ''),
+    String(key.accelerator || '').toUpperCase(),
+    String(key.shape || 'STANDARD').toUpperCase().replace(/^SHAPE_/, ''),
+  ].join(':');
   return specs.find((spec) => {
     if (spec.eligible !== true || !spec.key || typeof spec.key !== 'object' || Array.isArray(spec.key)) return false;
     const variant = String((spec.key as Record<string, unknown>).variant || '');
-    return variant === 'VARIANT_GPU' || variant === 'GPU';
+    return (variant === 'VARIANT_GPU' || variant === 'GPU')
+      && (!required || normalized(spec.key as Record<string, unknown>) === normalized(required));
   }) || null;
 }

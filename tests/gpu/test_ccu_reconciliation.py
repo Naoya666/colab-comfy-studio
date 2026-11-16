@@ -41,6 +41,47 @@ def test_reconcile_never_invents_or_returns_negative():
     assert ccu.reconcile(5, None) is None
 
 
+@pytest.mark.parametrize("kind", ["workflow_smoke", "prep"])
+def test_allocation_samples_missing_smoke_and_prep_baseline_and_records_delta(tmp_path, monkeypatch, kind):
+    repo = make_repo(tmp_path)
+    job, _ = repo.create_job(OWNER, {"execution_policy": {"provider": "colab"}}, "baseline")
+    job = repo.update("jobs", job["id"], {
+        "provider": "colab", "account_id": "acc-1", kind: True, "started_epoch": 120,
+    }, OWNER)
+    samples = iter([
+        {"balance": 100.0, "at": 100.0},
+        {"balance": 99.8, "at": 180.0},
+    ])
+    monkeypatch.setattr(ccu, "maybe_sample_balance", lambda *args: next(samples))
+    scheduler = Scheduler(repo, clock=lambda: 180.0)
+    job = scheduler._sample_allocation_baseline(job, {"create_attempts": 0})
+    assert job["ccu_before"] == 100.0
+    assert job["ccu_before_at"] == 100.0
+    scheduler._record_usage(job, {"id": "lease-1"}, 180.0)
+    measured = repo.get("jobs", job["id"], OWNER)
+    assert measured["actual_units"] == pytest.approx(0.2)
+    assert measured["ccu_source"] == "google_balance"
+    assert repo.list("usage", OWNER)[0]["units_actual"] == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("provider,before,attempts", [("mock", None, 0), ("colab", 0, 0), ("colab", None, 1)])
+def test_allocation_does_not_resample_or_backfill_after_create(tmp_path, monkeypatch, provider, before, attempts):
+    repo = make_repo(tmp_path)
+    scheduler = Scheduler(repo)
+    def forbidden(*args):
+        raise AssertionError("Must not sample an existing baseline, mock, or started allocation")
+    monkeypatch.setattr(ccu, "maybe_sample_balance", forbidden)
+    job = {"provider": provider, "ccu_before": before}
+    assert scheduler._sample_allocation_baseline(job, {"create_attempts": attempts}) is job
+
+
+def test_allocation_sampling_failure_remains_fail_soft(tmp_path, monkeypatch):
+    scheduler = Scheduler(make_repo(tmp_path))
+    monkeypatch.setattr(ccu, "maybe_sample_balance", lambda *args: None)
+    job = {"provider": "colab", "owner_id": OWNER, "account_id": "acc-1"}
+    assert scheduler._sample_allocation_baseline(job, {}) is job
+
+
 def test_measure_spend_uses_balance_delta_and_flags_contention(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     job = {

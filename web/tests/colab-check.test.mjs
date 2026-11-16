@@ -123,3 +123,16 @@ test('workflow activation selects eligible GPU and preserves its structured key'
   assert.deepEqual(selectEligibleColabGpuSpec([cpu, tpu, gpu]), gpu);
   assert.notStrictEqual(selectEligibleColabGpuSpec([cpu, tpu, gpu]).key, String(gpu.key));
 });
+
+test('workflow GPU selection follows its declared spec rather than provider ordering', () => {
+  const gpu = (accelerator, shape = 'SHAPE_STANDARD', eligible = true) => ({
+    key: { variant: 'VARIANT_GPU', accelerator, shape }, eligible,
+  });
+  const t4 = gpu('T4');
+  const specs = [gpu('H100'), gpu('A100'), gpu('L4'), gpu('T4', 'SHAPE_HIGHMEM'), t4];
+  const required = { variant: 'GPU', accelerator: 'T4', shape: 'STANDARD' };
+  assert.strictEqual(selectEligibleColabGpuSpec(specs, required), t4);
+  assert.equal(selectEligibleColabGpuSpec(specs.slice(0, -1), required), null);
+  assert.equal(selectEligibleColabGpuSpec([gpu('T4', 'SHAPE_STANDARD', false), gpu('H100')], required), null);
+  assert.strictEqual(selectEligibleColabGpuSpec(specs, gpu('T4', 'SHAPE_HIGHMEM').key), specs[3]);
+});

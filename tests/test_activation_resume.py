@@ -120,6 +120,34 @@ def smoke_body(workflow_id, key, prompt):
     }
 
 
+def test_real_smoke_rejects_gpu_upgrade_before_discovery_or_job_creation(monkeypatch):
+    st = Store("sqlite:///:memory:")
+    repo = Repository(st)
+    workflow = setup_workflow(repo)
+    repo.update("workflows", workflow["id"], {"manifest": {
+        **workflow["manifest"],
+        "compute_spec": {"variant": "VARIANT_GPU", "accelerator": "T4", "shape": "SHAPE_STANDARD"},
+    }}, OWNER["id"])
+    repo.create("accounts", OWNER["id"], {"enabled": True, "allow_allocation": True}, record_id="account-1")
+    def no_discovery(*args, **kwargs):
+        raise AssertionError("Mismatched GPU must fail before external calls")
+    monkeypatch.setattr(review_routes.GoogleColabProvider, "list_specs", no_discovery)
+    payload = smoke_body(workflow["id"], "ignored", "hello")
+    payload["spec"]["key"]["accelerator"] = "H100"
+    with pytest.raises(APIError) as exc:
+        review_routes.real_smoke(workflow["id"], payload, request({"Idempotency-Key": "wrong-gpu"}), OWNER, st)
+    assert exc.value.code == "WORKFLOW_GPU_SPEC_MISMATCH"
+    assert not repo.list("jobs", OWNER["id"])
+
+
+def test_workflow_spec_guard_accepts_aliases_but_rejects_different_memory_shape():
+    manifest = {"compute_spec": {"variant": "VARIANT_GPU", "accelerator": "T4", "shape": "SHAPE_STANDARD"}}
+    review_routes._require_workflow_spec(manifest, {"variant": "GPU", "accelerator": "T4", "shape": "STANDARD"})
+    with pytest.raises(APIError) as exc:
+        review_routes._require_workflow_spec(manifest, {"variant": "GPU", "accelerator": "T4", "shape": "HIGHMEM"})
+    assert exc.value.code == "WORKFLOW_GPU_SPEC_MISMATCH"
+
+
 def test_real_smoke_resumes_compatible_job_even_when_random_params_and_key_change(monkeypatch):
     st = Store("sqlite:///:memory:")
     repo = Repository(st)

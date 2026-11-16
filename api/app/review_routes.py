@@ -265,6 +265,20 @@ def _eligible_spec(specs, requested_key):
     raise APIError("GPU_UNAVAILABLE", "请求的GPU规格不是当前账户实际可用规格")
 
 
+def _require_workflow_spec(manifest, requested_key):
+    expected = manifest.get("compute_spec")
+    if not isinstance(expected, Mapping):
+        return  # Preserve explicit administrator smoke for legacy manifests.
+    def normalized(key):
+        return (
+            str(key.get("variant", "")).upper().removeprefix("VARIANT_"),
+            str(key.get("accelerator", "")).upper(),
+            str(key.get("shape", "STANDARD")).upper().removeprefix("SHAPE_"),
+        )
+    if normalized(expected) != normalized(requested_key):
+        raise APIError("WORKFLOW_GPU_SPEC_MISMATCH", "冒烟GPU必须匹配工作流声明的型号和内存规格，不会自动升级显卡")
+
+
 def _budget_check(st, owner: str, cfg: GpuConfig, units: float) -> None:
     if not math.isfinite(units) or units <= 0:
         raise APIError("RATE_UNKNOWN", "真实GPU费率或预算无效")
@@ -635,6 +649,7 @@ def real_smoke(
     row = own(repo, "workflows", workflow_id, user)
     if row.get("state") not in {"draft", "validated"}:
         raise APIError("WORKFLOW_REVIEW_INVALID", "真实冒烟只能用于未发布的draft或validated工作流")
+    _require_workflow_spec(row.get("manifest") or {}, requested_key)
     model = _model(repo, user["id"], row.get("model_id"))
     _reviewed_model(model)
     snapshot_parts = _reviewed_snapshot(row) if row.get("review_approved") is True else None

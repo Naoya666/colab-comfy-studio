@@ -800,6 +800,22 @@ class Scheduler:
         )
         return False
 
+    def _sample_allocation_baseline(self, job: dict, lease: dict) -> dict:
+        # Smoke and CPU-prep jobs bypass normal admission's balance sample.
+        # Never invent a baseline after a possibly billable create has started.
+        if (self._provider_name(job) != "colab" or job.get("ccu_before") is not None
+                or int(lease.get("create_attempts") or 0) > 0):
+            return job
+        from . import ccu
+
+        baseline = ccu.maybe_sample_balance(self.store, job["owner_id"], job.get("account_id"))
+        if not baseline:
+            return job
+        return self._update("jobs", job["id"], {
+            "ccu_before": baseline["balance"], "ccu_before_at": baseline["at"],
+            "ccu_before_source": "google_balance",
+        }, job["owner_id"])
+
     def _allocation(self, job: dict) -> dict:
         # Persist intent under the short lock, then release it before provider I/O.
         with self.db_store.dispatch_lock() as acquired:
@@ -835,6 +851,7 @@ class Scheduler:
         attempts = int(lease.get("create_attempts") or 0)
         if attempts > self.config.create_retries:
             return self._begin_failure(job, "gpu_create_failed", "GPU runtime allocation failed")
+        job = self._sample_allocation_baseline(job, lease)
         attempts += 1
         lease = self._update(
             "leases",
@@ -865,7 +882,8 @@ class Scheduler:
             return self._begin_failure(job, "gpu_provider_unavailable", self._safe_error(exc))
         except ColabAllocationError as exc:
             return self._allocation_failed(job, exc)
-        except Exception:
+        except Exception as exc:
+            self._update("leases", lease["id"], {"last_create_error": self._safe_error(exc)}, job.get("owner_id"))
             recovered = self._recover_unknown_create(job, lease, provider)
             if recovered == "cleaned":
                 return self._begin_failure(job, "gpu_create_failed", "GPU runtime allocation failed")

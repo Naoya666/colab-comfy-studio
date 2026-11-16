@@ -167,7 +167,7 @@ export function WorkflowActivationPanel({
               account_id: accountId,
               spec,
             },
-            smokeIdempotencyKey(workflow.id, projectId, smokeBody.assetIds),
+            smokeIdempotencyKey(workflow.id, projectId, smokeBody.assetIds, terminalSmokeJobId(snapshot)),
           );
           if (!isCurrent(token)) return;
           snapshot = await refresh(token);
@@ -235,9 +235,11 @@ export function WorkflowActivationPanel({
         if (request.provider !== 'colab') {
           throw new Error('没有已启用且已连接 Colab 的账号，无法读取真实 GPU 规格');
         }
-        const eligible = selectEligibleColabGpuSpec(await getGpuComputeSpecs('colab', request.accountId));
+        const requiredSpec = workflow.manifest?.compute_spec;
+        if (!requiredSpec || typeof requiredSpec !== 'object') throw new Error('工作流未声明 GPU 规格，请先补齐工作流配置');
+        const eligible = selectEligibleColabGpuSpec(await getGpuComputeSpecs('colab', request.accountId), requiredSpec);
         if (!isCurrent(token)) return;
-        if (!eligible) throw new Error('当前账号没有可用的真实 GPU 规格（已过滤 CPU/TPU）');
+        if (!eligible) throw new Error('当前账号没有工作流要求的 GPU 规格；不会自动改用其他显卡');
         setAccountId(request.accountId);
         setSpec(eligible);
       } catch (err) {
@@ -251,7 +253,7 @@ export function WorkflowActivationPanel({
       aliveRef.current = false;
       executionRef.current += 1;
     };
-  }, [isCurrent, refresh, say, waitForSmoke]);
+  }, [isCurrent, refresh, say, waitForSmoke, workflow.manifest]);
 
   useEffect(() => {
     if (!projectId) {
@@ -385,7 +387,7 @@ export function WorkflowActivationPanel({
       {needsNewSmoke ? (
         <label className={styles.checkline}>
           <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} />
-          <span>我知道会真实开 GPU 并产生费用</span>
+          <span>我知道会真实开 GPU{spec && typeof spec.key === 'object' ? `（${String(spec.key.accelerator || '')} / ${String(spec.key.shape || '')}）` : ''} 并产生费用</span>
         </label>
       ) : null}
       {historyError ? <p role="alert" className={styles.errorText}>{historyError}</p> : null}
