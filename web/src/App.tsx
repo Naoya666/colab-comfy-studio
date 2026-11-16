@@ -1,4 +1,5 @@
 import { ModelRunOverrides, type ModelOverride } from './components/ModelDependencies';
+import { NativeComfyPage } from './pages/NativeComfyPage';
 import { ModelLibraryPage } from './pages/ModelLibraryPage';
 import { SettingsPanel } from './pages/SettingsPage';
 import { GalleryPanel } from './pages/GalleryPage';
@@ -33,7 +34,7 @@ import { formatInstanceTime } from './lib/instance-time';
 import { JobHistoryDetails } from './components/JobHistoryDetails';
 import styles from './gpu.module.css';
 
-const tabs = ['创作', '任务', '作品', '算力', '模型库'] as const;
+const tabs = ['创作', '任务', '作品', '算力', '模型库', '原生 ComfyUI'] as const;
 type Tab = typeof tabs[number] | '设置';
 const terminalStates = new Set(['completed', 'succeeded', 'failed', 'failed_final', 'cancelled', 'cancelled_local', 'blocked']);
 
@@ -911,6 +912,7 @@ export default function App() {
           />
         )}
         {tab === '模型库' && <ModelLibraryPage />}
+        {tab === '原生 ComfyUI' && <NativeComfyPage accounts={accounts} />}
         {tab === '设置' && (
           <SettingsPanel
             accounts={accounts}

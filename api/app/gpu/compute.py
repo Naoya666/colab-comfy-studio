@@ -369,7 +369,7 @@ def _is_builtin_mcp_job(job: dict) -> bool:
         for value in values
     ):
         return True
-    return any(snapshot.get(flag) is True or record.get(flag) is True for flag in ("system_smoke", "prep"))
+    return any(snapshot.get(flag) is True or record.get(flag) is True for flag in ("system_smoke", "prep", "native_comfy"))
 
 
 def _mcp_executor(job: dict, *, store=None, owner_id: str | None = None):

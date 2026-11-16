@@ -186,3 +186,7 @@ npm --prefix web run build
 `.github/workflows/offline.yml` 提供同一命令的 CI 配置；当前仅本地执行验证，尚未在 GitHub Actions 上运行。依赖安装会访问软件包仓库，但验收阶段禁止真实 Colab、OAuth、Drive 业务及 GPU 调用。此验收不证明真实云存储或模型可用。
 
 统一模型库、工作流依赖自动解析及 Drive 下载队列的配置、升级、API 和验证限制，见 [第三阶段使用与交付说明](docs/model-library-phase3.md)。升级后需额外运行 `python -m app.worker model-worker`；模型准备不申请 GPU。
+
+### 原生 ComfyUI（独立域名）
+
+新增「原生 ComfyUI」入口，与 Studio 复用 GPU 会话，提供完整 HTTP/WebSocket 代理和 Drive 用户数据持久化。部署需配置独立域名、受 Access Service Auth 保护的 Cloudflare named tunnel，以及固定 ComfyUI 提交。详见 [部署、目录、酒馆兼容与真实 GPU 验收清单](docs/NATIVE_COMFYUI.md)。当前自动验证为离线模拟，真实 Colab/Drive/隧道仍需部署后验收。

@@ -43,6 +43,8 @@ from .instance_routes import router as instance_router
 from .job_history import job_timing_details, job_timings
 from .job_schemas import JobInput
 from .model_library_routes import router as model_library_router
+from .native_proxy import NativeHostMiddleware
+from .native_routes import router as native_router
 from .oauth_config_routes import router as oauth_config_router
 from .presenters import public_asset, public_job
 from .review_routes import router as review_router
@@ -934,6 +936,8 @@ if os.getenv("STUDIO_ATELIER_ENABLED", "0").strip().lower() in {"1", "true"}:
     app.include_router(atelier_router)
 app.include_router(account_router)
 app.include_router(instance_router)
+app.include_router(native_router)
+app.add_middleware(NativeHostMiddleware, studio_app=app)
 app.include_router(history_router)
 app.include_router(compute_router)
 app.include_router(review_router)

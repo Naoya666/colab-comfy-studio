@@ -34,6 +34,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 COMFY_REPO = "https://github.com/comfyanonymous/ComfyUI"
+NATIVE_SERVICE_MARKER = Path("/content/ai-studio/native/state.json")
 SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 COMMIT = re.compile(r"^[0-9a-fA-F]{40}$")
 DRIVE_API = "https://www.googleapis.com/drive/v3"
@@ -1257,13 +1258,29 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
     for node in graph.values():
         if not isinstance(node, dict) or node.get("class_type") not in allowlist:
             raise WorkerError("bound graph contains an unreviewed node")
-    comfy = root / "ComfyUI"
+    native_marker = NATIVE_SERVICE_MARKER
+    native_state = json.loads(native_marker.read_text()) if native_marker.is_file() else None
+    shared_native = native_state is not None
+    if shared_native and native_state.get("commit") != commit:
+        raise WorkerError("Studio workflow uses a different ComfyUI version; stop native session before switching versions")
+    comfy = Path(native_state["comfy"]) if shared_native else root / "ComfyUI"
     _check_loras(graph, manifest, (payload.get("snapshot") or {}).get("lora_files") or [])
     timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
     nodes = _reviewed_custom_nodes(manifest.get("custom_nodes"))
     checked = _validate_weights(manifest)
     fingerprint = _warm_fingerprint(commit, nodes, checked)
-    if _warm_take(root, fingerprint, nodes, checked):
+    if shared_native:
+        _verify_checkout(comfy, commit)
+        stages.start("restore_weights")
+        # The shared process already loaded its nodes. Never install packages or restart it under queued native work.
+        for node in nodes:
+            folder = comfy / "custom_nodes" / node["dir"]
+            actual = _run(["git", "rev-parse", "HEAD"], cwd=folder, timeout=30).stdout.strip()
+            if actual != node["commit"]:
+                raise WorkerError("Native service custom node version differs from reviewed Studio workflow")
+        env = {"source": "native_shared"}
+        weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False)
+    elif _warm_take(root, fingerprint, nodes, checked):
         # Same runtime, same environment: the previous job left it restored. Nothing to download.
         stages.start("warm_reuse")
         env = {"source": "warm"}
@@ -1285,7 +1302,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
         log = log_path.open("ab", buffering=0)
         process = None
         try:
-            process = subprocess.Popen(
+            process = None if shared_native else subprocess.Popen(
                 [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188"],
                 cwd=comfy,
                 stdout=log,
@@ -1300,7 +1317,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                     _http_json(api + "/system_stats", timeout=5)
                     break
                 except WorkerError:
-                    if process.poll() is not None:
+                    if process is not None and process.poll() is not None:
                         raise WorkerError("Comfy worker exited during startup")
                     time.sleep(1)
             else:
@@ -1377,7 +1394,8 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                     process.kill()
             log.close()
     finally:
-        _warm_put(root, fingerprint)  # restore succeeded above, so the tree is reusable even if this job failed later
+        if not shared_native:
+            _warm_put(root, fingerprint)  # restore succeeded above, so the tree is reusable even if this job failed later
 
 
 def _run_prep(root: Path, payload: dict, manifest: dict, stages: _Stages) -> list[dict]:
@@ -1429,7 +1447,10 @@ def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
             if diagnostics:
                 _status(root, "running", gpu_diagnostics=diagnostics)
             _check_compute_hardware(manifest, diagnostics, snapshot.get("runtime_compute_spec"))
-        if snapshot.get("system_smoke") is True:
+        if snapshot.get("native_comfy") is True:
+            from native_runtime import run as run_native
+            outputs = run_native(root, payload, stages)
+        elif snapshot.get("system_smoke") is True:
             if manifest.get("executor") != "cuda-smoke":
                 raise WorkerError("system smoke requires the cuda-smoke executor manifest")
             outputs = [run_cuda_smoke(root)]
@@ -1496,9 +1517,9 @@ def main(argv: list[str] | None = None) -> int:
             raise WorkerError("payload must be an object")
         root = Path(payload["execution_dir"]).resolve()
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if "drive_cache" in payload:  # keep the Drive token out of files that outlive the worker's read
+        if "drive_cache" in payload or "native_secrets" in payload:  # keep the Drive token out of files that outlive the worker's read
             payload_path.chmod(0o600)
-            _atomic_json(payload_path, {k: v for k, v in payload.items() if k != "drive_cache"})
+            _atomic_json(payload_path, {k: v for k, v in payload.items() if k not in {"drive_cache", "native_secrets"}})
             payload_path.chmod(0o600)
         artifacts = _MCPManifestStore(root) if payload.get('output_transport') == 'mcp-chunks-v1' else None
         run_job(payload, root, artifact_store=artifacts)

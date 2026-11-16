@@ -83,6 +83,7 @@ def build_bootstrap_code(execution_id: str, payload: dict, worker_source: str | 
         worker_source = Path(__file__).with_name("runtime_worker.py").read_text(encoding="utf-8")
     if not isinstance(worker_source, str) or not worker_source:
         raise MCPError("trusted worker source is unavailable")
+    native_b64 = base64.b64encode(Path(__file__).with_name("native_runtime.py").read_bytes()).decode("ascii")
     source_b64 = base64.b64encode(worker_source.encode("utf-8")).decode("ascii")
     payload_b64 = _b64_json(payload)
     execution_literal = repr(execution_id)
@@ -116,7 +117,10 @@ else:
     except FileExistsError:
         _result["existing"] = True
     else:
+        (_dir / "native_runtime.py").write_bytes(_base64.b64decode({native_b64!r}))
         _worker.write_bytes(_base64.b64decode({source_b64!r}))
+        _payload.touch(mode=0o600)
+        _payload.chmod(0o600)
         _payload.write_bytes(_base64.b64decode({payload_b64!r}))
         _marker.write_text(_json.dumps({{"execution_id": _execution_id, "state": "reserved"}}, sort_keys=True), encoding="utf-8")
         _log_handle = _log.open("ab")
@@ -656,7 +660,11 @@ class MCPGPUExecutor:
             raise MCPError("job无效")
         session = self._session(handle, job["id"])
         root = "/content/ai-studio/" + execution_id
-        code = build_bootstrap_code(execution_id, self._payload(job, execution_id, root))
+        payload = self._payload(job, execution_id, root)
+        if (job.get("snapshot") or {}).get("native_comfy"):
+            from .native import runtime_secrets
+            payload["native_secrets"] = runtime_secrets(self.store, job)
+        code = build_bootstrap_code(execution_id, payload)
         result = self._exec_code_on_handle(handle, session, execution_id, code)
         return {
             "execution_id": execution_id,

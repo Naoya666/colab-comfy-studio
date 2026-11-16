@@ -1,0 +1,237 @@
+"""Native ComfyUI admission and conservative activity checks on existing leases."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import httpx
+
+from app.common import APIError
+from app.config import settings
+from app.security import decrypt_secret
+
+from .compute import GpuConfig
+from .manifest import digest
+
+TERMINAL = {"completed", "failed", "cancelled", "rejected"}
+
+
+def secret_file(name):
+    path = os.getenv(name, "")
+    if not path:
+        raise APIError("NATIVE_CONFIG", f"必须配置 {name}", 503)
+    try:
+        value = Path(path).read_text().strip()
+    except OSError as exc:
+        raise APIError("NATIVE_CONFIG", f"无法读取 {name} 指定的凭据文件", 503) from exc
+    if not value:
+        raise APIError("NATIVE_CONFIG", f"{name} 指定的凭据文件为空", 503)
+    return value
+
+
+def backend():
+    url = settings.native_comfy_backend_url.rstrip("/")
+    p = urlsplit(url)
+    if p.scheme != "https" or not p.hostname or p.username or p.password or p.path or p.query or p.fragment:
+        raise APIError("NATIVE_CONFIG", "NATIVE_COMFY_BACKEND_URL 必须为独立 HTTPS 源地址", 503)
+    if p.netloc in {urlsplit(settings.site_url).netloc, urlsplit(settings.native_comfy_url).netloc}:
+        raise APIError("NATIVE_CONFIG", "内部 tunnel 域名必须与 Studio 和原生公网域名不同", 503)
+    try:
+        access = json.loads(secret_file("NATIVE_COMFY_ACCESS_FILE"))
+        if not isinstance(access, dict) or any(not isinstance(access.get(k), str) or not access[k] for k in ("client_id", "client_secret")):
+            raise ValueError
+    except (ValueError, TypeError) as exc:
+        raise APIError("NATIVE_CONFIG", "Access 凭据文件必须包含 client_id 和 client_secret", 503) from exc
+    return url, {"CF-Access-Client-Id": access["client_id"],
+                 "CF-Access-Client-Secret": access["client_secret"]}
+
+
+def active_lease(repo, owner="owner"):
+    return next((x for x in repo.list("leases", owner)
+                 if x.get("native_comfy") and x.get("state") not in {"deleted", "quarantined", "releasing", "deleting"}), None)
+
+
+def busy(client=None):
+    """Unknown is busy: network errors must never stop a video or an upload."""
+    try:
+        url, headers = backend()
+        with httpx.Client(timeout=8) if client is None else _borrow(client) as c:
+            q = c.get(url + "/queue", headers=headers)
+            q.raise_for_status()
+            data = q.json()
+            if not isinstance(data.get("queue_running"), list) or not isinstance(data.get("queue_pending"), list):
+                return True
+            queued = bool(data["queue_running"] or data["queue_pending"])
+            state = c.get(url + "/studio_native/state", headers=headers)
+            state.raise_for_status()
+            return queued or state.json().get("busy") is not False
+    except Exception:
+        return True
+
+
+class _borrow:
+    def __init__(self, value):
+        self.value = value
+
+    def __enter__(self):
+        return self.value
+
+    def __exit__(self, *args):
+        pass
+
+
+def admit(repo, owner, body, key):
+    cfg = GpuConfig.from_env()
+    if not settings.native_comfy_url or not cfg.real_enabled:
+        raise APIError("NATIVE_DISABLED", "请先配置原生 ComfyUI 域名并启用真实 GPU", 503)
+    backend()
+    secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
+    commit = os.getenv("NATIVE_COMFY_COMMIT", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise APIError("NATIVE_CONFIG", "NATIVE_COMFY_COMMIT 必须锁定 40 位官方提交", 503)
+    if not key or len(key) > 200:
+        raise APIError("IDEMPOTENCY_REQUIRED", "必须提供固定幂等键", 422)
+    account = body.get("account_id")
+    if not account or not isinstance(body.get("spec"), dict):
+        raise APIError("NATIVE_INPUT", "请选择账号和 GPU 规格", 422)
+    # A durable dispatch lock serializes admission with both API and worker processes.
+    with repo.store.dispatch_lock() as acquired:
+        if not acquired:
+            raise APIError("SCHEDULER_BUSY", "调度正在同步，请使用相同幂等键重试", 503)
+        previous = next((j for j in repo.list("jobs", owner) if j.get("idempotency_key") == key), None)
+        if previous:
+            if previous.get("native_request_hash") != digest(body):
+                raise APIError("IDEMPOTENCY_CONFLICT", "幂等键参数冲突", 409)
+            return previous
+        running = next((j for j in repo.list("jobs", owner)
+                        if (j.get("snapshot") or {}).get("native_comfy") and j["state"] not in TERMINAL), None)
+        live = active_lease(repo, owner)
+        if running or live:
+            source = running or repo.get("jobs", live["owner_job_id"], owner)
+            from .specs import spec_key
+            try:
+                same_spec = source and spec_key(source.get("requested_spec")) == spec_key(body["spec"])
+            except ValueError:
+                same_spec = False
+            if not source or source.get("account_id") != account or not same_spec:
+                raise APIError("NATIVE_ACTIVE", "已有原生会话；请等待任务和同步完成后停止旧实例，再切换 GPU", 409)
+            return source
+        # Never create a second GPU while another live instance is already present.
+        instances = [i for i in repo.list("instances", owner) if i.get("state") not in {"deleted"} and i.get("provider") == "colab"]
+        requested_instance = body.get("instance_id")
+        if instances:
+            if len(instances) != 1 or (requested_instance and instances[0]["id"] != requested_instance):
+                raise APIError("INSTANCE_CONFLICT", "请明确选择唯一可复用实例，或先释放其他实例", 409)
+            instance = instances[0]
+            if instance.get("state") not in {"ready", "retained_idle"} or instance.get("current_job_id"):
+                raise APIError("INSTANCE_BUSY", "现有实例仍在执行任务或初始化，请等待完成", 409)
+            if instance.get("account_id") != account:
+                raise APIError("INSTANCE_CONFLICT", "已有实例属于其他账号，请先停止旧实例", 409)
+            requested_instance = instance["id"]
+        from app.compute_routes import _require_account
+        _require_account(repo, owner, account)
+        if not cfg.unit_rate or cfg.unit_rate <= 0:
+            raise APIError("RATE_UNKNOWN", "请先配置 GPU_UNIT_RATE 与预算", 422)
+        project = "native-comfy-" + owner
+        if not repo.store.get("projects", project, owner):
+            repo.store.create("projects", owner, {"title": "原生 ComfyUI", "system": True}, record_id=project)
+        raw = {"kind": "native-comfy", **body}
+        job, _ = repo.create_job(owner, raw, key)
+        policy = {"provider": "colab", "lifecycle": "retain", "account_id": account,
+                  "retain_idle_minutes": settings.native_comfy_idle_minutes,
+                  "max_runtime_minutes": cfg.max_runtime_minutes,
+                  **({"instance_id": requested_instance, "allocation": "existing"} if requested_instance else {})}
+        return repo.update("jobs", job["id"], {
+            "native_request_hash": digest(body), "project_id": project, "provider": "colab",
+            "account_id": account, "requested_account_id": account,
+            "requested_instance_id": requested_instance, "requested_spec": body["spec"],
+            "lifecycle": "retain", "execution_policy": policy,
+            "model_id": "native-comfy", "workflow_key": "system/native-comfy", "workflow_version": 1,
+            "max_runtime_minutes": cfg.max_runtime_minutes, "unit_rate": cfg.unit_rate,
+            "estimated_units": cfg.max_runtime_minutes * cfg.unit_rate,
+            "snapshot": {"native_comfy": True, "bound_graph": {},
+                         "manifest": {"reviewed": True, "state": "published", "comfy_commit": commit,
+                                      "compute_spec": body["spec"].get("key", body["spec"])}}}, owner)
+
+
+def runtime_secrets(repo, job):
+    """Only sent over the trusted Colab execution channel; never saved in a DB row."""
+    from .drive import DriveStorage
+    drive = DriveStorage(job, repo)
+    try:
+        cache = drive.model_cache()
+        google = drive.google
+        cred = google._credential("drive", account_id=google.account_id)
+        client_id = cred.get("client_id")
+        if client_id and cred.get("encrypted_client_secret"):
+            client_secret = decrypt_secret(cred["encrypted_client_secret"])
+        else:
+            client_id, client_secret, _ = google._config()
+        return {"owner_folder_id": drive._owner_folder_id, "models_folder_id": cache["folder_id"],
+                "client_id": client_id, "client_secret": client_secret,
+                "refresh_token": decrypt_secret(cred["encrypted_refresh_token"]),
+                "access_token": cache["access_token"],
+                "tunnel_token": secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE"),
+                "cache_gb": settings.native_comfy_cache_gb, "max_upload_mb": settings.native_comfy_max_upload_mb,
+                "models": [dict(filename=m.get("filename"), category=m.get("model_type"), file_id=m["drive_file_id"])
+                           for m in repo.list("model_library", job["owner_id"])
+                           if m.get("state") == "ready" and m.get("drive_file_id")
+                           and m.get("drive_account_id") in {None, drive.account_id}]}
+    finally:
+        drive.close()
+
+
+def protect_lease(repo, lease, clock=time.time):
+    """Fence idle shutdown against new uploads/prompts under the existing dispatch lock."""
+    if not lease.get("native_comfy"):
+        return False
+    upstream_busy = busy()
+    with repo.store.dispatch_lock() as acquired:
+        if not acquired:
+            return True
+        lease = repo.get("leases", lease["id"], lease["owner_id"]) or lease
+        if upstream_busy:
+            repo.update("leases", lease["id"], {"native_last_busy": clock()}, lease["owner_id"])
+            return True
+        if clock() - float(lease.get("native_http_heartbeat") or 0) < 30:
+            return True
+        instance = repo.get("instances", lease.get("instance_id"), lease["owner_id"]) or {}
+        manual = instance.get("manual_stop_requested")
+        last = max(float(lease.get("native_last_busy") or 0), float(lease.get("native_last_write") or 0))
+        if not manual and clock() - last < settings.native_comfy_idle_minutes * 60:
+            return True
+        repo.update("leases", lease["id"], {"native_draining": True}, lease["owner_id"])
+        if lease.get("instance_id") and instance:
+            repo.update("instances", lease["instance_id"], {"native_draining": True}, lease["owner_id"])
+        return False
+
+
+def begin_write(repo, lease):
+    with repo.store.dispatch_lock() as acquired:
+        if not acquired:
+            raise APIError("SCHEDULER_BUSY", "会话正在同步，请稍后重试", 503)
+        fresh = repo.get("leases", lease["id"], lease["owner_id"]) or {}
+        if fresh.get("native_draining") or fresh.get("state") in {"deleted", "releasing", "deleting"}:
+            raise APIError("NATIVE_DRAINING", "实例正在释放，请回到 Studio 重启", 409)
+        repo.update("leases", lease["id"], {"native_last_write": time.time(), "native_http_heartbeat": time.time()}, lease["owner_id"])
+
+
+def ready(client=None):
+    try:
+        url, headers = backend()
+        with httpx.Client(timeout=8, follow_redirects=False) if client is None else _borrow(client) as c:
+            # Service-token protection of the internal tunnel is mandatory.
+            unauthenticated = c.get(url + "/system_stats")
+            if unauthenticated.status_code not in {401, 403, 302}:
+                return False
+            response = c.get(url + "/system_stats", headers=headers)
+            response.raise_for_status()
+            state = c.get(url + "/studio_native/state", headers=headers)
+            state.raise_for_status()
+            return isinstance(response.json().get("system"), dict) and isinstance(state.json().get("busy"), bool)
+    except Exception:
+        return False

@@ -1,0 +1,58 @@
+"""Studio control plane for native ComfyUI. Data plane lives on its own host."""
+import time
+from urllib.parse import urlsplit
+
+import httpx
+from fastapi import APIRouter, Depends, Request
+
+from .common import APIError, current_user, ok
+from .config import settings
+from .gpu import native
+from .security import sign_session
+
+router = APIRouter(prefix="/api/gpu/native")
+
+
+@router.get("/status")
+async def status(request: Request, user=Depends(current_user)):
+    repo = request.app.state.repo
+    lease = native.active_lease(repo, user["id"])
+    native_jobs = [j for j in repo.list("jobs", user["id"]) if (j.get("snapshot") or {}).get("native_comfy")]
+    job = max(native_jobs, key=lambda j: j.get("created_at") or "", default=None)
+    ready = False
+    if lease and lease.get("native_ready"):
+        try:
+            url, headers = native.backend()
+            async with httpx.AsyncClient(timeout=8) as client:
+                response = await client.get(url + "/system_stats", headers=headers)
+                ready = response.status_code == 200 and isinstance(response.json().get("system"), dict)
+        except (httpx.HTTPError, ValueError, APIError):
+            pass
+    events = repo.list("events", user["id"]) if job else []
+    return ok({"configured": bool(settings.native_comfy_url), "url": settings.native_comfy_url,
+               "ready": ready, "instance_id": lease.get("instance_id") if lease else None,
+               "job_id": job["id"] if job else None, "state": job["state"] if job else "stopped",
+               "error": job.get("error_message") if job else None,
+               "events": [{"message": e.get("message"), "state": e.get("state")}
+                          for e in events if e.get("job_id") == (job or {}).get("id")][-30:]}, request)
+
+
+@router.post("/start", status_code=202)
+def start(body: dict, request: Request, user=Depends(current_user)):
+    unknown = set(body) - {"account_id", "spec", "instance_id"}
+    if unknown:
+        raise APIError("NATIVE_INPUT", "不支持的启动参数", 422)
+    job = native.admit(request.app.state.repo, user["id"], body, request.headers.get("Idempotency-Key"))
+    return ok({"job_id": job["id"], "state": job["state"]}, request, 202)
+
+
+@router.post("/ticket")
+def ticket(request: Request, user=Depends(current_user)):
+    url = settings.native_comfy_url.rstrip("/")
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.path or parsed.query or parsed.fragment:
+        raise APIError("NATIVE_CONFIG", "NATIVE_COMFY_URL 必须为独立 HTTPS 源地址", 503)
+    now = int(time.time())
+    return ok({"url": url + "/_studio/session",
+               "ticket": sign_session({"uid": user["id"], "aud": url, "purpose": "native-handoff",
+                                       "iat": now, "exp": now + 60})}, request)

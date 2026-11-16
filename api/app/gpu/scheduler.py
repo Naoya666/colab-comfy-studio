@@ -44,6 +44,10 @@ MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 
 # Stage markers written by runtime_worker.py into status.json while a job is running.
 _STAGE_TEXT = {
+    "native_environment": "初始化原生 ComfyUI 和节点依赖",
+    "native_drive": "挂载 Google Drive 持久化目录",
+    "native_models": "准备按需模型缓存及模型目录",
+    "native_tunnel": "建立原生 ComfyUI 代理连接",
     "restore_env": "正在恢复运行环境",
     "restore_weights": "正在恢复模型文件",
     "warm_reuse": "同一台机器已有模型，直接复用",
@@ -237,7 +241,7 @@ class Scheduler:
             return job
         deadline = lease.get("deadline_epoch")
         idle_deadline = lease.get("idle_deadline_at")
-        if idle_deadline is not None and self.clock() >= float(idle_deadline):
+        if not lease.get("native_ready") and idle_deadline is not None and self.clock() >= float(idle_deadline):
             return job
         if deadline is not None and self.clock() >= float(deadline):
             return job
@@ -572,6 +576,8 @@ class Scheduler:
         One failed or cancelled prep stops the waiting (the job then runs uncached); it is never retried here.
         """
         snapshot = job.get("snapshot") or {}
+        if any(x.get("native_ready") and x.get("state") == "idle" for x in self._leases_for(job.get("owner_id"))):
+            return False
         sha = snapshot.get("workflow_sha256")
         if (
             self._provider_name(job) != "colab"
@@ -984,6 +990,8 @@ class Scheduler:
             # The lease is owned by this job (see _lease), so cleaning it up here is safe.
             return self._begin_failure(job, "gpu_execution_prepare_failed", f"Execution registration refused: {exc}")
         execution_id = job["execution_id"]
+        if (job.get("snapshot") or {}).get("native_comfy"):
+            lease = self._update("leases", lease["id"], {"native_comfy": True}, job["owner_id"])
         try:
             # The Drive token is attached to an in-memory copy only; it is never persisted.
             executor_job = {
@@ -1059,6 +1067,15 @@ class Scheduler:
         state = result.get("state")
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else None
         if state == "completed":
+            if (job.get("snapshot") or {}).get("native_comfy"):
+                from .native import ready
+                if not ready():
+                    if job.get("stage") != "native_tunnel":
+                        self._event(job, "running", "等待代理健康检查及内部隧道鉴权验证", None)
+                        return self._update("jobs", job["id"], {"stage": "native_tunnel"}, job["owner_id"])
+                    return job
+                lease = self._update("leases", lease["id"], {"native_ready": True, "native_last_busy": self.clock()}, job["owner_id"])
+                self._update("instances", job["instance_id"], {"native_comfy": True}, job["owner_id"])
             job = self._note_restored(job, lease, timings or {})
         if state == "running":
             stage = result.get("stage")
@@ -1428,6 +1445,10 @@ class Scheduler:
         next_epoch = float(lease.get("cleanup_next_epoch") or 0)
         if self.clock() < next_epoch:
             return job
+        if lease.get("native_ready"):
+            from .native import protect_lease
+            if protect_lease(self.store, lease, self.clock):
+                return job
         provider = self._provider(job)
         handle = self._lease_handle(lease) or self._intent_handle(job, lease)
         if handle is None:
@@ -1522,6 +1543,8 @@ class Scheduler:
             "cleaning_up",
             "cleanup_pending",
         }:
+            if (job.get("snapshot") or {}).get("native_comfy") and job.get("stage") == "native_tunnel":
+                return self._begin_failure(job, "native_proxy_unready", "原生代理健康检查超时：请检查 named tunnel、Access Service Auth 策略、service token 以及内部服务路由")
             return self._begin_failure(job, "gpu_timeout", "GPU job exceeded its runtime limit")
         state = job.get("state")
         if state == "queued":
@@ -1626,6 +1649,11 @@ class Scheduler:
         }
 
     def _cleanup_orphan_lease(self, lease: dict) -> bool:
+        lease = self._get("leases", lease["id"], lease.get("owner_id")) or lease
+        if lease.get("native_ready"):
+            from .native import protect_lease
+            if protect_lease(self.store, lease, self.clock):
+                return False
         owner_job_id = lease.get("owner_job_id")
         owner_id = lease.get("owner_id")
         instance_id = lease.get("instance_id")
@@ -1954,6 +1982,10 @@ class Scheduler:
                 recovered += 1
         for lease in leases:
             instance = next((row for row in self._service_instances() if self._instance_id(row) == lease.get("instance_id")), None)
+            if lease.get("native_ready"):
+                from .native import protect_lease
+                if protect_lease(self.store, lease, self.clock):
+                    continue
             stopping = bool(instance and (instance.get("manual_stop_requested") or instance.get("state") in {"releasing", "cleanup_pending"}))
             if lease.get('state')=='idle' and not stopping and self.clock()<min(
                     float(lease.get('idle_deadline_at') or 0),float(lease.get('deadline_epoch') or 0)):

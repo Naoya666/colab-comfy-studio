@@ -6,7 +6,9 @@ x-studio: &studio
   environment:
     DATABASE_URL: sqlite:////data/studio.db
     DATA_DIR: /data
-  volumes: [studio-data:/data]
+  volumes:
+    - studio-data:/data
+    - ./secrets:/run/studio-secrets:ro
   restart: unless-stopped
   mem_limit: 384m
   pids_limit: 128

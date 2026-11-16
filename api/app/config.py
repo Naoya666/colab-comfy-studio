@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +17,11 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 100 * 1024 * 1024
     allowed_hosts: list[str] = []
     studio_api_token: str = ""
+    native_comfy_url: str = ""
+    native_comfy_backend_url: str = ""
+    native_comfy_idle_minutes: int = Field(default=15, ge=1, le=30)
+    native_comfy_cache_gb: int = Field(default=20, ge=1)
+    native_comfy_max_upload_mb: int = Field(default=2048, ge=1)
 
 
 if os.getenv("STUDIO_OFFLINE_TEST") == "1":

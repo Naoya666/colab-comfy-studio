@@ -1,0 +1,150 @@
+# 原生 ComfyUI 接入与验收
+
+本功能在独立域名直接代理 Colab 内的官方 ComfyUI。Studio 的 manifest/api_graph/object_info 导入和原图提取保留，原生入口不经过这些转换。没有复制官方前端、重建节点编辑器或改写官方工作流。
+
+当前交付是代码实现及离线验证，尚未在真实 Colab、Drive FUSE、Cloudflare 或 SillyTavern 上完成端到端验收。下面明确区分自动测试和真实验证。
+
+## 源码分析与复用
+
+分析时本地 HEAD 为 `f003e09`，上游 origin/main 为 `c12f06071cc16c6e2661873f7703b60b30a46a8c`。fetch 后本地领先 4 个提交、落后 0 个：`b909b06`、`a901bca`（GPU 自由选择、原图提取）、`c971e08`（模型管理）、`f003e09`（创作页 GPU 选择）。这些提交全部保留；开始时工作区干净。
+
+已实际 clone 并阅读 [FireTable/comfy-colab-kit](https://github.com/FireTable/comfy-colab-kit)，参考提交 `e642a36306e495cd5d68c4c0030765590d3ac85b`：
+
+- `apps/gate/proxy.py`：Host/Origin 改写、用户凭据过滤、原始编码路径、流式响应、双向文本和二进制 WS、任务结束后的转发清理。按本项目 FastAPI/httpx/websockets 技术栈适配；额外将上传请求也改为流式，不注入 overlay。
+- `apps/gate/session.py`、`apps/gate/app.py`：幂等启动、持久会话恢复、控制面与原生代理分离。实际使用本项目已有数据库租约与锁，未引入第二套会话数据库。
+- `packages/colab/setup.py::start_tunnel`：named tunnel、HTTP/2、token-file。保留本项目 Colab CLI 隧道作为启动/执行控制通道；它提供 Jupyter/MCP 执行，不是已验证的任意端口 HTTP/WS 通道，所以浏览器数据通道采用参考项目的 Cloudflare 方案。
+- `apps/gate/stopper.py`、`docs/AUTO_STOP.md`：以队列活动判断空闲；本实现对探测失败保守保留，同时检查 Drive 写入和上传。
+- Manager 后台活动通过官方 [queue/status](https://github.com/Comfy-Org/ComfyUI-Manager/blob/main/openapi.yaml) 状态识别，包括节点安装及模型下载；兼容 legacy 和 v2 路径。
+- 已阅读 `docs/AGENT_SCAFFOLDING.md`、`docs/SECURITY.md`；MIT 声明保留在 [licenses/comfy-colab-kit.txt](licenses/comfy-colab-kit.txt)。当前仓库和官方 ComfyUI、ComfyUI_frontend、comfy-cli 的许可证均为 GPL-3.0，未把官方源码复制进本仓库。
+
+官方机制依据：[启动参数](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/cli_args.py)、[模型路径配置](https://github.com/Comfy-Org/ComfyUI/blob/master/extra_model_paths.yaml.example)、[内置 Manager 依赖](https://github.com/Comfy-Org/ComfyUI/blob/master/manager_requirements.txt)、[官方前端](https://github.com/Comfy-Org/ComfyUI_frontend)、[comfy-cli](https://github.com/Comfy-Org/comfy-cli)、[官方文档](https://docs.comfy.org/)。部署时必须填完整固定提交，代码不会自动追踪 master。
+
+复用与主要修改文件：
+
+| 文件 | 作用 |
+| --- | --- |
+| `api/app/gpu/colab.py`、`google.py`、`drive.py` | 复用 OAuth、账号绑定、GPU 分配、连接恢复、已有 Drive 模型目录；未覆盖其实现 |
+| `api/app/gpu/native.py` | 幂等启动任务、Drive 运行凭据、健康检查、空闲和关闭围栏 |
+| `api/app/gpu/native_runtime.py` | 官方服务、Manager、Drive VFS、用户目录、节点依赖恢复、Colab 侧失联回收 |
+| `api/app/native_proxy.py` | 按 Host 分流的完整 HTTP/WS 代理、跨域名登录票据、cookie 与 Bearer 鉴权 |
+| `api/app/native_routes.py` | `/api/gpu/native/status`、`start`、`ticket` |
+| `api/app/gpu/mcp.py`、`runtime_worker.py` | 复用可信 bootstrap、状态文件和进度；Studio 共享原生进程，不在任务结束后关闭它 |
+| `api/app/gpu/instances.py`、`scheduler.py` | 复用实例、预算、租约、CU 统计与回收；防止原生会话在忙时因不兼容而隐式创建第二台 GPU |
+| `web/src/pages/NativeComfyPage.tsx`、`App.tsx` | 原生入口、GPU 选择、真实任务事件、就绪后跳转 |
+| `tests/test_native_comfy.py` | 代理、鉴权、会话复用、回收和目录恢复模拟测试 |
+
+## 部署
+
+继续使用原有 api/worker/watchdog/model-worker 服务、同一个数据库与数据卷。无需迁移表。当前环境未连接用户的 Cloudflare 账号，以下域名、Access 策略和 tunnel 必须在部署环境配置。
+
+1. 为 VPS 配置 `studio.example.com` 和 `comfy.example.com`，都转发至本项目 API；必须保留原始 Host、编码 URL、查询参数、WebSocket Upgrade，并关闭代理缓冲。示例 [deploy/native-comfy.nginx.conf.example](deploy/native-comfy.nginx.conf.example)。不要把 `/api/*` 单独转到 Studio 路由；整个 Comfy 域名均经过同一网关。当前仅实现独立域名，不提供未经验证的 `/comfy/` 子路径。
+2. 在 Cloudflare 创建 **named tunnel**，另用内部域名，例如 `colab-backend.example.com`，origin 为 Colab 中的 `http://127.0.0.1:8188`。不能将其指向 VPS。此域名配置独立 Access Application，策略使用 **Service Auth**，只允许网关的 service token；不要配置公开 Bypass。启动时网关会验证无 service token 的健康检查不能返回 200。
+3. 保存 tunnel token 和 Access service token，目录及文件不可进入 Git。Compose 示例将 `./secrets` 只读挂载到 `/run/studio-secrets`，各服务运行 UID 10001，文件必须对该 UID 可读。建议目录 0700、文件 0600，并正确设置所有者。
+4. `.env` 增加下表，api、worker、watchdog 使用同一份配置。保留原有 Google OAuth、Drive 授权、真实 GPU 开关、费率与账号预算。完成正常构建、迁移和服务重启。
+
+| 配置 | 示例/默认值 |
+| --- | --- |
+| `NATIVE_COMFY_URL` | `https://comfy.example.com`，留空禁用；必须为独立 HTTPS 源地址 |
+| `NATIVE_COMFY_BACKEND_URL` | `https://colab-backend.example.com`，不能带路径、凭据或查询参数 |
+| `NATIVE_COMFY_COMMIT` | 官方 ComfyUI 的 40 位提交，且支持 `--enable-manager` 与 `manager_requirements.txt` |
+| `NATIVE_COMFY_ACCESS_FILE` | `/run/studio-secrets/comfy-access.json`，内容 `{"client_id":"…","client_secret":"…"}` |
+| `NATIVE_COMFY_TUNNEL_TOKEN_FILE` | `/run/studio-secrets/comfy-tunnel.token`，内容为 tunnel connector token |
+| `NATIVE_COMFY_IDLE_MINUTES` | `15`，范围 1–30，原生队列/写入活动结束后才开始计时 |
+| `NATIVE_COMFY_CACHE_GB` | `20`，按需 VFS 缓存回收目标；活动文件可能暂时超过该值；另外保留 5GiB 本地可用空间 |
+| `NATIVE_COMFY_MAX_UPLOAD_MB` | `2048`，传给 ComfyUI `--max-upload-size`；Cloudflare 套餐仍可能限制单次请求大小 |
+| `STUDIO_API_TOKEN` | 标准 API 客户端使用的现有 Bearer Token |
+| `GPU_MAX_RUNTIME_MINUTES` | 复用原有会话期限；期限后拒绝新的原生写入，已入队任务和 Drive 同步完成后才释放 |
+
+Colab 初始化安装 fuse3、固定 rclone v1.70.3（核对 [官方 release SHA256SUMS](https://github.com/rclone/rclone/releases/download/v1.70.3/SHA256SUMS)）和 cloudflared；需 Colab 支持 FUSE、系统包安装以及访问官方依赖源。这部分必须在真实 runtime 验证，不支持时启动任务会明确失败并走已有清理流程。GPU 参数保持自动选择，不使用固定 L4/highvram/tmpfs 优化。
+
+## 使用与生命周期
+
+在已登录 Studio 点击「原生 ComfyUI」。已有健康会话直接进入；没有会话时选择账号与实际可申请 GPU，提交后查看现有任务事件，健康检查通过后跳转。跨域名通过 60 秒签名票据的 POST 建立专用 HttpOnly/Secure cookie，票据不放进 URL；原生 API 写入和 WS 使用此 cookie。服务不向浏览器发送 Colab、Drive 或 tunnel 凭据。
+
+API 客户端使用相同外部源地址和 `Authorization: Bearer <STUDIO_API_TOKEN>`。未授权请求返回 401，不跳转 OAuth。所有原生 API、静态资源和扩展路径由完整代理处理，路由不使用 API 白名单。内置 ComfyUI API 版本也可能有 `/api/` 前缀，仍原样转发。
+
+原生启动也是现有调度器里的任务；多标签页、多进程启动以及 VPS 重启使用数据库作唯一来源。正在启动或已有原生实例时不会再创建一个原生 GPU。若已有 Studio 实例，必须等它空闲后复用。切换账号/GPU 要先停止旧实例，待旧租约释放后再选新规格；公网域名不变。会话到运行期限后也需要停止并重启。
+
+Studio 复用原生实例时必须使用同一 ComfyUI 提交，所需受审节点也必须已安装且版本匹配。版本不一致会明确失败，不会在运行中的原生会话里改包或重启服务。原生队列与 Studio 队列最终都提交到该 ComfyUI 的同一个执行队列，原生页面不受 Studio 封装格式约束。
+
+回收检查原生 `/queue`、Manager 节点/模型安装队列、rclone 上传队列/错误/空间、传输活动，以及持久目录的打开写句柄。HTTP 写入有持久活动心跳，关闭围栏与新请求共用 dispatch lock。页面静态请求、打开 WS、查看进度不延长空闲时间。未知/探测失败按忙处理，可能延迟释放，需检查 tunnel/rclone 日志；不会为达到超时强杀未完成视频或持久化写入。
+
+Colab 侧 watchdog 还会按 PID 启动时间检查并恢复退出的 tunnel connector。另有失联保护：网关探测心跳丢失 20 分钟，且连续两次确认无队列及待写入时，尝试 `google.colab.runtime.unassign()`。它只在原生 bootstrap 成功后启动；初始化阶段仍依靠原有 worker/watchdog 恢复与清理。实际 Colab 自释放行为待验证。
+
+## Drive 目录与持久化
+
+沿用现有账号解析和 `AI-Studio/<owner>` 目录，不移动、改名或删除已有模型。
+
+```text
+AI-Studio/<owner>/
+  models/                    # 原有模型缓存，保留 checkpoint/LoRA 等原生类别目录
+    checkpoints/ … loras/
+    native-index/<类别>/     # 模型库 ready 文件的 Drive 快捷方式；不复制权重
+  native-comfy/
+    user/                    # 原生工作流、设置、前端/Manager 用户数据
+    input/                   # 上传的素材
+    output/                  # 图片、视频等结果
+    custom_nodes/            # 自定义节点源码及配置
+  runtime-cache/             # 原有 Studio 环境缓存保持原样
+```
+
+`models/native-index` 名称加文件 ID 前缀避免同名模型冲突。模型库索引在原生启动时生成；运行中经 Studio 新导入的库文件需要重启会话刷新索引，Manager 直接下载到原生模型目录的文件不受此限制。OAuth 维持现有 `drive.file` 权限，只能看到此应用可访问的文件；用户 Drive 中其他文件需先通过已有模型库授权/导入。不能据此宣称扫描了全部 10TB。
+
+本地 `/content/ai-studio/native/drive` 为 rclone 挂载，模型按实际读取下载到有上限的本地 VFS 缓存；模型文件在执行时真实可读，不做仅名称占位。不预复制整个 Drive，不强行加载显存。`extra_model_paths.yaml` 保留 `unet/diffusion_models`、`clip/text_encoders` 等别名。
+
+用户目录、输入输出、自定义节点、Manager 下载的模型写回 Drive，VFS 只上传完整关闭的文件并等待上传结束后允许正常释放。Python 依赖每次根据官方 requirements 和各节点 requirements 恢复，不共享不同 GPU 的整个 site-packages。依赖冲突会令启动失败；特殊节点自己的 install.py、系统依赖、二进制安装脚本可能仍需按节点说明处理。
+
+临时预览/中间文件在本地 `native/temp`，VFS 缓存和未完成下载也属于临时数据。突然被 Colab 强制回收、断电或手工外部删除 VM 时，尚未上传完成的数据仍可能丢失；代码不能保证未落盘数据在基础设施强制终止后恢复。已确认写入 Drive 的工作流、模型与结果保留。不要把配置了挂载等同于已经验证了真实持久化恢复。
+
+## SillyTavern
+
+核查了实际克隆的 [SillyTavern/src/endpoints/stable-diffusion.js](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/src/endpoints/stable-diffusion.js)，其中 ComfyUI 的 ping、object_info、prompt、history、view 等 fetch 多数不带 Authorization；仅部分取消请求带 auth。因此不能要求其现有 ComfyUI 页面完成本站网页登录，或声称在一个 auth 输入框里填 Bearer 就都能成功。
+
+可用兼容配置是 [deploy/sillytavern-comfy.nginx.conf.example](deploy/sillytavern-comfy.nginx.conf.example)：仅监听 SillyTavern 服务器的 `127.0.0.1:8189`，服务端注入本站 Token，再请求固定公网 Comfy 域名。Token 写在权限受限的 nginx include 文件中，不写进酒馆 URL、工作流或浏览器脚本。酒馆 ComfyUI 地址填写 `http://127.0.0.1:8189`（由酒馆后端发起）。如果酒馆运行于另一台机器，将此 loopback relay 部署在那里；容器场景需使用仅私网可达且访问受限的 relay。也可用 SSH 转发访问 VPS loopback。禁止把无鉴权 relay 直接公开到公网。
+
+实际酒馆生成、轮询和取图仍需真实环境验证；已离线验证的只是网关对标准授权 API 请求的透明转发。
+
+## 自动测试与真实验收
+
+新增测试使用 MockTransport、ASGI WebSocket、真实 SQLite 调度器及模拟 GPU，不申请 GPU、不调用 Google、不启动真实 tunnel。
+
+- `pytest -q tests/test_native_comfy.py`：代理所有主要路径和任意扩展路由、编码路径、分块媒体响应、大请求体、任意 HTTP 方法、文本/二进制 WS 与断开、cookie 登录、跨站拒绝、未授权拒绝、会话期限和停止围栏。
+- 实例测试：重复启动、服务重启后复用同一启动任务、GPU 切换冲突、Studio 不另起/关闭原生进程、mock bootstrap→保留→watchdog→释放；视频忙时即使过硬期限也保留。
+- 本地目录重建模拟：已保存工作流和模型在新 checkout 下仍可读；不是 Drive FUSE 实测。
+- 原有后端测试、前端 TypeScript/构建、前端 contract 和 Node 测试继续执行。执行结果如下；不把模拟测试当作真实 GPU 通过。
+
+部署后按以下 16 项验收，以下均尚未在真实 GPU 验证：
+
+| 场景 | 当前证据 / 真实环境动作 |
+| --- | --- |
+| 1. 未启动时选 GPU 启动 | 幂等 admission/mock 生命周期覆盖；实测账号分配、FUSE、依赖及 tunnel |
+| 2. 已启动时不重复创建 | 数据库幂等与重启模拟覆盖；实测多标签页和已有 Studio 实例 |
+| 3. 官方节点编辑器 | HTML/资源透明代理覆盖；浏览器打开官方 UI |
+| 4. 普通 UI Workflow JSON | 直接使用官方导入；用真实 UI JSON 导入 |
+| 5. 元数据图片拖入 | 未改官方导入；拖入 PNG 验证 |
+| 6. Drive checkpoint/LoRA | 目录/索引代码及模拟恢复；实测已校验文件可选且可执行 |
+| 7. 出图和实时预览 | WS 二进制模拟覆盖；实测 GPU 采样预览 |
+| 8. 上传/图片/视频下载 | 流式及 Range 模拟覆盖；实测 Cloudflare 套餐限制和大文件 |
+| 9. 自定义节点 | 官方 Manager 启用与 requirements 恢复；安装并执行至少一个节点 |
+| 10. 释放后持久化恢复 | 本地目录重建覆盖；实测等待上传后释放、新 VM 恢复工作流与模型 |
+| 11. GPU 切换固定域名 | 冲突拒绝模拟覆盖；停止→换规格→原域名恢复 |
+| 12. 酒馆 API | 标准 API 代理模拟覆盖；配置 loopback relay 后实际生成取图 |
+| 13. Studio/封装导入 | 原有测试继续通过；真实共享进程上跑已有工作流 |
+| 14. 视频不会误回收 | 队列、同步、超时保护模拟覆盖；实测无浏览器长视频任务 |
+| 15. VPS 重启不重复分配 | 持久 job/lease 模拟覆盖；重启 api/worker/watchdog 后核对 Colab assignments |
+| 16. 未授权不能访问或启动 | 代理/cookie/WS 拒绝模拟覆盖；公网检查 Comfy、内部 tunnel、启动 API |
+
+
+2026-11-16 本次执行结果：
+
+| 检查 | 结果 |
+| --- | --- |
+| `/tmp/colab-studio-venv/bin/pytest -q` | **646 passed，3 subtests passed**；1 个既有 Starlette/httpx 弃用警告；56.25 秒 |
+| 新增 `tests/test_native_comfy.py` | **38 passed**，包含启动失败释放、Manager 队列及 rclone 校验测试 |
+| `npm run build --prefix web` | TypeScript 与 Vite 构建通过 |
+| `npm run test:contract --prefix web` | 两项契约检查通过 |
+| 在 `web/` 执行 `node --test tests/*.test.mjs` | **57 passed，0 failed** |
+| Ruff 检查全部改动 Python 模块和新增测试 | 通过 |
+| `git diff --check` | 通过 |
+
+上述测试由仓库的离线网络拦截器禁止真实 Google/Colab 请求；未申请 GPU，未消费 CU。未构建或发布 Docker 镜像，未配置外部 DNS、TLS 或 Cloudflare 账号。真实 UI、FUSE、模型读取/生成、Manager 安装、Drive 恢复和酒馆端到端状态均仍为上表的待验收项。

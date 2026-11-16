@@ -1,0 +1,23 @@
+# Add map in the http context. Replace example host and certificate paths.
+map $http_upgrade $native_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+server {
+    listen 443 ssl;
+    server_name comfy.example.com;
+    ssl_certificate /etc/letsencrypt/live/comfy.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/comfy.example.com/privkey.pem;
+    client_max_body_size 0;
+    location / {
+        proxy_pass http://127.0.0.1:8788;
+        proxy_set_header Host $http_host;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $native_connection_upgrade;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

@@ -364,6 +364,10 @@ class InstanceService:
         data = self._data(instance)
         if self._value(data, "account_id") != account_id:
             return False
+        if data.get("native_draining"):
+            return False
+        if data.get("native_comfy") and data.get("hard_deadline_at") is not None and self.clock() >= float(data["hard_deadline_at"]):
+            return False
         if data.get("current_job_id") is not None:
             return False
         if instance.state not in self._IDLE_STATES:
@@ -375,7 +379,7 @@ class InstanceService:
             if not previous or spec_key(previous) != spec_key(requested):
                 return False
         signature = job.get("compatibility_signature")
-        return not signature or data.get("compatibility_signature") == signature
+        return data.get("native_comfy") or not signature or data.get("compatibility_signature") == signature
 
     def _claim_existing(self, session, instance, job, account, key, stable_id, reason, units):
         data = self._data(instance)
@@ -503,6 +507,8 @@ class InstanceService:
                 units = self._reserve_budget(session, job, account, provider)
                 return self._claim_existing(session, instance, job, account, key, stable_id, "reuse_idle", units)
 
+            if provider == "colab" and any(self._data(r).get("native_comfy") and r.state != "deleted" for r in idle):
+                raise InstanceConflict("原生 ComfyUI 会话仍占用 GPU，请复用同一规格或先停止旧实例")
             account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
             units = self._reserve_budget(session, job, account, provider)
             return self._create_instance(session, job, account, key, stable_id, units, "requested_account" if requested_account else "round_robin")
@@ -550,8 +556,10 @@ class InstanceService:
             # The instance override is authoritative: a later job payload must
             # not turn an explicitly retained instance back into a release.
             mode = data.get("retention_mode") or job.get("lifecycle") or policy.get("lifecycle") or "save"
+            if data.get("native_comfy") and not data.get("manual_stop_requested"):
+                mode = "retain"
             hard = data.get("hard_deadline_at")
-            retain = success and mode in {"retain", "smart"} and not data.get("manual_stop_requested") and (hard is None or self.clock() < float(hard))
+            retain = (success or data.get("native_comfy")) and mode in {"retain", "smart"} and not data.get("manual_stop_requested") and (hard is None or self.clock() < float(hard))
             data.update(current_job_id=None, last_seen_at=self.clock(), retention_mode=mode)
             state = "retained_idle" if retain else "releasing"
             if retain:

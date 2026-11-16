@@ -1,0 +1,393 @@
+"""Credential-free native data-plane and lifecycle regression tests."""
+import asyncio
+import time
+from contextlib import asynccontextmanager, contextmanager
+
+import httpx
+import pytest
+from app import native_proxy
+from app.config import settings
+from app.gpu import native
+from app.gpu.native_runtime import EXTENSION, model_paths, prepare_paths
+from app.native_proxy import NativeHostMiddleware
+from app.security import sign_session
+from fastapi import FastAPI
+from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
+
+class BytesStream(httpx.AsyncByteStream):
+    def __init__(self, content):
+        self.content = content
+
+    async def __aiter__(self):
+        # Multiple chunks catch accidental buffering and preserve encoded media bytes.
+        for offset in range(0, len(self.content), 4):
+            yield self.content[offset:offset + 4]
+
+
+class Repo:
+    def __init__(self):
+        self.store = self
+        self.lease = {"id": "lease", "owner_id": "owner", "instance_id": "instance", "native_comfy": True,
+                      "native_ready": True, "state": "idle", "native_last_busy": 100}
+        self.instance = {}
+
+    @contextmanager
+    def dispatch_lock(self):
+        yield True
+
+    def get(self, kind, ident, owner):
+        return self.lease if kind == "leases" else self.instance
+
+    def update(self, kind, ident, patch, owner):
+        self.lease.update(patch)
+        return self.lease
+
+    def list(self, kind, owner):
+        return [self.lease] if kind == "leases" else []
+
+
+@pytest.fixture
+def proxy(monkeypatch):
+    monkeypatch.setattr(settings, "native_comfy_url", "https://comfy.example.test")
+    monkeypatch.setattr(settings, "site_url", "https://studio.example.test")
+    monkeypatch.setattr(settings, "studio_api_token", "api-test-token")
+    monkeypatch.setattr(settings, "session_secret", "test-session-secret")
+    monkeypatch.setattr(native, "backend", lambda: ("https://internal.example.test", {"CF-Access-Client-Id": "service-id", "CF-Access-Client-Secret": "internal-secret"}))
+    app = FastAPI()
+    app.state.repo = Repo()
+    app.add_middleware(NativeHostMiddleware, studio_app=app)
+    return app
+
+
+@pytest.mark.parametrize("path", ["/", "/assets/app.js", "/extensions/example/main.js", "/object_info", "/system_stats", "/history", "/history/123", "/view?filename=video.mp4&type=output", "/queue", "/api/userdata/workflows%2Ftest.json", "/unknown-extension/route"])
+def test_complete_http_proxy_keeps_raw_paths_and_streamed_bytes(proxy, monkeypatch, path):
+    seen = []
+
+    async def handler(req):
+        seen.append(req)
+        assert req.headers["origin"] == "https://internal.example.test"
+        assert req.headers["host"] == "internal.example.test"
+        assert "authorization" not in req.headers and "cookie" not in req.headers
+        assert req.headers["CF-Access-Client-Secret"] == "internal-secret"
+        return httpx.Response(206, stream=BytesStream(b"raw-media"), headers={"Content-Type": "video/mp4", "Content-Range": "bytes 0-8/99", "ETag": '"v1"', "Set-Cookie": "CF_Authorization=private"})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        response = c.get(path, headers={"Authorization": "Bearer api-test-token", "Cookie": "private=browser"})
+    assert response.status_code == 206
+    assert response.content == b"raw-media"
+    assert response.headers["content-range"] == "bytes 0-8/99"
+    assert "set-cookie" not in response.headers
+    assert seen[0].url.raw_path == path.encode()
+
+
+@pytest.mark.parametrize("path,method", [("/prompt", "POST"), ("/interrupt", "POST"), ("/upload/image", "POST"), ("/upload/mask", "POST"), ("/api/userdata/workflows%2Ftest.json", "PUT"), ("/extension/route", "DELETE")])
+def test_upload_and_arbitrary_methods(proxy, monkeypatch, path, method):
+    content = b"binary\x00payload" * 200000
+
+    async def handler(req):
+        assert await req.aread() == content
+        assert req.headers["content-type"] == "application/octet-stream"
+        return httpx.Response(200, stream=BytesStream(b'{"ok":true}'), headers={"Content-Type": "application/json"})
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        r = c.request(method, path, content=content, headers={"Authorization": "Bearer api-test-token", "Content-Type": "application/octet-stream"})
+    assert r.status_code == 200
+    assert proxy.state.repo.lease.get("native_last_write")
+
+
+def test_browser_login_cookie_writes_and_csrf(proxy, monkeypatch):
+    now = int(time.time())
+    ticket = sign_session({"uid": "owner", "aud": settings.native_comfy_url, "purpose": "native-handoff", "iat": now, "exp": now + 60})
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(lambda req: httpx.Response(200, stream=BytesStream(b'{"ok":true}'), headers={"Content-Type": "application/json"})), **kwargs))
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        assert c.get("/prompt").status_code == 401
+        r = c.post("/_studio/session", data={"ticket": ticket}, headers={"Origin": settings.site_url}, follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/"
+        assert "HttpOnly" in r.headers["set-cookie"] and "Secure" in r.headers["set-cookie"]
+        assert "internal-secret" not in r.text
+        assert c.post("/prompt", json={}, headers={"Origin": settings.native_comfy_url}).status_code == 200
+        assert c.post("/prompt", json={}, headers={"Origin": "https://evil.example"}).status_code == 403
+        assert c.post("/_studio/session", data={"ticket": ticket}, headers={"Origin": "https://evil.example"}).status_code == 403
+        assert c.post("/_studio/session", data={"ticket": sign_session({"uid": "owner", "iat": now, "exp": now + 60})}, headers={"Origin": settings.site_url}).status_code == 401
+
+
+def test_stop_and_deadline_reject_new_work(proxy):
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        proxy.state.repo.instance["manual_stop_requested"] = True
+        assert c.post("/prompt", json={}, headers={"Authorization": "Bearer api-test-token"}).status_code == 409
+        proxy.state.repo.instance.clear()
+        proxy.state.repo.lease["deadline_epoch"] = time.time() - 1
+        assert c.post("/prompt", json={}, headers={"Authorization": "Bearer api-test-token"}).status_code == 409
+
+
+def test_ws_binary_text_and_cancellation(proxy, monkeypatch):
+    closed = []
+
+    class Upstream:
+        subprotocol = None
+
+        def __init__(self):
+            self.messages = asyncio.Queue()
+
+        async def send(self, message):
+            await self.messages.put(message)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self.messages.get()
+
+    @asynccontextmanager
+    async def connect(url, **kwargs):
+        assert url == "wss://internal.example.test/ws?clientId=abc"
+        assert kwargs["origin"] == "https://internal.example.test"
+        assert not any(k.lower().startswith("sec-websocket") for k, v in kwargs["additional_headers"])
+        try:
+            yield Upstream()
+        finally:
+            closed.append(True)
+    monkeypatch.setattr(native_proxy, "connect", connect)
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        with c.websocket_connect("wss://comfy.example.test/ws?clientId=abc", headers={"Authorization": "Bearer api-test-token", "Origin": settings.native_comfy_url}) as ws:
+            ws.send_text('{"type":"status"}')
+            assert ws.receive_text() == '{"type":"status"}'
+            ws.send_bytes(b"\x00\x01preview")
+            assert ws.receive_bytes() == b"\x00\x01preview"
+        with pytest.raises(WebSocketDisconnect):
+            with c.websocket_connect("wss://comfy.example.test/ws"):
+                pass
+    assert closed
+
+
+@pytest.mark.parametrize("queue,persistence,result", [({"queue_running": [["video"]], "queue_pending": []}, False, True), ({"queue_running": [], "queue_pending": [["image"]]}, False, True), ({"queue_running": [], "queue_pending": []}, True, True), ({"queue_running": [], "queue_pending": []}, False, False), ({}, False, True)])
+def test_activity_probes_queue_and_persistence(proxy, queue, persistence, result):
+    def handler(req):
+        return httpx.Response(200, json=queue if req.url.path == "/queue" else {"busy": persistence})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert native.busy(client) is result
+
+
+def test_unknown_activity_never_releases(proxy, monkeypatch):
+    def handler(req):
+        raise httpx.ConnectError("offline", request=req)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert native.busy(client)
+    monkeypatch.setattr(native, "busy", lambda: True)
+    assert native.protect_lease(proxy.state.repo, proxy.state.repo.lease, clock=lambda: 10000)
+    assert proxy.state.repo.lease["native_last_busy"] == 10000
+    monkeypatch.setattr(native, "busy", lambda: False)
+    assert native.protect_lease(proxy.state.repo, proxy.state.repo.lease, clock=lambda: 10001)
+    assert not native.protect_lease(proxy.state.repo, proxy.state.repo.lease, clock=lambda: 12000)
+
+
+def test_ready_requires_protected_tunnel_and_native_extension(proxy):
+    def handler(req):
+        if "CF-Access-Client-Secret" not in req.headers:
+            return httpx.Response(403)
+        return httpx.Response(200, json={"system": {}} if req.url.path == "/system_stats" else {"busy": False})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert native.ready(client)
+    with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"system": {}}))) as client:
+        assert not native.ready(client)
+
+
+def test_persistent_directories_restore_after_checkout_recreation(tmp_path):
+    mount = tmp_path / "drive"
+    mount.mkdir()
+    for name in ("first", "after-restart"):
+        comfy = tmp_path / name
+        comfy.mkdir()
+        (comfy / "models").mkdir()
+        (comfy / "models" / "example.txt").write_text("official placeholder")
+        data = prepare_paths(comfy, mount)
+        if name == "first":
+            (data / "user" / "workflow.json").write_text('{"nodes": []}')
+            (comfy / "models" / "checkpoints" / "model.safetensors").write_bytes(b"model")
+        else:
+            assert (data / "user" / "workflow.json").read_text() == '{"nodes": []}'
+            assert (comfy / "models" / "checkpoints" / "model.safetensors").read_bytes() == b"model"
+        assert (comfy / "models.checkout" / "example.txt").is_file()
+    paths = model_paths(mount)["studio_drive"]
+    assert "models/unet" in paths["diffusion_models"]
+    assert "models/clip" in paths["text_encoders"]
+    compile(EXTENSION, "native_extension", "exec")
+
+
+def test_native_admission_idempotent_across_restart_and_gpu_switch(proxy, monkeypatch):
+    from app.common import APIError
+    from app.db import Store
+    from app.gpu.compute import GpuConfig
+    from app.gpu.repository import Repository
+
+    store = Store("sqlite:///:memory:")
+    repo = Repository(store)
+    repo.create("accounts", "owner", {"account_id": "account", "enabled": True, "allow_allocation": True, "connected": True}, record_id="account")
+    monkeypatch.setattr(native.GpuConfig, "from_env", lambda: GpuConfig(real_enabled=True, unit_rate=0.01))
+    monkeypatch.setattr(native, "secret_file", lambda name: "test-secret")
+    monkeypatch.setenv("NATIVE_COMFY_COMMIT", "a" * 40)
+    body = {"account_id": "account", "spec": {"key": {"variant": "VARIANT_GPU", "accelerator": "T4", "shape": "SHAPE_STANDARD"}}}
+    job = native.admit(repo, "owner", body, "native-start")
+    assert native.admit(Repository(store), "owner", body, "native-start")["id"] == job["id"]
+    assert native.admit(Repository(store), "owner", body, "another-browser")["id"] == job["id"]
+    assert len(repo.list("jobs", "owner")) == 1
+    with pytest.raises(APIError) as error:
+        native.admit(repo, "owner", {**body, "spec": {"key": {"accelerator": "A100"}}}, "switch-gpu")
+    assert error.value.status == 409
+    assert "secret" not in str(job)
+
+
+def test_native_shared_studio_does_not_spawn_or_kill_comfy(monkeypatch, tmp_path):
+    import json
+
+    from app.gpu import runtime_worker as worker
+
+    root = tmp_path / "studio-job"
+    root.mkdir()
+    comfy = tmp_path / "native" / "ComfyUI"
+    comfy.mkdir(parents=True)
+    marker = tmp_path / "native" / "state.json"
+    marker.write_text(json.dumps({"commit": "a" * 40, "comfy": str(comfy)}))
+    monkeypatch.setattr(worker, "NATIVE_SERVICE_MARKER", marker)
+    monkeypatch.setattr(worker, "_verify_checkout", lambda *args: None)
+    monkeypatch.setattr(worker, "_restore_weights", lambda *args, **kwargs: [])
+    monkeypatch.setattr(worker, "_warm_put", lambda *args: pytest.fail("native process must remain in its own directory"))
+    monkeypatch.setattr(worker.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must use the resident ComfyUI process"))
+    calls = []
+
+    def api(url, method="GET", body=None, timeout=30):
+        calls.append((url, method))
+        if url.endswith("/prompt"):
+            return {"prompt_id": "native-and-studio"}
+        if "/history/" in url:
+            return {"native-and-studio": {"status": {"completed": True}, "outputs": {}}}
+        return {"system": {}}
+    monkeypatch.setattr(worker, "_http_json", api)
+    manifest = {"comfy_commit": "a" * 40, "node_allowlist": ["TestNode"], "weight_files": [{"repo_id": "test/model", "filename": "model.safetensors", "target": "checkpoints/model.safetensors", "revision": "b" * 40, "sha256": "c" * 64}]}
+    assert worker._run_comfy(root, {"snapshot": {}}, manifest, {"1": {"class_type": "TestNode", "inputs": {}}}, worker._Stages(root)) == []
+    assert any(url.endswith("/prompt") for url, method in calls)
+    assert marker.exists()
+
+
+def test_shutdown_fence_and_inflight_uploads(proxy, monkeypatch):
+    from app.common import APIError
+    repo = proxy.state.repo
+    monkeypatch.setattr(native, "busy", lambda: False)
+    repo.lease["native_http_heartbeat"] = 9999
+    assert native.protect_lease(repo, repo.lease, clock=lambda: 10000)
+    repo.lease["native_http_heartbeat"] = 0
+    assert not native.protect_lease(repo, repo.lease, clock=lambda: 10000)
+    assert repo.lease["native_draining"]
+    with pytest.raises(APIError):
+        native.begin_write(repo, repo.lease)
+
+
+def test_runtime_probe_and_watchdog_compile():
+    from app.gpu.native_runtime import EXTENSION, WATCHDOG
+    probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("@PromptServer")]
+    compile("import os, json\nfrom pathlib import Path\nfrom urllib.request import Request, urlopen\n" + probe, "probe.py", "exec")
+    compile(WATCHDOG, "watchdog.py", "exec")
+
+
+@pytest.mark.parametrize("fail_start", [False, True])
+def test_native_boot_job_retains_one_lease_and_watchdog_waits_for_video(monkeypatch, fail_start):
+    from app.db import Store
+    from app.gpu.compute import GpuConfig, MockColabProvider, MockGPUExecutor
+    from app.gpu.repository import Repository
+    from app.gpu.scheduler import Scheduler
+
+    store = Store("sqlite:///:memory:")
+    repo = Repository(store)
+    provider = MockColabProvider()
+    executor = MockGPUExecutor(fail_on_start=fail_start)
+    now = [1000.0]
+    monkeypatch.setattr(native, "ready", lambda: True)
+    monkeypatch.setattr(native, "busy", lambda: False)
+    spec = provider.list_specs()[0]
+    job, _ = repo.create_job("owner", {"project_id": "native", "execution_policy": {"provider": "mock"}}, "boot-native")
+    job = repo.update("jobs", job["id"], {"provider": "mock", "project_id": "native", "lifecycle": "retain",
+        "execution_policy": {"provider": "mock", "lifecycle": "retain", "retain_idle_minutes": 15},
+        "snapshot": {"native_comfy": True, "manifest": {}, "bound_graph": {}}, "requested_spec": spec}, "owner")
+    config = GpuConfig(max_runtime_minutes=30, unit_rate=0.01)
+
+    def scheduler():
+        return Scheduler(store, config=config, clock=lambda: now[0], provider_factory=lambda job: provider, executor_factory=lambda job: executor)
+    for _ in range(30):
+        scheduler().tick()
+        job = repo.get("jobs", job["id"], "owner")
+        if job["state"] in native.TERMINAL:
+            break
+    if fail_start:
+        assert job["state"] == "failed", job
+        assert repo.list("leases", "owner")[0]["state"] == "deleted"
+        assert repo.list("instances", "owner")[0]["state"] == "deleted"
+        return
+    assert job["state"] == "completed", job
+    leases = repo.list("leases", "owner")
+    assert len(leases) == 1
+    assert leases[0]["native_ready"] and leases[0]["state"] == "idle"
+    assert len(repo.list("instances", "owner")) == 1
+    now[0] += 5000  # Past both idle and hard deadline: an active video still must finish.
+    monkeypatch.setattr(native, "busy", lambda: True)
+    scheduler().watchdog()
+    assert repo.get("leases", leases[0]["id"], "owner")["state"] != "deleted"
+    monkeypatch.setattr(native, "busy", lambda: False)
+    now[0] += 1000
+    scheduler().watchdog()
+    assert repo.get("leases", leases[0]["id"], "owner")["state"] == "deleted"
+
+
+@pytest.mark.parametrize("processing,uploads,expected", [(True, 0, True), (False, 1, True), (False, 0, False)])
+def test_native_probe_includes_manager_download_queue(processing, uploads, expected):
+    import io
+    import json
+
+    from app.gpu.native_runtime import EXTENSION
+
+    namespace = {}
+    probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("@PromptServer")]
+    exec("import os, json\nfrom pathlib import Path\nfrom urllib.request import Request, urlopen\n" + probe, namespace)
+
+    def local_api(request, **kwargs):
+        url = request if isinstance(request, str) else request.full_url
+        if url.endswith("/vfs/stats"):
+            data = {"inUse": 1, "diskCache": {"uploadsQueued": uploads}}
+        elif url.endswith("/core/stats"):
+            data = {"errors": 0}
+        elif url.endswith("/manager/queue/status"):
+            data = {"is_processing": processing, "total_count": 1 if processing else 0, "done_count": 0}
+        else:
+            pytest.fail(url)
+        return io.BytesIO(json.dumps(data).encode())
+    namespace["urlopen"] = local_api
+    namespace["open_writes"] = lambda: False
+    assert namespace["probe"]()["busy"] is expected
+
+
+def test_rclone_install_checks_checksum_and_publishes_atomically(monkeypatch, tmp_path):
+    import hashlib
+    import io
+    import zipfile
+
+    from app.gpu import native_runtime as runtime
+    from app.gpu import runtime_worker as worker
+
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w") as archive:
+        archive.writestr(f"rclone-{runtime.RCLONE_VERSION}-linux-amd64/rclone", b"test-rclone-executable")
+    content = data.getvalue()
+    monkeypatch.setattr(runtime, "urlopen", lambda *args, **kwargs: io.BytesIO(content))
+    with pytest.raises(RuntimeError, match="checksum"):
+        runtime.install_rclone(tmp_path, worker)
+    assert not (tmp_path / "rclone").exists()
+    assert not (tmp_path / "rclone.zip").exists()
+    monkeypatch.setattr(runtime, "RCLONE_SHA256", hashlib.sha256(content).hexdigest())
+    binary = runtime.install_rclone(tmp_path, worker)
+    assert binary.read_bytes() == b"test-rclone-executable"
+    assert binary.stat().st_mode & 0o777 == 0o700

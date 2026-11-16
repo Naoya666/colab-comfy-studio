@@ -9,6 +9,8 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app/api
 WORKDIR /app
 COPY requirements.lock ./
+COPY LICENSE ./LICENSE
+COPY docs/licenses/ ./licenses/
 RUN pip install --no-cache-dir -r requirements.lock
 COPY api/ ./api/
 COPY scripts/ ./scripts/
