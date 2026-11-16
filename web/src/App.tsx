@@ -1,3 +1,5 @@
+import { ModelRunOverrides, type ModelOverride } from './components/ModelDependencies';
+import { ModelLibraryPage } from './pages/ModelLibraryPage';
 import { SettingsPanel } from './pages/SettingsPage';
 import { GalleryPanel } from './pages/GalleryPage';
 import { TasksPanel } from './pages/JobsPage';
@@ -31,7 +33,7 @@ import { formatInstanceTime } from './lib/instance-time';
 import { JobHistoryDetails } from './components/JobHistoryDetails';
 import styles from './gpu.module.css';
 
-const tabs = ['创作', '任务', '作品', '算力'] as const;
+const tabs = ['创作', '任务', '作品', '算力', '模型库'] as const;
 type Tab = typeof tabs[number] | '设置';
 const terminalStates = new Set(['completed', 'succeeded', 'failed', 'failed_final', 'cancelled', 'cancelled_local', 'blocked']);
 
@@ -231,6 +233,7 @@ export default function App() {
   const [workflowId, setWorkflowId] = useState('');
   const [gpuChoices, setGpuChoices] = useState<Record<string, Record<string, unknown> | null>>(() => { try { return JSON.parse(localStorage.getItem('studio-workflow-gpus') || '{}'); } catch { return {}; } });
   const selectedCompute = gpuChoices[workflowId] || null;
+  const [modelOverrides, setModelOverrides] = useState<Record<string, ModelOverride[]>>({});
   function chooseGpu(key: Record<string, unknown> | null) {
     const next = { ...gpuChoices, [workflowId]: key }; setGpuChoices(next); idempotencyKey.current = '';
     try { localStorage.setItem('studio-workflow-gpus', JSON.stringify(next)); } catch { /* browser storage unavailable */ }
@@ -538,6 +541,7 @@ export default function App() {
         workflow_key: activeWorkflow.workflow_key,
         workflow_version: activeWorkflow.workflow_version,
         params,
+        ...(modelOverrides[workflowId]?.length ? {model_overrides: modelOverrides[workflowId]} : {}),
         asset_ids: supportsReferences(manifest)
           ? [...new Set([...selectedAssets.filter((id) => validAssetIds.has(id)), ...assetIdsFromParams(params, validAssetIds)])]
           : [],
@@ -814,6 +818,7 @@ export default function App() {
       {/* 主工作区 */}
       <main className={styles.page}>
         {tab === '创作' && (
+          <>
           <CreatePanel
             gpuSelection={runtime === 'colab' ? <WorkflowGpuSelection manifest={manifest} accountId={runtimeChoice.accountId} value={selectedCompute} onChange={chooseGpu} /> : null}
             projectId={projectId}
@@ -851,6 +856,8 @@ export default function App() {
             onApplyPreset={applyPreset}
             onSavePreset={(name) => void savePreset(name)}
           />
+          {workflowId && <ModelRunOverrides workflowId={workflowId} value={modelOverrides[workflowId] || []} onChange={value => setModelOverrides(current => ({...current, [workflowId]:value}))} />}
+          </>
         )}
 
         {tab === '任务' && (
@@ -903,6 +910,7 @@ export default function App() {
             error={error}
           />
         )}
+        {tab === '模型库' && <ModelLibraryPage />}
         {tab === '设置' && (
           <SettingsPanel
             accounts={accounts}

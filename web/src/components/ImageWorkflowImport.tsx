@@ -49,7 +49,7 @@ export function ImageWorkflowImport({ onImport }: { onImport: (bundle: string) =
       <textarea aria-label="提取 JSON 预览" readOnly rows={10} value={json} />
       <div className="actions">
         <button className="button secondary small" type="button" onClick={() => { void navigator.clipboard.writeText(json).catch(() => setError('复制失败，请从 JSON 预览中手动复制')); }}>复制 JSON</button>
-        <button className="button small" type="button" onClick={() => onImport(JSON.stringify({ workflow_key: `image-${crypto.randomUUID()}`, image_extraction: { workflow: result.workflow, prompt: result.prompt } }))}>导入为待配置草稿</button>
+        <button className="button small" type="button" onClick={() => onImport(JSON.stringify({ workflow_key: `image-${crypto.randomUUID()}`, image_extraction: { workflow: result.workflow, prompt: result.prompt, metadata: result.metadata } }))}>导入为待配置草稿</button>
         <button className="button ghost small" type="button" onClick={() => { void read(); }}>取消 / 重新上传</button>
       </div>
     </>}

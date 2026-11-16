@@ -87,7 +87,7 @@ def extraction_bundle(bundle: dict) -> dict:
         "api_graph": copy.deepcopy(prompt or {}),
         "object_info": {},
         "editable_graph": copy.deepcopy(workflow if workflow is not None else prompt),
-        "image_extraction": copy.deepcopy({"workflow": workflow, "prompt": prompt}),
+        "image_extraction": copy.deepcopy({"workflow": workflow, "prompt": prompt, **({"metadata": extracted["metadata"]} if "metadata" in extracted else {})}),
         "image_import_summary": {"node_count": len(nodes), "node_types": types, "model_files": sorted(files)},
         "pending_configuration": missing_configuration({"api_graph": prompt}),
     }

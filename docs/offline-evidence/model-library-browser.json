@@ -1,0 +1,26 @@
+{
+  "mode": "isolated local API and database; no real platform credentials",
+  "catalog": {
+    "catalog_add_search_edit": true,
+    "queue_cancel": true,
+    "masked_credentials": true,
+    "mobile_desktop_no_overflow": true,
+    "real_provider_requests": 0,
+    "page_errors": []
+  },
+  "existing_features": {
+    "viewport": "390x844",
+    "compressed_png_extracted": true,
+    "both_downloads_clicked": true,
+    "image_upload_requests": 0,
+    "gpu_job_creates": 0,
+    "no_horizontal_overflow": true,
+    "page_errors": [],
+    "gpu_fixture": "L4/A100 only; A100 choice persisted and shown in confirmation; no real GPU submission"
+  },
+  "database_migration": {
+    "database": "temporary empty SQLite",
+    "head": "0004_model_library",
+    "tables_present": ["gpu_model_library", "gpu_model_downloads", "gpu_model_dependencies"]
+  }
+}

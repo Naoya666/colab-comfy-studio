@@ -195,12 +195,48 @@ def admit_job(st, user, body, key, *, validate_only=False):
     # After the published stamp, so the curated LoRA weight files stay in the manifest the runtime restores.
     if body.get("loras"):
         _apply_loras(repo, user, workflow, body["loras"], snapshot, policy["provider"])
+    from .gpu.model_dependencies import approved_alternates, bind, runtime_copy
+    from .gpu.model_library import ModelLibrary
+    from .gpu.model_sources import ModelError
+    library = ModelLibrary(repo, user["id"])
+    model_drive_account = None
+    try:
+        binding = next((r for r in repo.list("model_dependencies", user["id"])
+                        if r.get("workflow_id") == workflow["id"]), None)
+        if body.get("model_overrides"):
+            binding = library.dependency_record(workflow["id"])
+            dependencies = copy.deepcopy(binding["dependencies"])
+            for override in body["model_overrides"]:
+                dep = next((d for d in dependencies if d["id"] == override.get("dependency_id")), None)
+                if dep is None:
+                    raise ModelError("任务模型覆盖引用了未知依赖")
+                replacement = library.get(override.get("model_id"))
+                dep.update(bind(dep, replacement, confirm_unknown=override.get("confirm_unknown") is True,
+                                strengths=override.get("strengths"), disabled=override.get("disabled") is True))
+            binding = {**binding, "dependencies": dependencies}
+        if binding:
+            bound_models = []
+            for ident in {d.get("model_id") for d in binding["dependencies"] if d.get("model_id")}:
+                if policy["provider"] == "colab":
+                    bound_models.append(library.check_remote(ident))
+                else:
+                    bound_models.append(library.get(ident))
+            drive_accounts = {m.get("drive_account_id") for m in bound_models if m.get("drive_account_id")}
+            if len(drive_accounts) > 1:
+                raise ModelError("本次模型来自不同 Drive 账号，请先统一存储账号")
+            model_drive_account = next(iter(drive_accounts), None)
+            snapshot = runtime_copy(snapshot, binding["dependencies"], bound_models,
+                                    approved=approved_alternates(repo, user["id"], workflow))
+    except ModelError as exc:
+        raise APIError("MODEL_DEPENDENCIES_NOT_READY", str(exc), 409) from exc
+    finally:
+        library.close()
     compute_fields["compatibility_signature"] = compatibility_signature(policy["provider"], snapshot, requested_spec, workflow["workflow_key"], workflow["workflow_version"])
     if validate_only:
         return {**body, **compute_fields, "execution_policy": policy,
                 "requested_account_id": policy.get("account_id"),
                 "requested_instance_id": policy.get("instance_id"),
-                **({"drive_account_id": _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if policy.get("account_id") else {}),
+                **({"drive_account_id": model_drive_account or _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if model_drive_account or policy.get("account_id") else {}),
                 "snapshot": snapshot, "params": params,
                 "resolved_seed": params.get("seed"),
                 "max_runtime_minutes": min(policy["max_runtime_minutes"], cfg.max_runtime_minutes),
@@ -215,7 +251,7 @@ def admit_job(st, user, body, key, *, validate_only=False):
             "requested_account_id": policy.get("account_id"),
             "requested_instance_id": policy.get("instance_id"),
             **(baseline_fields),
-            **({"drive_account_id": _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if policy.get("account_id") else {}),
+            **({"drive_account_id": model_drive_account or _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if model_drive_account or policy.get("account_id") else {}),
             "snapshot": snapshot,
             "params": params,
             "resolved_seed": params.get("seed"),

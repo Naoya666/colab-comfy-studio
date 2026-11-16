@@ -549,8 +549,21 @@ def review_model(
         raise APIError("LICENSE_CONFIRMATION_REQUIRED", "必须明确接受模型许可", 403)
     repo = Repository(st)
     model = _model(repo, user["id"], model_id)
-    _source(model.get("source"))
-    _fixed_commit(model.get("revision"), "revision")
+    if model.get("library_model_id"):
+        from .gpu.model_library import ModelLibrary
+        from .gpu.model_sources import ModelError
+        lib = ModelLibrary(repo, user["id"])
+        try:
+            entry = lib.check_remote(model["library_model_id"])
+            if entry.get("state") != "ready" or entry.get("sha256") != model.get("model_sha256"):
+                raise ModelError("模型库文件身份已变化或未就绪，请重新注册工作流模型")
+        except ModelError as exc:
+            raise APIError("MODEL_REVIEW_INVALID", str(exc)) from exc
+        finally:
+            lib.close()
+    else:
+        _source(model.get("source"))
+        _fixed_commit(model.get("revision"), "revision")
     license_name = model.get("license")
     if not isinstance(license_name, str) or not license_name.strip():
         raise APIError("MODEL_REVIEW_INVALID", "模型license不能为空")

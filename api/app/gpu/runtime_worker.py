@@ -1107,7 +1107,15 @@ def _restore_weights(
         record = {"target": item["target"], "sha256": item["sha256"]}
         if is_drive:
             record.update(source="drive", drive_file_id=item["drive_file_id"])
-        if cache is not None:
+        if not prep and target.is_file():
+            # Retained runtimes reuse only bytes matching the reviewed identity.
+            if (item.get("size") is None or target.stat().st_size == item["size"]) and _sha256(target) == item["sha256"]:
+                return {**record, "source": "local", "seconds": round(time.time() - started, 1)}
+            target.unlink(missing_ok=True)
+        required_space = item.get("size") or 0
+        if required_space and shutil.disk_usage(models).free < required_space + 256 * 1024 * 1024:
+            raise WorkerError("Colab 本地磁盘空间不足，无法恢复当前任务模型")
+        if cache is not None and not is_drive:
             try:
                 entry = cache.lookup(item["target"], item["sha256"], item["size"])
                 if entry and not is_drive:
@@ -1132,7 +1140,7 @@ def _restore_weights(
                 cache.fetch(entry, target)  # type: ignore[union-attr]
                 sha256, md5, size = verify_file(target, item)
                 if prep:
-                    cache.store(item["target"], target, sha256, md5, size)  # type: ignore[union-attr]
+                    # The library file already lives in Drive; never create a second cache copy.
                     target.unlink(missing_ok=True)
                     record["cache_stored"] = True
                 record["seconds"] = round(time.time() - started, 1)

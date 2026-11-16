@@ -21,7 +21,7 @@ def stop(*_):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["worker", "watchdog"], default="worker", nargs="?")
+    parser.add_argument("mode", choices=["worker", "watchdog", "model-worker"], default="worker", nargs="?")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--interval", type=float, default=2)
     args = parser.parse_args()
@@ -33,7 +33,12 @@ def main():
     while running:
         try:
             scheduler = Scheduler(store)
-            result = scheduler.watchdog() if args.mode == "watchdog" else scheduler.tick()
+            if args.mode == "model-worker":
+                from .gpu.model_library import transfer_tick
+                from .gpu.repository import Repository
+                result = transfer_tick(Repository(store))
+            else:
+                result = scheduler.watchdog() if args.mode == "watchdog" else scheduler.tick()
             if args.mode == "worker" and os.getenv("STUDIO_ATELIER_ENABLED", "0") == "1":
                 from .atelier_routes import auto_export_tick
 

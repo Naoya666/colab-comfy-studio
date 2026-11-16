@@ -1,3 +1,4 @@
+import { ModelDependencies } from '../components/ModelDependencies';
 import { ImageWorkflowImport } from '../components/ImageWorkflowImport';
 import { ImageDraftConfiguration } from '../components/ImageDraftConfiguration';
 import { Fragment, useCallback, useMemo, useRef, useState } from 'react';
@@ -167,6 +168,7 @@ export function WorkflowsPanel({
                             {published && !wf.active && <button className="button secondary small" type="button" onClick={() => onRollback(wf)}>设为当前</button>}
                           </span>
                         </div>
+                        <ModelDependencies workflowId={wf.id} onDraft={onActivated} />
                         {wf.image_extraction && wf.state === 'draft' ? <ImageDraftConfiguration workflow={wf} onDone={onActivated} /> : null}
                         {activating === wf.id && (
                           <div className={styles.versionDetail}>

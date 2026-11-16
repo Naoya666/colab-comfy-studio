@@ -27,6 +27,11 @@ services:
     command: [python, -m, app.worker, worker]
     depends_on:
       api: {condition: service_healthy}
+  model-worker:
+    <<: *studio
+    command: [python, -m, app.worker, model-worker]
+    depends_on:
+      api: {condition: service_healthy}
   watchdog:
     <<: *studio
     command: [python, -m, app.worker, watchdog, --interval, '5']

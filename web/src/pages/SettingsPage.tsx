@@ -1,3 +1,4 @@
+import { ModelSourceSettings, ModelStorageSettings } from './ModelLibraryPage';
 import { useState } from 'react';
 import { Settings, ChevronLeft, ChevronRight, Monitor, Gauge, Plug, Cpu, Layers, LogOut, Search, Square } from 'lucide-react';
 import { WorkflowsPanel } from './WorkflowManager';
@@ -87,6 +88,8 @@ export function SettingsPanel({
         </div>
       </Card>
 
+      <ModelStorageSettings />
+      <ModelSourceSettings />
       <InstanceCenter instances={instances} onRefresh={onRefreshInstances} />
 
       <Card icon={<Plug size={17} strokeWidth={1.6} aria-hidden />} title="Google 账号" aside={settings?.offline_mode ? <span className="pill">离线模式</span> : undefined}>

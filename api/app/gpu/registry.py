@@ -18,6 +18,14 @@ _SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-
 _PUBLISH_NODE_ALLOWLIST = {
     "MinimaxH3LatentUpscaler3DRefineHandoff",  # pinned + reviewed custom node (runtime_worker.REVIEWED_CUSTOM_NODES)
     "CheckpointLoaderSimple",
+    "LoraLoader",
+    "DualCLIPLoader",
+    "TripleCLIPLoader",
+    "CLIPVisionLoader",
+    "ControlNetLoader",
+    "UpscaleModelLoader",
+    "ControlNetApply",
+    "ControlNetApplyAdvanced",
     "CLIPTextEncode",
     "KSampler",
     "VAEDecode",
@@ -205,6 +213,8 @@ class Registry:
             "smoke_test_kind": None,
             "active": False,
         }
+        from .model_dependencies import scan
+        payload["model_dependency_scan"] = scan(payload)
         if version is not None:
             return self.repo.create("workflows", owner_id, payload)
         # Legacy bundles without manifest.version receive an integer version.

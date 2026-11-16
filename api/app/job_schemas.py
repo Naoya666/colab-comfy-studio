@@ -103,6 +103,22 @@ def normalize_policy(policy: Policy | dict) -> dict:
     return data
 
 
+class ModelOverrideInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dependency_id: str = Field(min_length=1, max_length=100)
+    model_id: str = Field(min_length=1, max_length=100)
+    strengths: dict[str, float] | None = None
+    disabled: bool = False
+    confirm_unknown: bool = False
+
+    @field_validator("strengths")
+    @classmethod
+    def _strengths(cls, value):
+        if value is not None and (len(value) > 20 or any(not -3 <= v <= 3 for v in value.values())):
+            raise ValueError("LoRA 权重需在 -3 到 3 之间")
+        return value
+
+
 class JobInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     project_id: str
@@ -112,6 +128,7 @@ class JobInput(BaseModel):
     params: dict = Field(default_factory=dict)
     asset_ids: list[str] = Field(default_factory=list, max_length=10)
     loras: list[dict] = Field(default_factory=list, max_length=lora_registry.MAX_LORAS)
+    model_overrides: list[ModelOverrideInput] = Field(default_factory=list, max_length=100)
     preset_id: str | None = None
     execution_policy: Policy = Field(default_factory=Policy)
 

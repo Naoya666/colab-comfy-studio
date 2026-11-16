@@ -152,7 +152,7 @@ svg { flex: none; }
 .bottomNav {
   position: fixed; z-index: 30; left: 50%; bottom: 0; transform: translateX(-50%);
   width: 100%; max-width: var(--col);
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px;
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px;
   padding: 6px 10px calc(6px + var(--safe-b));
   background: var(--bg); border-top: 1px solid var(--line);
 }
@@ -269,3 +269,7 @@ details.foldable[open] > summary::after { transform: rotate(-135deg) translateY(
 
 .specList { display: flex; flex-wrap: wrap; gap: 6px; }
 .specList .muted { flex-basis: 100%; font-size: 0.75rem; }
+
+/* Model catalog hashes and long filenames remain readable on narrow screens. */
+progress { width: 100%; accent-color: var(--accent); }
+article p, section[aria-label="模型详情"] p { overflow-wrap: anywhere; }

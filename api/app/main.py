@@ -42,6 +42,7 @@ from .history_routes import router as history_router
 from .instance_routes import router as instance_router
 from .job_history import job_timing_details, job_timings
 from .job_schemas import JobInput
+from .model_library_routes import router as model_library_router
 from .oauth_config_routes import router as oauth_config_router
 from .presenters import public_asset, public_job
 from .review_routes import router as review_router
@@ -403,6 +404,19 @@ def import_workflow(body: dict, request: Request, user=Depends(current_user), st
         "model_id": body.get("model_id", manifest.get("model_id")),
     }
     row = registry.import_workflow(user["id"], body)
+    from .gpu.model_library import ModelLibrary
+    lib = ModelLibrary(repo, user["id"])
+    try:
+        lib.dependency_record(row["id"], rescan=True)
+        # Exact manifest sources can enter the durable queue without allocating GPU.
+        if any(d.get("weight") for d in row.get("model_dependency_scan") or []):
+            from .gpu.model_sources import ModelError
+            try:
+                lib.prepare_dependencies(row["id"])
+            except ModelError as exc:
+                row = repo.update("workflows", row["id"], {"model_preparation_error": str(exc)}, user["id"])
+    finally:
+        lib.close()
     row = cloud_sync_workflow(st, user["id"], row)
     return ok(row, request, 201)
 
@@ -431,6 +445,8 @@ def configure_image_draft(workflow_id: str, body: dict, request: Request,
     patch.update(pending_configuration=pending, review_approved=False, smoke_test_passed=False,
                  smoke_test_kind=None, sha256=digest({k: patch[k] for k in ("manifest", "api_graph", "object_info")}))
     row = repo.update("workflows", workflow_id, patch, user["id"])
+    from .gpu.model_library import ModelLibrary
+    ModelLibrary(repo, user["id"]).dependency_record(row["id"], rescan=True)
     return ok(row, request)
 
 
@@ -922,6 +938,7 @@ app.include_router(history_router)
 app.include_router(compute_router)
 app.include_router(review_router)
 app.include_router(oauth_config_router)
+app.include_router(model_library_router)
 
 
 @app.exception_handler(GoogleError)

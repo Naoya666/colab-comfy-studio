@@ -78,6 +78,18 @@ class GpuFileRow(CommonMixin, Base):
     __tablename__ = "gpu_files"
 
 
+class ModelLibraryRow(CommonMixin, Base):
+    __tablename__ = "gpu_model_library"
+
+
+class ModelDownloadRow(CommonMixin, Base):
+    __tablename__ = "gpu_model_downloads"
+
+
+class ModelDependencyRow(CommonMixin, Base):
+    __tablename__ = "gpu_model_dependencies"
+
+
 class GpuCredentialRow(CommonMixin, Base):
     __tablename__ = "gpu_credentials"
     account_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
@@ -117,6 +129,9 @@ _GPU_MODELS = {
     "batches": GpuBatchRow,
     "executions": GpuExecutionRow,
     "models": GpuModelRow,
+    "model_library": ModelLibraryRow,
+    "model_downloads": ModelDownloadRow,
+    "model_dependencies": ModelDependencyRow,
     "workflows": GpuWorkflowRow,
     "jobs": GpuJobRow,
     "leases": GpuLeaseRow,

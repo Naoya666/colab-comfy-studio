@@ -5,6 +5,7 @@ const MAX_CHUNKS = 10000;
 export type ExtractedWorkflow = {
   workflow?: Record<string, unknown>;
   prompt?: Record<string, unknown>;
+  metadata?: Array<{keyword:string; text:string}>;
   warnings: string[];
   node_count: number;
   node_types: string[];
@@ -45,6 +46,7 @@ export async function extractPng(bytes: Uint8Array): Promise<ExtractedWorkflow> 
   if (ascii(bytes.subarray(0, 8)) !== '\x89PNG\r\n\x1a\n') throw new Error('请选择 PNG 原图，不支持此文件格式');
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const texts = new Map<string, string>();
+  const metadata: Array<{keyword:string; text:string}> = [];
   let offset = 8, chunks = 0, total = 0, compressed = 0, ended = false, imageData = false;
   while (offset < bytes.length) {
     if (++chunks > MAX_CHUNKS || offset + 12 > bytes.length) throw new Error('PNG 损坏或数据块过多');
@@ -82,6 +84,9 @@ export async function extractPng(bytes: Uint8Array): Promise<ExtractedWorkflow> 
       if (packed) payload = await inflate(payload, MAX_TEXT - total);
       total += payload.length;
       if (total > MAX_TEXT) throw new Error('元数据解压后超过 4 MiB 限制');
+      let originalText: string;
+      try { originalText = utf8(payload); } catch { originalText = new TextDecoder('windows-1252').decode(payload); }
+      metadata.push({keyword:key, text:originalText});
       if (['workflow', 'prompt', 'parameters'].includes(key)) {
         if (texts.has(key)) throw new Error(`重复的 ${key} 元数据，无法确定应使用哪份`);
         texts.set(key, utf8(payload));
@@ -94,7 +99,7 @@ export async function extractPng(bytes: Uint8Array): Promise<ExtractedWorkflow> 
     }
   }
   if (!ended) throw new Error('PNG 文件不完整');
-  const result: ExtractedWorkflow = { warnings: [], node_count: 0, node_types: [], model_files: [] };
+  const result: ExtractedWorkflow = { metadata, warnings: [], node_count: 0, node_types: [], model_files: [] };
   for (const key of ['workflow', 'prompt'] as const) {
     if (!texts.has(key)) continue;
     try {
