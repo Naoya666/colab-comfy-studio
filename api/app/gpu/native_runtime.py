@@ -42,6 +42,13 @@ def open_writes():
                     target = os.readlink(fd)
                     if not target.startswith("/content/ai-studio/native/drive/"):
                         continue
+                    # Manager holds its diagnostic log open for the entire
+                    # session. This is not an outstanding user-data write.
+                    if target in {
+                        "/content/ai-studio/native/drive/native-comfy/user/comfyui.log",
+                        "/content/ai-studio/native/drive/native-comfy/user/comfyui_8188.log",
+                    }:
+                        continue
                     info = (process / "fdinfo" / fd.name).read_text()
                     flags = next(line.split()[1] for line in info.splitlines() if line.startswith("flags:"))
                     if int(flags, 8) & 3:
@@ -85,7 +92,9 @@ def probe():
         v = rpc("vfs/stats")
         d = v.get("diskCache", {})
         io = rpc("core/stats")
-        return {"busy": bool(manager_busy() or open_writes() or d.get("uploadsQueued", 0) or d.get("uploadsInProgress", 0) or d.get("erroredFiles", 0) or d.get("outOfSpace", False) or io.get("transferring") or io.get("errors", 0))}
+        # core/stats.errors is cumulative, including recovered reads and renamed
+        # temporary files. Current VFS errors and pending writes still fence shutdown.
+        return {"busy": bool(manager_busy() or open_writes() or d.get("uploadsQueued", 0) or d.get("uploadsInProgress", 0) or d.get("erroredFiles", 0) or d.get("outOfSpace", False) or io.get("transferring"))}
     except Exception:
         return {"busy": True}
 
@@ -232,7 +241,7 @@ def mount_drive(root, secret):
                   f"client_id = {secret['client_id']}\nclient_secret = {secret['client_secret']}\n" +
                   f"root_folder_id = {secret['owner_folder_id']}\ntoken = {token}\n")
     args = [str(root / "rclone"), "mount", "studio:", str(mount), "--config", str(config),
-         "--vfs-cache-mode", "full", "--vfs-write-back", "0s",
+         "--vfs-cache-mode", "full", "--vfs-write-back", "5s",
          "--vfs-cache-max-size", f"{int(secret['cache_gb'])}G", "--vfs-cache-min-free-space", "5G",
          "--cache-dir", str(root / "vfs-cache"), "--dir-cache-time", "30s", "--poll-interval", "15s",
          "--rc", "--rc-addr", "127.0.0.1:5572", "--rc-no-auth", "--log-level", "ERROR"]
@@ -380,6 +389,9 @@ def run(root, payload, stages):
             except ImportError:
                 from .node_persistence import protect_environment
             protect_environment(ROOT)
+            # Colab's base IPython can omit this required package. Repair the
+            # base environment before the strict plugin compatibility check.
+            worker._run([sys.executable, "-m", "pip", "install", "-q", "jedi>=0.16,<0.20"], timeout=180)
             worker._run([sys.executable, "-m", "pip", "install", "-q", "-r", str(comfy / "requirements.txt")], timeout=600)
             manager = comfy / "manager_requirements.txt"
             if not manager.is_file():
@@ -400,21 +412,10 @@ def run(root, payload, stages):
             guard.mkdir(exist_ok=True)
             (guard / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n")
             (guard / "prestartup_script.py").write_text(
-                "import sys, os\nfrom pathlib import Path\n"
+                "import sys\nfrom pathlib import Path\n"
                 "sys.path.insert(0, '/content/ai-studio/native')\n"
-                "from node_persistence import read, atomic, protect_environment, Persistence\n"
-                "root = Path('/content/ai-studio/native')\n"
-                "config = read(root / 'plugins-config.json')\n"
-                "if config and config.get('pid') != os.getpid():\n"
-                "    config['log_offset'] = Path(config['log']).stat().st_size\n"
-                "    config['pid'] = os.getpid()\n"
-                "    atomic(root / 'plugins-config.json', config)\n"
-                "protect_environment(root)\n"
-                "try:\n"
-                "    Persistence(root, Path(config['comfy']), Path(config['user'])).dependencies()\n"
-                "except Exception as exc:\n"
-                "    atomic(root / 'plugin-errors.json', {'error': str(exc)})\n"
-                "    raise\n")
+                "from node_persistence import prestartup\n"
+                "prestartup(Path('/content/ai-studio/native'))\n")
             probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("@PromptServer")]
             (ROOT / "probe.py").write_text("import os, json\nfrom pathlib import Path\nfrom urllib.request import Request, urlopen\n" + probe)
             stages.start("comfy_start")

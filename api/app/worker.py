@@ -26,6 +26,9 @@ def main():
     parser.add_argument("--interval", type=float, default=2)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
+    # Colab proxy credentials appear in HTTP query strings; never log URLs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     store = Store(settings.database_url)

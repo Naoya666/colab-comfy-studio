@@ -142,12 +142,29 @@ class NativeHostMiddleware:
         if mutating:
             await asyncio.to_thread(native.begin_write, repo, lease)
         heartbeat = asyncio.create_task(activity()) if mutating else None
+        downstream_started = False
         try:
             client = self.http_client()
-            req = client.build_request(request.method, httpx.URL(url), headers=headers, content=request.stream())
-            # The pool must never replay upstream cookies on another browser request.
-            req.headers.pop("cookie", None)
-            response = await client.send(req, stream=True)
+            retryable = (request.method in {"GET", "HEAD"}
+                         and request.headers.get("content-length", "0") == "0"
+                         and "transfer-encoding" not in request.headers)
+            for attempt in range(3 if retryable else 1):
+                req = client.build_request(request.method, httpx.URL(url), headers=headers,
+                                           content=None if retryable else request.stream())
+                # The pool must never replay upstream cookies on another browser request.
+                req.headers.pop("cookie", None)
+                try:
+                    response = await client.send(req, stream=True)
+                except httpx.TransportError:
+                    if not retryable or attempt == 2:
+                        raise
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+                if retryable and response.status_code in {502, 503, 504} and attempt < 2:
+                    await response.aclose()
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+                break
             try:
                 response_headers = clean_headers(response.headers)
                 response_headers = [(k, v.replace(base, settings.native_comfy_url.rstrip("/")) if k.lower() == "location" else v)
@@ -155,12 +172,13 @@ class NativeHostMiddleware:
                 response_headers += [("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")]
                 downstream = StreamingResponse(response.aiter_raw(), status_code=response.status_code)
                 downstream.raw_headers = [(k.lower().encode("latin1"), v.encode("latin1")) for k, v in response_headers]
+                downstream_started = True
                 await downstream(scope, receive, send)
             finally:
                 await response.aclose()
         except httpx.HTTPError:
             # Never include backend URLs/service credentials in browser-visible errors.
-            if 'response' not in locals():
+            if not downstream_started:
                 await JSONResponse({"error": "NATIVE_UPSTREAM_UNAVAILABLE"}, status_code=502)(scope, receive, send)
         finally:
             stop_heartbeat.set()

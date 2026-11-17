@@ -90,10 +90,16 @@ def read_diagnostic_report(job,item):
     verified,path=verify_output(job,item)
     if verified['mime']!='application/json' or verified['size_bytes']>1024*1024:
         raise ArtifactError('diagnostic report must be JSON <=1MiB')
-    if not ((job.get('snapshot') or {}).get('system_smoke') or job.get('prep') or (job.get('snapshot') or {}).get('prep')):
+    snapshot = job.get('snapshot') or {}
+    native = snapshot.get('native_comfy') is True
+    if not (snapshot.get('system_smoke') or job.get('prep') or snapshot.get('prep') or native):
         raise ArtifactError('JSON output only allowed for diagnostic or prep jobs')
     with path.open(encoding='utf-8') as report:
         value=json.load(report)
     if not isinstance(value,dict):
         raise ArtifactError('diagnostic report must be an object')
+    if native and (value.get('native_comfy') is not True
+                   or value.get('commit') != (snapshot.get('manifest') or {}).get('comfy_commit')
+                   or not isinstance(value.get('stage_seconds'), dict)):
+        raise ArtifactError('invalid native readiness report')
     return value

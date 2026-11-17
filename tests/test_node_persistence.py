@@ -259,6 +259,25 @@ def test_dependency_stamp_is_local_and_respects_gpu_version(setup, monkeypatch):
     assert all('restore-snapshot' not in c for c in calls)
 
 
+def test_manager_exec_restart_verifies_dependencies_even_when_pid_is_unchanged(setup, monkeypatch):
+    new, _ = setup
+    instance = new('same-pid')
+    log = instance.root / 'comfy.log'
+    log.write_text('previous startup\n')
+    p.atomic(instance.root / 'plugins-config.json', {
+        'pid': p.os.getpid(), 'log': str(log), 'comfy': str(instance.comfy), 'user': str(instance.user),
+    })
+    calls = []
+    monkeypatch.setattr(p, 'protect_environment', lambda root: {})
+    monkeypatch.setattr(p.Persistence, 'dependencies', lambda self: calls.append(self.root))
+    p.prestartup(instance.root)
+    first = p.read(instance.root / 'plugins-config.json')['log_offset']
+    log.write_text(log.read_text() + 'new process startup\n')
+    p.prestartup(instance.root)
+    assert len(calls) == 2
+    assert p.read(instance.root / 'plugins-config.json')['log_offset'] > first
+
+
 def test_vps_manifest_is_committed_in_existing_settings_only_after_drive_head(setup, monkeypatch):
     from app.db import Store
     from app.gpu import native

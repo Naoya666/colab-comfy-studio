@@ -191,6 +191,23 @@ def protect_environment(root):
     return protected
 
 
+def prestartup(root):
+    """Manager exec-restarts keep their PID; verify every startup, including those."""
+    root = Path(root)
+    config = read(root / 'plugins-config.json')
+    if not config:
+        return
+    config['log_offset'] = Path(config['log']).stat().st_size
+    config['pid'] = os.getpid()
+    atomic(root / 'plugins-config.json', config)
+    protect_environment(root)
+    try:
+        Persistence(root, Path(config['comfy']), Path(config['user'])).dependencies()
+    except Exception as exc:
+        atomic(root / 'plugin-errors.json', {'error': str(exc)})
+        raise
+
+
 class Persistence:
     def __init__(self, root, comfy, user, remote=None):
         self.root, self.comfy, self.user = Path(root), Path(comfy), Path(user)

@@ -103,6 +103,41 @@ def test_upload_and_arbitrary_methods(proxy, monkeypatch, path, method):
     assert proxy.state.repo.lease.get("native_last_write")
 
 
+@pytest.mark.parametrize('method,body,persistent,network,expected_calls,expected_status', [
+    ('GET', b'', False, False, 2, 200), ('HEAD', b'', False, False, 2, 200),
+    ('GET', b'', True, False, 3, 502), ('POST', b'write', False, False, 1, 502),
+    ('GET', b'body', False, False, 1, 502), ('GET', b'', False, True, 2, 200),
+    ('GET', b'', True, True, 3, 502),
+])
+def test_transient_upstream_retry_only_replays_empty_safe_reads(
+    proxy, monkeypatch, method, body, persistent, network, expected_calls, expected_status,
+):
+    calls, responses = [], []
+
+    async def handler(req):
+        calls.append(await req.aread())
+        if len(calls) == 1 or persistent:
+            if network:
+                raise httpx.ConnectError('temporary connection failure', request=req)
+            status = 502
+        else:
+            status = 200
+        response = httpx.Response(status, stream=BytesStream(b'upstream'))
+        responses.append(response)
+        return response
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, 'AsyncClient', lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs))
+    with TestClient(proxy, base_url=settings.native_comfy_url) as client:
+        response = client.request(method, '/assets/module.js', content=body,
+                                  headers={'Authorization': 'Bearer api-test-token'})
+        assert response.status_code == expected_status
+        assert len(calls) == expected_calls
+        assert all(content == body for content in calls)
+        assert all(item.is_closed for item in responses)
+
+
 def test_browser_login_cookie_writes_and_csrf(proxy, monkeypatch):
     now = int(time.time())
     ticket = sign_session({"uid": "owner", "aud": settings.native_comfy_url, "purpose": "native-handoff", "iat": now, "exp": now + 60})
@@ -417,8 +452,11 @@ def test_native_boot_job_retains_one_lease_and_watchdog_waits_for_video(monkeypa
     assert repo.get("leases", leases[0]["id"], "owner")["state"] == "deleted"
 
 
-@pytest.mark.parametrize("processing,uploads,expected", [(True, 0, True), (False, 1, True), (False, 0, False)])
-def test_native_probe_includes_manager_download_queue(processing, uploads, expected):
+@pytest.mark.parametrize("processing,uploads,errors,current_errors,expected", [
+    (True, 0, 0, 0, True), (False, 1, 0, 0, True), (False, 0, 0, 0, False),
+    (False, 0, 2, 0, False), (False, 0, 2, 1, True),
+])
+def test_native_probe_includes_manager_download_queue(processing, uploads, errors, current_errors, expected):
     import io
     import json
 
@@ -431,9 +469,9 @@ def test_native_probe_includes_manager_download_queue(processing, uploads, expec
     def local_api(request, **kwargs):
         url = request if isinstance(request, str) else request.full_url
         if url.endswith("/vfs/stats"):
-            data = {"inUse": 1, "diskCache": {"uploadsQueued": uploads}}
+            data = {"inUse": 1, "diskCache": {"uploadsQueued": uploads, "erroredFiles": current_errors}}
         elif url.endswith("/core/stats"):
-            data = {"errors": 0}
+            data = {"errors": errors}
         elif url.endswith("/manager/queue/status"):
             data = {"is_processing": processing, "total_count": 1 if processing else 0, "done_count": 0}
         else:
@@ -442,6 +480,28 @@ def test_native_probe_includes_manager_download_queue(processing, uploads, expec
     namespace["urlopen"] = local_api
     namespace["open_writes"] = lambda: False
     assert namespace["probe"]()["busy"] is expected
+
+
+@pytest.mark.parametrize('target,expected', [
+    ('native-comfy/user/comfyui_8188.log', False),
+    ('native-comfy/user/comfyui.log', False),
+    ('native-comfy/output/result.png', True),
+    ('native-comfy/user/default/workflows/current.json', True),
+])
+def test_manager_diagnostic_log_does_not_hold_gpu_but_user_writes_do(tmp_path, target, expected):
+    from pathlib import Path
+
+    from app.gpu.native_runtime import EXTENSION
+
+    proc = tmp_path / 'proc'
+    (proc / '123/fd').mkdir(parents=True)
+    (proc / '123/fdinfo').mkdir()
+    (proc / '123/fd/4').symlink_to('/content/ai-studio/native/drive/' + target)
+    (proc / '123/fdinfo/4').write_text('flags:\t0100001\n')
+    source = EXTENSION[EXTENSION.index('def open_writes():'):EXTENSION.index('def manager_busy():')]
+    namespace = {'os': __import__('os'), 'Path': lambda value: proc if value == '/proc' else Path(value)}
+    exec(source, namespace)
+    assert namespace['open_writes']() is expected
 
 
 def test_rclone_install_checks_checksum_and_publishes_atomically(monkeypatch, tmp_path):
@@ -756,6 +816,7 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
         return
 
     runtime.run(job, payload, stages)
+    assert [sys.executable, '-m', 'pip', 'install', '-q', 'jedi>=0.16,<0.20'] in commands
     manager_pip = [args for args in commands if str(comfy / 'manager_requirements.txt') in args]
     assert manager_pip == [[sys.executable, '-m', 'pip', 'install', '-q', '-r',
                             str(comfy / 'manager_requirements.txt')]]
