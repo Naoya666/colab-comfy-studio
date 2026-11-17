@@ -545,3 +545,33 @@ def test_remote_deletion_probe_uses_exact_account_and_requires_boolean_confirmat
     assert native._runtime_deleted(object(), lease) is bool(status and status.get('deleted') is True)
     lease['account_id'] = None
     assert native._runtime_deleted(object(), lease) is False
+
+
+def test_http_pool_reuses_connections_closes_and_never_replays_cookies(proxy, monkeypatch):
+    clients = []
+    seen = []
+
+    async def handler(req):
+        seen.append(req)
+        assert 'cookie' not in req.headers
+        return httpx.Response(200, stream=BytesStream(b'ok'), headers={
+            'Set-Cookie': 'private_backend_cookie=never-replay; Path=/',
+        })
+
+    original = httpx.AsyncClient
+
+    def make_client(**kwargs):
+        client = original(transport=httpx.MockTransport(handler), **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(native_proxy.httpx, 'AsyncClient', make_client)
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        for path in ['/assets/first.js', '/assets/second.js', '/api/object_info']:
+            r = c.get(path, headers={'Authorization': 'Bearer api-test-token'})
+            assert r.content == b'ok'
+            assert 'set-cookie' not in r.headers
+        assert len(clients) == 1
+        assert not clients[0].is_closed
+    assert len(seen) == 3
+    assert clients[0].is_closed

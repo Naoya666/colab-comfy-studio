@@ -55,8 +55,24 @@ class NativeHostMiddleware:
     def __init__(self, app, studio_app):
         self.app = app
         self.studio_app = studio_app
+        self._http_client = None
+
+    def http_client(self):
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(None, connect=15), follow_redirects=False,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=100),
+            )
+        return self._http_client
 
     async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                if self._http_client is not None:
+                    await self._http_client.aclose()
+                    self._http_client = None
         if scope["type"] not in {"http", "websocket"} or not settings.native_comfy_url:
             return await self.app(scope, receive, send)
         headers = httpx.Headers(scope["headers"])
@@ -127,19 +143,21 @@ class NativeHostMiddleware:
             await asyncio.to_thread(native.begin_write, repo, lease)
         heartbeat = asyncio.create_task(activity()) if mutating else None
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=15), follow_redirects=False) as client:
-                req = client.build_request(request.method, httpx.URL(url), headers=headers, content=request.stream())
-                response = await client.send(req, stream=True)
-                try:
-                    response_headers = clean_headers(response.headers)
-                    response_headers = [(k, v.replace(base, settings.native_comfy_url.rstrip("/")) if k.lower() == "location" else v)
-                                        for k, v in response_headers]
-                    response_headers += [("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")]
-                    downstream = StreamingResponse(response.aiter_raw(), status_code=response.status_code)
-                    downstream.raw_headers = [(k.lower().encode("latin1"), v.encode("latin1")) for k, v in response_headers]
-                    await downstream(scope, receive, send)
-                finally:
-                    await response.aclose()
+            client = self.http_client()
+            req = client.build_request(request.method, httpx.URL(url), headers=headers, content=request.stream())
+            # The pool must never replay upstream cookies on another browser request.
+            req.headers.pop("cookie", None)
+            response = await client.send(req, stream=True)
+            try:
+                response_headers = clean_headers(response.headers)
+                response_headers = [(k, v.replace(base, settings.native_comfy_url.rstrip("/")) if k.lower() == "location" else v)
+                                    for k, v in response_headers]
+                response_headers += [("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")]
+                downstream = StreamingResponse(response.aiter_raw(), status_code=response.status_code)
+                downstream.raw_headers = [(k.lower().encode("latin1"), v.encode("latin1")) for k, v in response_headers]
+                await downstream(scope, receive, send)
+            finally:
+                await response.aclose()
         except httpx.HTTPError:
             # Never include backend URLs/service credentials in browser-visible errors.
             if 'response' not in locals():
