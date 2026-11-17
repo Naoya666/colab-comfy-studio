@@ -30,6 +30,7 @@ async def status(request: Request, user=Depends(current_user)):
             pass
     events = repo.list("events", user["id"]) if job else []
     return ok({"configured": bool(settings.native_comfy_url), "url": settings.native_comfy_url,
+               "timeouts": native.timeout_options(),
                "ready": ready, "instance_id": lease.get("instance_id") if lease else None,
                "job_id": job["id"] if job else None, "state": job["state"] if job else "stopped",
                "error": job.get("error_message") if job else None,
@@ -39,7 +40,8 @@ async def status(request: Request, user=Depends(current_user)):
 
 @router.post("/start", status_code=202)
 def start(body: dict, request: Request, user=Depends(current_user)):
-    unknown = set(body) - {"account_id", "spec", "instance_id", "plugin_generation"}
+    unknown = set(body) - {"account_id", "spec", "instance_id", "plugin_generation",
+                           "retain_idle_minutes", "max_runtime_minutes"}
     if unknown:
         raise APIError("NATIVE_INPUT", "不支持的启动参数", 422)
     job = native.admit(request.app.state.repo, user["id"], body, request.headers.get("Idempotency-Key"))

@@ -20,6 +20,16 @@ from .manifest import digest
 TERMINAL = {"completed", "failed", "cancelled", "rejected"}
 
 
+def timeout_options():
+    max_runtime = GpuConfig.from_env().max_runtime_minutes
+    return {
+        "defaults": {"retain_idle_minutes": settings.native_comfy_idle_minutes,
+                     "max_runtime_minutes": max_runtime},
+        "limits": {"retain_idle_minutes": 30,
+                   "max_runtime_minutes": max_runtime},
+    }
+
+
 def secret_file(name):
     path = os.getenv(name, "")
     if not path:
@@ -86,6 +96,13 @@ class _borrow:
 
 def admit(repo, owner, body, key):
     cfg = GpuConfig.from_env()
+    timeouts = {"retain_idle_minutes": settings.native_comfy_idle_minutes,
+                "max_runtime_minutes": cfg.max_runtime_minutes}
+    for field, maximum in (("retain_idle_minutes", 30), ("max_runtime_minutes", cfg.max_runtime_minutes)):
+        value = body.get(field, timeouts[field])
+        if type(value) is not int or not 1 <= value <= maximum:
+            raise APIError("NATIVE_INPUT", f"{field} 必须为 1–{maximum} 的整数（分钟）", 422)
+        timeouts[field] = value
     if not settings.native_comfy_url or not cfg.real_enabled:
         raise APIError("NATIVE_DISABLED", "请先配置原生 ComfyUI 域名并启用真实 GPU", 503)
     backend()
@@ -122,6 +139,11 @@ def admit(repo, owner, body, key):
                 same_spec = False
             if not source or source.get("account_id") != account or not same_spec:
                 raise APIError("NATIVE_ACTIVE", "已有原生会话；请等待任务和同步完成后停止旧实例，再切换 GPU", 409)
+            policy = source.get("execution_policy") or {}
+            if any(field in body and timeouts[field] != policy.get(field, default)
+                   for field, default in (("retain_idle_minutes", settings.native_comfy_idle_minutes),
+                                          ("max_runtime_minutes", cfg.max_runtime_minutes))):
+                raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止旧实例后重新启动以调整时间参数", 409)
             return source
         # Never create a second GPU while another live instance is already present.
         instances = [i for i in repo.list("instances", owner) if i.get("state") not in {"deleted"} and i.get("provider") == "colab"]
@@ -145,8 +167,7 @@ def admit(repo, owner, body, key):
         raw = {"kind": "native-comfy", **body}
         job, _ = repo.create_job(owner, raw, key)
         policy = {"provider": "colab", "lifecycle": "retain", "account_id": account,
-                  "retain_idle_minutes": settings.native_comfy_idle_minutes,
-                  "max_runtime_minutes": cfg.max_runtime_minutes,
+                  **timeouts,
                   **({"instance_id": requested_instance, "allocation": "existing"} if requested_instance else {})}
         return repo.update("jobs", job["id"], {
             "native_request_hash": digest(body), "project_id": project, "provider": "colab",
@@ -154,8 +175,9 @@ def admit(repo, owner, body, key):
             "requested_instance_id": requested_instance, "requested_spec": body["spec"],
             "lifecycle": "retain", "execution_policy": policy,
             "model_id": "native-comfy", "workflow_key": "system/native-comfy", "workflow_version": 1,
-            "max_runtime_minutes": cfg.max_runtime_minutes, "unit_rate": cfg.unit_rate,
-            "estimated_units": cfg.max_runtime_minutes * cfg.unit_rate,
+            "max_runtime_minutes": timeouts["max_runtime_minutes"], "unit_rate": cfg.unit_rate,
+            "native_session_deadline_epoch": time.time() + timeouts["max_runtime_minutes"] * 60,
+            "estimated_units": timeouts["max_runtime_minutes"] * cfg.unit_rate,
             "snapshot": {"native_comfy": True, "native_plugin_generation": body.get("plugin_generation"), "bound_graph": {},
                          "manifest": {"reviewed": True, "state": "published", "comfy_commit": commit,
                                       "compute_spec": body["spec"].get("key", body["spec"])}}}, owner)
@@ -245,7 +267,13 @@ def protect_lease(repo, lease, clock=time.time):
         instance = repo.get("instances", lease.get("instance_id"), lease["owner_id"]) or {}
         manual = instance.get("manual_stop_requested")
         last = max(float(lease.get("native_last_busy") or 0), float(lease.get("native_last_write") or 0))
-        if not manual and clock() - last < settings.native_comfy_idle_minutes * 60:
+        idle_minutes = lease.get("native_idle_minutes")
+        if idle_minutes is None:
+            job = repo.get("jobs", lease.get("owner_job_id"), lease["owner_id"]) if lease.get("owner_job_id") else None
+            idle_minutes = ((job or {}).get("execution_policy") or {}).get("retain_idle_minutes", settings.native_comfy_idle_minutes)
+        deadline = lease.get("deadline_epoch")
+        expired = deadline is not None and clock() >= float(deadline)
+        if not manual and not expired and clock() - last < idle_minutes * 60:
             return True
         repo.update("leases", lease["id"], {"native_draining": True}, lease["owner_id"])
         if lease.get("instance_id") and instance:

@@ -1068,14 +1068,28 @@ class Scheduler:
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else None
         if state == "completed":
             if (job.get("snapshot") or {}).get("native_comfy"):
+                from app.config import settings
+
                 from .native import ready
                 if not ready():
                     if job.get("stage") != "native_tunnel":
                         self._event(job, "running", "等待代理健康检查及内部隧道鉴权验证", None)
                         return self._update("jobs", job["id"], {"stage": "native_tunnel"}, job["owner_id"])
                     return job
-                lease = self._update("leases", lease["id"], {"native_ready": True, "native_last_busy": self.clock()}, job["owner_id"])
-                self._update("instances", job["instance_id"], {"native_comfy": True}, job["owner_id"])
+                deadline = min(float(lease["deadline_epoch"]),
+                               float(job.get("native_session_deadline_epoch") or lease["deadline_epoch"]))
+                lease = self._update("leases", lease["id"], {
+                    "native_ready": True, "native_last_busy": self.clock(),
+                    "deadline_epoch": deadline,
+                    "native_idle_minutes": (job.get("execution_policy") or {}).get(
+                        "retain_idle_minutes", settings.native_comfy_idle_minutes),
+                }, job["owner_id"])
+                self._update("instances", job["instance_id"], {
+                    "native_comfy": True, "hard_deadline_at": deadline,
+                }, job["owner_id"])
+                job = self._update("jobs", job["id"], {
+                    "deadline_epoch": deadline, "hard_deadline_at": deadline,
+                }, job["owner_id"])
             job = self._note_restored(job, lease, timings or {})
         if state == "running":
             stage = result.get("stage")

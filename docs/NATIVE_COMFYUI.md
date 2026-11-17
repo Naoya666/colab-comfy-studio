@@ -77,6 +77,8 @@ Colab 回收后 `/content` 中的状态和 Python 包不再保留；下一次初
 
 在已登录 Studio 点击「原生 ComfyUI」。已有健康会话直接进入；没有会话时选择账号与实际可申请 GPU，提交后查看现有任务事件，健康检查通过后跳转。跨域名通过 60 秒签名票据的 POST 建立专用 HttpOnly/Secure cookie，票据不放进 URL；原生 API 写入和 WS 使用此 cookie。服务不向浏览器发送 Colab、Drive 或 tunnel 凭据。
 
+启动页可设置「空闲回收时间」和「会话上限时间」，单位为整数分钟。空闲回收范围为 1–30，默认使用 `NATIVE_COMFY_IDLE_MINUTES`；会话上限范围为 1–`GPU_MAX_RUNTIME_MINUTES`，默认使用该服务端上限，从提交启动时计时，并按所选时长估算预算。`POST /api/gpu/native/start` 对应可选字段为 `retain_idle_minutes` 和 `max_runtime_minutes`，省略时沿用默认值。参数随会话持久化，重启服务后仍生效；修改已有原生会话的时间参数需先停止旧实例。复用 Studio GPU 时取本次会话截止与原实例截止的较早时间。会话到期后等待生成和同步完成再回收。
+
 API 客户端使用相同外部源地址和 `Authorization: Bearer <STUDIO_API_TOKEN>`。未授权请求返回 401，不跳转 OAuth。所有原生 API、静态资源和扩展路径由完整代理处理，路由不使用 API 白名单。内置 ComfyUI API 版本也可能有 `/api/` 前缀，仍原样转发。
 
 原生启动也是现有调度器里的任务；多标签页、多进程启动以及 VPS 重启使用数据库作唯一来源。正在启动或已有原生实例时不会再创建一个原生 GPU。若已有 Studio 实例，必须等它空闲后复用。切换账号/GPU 要先停止旧实例，待旧租约释放后再选新规格；公网域名不变。会话到运行期限后也需要停止并重启。

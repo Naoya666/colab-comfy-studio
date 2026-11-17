@@ -32,12 +32,15 @@ class Repo:
         self.lease = {"id": "lease", "owner_id": "owner", "instance_id": "instance", "native_comfy": True,
                       "native_ready": True, "state": "idle", "native_last_busy": 100}
         self.instance = {}
+        self.job = {}
 
     @contextmanager
     def dispatch_lock(self):
         yield True
 
     def get(self, kind, ident, owner):
+        if kind == "jobs":
+            return self.job
         return self.lease if kind == "leases" else self.instance
 
     def update(self, kind, ident, patch, owner):
@@ -220,7 +223,8 @@ def test_persistent_directories_restore_after_checkout_recreation(tmp_path):
     compile(EXTENSION, "native_extension", "exec")
 
 
-def test_native_admission_idempotent_across_restart_and_gpu_switch(proxy, monkeypatch):
+@pytest.mark.parametrize("timeouts", [{}, {"retain_idle_minutes": 7, "max_runtime_minutes": 20}])
+def test_native_admission_idempotent_across_restart_and_gpu_switch(proxy, monkeypatch, timeouts):
     from app.common import APIError
     from app.db import Store
     from app.gpu.compute import GpuConfig
@@ -232,15 +236,81 @@ def test_native_admission_idempotent_across_restart_and_gpu_switch(proxy, monkey
     monkeypatch.setattr(native.GpuConfig, "from_env", lambda: GpuConfig(real_enabled=True, unit_rate=0.01))
     monkeypatch.setattr(native, "secret_file", lambda name: "test-secret")
     monkeypatch.setenv("NATIVE_COMFY_COMMIT", "a" * 40)
-    body = {"account_id": "account", "spec": {"key": {"variant": "VARIANT_GPU", "accelerator": "T4", "shape": "SHAPE_STANDARD"}}}
+    body = {"account_id": "account", "spec": {"key": {"variant": "VARIANT_GPU", "accelerator": "T4", "shape": "SHAPE_STANDARD"}}, **timeouts}
     job = native.admit(repo, "owner", body, "native-start")
+    assert job["execution_policy"]["retain_idle_minutes"] == timeouts.get("retain_idle_minutes", settings.native_comfy_idle_minutes)
+    assert job["max_runtime_minutes"] == job["execution_policy"]["max_runtime_minutes"] == timeouts.get("max_runtime_minutes", 30)
+    assert job["estimated_units"] == job["max_runtime_minutes"] * 0.01
+    assert 0 <= job["native_session_deadline_epoch"] - time.time() <= job["max_runtime_minutes"] * 60
     assert native.admit(Repository(store), "owner", body, "native-start")["id"] == job["id"]
     assert native.admit(Repository(store), "owner", body, "another-browser")["id"] == job["id"]
     assert len(repo.list("jobs", "owner")) == 1
     with pytest.raises(APIError) as error:
         native.admit(repo, "owner", {**body, "spec": {"key": {"accelerator": "A100"}}}, "switch-gpu")
     assert error.value.status == 409
+    with pytest.raises(APIError) as error:
+        native.admit(repo, "owner", {**body, "retain_idle_minutes": 3}, "change-timeouts")
+    assert error.value.status == 409
+    with pytest.raises(APIError) as error:
+        native.admit(repo, "owner", {**body, "max_runtime_minutes": 5}, "native-start")
+    assert error.value.code == "IDEMPOTENCY_CONFLICT"
     assert "secret" not in str(job)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("retain_idle_minutes", 0), ("retain_idle_minutes", 31),
+    ("max_runtime_minutes", -1), ("max_runtime_minutes", 31),
+    ("retain_idle_minutes", True), ("max_runtime_minutes", 1.5),
+    ("retain_idle_minutes", "5"), ("max_runtime_minutes", None),
+])
+def test_native_admission_rejects_invalid_timeouts(monkeypatch, field, value):
+    from app.common import APIError
+    from app.gpu.compute import GpuConfig
+
+    monkeypatch.setattr(native.GpuConfig, "from_env", lambda: GpuConfig(max_runtime_minutes=30))
+    with pytest.raises(APIError) as error:
+        native.admit(Repo(), "owner", {field: value}, "invalid-timeout")
+    assert error.value.code == "NATIVE_INPUT"
+    assert error.value.status == 422
+
+
+@pytest.mark.parametrize("idle_minutes,deadline,now,protected", [
+    (2, 10000, 219, True), (2, 10000, 220, False),
+    (20, 10000, 1000, True), (20, 10000, 1300, False),
+    (20, 500, 500, False),
+])
+def test_native_reclamation_uses_session_timeouts(proxy, monkeypatch, idle_minutes, deadline, now, protected):
+    repo = proxy.state.repo
+    repo.lease.update(owner_job_id="job", deadline_epoch=deadline)
+    repo.job = {"execution_policy": {"retain_idle_minutes": idle_minutes}}
+    monkeypatch.setattr(native, "busy", lambda: False)
+    assert native.protect_lease(repo, repo.lease, clock=lambda: now) is protected
+    assert bool(repo.lease.get("native_draining")) is (not protected)
+
+
+def test_native_idle_timeout_survives_studio_handoff(proxy, monkeypatch):
+    repo = proxy.state.repo
+    repo.lease.update(owner_job_id="studio-job", native_idle_minutes=2, deadline_epoch=10000)
+    repo.job = {"execution_policy": {"retain_idle_minutes": 30}}
+    monkeypatch.setattr(native, "busy", lambda: False)
+    assert not native.protect_lease(repo, repo.lease, clock=lambda: 220)
+
+
+def test_native_status_exposes_timeout_defaults_and_limits(proxy, monkeypatch):
+    from app.gpu.compute import GpuConfig
+    from app.native_routes import router
+
+    proxy.include_router(router)
+    proxy.state.repo.lease["native_ready"] = False
+    monkeypatch.setattr(settings, "native_comfy_idle_minutes", 8)
+    monkeypatch.setattr(native.GpuConfig, "from_env", lambda: GpuConfig(max_runtime_minutes=60))
+    with TestClient(proxy) as client:
+        response = client.get("/api/gpu/native/status", headers={"Authorization": "Bearer api-test-token"})
+    assert response.status_code == 200
+    assert response.json()["data"]["timeouts"] == {
+        "defaults": {"retain_idle_minutes": 8, "max_runtime_minutes": 60},
+        "limits": {"retain_idle_minutes": 30, "max_runtime_minutes": 60},
+    }
 
 
 def test_native_shared_studio_does_not_spawn_or_kill_comfy(monkeypatch, tmp_path):
@@ -313,6 +383,7 @@ def test_native_boot_job_retains_one_lease_and_watchdog_waits_for_video(monkeypa
     job, _ = repo.create_job("owner", {"project_id": "native", "execution_policy": {"provider": "mock"}}, "boot-native")
     job = repo.update("jobs", job["id"], {"provider": "mock", "project_id": "native", "lifecycle": "retain",
         "execution_policy": {"provider": "mock", "lifecycle": "retain", "retain_idle_minutes": 15},
+        "native_session_deadline_epoch": 1600,
         "snapshot": {"native_comfy": True, "manifest": {}, "bound_graph": {}}, "requested_spec": spec}, "owner")
     config = GpuConfig(max_runtime_minutes=30, unit_rate=0.01)
 
@@ -332,6 +403,9 @@ def test_native_boot_job_retains_one_lease_and_watchdog_waits_for_video(monkeypa
     leases = repo.list("leases", "owner")
     assert len(leases) == 1
     assert leases[0]["native_ready"] and leases[0]["state"] == "idle"
+    assert leases[0]["native_idle_minutes"] == 15
+    assert leases[0]["deadline_epoch"] == 1600
+    assert repo.list("instances", "owner")[0]["hard_deadline_at"] == 1600
     assert len(repo.list("instances", "owner")) == 1
     now[0] += 5000  # Past both idle and hard deadline: an active video still must finish.
     monkeypatch.setattr(native, "busy", lambda: True)
