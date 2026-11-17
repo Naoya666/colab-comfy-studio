@@ -5,8 +5,10 @@ Third-party code runs with the runtime's privileges, not in a security sandbox.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -17,6 +19,7 @@ import tarfile
 import tempfile
 import time
 import tomllib
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -42,7 +45,29 @@ finally:
 
 EXCLUDE = {'.git', '__pycache__', '.venv', 'venv', 'node_modules', '.env', 'tokens', 'credentials',
            '.cache', '.pytest_cache', 'models', 'checkpoints', 'output', 'input'}
-SECRET = re.compile(rb'(?i)(?:access_token|refresh_token|client_secret|api_key|password)["\s]*[:=]["\s]*[A-Za-z0-9_./+\-]{8,}|(?:gh[pousr]_|hf_)[A-Za-z0-9]{16,}|-----BEGIN .*PRIVATE KEY-----')
+SECRET = re.compile(rb'(?i:(?:access_token|refresh_token|client_secret|api_key|password)["\s]*[:=]["\s]*(?P<assignment_value>[A-Za-z0-9_./+\-]{8,}))|(?:gh[pousr]_|hf_)[A-Za-z0-9]{16,}|-----BEGIN .*PRIVATE KEY-----')
+
+
+def check_credentials(data, path):
+    """Ignore proven Python dynamic values; keep literals and parse failures blocked."""
+    dynamic_starts = None
+    for match in SECRET.finditer(data):
+        if match.group('assignment_value') is not None and path.suffix == '.py':
+            if dynamic_starts is None:
+                dynamic_starts = set()
+                try:
+                    tree = ast.parse(data)
+                    offsets = [0]
+                    for line in data.splitlines(keepends=True):
+                        offsets.append(offsets[-1] + len(line))
+                    for node in ast.walk(tree):
+                        if isinstance(node, (ast.Name, ast.Attribute, ast.Call, ast.Subscript)):
+                            dynamic_starts.add(offsets[node.lineno - 1] + node.col_offset)
+                except (SyntaxError, ValueError, UnicodeError):
+                    pass
+            if match.start('assignment_value') in dynamic_starts:
+                continue
+        raise RuntimeError(f'Possible credential in plugin backup: {path}; remove it before syncing')
 
 
 def file_hash(path):
@@ -72,6 +97,34 @@ def safe_url(value):
     return None
 
 
+def source_stamp(path):
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+@lru_cache(maxsize=4096)
+def _cached_checked_source(path, stamp):
+    """Reuse scans only while content metadata (including ctime) is unchanged."""
+    checksum = hashlib.sha256()
+    with path.open('rb') as source:
+        previous = b''
+        while block := source.read(1024**2):
+            if SECRET.search(previous + block):
+                check_credentials(path.read_bytes(), path)
+            checksum.update(block)
+            previous = block[-512:]
+    if source_stamp(path) != stamp:
+        raise RuntimeError(f'Plugin file changed during scan: {path}; retrying after settling')
+    return checksum.hexdigest()
+
+
+def checked_source(path, stamp):
+    # Small code/config writes may share coarse filesystem timestamps. Always scan
+    # them; reserve the metadata cache for large assets such as the CSV dictionary.
+    scan = _cached_checked_source if stamp[2] >= 1024**2 else _cached_checked_source.__wrapped__
+    return scan(path, stamp)
+
+
 def files(folder):
     """Never follow links or archive credentials, environments, or Git auth config."""
     for base, dirs, names in os.walk(folder, followlinks=False):
@@ -84,15 +137,10 @@ def files(folder):
                 continue
             if path.is_symlink() or not path.is_file():
                 raise RuntimeError(f'Unsupported plugin file: {path}')
-            if path.stat().st_size > 64 * 1024**2:
-                raise RuntimeError(f'Plugin source file exceeds 64 MiB: {path}; store weights under Drive models')
-            with path.open('rb') as source:
-                previous = b''
-                while block := source.read(1024**2):
-                    if SECRET.search(previous + block):
-                        raise RuntimeError(f'Possible credential in plugin backup: {path}; remove it before syncing')
-                    previous = block[-512:]
-            yield path, file_hash(path)
+            limit = 128 if path.suffix.lower() == '.csv' else 64
+            if path.stat().st_size > limit * 1024**2:
+                raise RuntimeError(f'Plugin source file exceeds {limit} MiB: {path}; store weights under Drive models')
+            yield path, checked_source(path, source_stamp(path))
 
 
 def inventory(nodes):
@@ -111,8 +159,8 @@ def inventory(nodes):
         if node.is_file() and not node.name.endswith(('.py', '.py.disabled')):
             continue
         entries = list(files(node)) if node.is_dir() else [(node, file_hash(node))]
-        if node.is_file() and SECRET.search(node.read_bytes()):
-            raise RuntimeError(f'Possible credential in plugin backup: {node}')
+        if node.is_file():
+            check_credentials(node.read_bytes(), node)
         checks = [(str(path.relative_to(node)) if node.is_dir() else node.name, h) for path, h in entries]
         item = {'path': str(node.relative_to(nodes)), 'checksum': digest(checks),
                 'enabled': enabled, 'repo': None, 'commit': None, 'version': None}
@@ -398,8 +446,12 @@ class Persistence:
                                 # Pack only this commit/tree, never repository history or Git config.
                                 committed = subprocess.check_output(['git', '-C', str(node), 'archive', 'HEAD'])
                                 commit_data = subprocess.check_output(['git', '-C', str(node), 'cat-file', 'commit', 'HEAD'])
-                                if SECRET.search(committed + commit_data) or re.search(rb'https?://[^/\s"]+@', committed):
+                                if SECRET.search(commit_data) or re.search(rb'https?://[^/\s"]+@', committed):
                                     raise RuntimeError('Possible credential in committed plugin source: ' + p['path'])
+                                with tarfile.open(fileobj=io.BytesIO(committed)) as source:
+                                    for member in source:
+                                        if member.isfile():
+                                            check_credentials(source.extractfile(member).read(), Path(member.name))
                                 objects = subprocess.check_output(['git', '-C', str(node), 'rev-list', '--objects', '--no-walk', 'HEAD'])
                                 ids = b'\n'.join(line.split(b' ')[0] for line in objects.splitlines()) + b'\n'
                                 bundle = self.cache / 'repo.pack'
@@ -433,11 +485,17 @@ class Persistence:
 
     def status(self):
         pending = read(self.root / 'plugins-pending.json', {}).get('manifest')
+        error = self.error or read(self.root / 'plugin-errors.json')
+        try:
+            durable = bool(read(self.root / 'plugins-pending.json', {}).get('source') == digest(inventory(self.nodes)))
+        except Exception as exc:
+            durable = False
+            error = str(exc)
         return {'manifest': self.manifest, 'pending_generation': (pending or {}).get('generation'),
                 'restart_required': bool(pending and (not self.manifest or pending['generation'] != self.manifest['generation'])),
-                'durable': bool(read(self.root / 'plugins-pending.json', {}).get('source') == digest(inventory(self.nodes))),
+                'durable': durable,
                 'install_notes': read(self.root / 'plugin-install-notes.json', []),
-                'error': self.error or read(self.root / 'plugin-errors.json')}
+                'error': error}
 
 
 def install(server, root, manager_busy):
@@ -448,7 +506,13 @@ def install(server, root, manager_busy):
     root = Path(root)
     config = read(root / 'plugins-config.json')
     persistence = Persistence(root, config['comfy'], config['user'])
-    boot_fingerprint = digest(inventory(persistence.nodes))
+    # A rejected plugin must not prevent the status endpoint/loop from loading.
+    # Leave boot unset on failure: later repairs require restart before head promotion.
+    boot_fingerprint = None
+    try:
+        boot_fingerprint = digest(inventory(persistence.nodes))
+    except Exception as exc:
+        persistence.error = str(exc)
 
     def healthy():
         from urllib.request import urlopen
@@ -478,7 +542,8 @@ def install(server, root, manager_busy):
         except Exception as exc:
             persistence.error = str(exc)
             atomic(root / 'plugin-errors.json', {'error': str(exc)})
-        load_error = persistence.error
+        # Scan failures are retried by tick; startup/dependency failures stay sticky.
+        load_error = persistence.error if read(root / 'plugin-errors.json') else None
         while True:
             try:
                 success = await asyncio.to_thread(persistence.tick, await asyncio.to_thread(manager_busy))

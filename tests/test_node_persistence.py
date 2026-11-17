@@ -389,3 +389,160 @@ def test_pack_does_not_include_repository_history_or_git_credentials(setup):
     assert 'private-git-token' not in config
     result = subprocess.run(['git', '-C', str(second.nodes / 'demo'), 'rev-list', 'HEAD'], capture_output=True, text=True)
     assert result.stdout.splitlines() == [manifest['plugins'][0]['commit']]
+
+
+def test_downloaded_csv_dictionary_has_bounded_larger_allowance(tmp_path):
+    node = tmp_path / 'autocomplete'
+    node.mkdir()
+    dictionary = node / 'tags.csv'
+    with dictionary.open('wb') as stream:
+        stream.truncate(65 * 1024**2)
+    assert [path for path, _ in p.files(node)] == [dictionary]
+    dictionary.rename(node / 'weights.bin')
+    with pytest.raises(RuntimeError, match='64 MiB'):
+        list(p.files(node))
+    (node / 'weights.bin').unlink()
+    with dictionary.open('wb') as stream:
+        stream.truncate(129 * 1024**2)
+    with pytest.raises(RuntimeError, match='128 MiB'):
+        list(p.files(node))
+
+
+def test_inventory_error_is_reported_without_killing_status_polling(setup, monkeypatch):
+    new, _ = setup
+    obj = new('runtime')
+    add(obj)
+    original = p.inventory
+    def broken(_):
+        raise RuntimeError('Plugin source file exceeds limit')
+    monkeypatch.setattr(p, 'inventory', broken)
+    status = obj.status()
+    assert status['durable'] is False
+    assert status['error'] == 'Plugin source file exceeds limit'
+    monkeypatch.setattr(p, 'inventory', original)
+    assert obj.status()['error'] is None
+
+
+def test_cached_scan_detects_secret_added_with_same_size_and_restored_mtime(tmp_path):
+    import os
+    node = tmp_path / 'node'
+    node.mkdir()
+    source = node / 'config.txt'
+    source.write_bytes(b'x' * 64)
+    list(p.files(node))
+    before = source.stat()
+    source.write_bytes(b'api_key="secret123456789"'.ljust(64, b' '))
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(RuntimeError, match='credential'):
+        list(p.files(node))
+
+
+@pytest.mark.parametrize('source', [
+    'api_key = settings.github_token\n',
+    'headers = {"api_key": get_token()}\n',
+    'client(api_key=settings.token)\n',
+    'api_key: str = os.environ["TOKEN"]\n',
+    'label = "中文"; api_key = settings.token\n',
+    'class HF_TransformersClassifierProvider: pass\n',
+    'nodes = {"Provider": HF_TransformersClassifierProvider}\n',
+    'if proxy_password:\n    full_proxy_url = f"{proxy_password}@{host}"\n',
+    'api_key = settings.token or None\n',
+    'api_key = settings.token if enabled else None\n',
+])
+def test_python_dynamic_values_are_not_credentials(tmp_path, source):
+    p.check_credentials(source.encode(), tmp_path / 'github.py')
+
+
+@pytest.mark.parametrize('source', [
+    'api_key = "secret123456789"\n',
+    'headers = {"api_key": "secret123456789"}\n',
+    'client(api_key="secret123456789")\n',
+    'api_key = settings.token\nrefresh_token = "secret123456789"\n',
+    'token = "ghp_12345678901234567890"\n',
+    'token = "hf_12345678901234567890"\n',
+    'API_KEY = "secret123456789"\n',
+    '# api_key=secret123456789\n',
+    'description = "api_key=settings.github_token"\n',
+    'api_key = settings.token\nthis is invalid python!\n',
+])
+def test_literals_comments_and_parse_failures_remain_blocked(tmp_path, source):
+    with pytest.raises(RuntimeError, match='credential'):
+        p.check_credentials(source.encode(), tmp_path / 'github.py')
+
+
+def test_dynamic_exemption_is_python_only(tmp_path):
+    with pytest.raises(RuntimeError, match='credential'):
+        p.check_credentials(b'api_key = settings.github_token', tmp_path / 'config.txt')
+
+
+def test_git_archive_dynamic_source_restores_but_committed_secret_blocks(setup):
+    new, drive = setup
+    first = new('first')
+    node = add(first)
+    source = node / 'github.py'
+    source.write_text('api_key = settings.github_token\n')
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(node), '-c', 'user.name=Test',
+                                        '-c', 'user.email=test@example.test', *args], stderr=subprocess.DEVNULL)
+    git('init')
+    git('add', '.')
+    git('commit', '-m', 'dynamic')
+    head = sync(first)['manifest']
+    second = new('second')
+    second.restore()
+    assert (second.nodes / 'demo/github.py').read_bytes() == source.read_bytes()
+    source.write_text('api_key = "secret123456789"\n')
+    git('add', '.')
+    git('commit', '-m', 'unsafe')
+    source.write_text('api_key = settings.github_token\n')
+    with pytest.raises(RuntimeError, match='credential'):
+        sync(first)
+    assert json.loads((drive.path / 'head.json').read_text()) == head
+
+
+@pytest.mark.asyncio
+async def test_boot_scan_failure_keeps_loop_alive_and_recovers_after_repair(setup, monkeypatch):
+    import asyncio
+    import io
+    new, drive = setup
+    obj = new('runtime')
+    node = add(obj)
+    source = node / 'github.py'
+    source.write_text('api_key = "secret123456789"\n')
+    log = obj.root / 'comfy.log'
+    log.write_text('startup complete\n')
+    p.atomic(obj.root / 'plugins-config.json', {
+        'comfy': str(obj.comfy), 'user': str(obj.user), 'log': str(log), 'log_offset': 0,
+    })
+    monkeypatch.setattr(p, 'Remote', lambda root: drive)
+    monkeypatch.setattr('urllib.request.urlopen', lambda *a, **kw: io.BytesIO(b'{"system": {"os": "linux"}}'))
+    clock = [0]
+    monkeypatch.setattr(p.time, 'monotonic', lambda: clock[0])
+    iteration = [0]
+    def busy():
+        return False
+    async def sleep(seconds):
+        assert seconds == 10
+        iteration[0] += 1
+        status = p.read(obj.root / 'plugins-status.json')
+        if iteration[0] == 1:
+            assert status['durable'] is False
+            assert 'credential' in status['error']
+            assert not (drive.path / 'head.json').exists()
+            source.write_text('api_key = settings.github_token\n')
+        if iteration[0] == 3:
+            assert status['durable'] is True
+            assert status['error'] is None
+            assert status['restart_required'] is True
+            assert (drive.path / 'pending.json').exists()
+            assert not (drive.path / 'head.json').exists()
+            raise asyncio.CancelledError
+        clock[0] += 31
+    monkeypatch.setattr(asyncio, 'sleep', sleep)
+    tasks = []
+    server = SimpleNamespace(loop=SimpleNamespace(create_task=lambda coro: tasks.append(asyncio.create_task(coro))))
+    persistence = p.install(server, obj.root, busy)
+    assert persistence is not None
+    with pytest.raises(asyncio.CancelledError):
+        await tasks[0]
+    assert iteration[0] == 3
