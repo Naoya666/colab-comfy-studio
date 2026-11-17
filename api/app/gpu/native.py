@@ -280,14 +280,38 @@ def protect_lease(repo, lease, clock=time.time):
         return False
 
 
-def begin_write(repo, lease):
-    with repo.store.dispatch_lock() as acquired:
-        if not acquired:
-            raise APIError("SCHEDULER_BUSY", "会话正在同步，请稍后重试", 503)
-        fresh = repo.get("leases", lease["id"], lease["owner_id"]) or {}
-        if fresh.get("native_draining") or fresh.get("state") in {"deleted", "releasing", "deleting"}:
-            raise APIError("NATIVE_DRAINING", "实例正在释放，请回到 Studio 重启", 409)
-        repo.update("leases", lease["id"], {"native_last_write": time.time(), "native_http_heartbeat": time.time()}, lease["owner_id"])
+def begin_write(repo, lease, *, allow_stopping=False, timeout=2.0):
+    """Wait only for local admission; never replay an upstream write.
+
+    Keep the scheduler's nonblocking lock semantics. Sleep after releasing each
+    failed lock context, and revalidate the original session under the fence.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        with repo.store.dispatch_lock() as acquired:
+            if acquired:
+                fresh = repo.get("leases", lease["id"], lease["owner_id"])
+                if not fresh or _lease_identity(fresh) != _lease_identity(lease):
+                    raise APIError("NATIVE_SESSION_CHANGED", "会话已结束或切换，请回到 Studio 重新打开", 409)
+                if (not fresh.get("native_ready") or fresh.get("native_draining")
+                        or fresh.get("state") in {"deleted", "releasing", "deleting"}):
+                    raise APIError("NATIVE_DRAINING", "实例正在释放，请回到 Studio 重启", 409)
+                instance = repo.get("instances", fresh.get("instance_id"), fresh["owner_id"]) or {}
+                if (instance.get("native_draining")
+                        or instance.get("state") in {"deleted", "releasing", "deleting"}):
+                    raise APIError("NATIVE_DRAINING", "实例正在释放，请回到 Studio 重启", 409)
+                now = time.time()
+                if not allow_stopping and (instance.get("manual_stop_requested")
+                        or now >= float(fresh.get("deadline_epoch") or float("inf"))):
+                    raise APIError("NATIVE_DRAINING", "会话已到运行时限或正在停止；等待已有任务及同步结束后重启", 409)
+                repo.update("leases", fresh["id"], {
+                    "native_last_write": now, "native_http_heartbeat": now,
+                }, fresh["owner_id"])
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise APIError("SCHEDULER_BUSY", "会话状态繁忙，请稍后重试", 503)
+        time.sleep(min(0.02, remaining))
 
 
 def ready(client=None):

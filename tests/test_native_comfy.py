@@ -865,3 +865,194 @@ def test_manager_probe_supports_legacy_queue_path(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, '_http_json', http)
     runtime.verify_manager(worker, log)
     assert len(seen) == 2
+
+
+@pytest.mark.parametrize('path', ['/api/v2/manager/queue/task', '/v2/manager/queue/task', '/upload/image'])
+@pytest.mark.parametrize('outcome', ['ok', 'busy', 'deleted', 'draining', 'identity', 'stopped', 'expired', 'not_ready'])
+def test_write_admission_waits_and_revalidates(proxy, monkeypatch, path, outcome):
+    repo = proxy.state.repo
+    attempts, calls = [], []
+    original_begin = native.begin_write
+    monkeypatch.setattr(native, 'begin_write', lambda *args, **kwargs: original_begin(*args, timeout=0.05, **kwargs))
+
+    @contextmanager
+    def lock():
+        attempts.append(1)
+        if len(attempts) == 1:
+            # Replace, rather than mutate, the snapshot selected before waiting.
+            fresh = dict(repo.lease)
+            if outcome == 'deleted':
+                fresh = None
+            elif outcome == 'identity':
+                fresh['runtime_id'] = 'replacement'
+            elif outcome == 'draining':
+                fresh['native_draining'] = True
+            elif outcome == 'stopped':
+                repo.instance['manual_stop_requested'] = True
+            elif outcome == 'expired':
+                fresh['deadline_epoch'] = time.time() - 1
+            elif outcome == 'not_ready':
+                fresh['native_ready'] = False
+            repo.lease = fresh
+        yield len(attempts) > 1 and outcome != 'busy'
+
+    monkeypatch.setattr(repo, 'dispatch_lock', lock)
+
+    async def handler(req):
+        calls.append(await req.aread())
+        return httpx.Response(200, stream=BytesStream(b'accepted'))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, 'AsyncClient', lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs))
+    started = time.monotonic()
+    with TestClient(proxy, base_url=settings.native_comfy_url) as client:
+        response = client.post(path, content=b'ordered\x00upload', headers={'Authorization': 'Bearer api-test-token'})
+    assert time.monotonic() - started < 1
+    assert len(attempts) >= 2
+    assert response.status_code == (200 if outcome == 'ok' else 503 if outcome == 'busy' else 409)
+    assert calls == ([b'ordered\x00upload'] if outcome == 'ok' else [])
+    if outcome != 'ok' and repo.lease:
+        assert 'native_http_heartbeat' not in repo.lease
+    if outcome == 'busy':
+        assert response.json() == {'error': 'SCHEDULER_BUSY', 'message': '会话状态繁忙，请稍后重试'}
+
+
+@pytest.mark.parametrize('path', ['/interrupt', '/api/interrupt', '/queue', '/api/queue'])
+@pytest.mark.parametrize('change', ['stop', 'deadline'])
+def test_stop_operations_remain_allowed_after_wait(proxy, monkeypatch, path, change):
+    repo = proxy.state.repo
+    attempts = []
+
+    @contextmanager
+    def lock():
+        attempts.append(1)
+        if change == 'stop':
+            repo.instance['manual_stop_requested'] = True
+        else:
+            repo.lease = {**repo.lease, 'deadline_epoch': time.time() - 1}
+        yield len(attempts) > 1
+
+    monkeypatch.setattr(repo, 'dispatch_lock', lock)
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, 'AsyncClient', lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, stream=BytesStream(b'ok'))), **kwargs))
+    with TestClient(proxy, base_url=settings.native_comfy_url) as client:
+        assert client.post(path, headers={'Authorization': 'Bearer api-test-token'}).status_code == 200
+    assert repo.lease['native_http_heartbeat']
+
+
+@pytest.mark.parametrize('network,status', [(False, 502), (False, 503), (True, 502)])
+def test_admission_retry_never_replays_manager_post(proxy, monkeypatch, network, status):
+    attempts, calls = [], []
+
+    @contextmanager
+    def lock():
+        attempts.append(1)
+        yield len(attempts) > 1
+
+    monkeypatch.setattr(proxy.state.repo, 'dispatch_lock', lock)
+
+    async def handler(req):
+        calls.append(await req.aread())
+        if network:
+            raise httpx.ReadError('outcome unknown', request=req)
+        return httpx.Response(status, stream=BytesStream(b'unknown'))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, 'AsyncClient', lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs))
+    with TestClient(proxy, base_url=settings.native_comfy_url) as client:
+        assert client.post('/api/v2/manager/queue/task', content=b'install',
+                           headers={'Authorization': 'Bearer api-test-token'}).status_code == status
+    assert calls == [b'install']
+
+
+@pytest.mark.parametrize('admitted', [False, True])
+def test_admission_does_not_consume_upload_until_lock(proxy, monkeypatch, admitted):
+    """Drive ASGI directly so receive calls prove the upload stays unbuffered."""
+    chunks, consumed, calls, attempts = [b'first\x00', b'second', b'last'], [], [], []
+    original_begin = native.begin_write
+    monkeypatch.setattr(native, 'begin_write', lambda *args, **kwargs: original_begin(*args, timeout=0.05, **kwargs))
+
+    @contextmanager
+    def lock():
+        attempts.append(1)
+        assert not consumed
+        yield admitted and len(attempts) > 1
+
+    monkeypatch.setattr(proxy.state.repo, 'dispatch_lock', lock)
+
+    async def handler(req):
+        calls.append(await req.aread())
+        return httpx.Response(200, stream=BytesStream(b'ok'))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, 'AsyncClient', lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs))
+
+    async def run():
+        messages = []
+
+        async def receive():
+            if len(consumed) < len(chunks):
+                chunk = chunks[len(consumed)]
+                consumed.append(chunk)
+                return {'type': 'http.request', 'body': chunk, 'more_body': len(consumed) < len(chunks)}
+            await asyncio.Event().wait()
+
+        async def send(message):
+            messages.append(message)
+
+        scope = {'type': 'http', 'asgi': {'version': '3.0', 'spec_version': '2.3'},
+                 'http_version': '1.1', 'method': 'POST', 'scheme': 'https', 'path': '/upload/image',
+                 'raw_path': b'/upload/image', 'query_string': b'',
+                 'headers': [(b'host', b'comfy.example.test'), (b'authorization', b'Bearer api-test-token')],
+                 'server': ('comfy.example.test', 443), 'client': ('127.0.0.1', 1)}
+        middleware = NativeHostMiddleware(proxy, proxy)
+        try:
+            await middleware(scope, receive, send)
+        finally:
+            if middleware._http_client:
+                await middleware._http_client.aclose()
+        assert messages[0]['status'] == (200 if admitted else 503)
+
+    asyncio.run(run())
+    assert calls == ([b''.join(chunks)] if admitted else [])
+    assert consumed == (chunks if admitted else [])
+
+
+def test_begin_write_waits_for_real_sqlite_dispatch_lock(tmp_path):
+    import threading
+
+    from app.db import Store
+    from app.gpu.repository import Repository
+
+    url = f'sqlite:///{tmp_path / "studio.db"}'
+    holder, contender = Store(url), Store(url)
+    repo = Repository(contender)
+    lease = repo.create('leases', 'owner', Repo().lease)
+    entered, done = threading.Event(), threading.Event()
+    errors = []
+
+    def admit():
+        entered.set()
+        try:
+            native.begin_write(repo, lease)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    with holder.dispatch_lock() as acquired:
+        assert acquired
+        thread = threading.Thread(target=admit)
+        thread.start()
+        assert entered.wait(1)
+        assert not done.wait(0.08)
+        assert not repo.get('leases', lease['id'], 'owner').get('native_http_heartbeat')
+    thread.join(2)
+    assert done.is_set() and not errors
+    assert repo.get('leases', lease['id'], 'owner')['native_http_heartbeat']
+    holder.engine.dispose()
+    contender.engine.dispose()

@@ -140,7 +140,10 @@ class NativeHostMiddleware:
                 except TimeoutError:
                     pass
         if mutating:
-            await asyncio.to_thread(native.begin_write, repo, lease)
+            await asyncio.to_thread(
+                native.begin_write, repo, lease,
+                allow_stopping=scope["path"] in {"/interrupt", "/api/interrupt", "/queue", "/api/queue"},
+            )
         heartbeat = asyncio.create_task(activity()) if mutating else None
         downstream_started = False
         try:
