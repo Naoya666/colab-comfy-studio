@@ -174,6 +174,7 @@ def test_orphan_confirmed_delete_records_instance_segment_without_actual_cu():
         {
             "owner_job_id": "orphan-job",
             "provider": "mock",
+            "account_id": "scoped-cleanup-account",
             "state": "active",
             "request_id": request_id,
             "runtime_id": runtime_id,
@@ -182,9 +183,13 @@ def test_orphan_confirmed_delete_records_instance_segment_without_actual_cu():
             "deadline_epoch": 900.0,
         },
     )
+    def scoped_provider(job):
+        assert job['account_id'] == 'scoped-cleanup-account'
+        return provider
+
     scheduler = Scheduler(
         repo,
-        provider_factory=lambda _: provider,
+        provider_factory=scoped_provider,
         executor_factory=lambda _: MockGPUExecutor(),
         instance_service=service,
         clock=lambda: 1_000.0,

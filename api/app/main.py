@@ -169,7 +169,15 @@ async def security_context(request, call_next):
         response = error_response(request, exc)
     response.headers["X-Request-ID"] = request.state.request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "same-origin"
+    # A same-origin referrer policy turns cross-origin form POST Origin into
+    # "null" in browsers, breaking the signed native-host login handoff.
+    # HTML documents may send only their origin cross-site; API responses keep
+    # the stricter policy. NativeHostMiddleware still requires exact Origin.
+    response.headers["Referrer-Policy"] = (
+        "strict-origin-when-cross-origin"
+        if response.headers.get("content-type", "").startswith("text/html")
+        else "same-origin"
+    )
     response.headers["X-Frame-Options"] = "DENY"
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "private, no-store"

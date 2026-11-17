@@ -185,15 +185,47 @@ def runtime_secrets(repo, job):
         drive.close()
 
 
+def _runtime_deleted(repo, lease):
+    """Only provider confirmation can distinguish a gone VM from a broken tunnel."""
+    handle = lease.get("handle")
+    if lease.get("provider") != "colab" or not lease.get("account_id") or not isinstance(handle, dict):
+        return False
+    from .colab import GoogleColabProvider
+
+    try:
+        handle = {**handle, "job_id": lease.get("owner_job_id"), "owner_job_id": lease.get("owner_job_id")}
+        with httpx.Client(timeout=10) as client:
+            provider = GoogleColabProvider(repo, lease["owner_id"], account_id=lease["account_id"], client=client)
+            return provider.inspect(handle).get("deleted") is True
+    except Exception:
+        return False  # Provider outages are not deletion evidence.
+
+
+def _lease_identity(lease):
+    return tuple(lease.get(k) for k in ("owner_id", "owner_job_id", "instance_id", "account_id", "runtime_id", "request_id", "handle"))
+
+
 def protect_lease(repo, lease, clock=time.time):
     """Fence idle shutdown against new uploads/prompts under the existing dispatch lock."""
     if not lease.get("native_comfy"):
         return False
+    identity = _lease_identity(lease)
     upstream_busy = busy()
+    # An offline tunnel also reports "busy". It cannot veto reconciliation of
+    # a VM already confirmed absent by Colab's independent control plane.
+    remote_deleted = upstream_busy and _runtime_deleted(repo, lease)
     with repo.store.dispatch_lock() as acquired:
         if not acquired:
             return True
         lease = repo.get("leases", lease["id"], lease["owner_id"]) or lease
+        if remote_deleted:
+            if _lease_identity(lease) != identity:
+                return True  # The lease was handed off while inspection ran.
+            repo.update("leases", lease["id"], {
+                "native_ready": False, "native_draining": True,
+                "native_remote_deleted_verified_at": clock(),
+            }, lease["owner_id"])
+            return False  # Existing scheduler cleanup still confirms deletion.
         if upstream_busy:
             repo.update("leases", lease["id"], {"native_last_busy": clock()}, lease["owner_id"])
             return True

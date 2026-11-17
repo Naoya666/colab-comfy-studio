@@ -472,3 +472,76 @@ def test_drive_mount_reuses_existing_mount_without_rewriting_credentials(monkeyp
     monkeypatch.setattr(runtime.subprocess, 'Popen', lambda *a, **kw: pytest.fail('must not start another RC server'))
     assert runtime.mount_drive(tmp_path, {}) == tmp_path / 'drive'
     assert not (tmp_path / 'rclone.conf').exists()
+
+
+@pytest.mark.parametrize('content_type,expected', [('text/html; charset=utf-8', 'strict-origin-when-cross-origin'), ('application/json', 'same-origin')])
+def test_studio_document_policy_preserves_handoff_origin(content_type, expected):
+    from app.main import security_context
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    async def response(request):
+        return Response('test', headers={'content-type': content_type})
+
+    request = Request({'type': 'http', 'method': 'GET', 'path': '/', 'headers': [], 'query_string': b''})
+    result = asyncio.run(security_context(request, response))
+    assert result.headers['Referrer-Policy'] == expected
+
+
+@pytest.mark.parametrize('origin', ['null', '', 'https://evil.example'])
+def test_handoff_still_rejects_missing_opaque_and_foreign_origins(proxy, origin):
+    now = int(time.time())
+    ticket = sign_session({'uid': 'owner', 'aud': settings.native_comfy_url, 'purpose': 'native-handoff', 'iat': now, 'exp': now + 60})
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        assert c.post('/_studio/session', data={'ticket': ticket}, headers={'Origin': origin}).status_code == 403
+
+
+@pytest.mark.parametrize('deleted', [True, False])
+def test_offline_native_tunnel_only_yields_to_confirmed_remote_deletion(proxy, monkeypatch, deleted):
+    repo = proxy.state.repo
+    monkeypatch.setattr(native, 'busy', lambda: True)
+    monkeypatch.setattr(native, '_runtime_deleted', lambda repo, lease: deleted)
+    assert native.protect_lease(repo, repo.lease, clock=lambda: 20000) is not deleted
+    if deleted:
+        assert repo.lease['native_ready'] is False
+        assert repo.lease['native_draining'] is True
+        assert repo.lease['native_remote_deleted_verified_at'] == 20000
+    else:
+        assert repo.lease['native_ready'] is True
+
+
+def test_remote_deletion_evidence_does_not_apply_after_lease_handoff(proxy, monkeypatch):
+    repo = proxy.state.repo
+    lease = {**repo.lease, 'owner_job_id': 'old-job'}
+    repo.lease = lease
+    monkeypatch.setattr(native, 'busy', lambda: True)
+
+    def inspect(repo, original):
+        repo.lease = {**original, 'owner_job_id': 'new-job'}
+        return True
+
+    monkeypatch.setattr(native, '_runtime_deleted', inspect)
+    assert native.protect_lease(repo, lease, clock=lambda: 20000) is True
+    assert repo.lease['native_ready'] is True
+
+
+@pytest.mark.parametrize('status', [{'deleted': True}, {'deleted': False}, {}, {'deleted': 'true'}, None])
+def test_remote_deletion_probe_uses_exact_account_and_requires_boolean_confirmation(monkeypatch, status):
+    from app.gpu import colab
+
+    class Provider:
+        def __init__(self, repo, owner, *, account_id, client):
+            assert owner == 'owner' and account_id == 'colab-account'
+
+        def inspect(self, handle):
+            assert handle['owner_job_id'] == handle['job_id'] == 'current-job'
+            if status is None:
+                raise httpx.ConnectError('unavailable')
+            return status
+
+    monkeypatch.setattr(colab, 'GoogleColabProvider', Provider)
+    lease = {'provider': 'colab', 'account_id': 'colab-account', 'owner_id': 'owner',
+             'owner_job_id': 'current-job', 'handle': {'owner_job_id': 'old-job'}}
+    assert native._runtime_deleted(object(), lease) is bool(status and status.get('deleted') is True)
+    lease['account_id'] = None
+    assert native._runtime_deleted(object(), lease) is False

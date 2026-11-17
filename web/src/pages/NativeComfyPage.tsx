@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import type { GpuAccount } from '../components/AccountDirectory';
+import { submitNativeHandoff } from '../lib/native-handoff';
 
 type NativeStatus = { configured: boolean; ready: boolean; state: string; url: string; instance_id?: string; error?: string; events: { state?: string; message?: string }[] };
 
@@ -12,7 +13,7 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
   const [error, setError] = useState('');
   const [starting, setStarting] = useState(false);
   const [stopConfirm, setStopConfirm] = useState(false);
-  const [autoOpen, setAutoOpen] = useState(true);
+  const [autoOpen, setAutoOpen] = useState(false);
   const key = useRef(crypto.randomUUID());
   const opening = useRef(false);
   async function enter() {
@@ -20,11 +21,7 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
     opening.current = true;
     try {
       const data = await apiFetch<{ url: string; ticket: string }>('/api/gpu/native/ticket', { method: 'POST' });
-      const form = document.createElement('form');
-      form.method = 'POST'; form.action = data.url;
-      const input = document.createElement('input');
-      input.type = 'hidden'; input.name = 'ticket'; input.value = data.ticket;
-      form.append(input); document.body.append(form); form.submit(); form.remove();
+      submitNativeHandoff(document, data);
     } catch (cause) { setError(apiMessage(cause)); opening.current = false; }
   }
   useEffect(() => {
