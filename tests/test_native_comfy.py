@@ -613,7 +613,7 @@ def test_ready_rejects_manager_access_bypass(proxy):
         assert not native.ready(client)
 
 
-@pytest.mark.parametrize('failure', [None, 'requirements', 'log', 'api', 'stale-log'])
+@pytest.mark.parametrize('failure', [None, 'requirements', 'log', 'api', 'stale-log', 'node-import'])
 def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_path, failure):
     import json
     import sys
@@ -623,6 +623,10 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
     from app.gpu import runtime_worker as worker
 
     monkeypatch.setitem(sys.modules, 'runtime_worker', worker)
+    from app.gpu.node_persistence import Remote
+    monkeypatch.setattr(Remote, 'get', lambda *args: False)
+    monkeypatch.setenv('PIP_CONSTRAINT', '')
+    monkeypatch.setenv('UV_CONSTRAINT', '')
     service = tmp_path / 'native'
     comfy = service / 'ComfyUI'
     comfy.mkdir(parents=True)
@@ -661,6 +665,8 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
         launches.append((args, kwargs))
         if 'main.py' in args and failure not in {'log', 'stale-log'}:
             kwargs['stdout'].write(b'[START] ComfyUI-Manager\n')
+            if failure == 'node-import':
+                kwargs['stdout'].write(b'1.0 seconds (IMPORT FAILED): /custom_nodes/broken\n')
             kwargs['stdout'].flush()
         return process
     monkeypatch.setattr(runtime.subprocess, 'Popen', launch)
@@ -668,7 +674,7 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
     payload = {'snapshot': {'manifest': {'comfy_commit': 'a' * 40}},
                'native_secrets': {'max_upload_mb': 2048, 'tunnel_token': 'fake-token'}}
     if failure:
-        with pytest.raises(RuntimeError, match='Manager'):
+        with pytest.raises(RuntimeError, match='Manager|Custom node load failed'):
             runtime.run(job, payload, stages)
         assert not (service / 'state.json').exists()
         assert len(launches) == (0 if failure == 'requirements' else 1)

@@ -83,6 +83,7 @@ def build_bootstrap_code(execution_id: str, payload: dict, worker_source: str | 
         worker_source = Path(__file__).with_name("runtime_worker.py").read_text(encoding="utf-8")
     if not isinstance(worker_source, str) or not worker_source:
         raise MCPError("trusted worker source is unavailable")
+    plugins_b64 = base64.b64encode(Path(__file__).with_name("node_persistence.py").read_bytes()).decode("ascii")
     native_b64 = base64.b64encode(Path(__file__).with_name("native_runtime.py").read_bytes()).decode("ascii")
     source_b64 = base64.b64encode(worker_source.encode("utf-8")).decode("ascii")
     payload_b64 = _b64_json(payload)
@@ -117,6 +118,7 @@ else:
     except FileExistsError:
         _result["existing"] = True
     else:
+        (_dir / "node_persistence.py").write_bytes(_base64.b64decode({plugins_b64!r}))
         (_dir / "native_runtime.py").write_bytes(_base64.b64decode({native_b64!r}))
         _worker.write_bytes(_base64.b64decode({source_b64!r}))
         _payload.touch(mode=0o600)
@@ -664,6 +666,7 @@ class MCPGPUExecutor:
         if (job.get("snapshot") or {}).get("native_comfy"):
             from .native import runtime_secrets
             payload["native_secrets"] = runtime_secrets(self.store, job)
+            payload["native_plugin_generation"] = job["snapshot"].get("native_plugin_generation")
         code = build_bootstrap_code(execution_id, payload)
         result = self._exec_code_on_handle(handle, session, execution_id, code)
         return {

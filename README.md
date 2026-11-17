@@ -189,4 +189,4 @@ npm --prefix web run build
 
 ### 原生 ComfyUI（独立域名）
 
-新增「原生 ComfyUI」入口，与 Studio 复用 GPU 会话，提供完整 HTTP/WebSocket 代理和 Drive 用户数据持久化。部署需配置独立域名、受 Access Service Auth 保护的 Cloudflare named tunnel，以及固定 ComfyUI 提交。详见 [部署、目录、酒馆兼容与真实 GPU 验收清单](docs/NATIVE_COMFYUI.md)。当前自动验证为离线模拟，真实 Colab/Drive/隧道仍需部署后验收。
+新增「原生 ComfyUI」入口，与 Studio 复用 GPU 会话，提供完整 HTTP/WebSocket 代理和 Drive 用户数据持久化。部署需配置独立域名、受 Access Service Auth 保护的 Cloudflare named tunnel，以及固定 ComfyUI 提交。详见 [部署、目录、酒馆兼容与真实 GPU 验收清单](docs/NATIVE_COMFYUI.md)。自定义节点支持 Drive 归档、运行期同步和版本回滚，见 [Custom Nodes 持久化](docs/CUSTOM_NODES_PERSISTENCE.md)。当前自动验证为离线模拟，真实 Colab/Drive/隧道仍需部署后验收。

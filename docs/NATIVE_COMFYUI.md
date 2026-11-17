@@ -65,7 +65,7 @@ Colab 初始化安装 fuse3、固定 rclone v1.70.3（核对 [官方 release SHA
 
 ComfyUI 健康检查成功后，还要求本次启动的 `comfy.log` 包含官方 `[START] ComfyUI-Manager` 标记，并且本机 `/v2/manager/queue/status`（兼容 `/manager/queue/status`）返回布尔 `is_processing`。通过后 `worker.log` 输出 `[studio-native] Manager loaded: …`，之后才继续 tunnel/watchdog 和就绪报告。校验失败会报错并回收本次启动的 ComfyUI 子进程；历史日志中的标记不能冒充本次成功。日志位于 `/content/ai-studio/<execution_id>/comfy.log`，其路径和本次日志起点保存在 `native/state.json`；复用时校验原进程的日志及实时 Manager API，不另起进程。升级前缺少日志元数据的旧会话需正常停止后重新启动。
 
-Colab 回收后 `/content` 中的状态和 Python 包不再保留；下一次初始化会再次安装官方和 Manager requirements，并携带 `--enable-manager`。Drive 上的用户数据及节点 requirements 仍按原流程恢复。
+Colab 回收后 `/content` 中的状态和 Python 包不再保留；下一次初始化会再次安装官方和 Manager requirements，并携带 `--enable-manager`。Drive 用户数据保持恢复；自定义节点从校验归档恢复到本地 SSD，再通过官方 Manager 恢复依赖，详见 [Custom Nodes 持久化](CUSTOM_NODES_PERSISTENCE.md)。
 
 安全边界为公网 Comfy 域名的 Studio 登录/Bearer 鉴权与写请求 Origin 校验，加内部 tunnel 全路径的 Access Service Auth。Manager 自身的 security level 不能替代这些鉴权。就绪检查除了 `/system_stats`，还对 Manager 队列及安装路径发起**无凭据 GET**，要求得到 401/403/302；不会提交安装操作。不要给 `/manager/*`、`/v2/*`、`/customnode/*` 或 `/api/*` 配置 Access Bypass，也不要降低 Manager 安全等级来绕过安装限制。
 
@@ -100,7 +100,8 @@ AI-Studio/<owner>/
     user/                    # 原生工作流、设置、前端/Manager 用户数据
     input/                   # 上传的素材
     output/                  # 图片、视频等结果
-    custom_nodes/            # 自定义节点源码及配置
+    custom_nodes/            # 旧版本源码，保留用于首次迁移
+    plugins/                 # 校验归档、候选/已验证清单、历史版本
   runtime-cache/             # 原有 Studio 环境缓存保持原样
 ```
 
@@ -108,7 +109,7 @@ AI-Studio/<owner>/
 
 本地 `/content/ai-studio/native/drive` 为 rclone 挂载，模型按实际读取下载到有上限的本地 VFS 缓存；模型文件在执行时真实可读，不做仅名称占位。不预复制整个 Drive，不强行加载显存。`extra_model_paths.yaml` 保留 `unet/diffusion_models`、`clip/text_encoders` 等别名。
 
-用户目录、输入输出、自定义节点、Manager 下载的模型写回 Drive，VFS 只上传完整关闭的文件并等待上传结束后允许正常释放。Python 依赖每次根据官方 requirements 和各节点 requirements 恢复，不共享不同 GPU 的整个 site-packages。依赖冲突会令启动失败；特殊节点自己的 install.py、系统依赖、二进制安装脚本可能仍需按节点说明处理。
+用户目录、输入输出、Manager 下载的模型沿用 Drive VFS。自定义节点从本地 SSD 执行，稳定后以压缩对象直接写入 Drive，重启加载验证后更新 VPS 清单；正常释放会等待候选同步完成。依赖通过同一 Python 环境下的官方 Manager restore-dependencies 恢复，同一 VM 指纹不变时复用安装结果，不共享不同 GPU 的整个 site-packages。完整协议、回滚接口和八项验收见 [Custom Nodes 持久化](CUSTOM_NODES_PERSISTENCE.md)。
 
 临时预览/中间文件在本地 `native/temp`，VFS 缓存和未完成下载也属于临时数据。突然被 Colab 强制回收、断电或手工外部删除 VM 时，尚未上传完成的数据仍可能丢失；代码不能保证未落盘数据在基础设施强制终止后恢复。已确认写入 Drive 的工作流、模型与结果保留。不要把配置了挂载等同于已经验证了真实持久化恢复。
 

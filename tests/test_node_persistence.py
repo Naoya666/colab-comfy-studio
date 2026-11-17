@@ -1,0 +1,372 @@
+"""Offline lifecycle acceptance tests. Real archives/Git, simulated durable Drive and Manager CLI."""
+import hashlib
+import json
+import shutil
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from app.gpu import node_persistence as p
+
+
+class Drive:
+    def __init__(self, path):
+        self.path = path
+        self.uploads = []
+        self.fail = None
+
+    def get(self, key, target):
+        source = self.path / key
+        if not source.exists():
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        return True
+
+    def put(self, source, key):
+        if self.fail == key:
+            raise RuntimeError('interrupted upload')
+        self.uploads.append(key)
+        target = self.path / key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+
+@pytest.fixture
+def setup(tmp_path, monkeypatch):
+    remote = Drive(tmp_path / 'drive')
+    def new(name):
+        root = tmp_path / name
+        comfy = root / 'ComfyUI'
+        (comfy / 'custom_nodes').mkdir(parents=True)
+        obj = p.Persistence(root, comfy, root / 'user', remote)
+        return obj
+    monkeypatch.setattr(p.Persistence, 'snapshot', lambda self: {'git_custom_nodes': {}})
+    return new, remote
+
+
+def add(obj, name='demo', version=1):
+    folder = obj.nodes / name
+    folder.mkdir(exist_ok=True)
+    (folder / '__init__.py').write_text(f'NODE_CLASS_MAPPINGS = {{}}\nVERSION = {version}\n')
+    (folder / 'pyproject.toml').write_text(f'[project]\nversion = "{version}.0"\n')
+    return folder
+
+
+def sync(obj, verified=True):
+    if verified:
+        obj.boot = p.digest(p.inventory(obj.nodes))
+    obj.tick(now=0)
+    assert obj.tick(now=31)
+    return obj.status()
+
+
+def test_first_install_and_new_vm_restores_without_clone(setup):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    status = sync(first)
+    assert status['manifest']['plugins'][0]['version'] == '1.0'
+    assert not status['restart_required']
+    second = new('second')
+    second.restore()
+    assert (second.nodes / 'demo/__init__.py').read_bytes() == (first.nodes / 'demo/__init__.py').read_bytes()
+    assert not second.nodes.is_symlink()
+    assert sync(second)['manifest']['generation'] == status['manifest']['generation']
+
+
+def test_manager_new_install_survives_death_before_restart_but_is_not_verified(setup):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    head = sync(first)['manifest']
+    add(first, 'new')
+    status = sync(first, verified=False)
+    assert status['restart_required'] and status['durable']
+    assert json.loads((drive.path / 'head.json').read_text()) == head
+    second = new('second')
+    second.restore()
+    assert (second.nodes / 'new').is_dir()
+    assert len(sync(second)['manifest']['plugins']) == 2
+
+
+def test_update_rollback_disable_delete_are_complete_sets(setup):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    v1 = sync(first)['manifest']
+    add(first, version=2)
+    v2 = sync(first)['manifest']
+    assert v2['generation'] != v1['generation']
+    rollback = new('rollback')
+    rollback.restore(v1['generation'])
+    assert 'VERSION = 1' in (rollback.nodes / 'demo/__init__.py').read_text()
+    (first.nodes / 'demo').rename(first.nodes / 'demo.disabled')
+    assert not sync(first)['manifest']['plugins'][0]['enabled']
+    disabled = new('disabled')
+    disabled.restore()
+    assert (disabled.nodes / 'demo.disabled').is_dir()
+    shutil.rmtree(first.nodes / 'demo.disabled')
+    assert sync(first)['manifest']['plugins'] == []
+    empty = new('empty')
+    add(empty, 'stale')
+    empty.restore()
+    assert list(empty.nodes.iterdir()) == []
+
+
+def test_corrupt_remote_archive_fails_before_replacing_local_nodes(setup):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    manifest = sync(first)['manifest']
+    archive = manifest['plugins'][0]['archive']
+    (drive.path / 'objects' / (archive + '.tar.gz')).write_bytes(b'broken')
+    second = new('second')
+    add(second, 'existing')
+    with pytest.raises(RuntimeError, match='Corrupt plugin cache'):
+        second.restore()
+    assert (second.nodes / 'existing').is_dir()
+    assert not (second.nodes / 'demo').exists()
+
+
+def test_corrupt_local_cache_redownloads_verified_remote(setup):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    manifest = sync(first)['manifest']
+    archive = first.cache / (manifest['plugins'][0]['archive'] + '.tar.gz')
+    archive.write_bytes(b'broken')
+    first.restore()
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == archive.stem.split('.')[0]
+
+
+def test_interrupted_commit_keeps_previous_head_and_retries(setup):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    v1 = sync(first)['manifest']
+    add(first, version=2)
+    drive.fail = 'pending.json'
+    with pytest.raises(RuntimeError, match='interrupted'):
+        sync(first)
+    assert json.loads((drive.path / 'head.json').read_text()) == v1
+    drive.fail = None
+    v2 = sync(first)['manifest']
+    assert v2['generation'] != v1['generation']
+
+
+def test_unstable_or_busy_install_does_not_publish(setup):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    first.tick(now=0)
+    first.tick(now=29)
+    add(first, version=2)
+    first.tick(now=32)
+    first.tick(busy=True, now=60)
+    assert drive.uploads == []
+    first.tick(now=91)
+    assert 'pending.json' in drive.uploads
+    assert 'head.json' not in drive.uploads
+
+
+def test_unchanged_restart_reuses_archives(setup):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    sync(first)
+    count = len([x for x in drive.uploads if x.startswith('objects/')])
+    for i in range(3):
+        other = new('restart' + str(i))
+        other.restore()
+        sync(other)
+    assert len([x for x in drive.uploads if x.startswith('objects/')]) == count
+
+
+def test_git_origin_commit_and_manager_update_support_survive_archive(setup):
+    new, drive = setup
+    first = new('first')
+    node = add(first)
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(node), *args], stderr=subprocess.DEVNULL, text=True).strip()
+    git('init')
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'add', '.')
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-m', 'first')
+    git('remote', 'add', 'origin', 'https://github.com/example/demo.git')
+    commit = git('rev-parse', 'HEAD')
+    manifest = sync(first)['manifest']
+    assert manifest['plugins'][0]['commit'] == commit
+    second = new('second')
+    second.restore()
+    restored = p.inventory(second.nodes)[0]
+    assert restored['commit'] == commit
+    assert restored['repo'] == 'https://github.com/example/demo.git'
+    assert restored['checksum'] == manifest['plugins'][0]['checksum']
+
+
+def test_credentials_symlinks_and_traversal_are_rejected(setup, tmp_path):
+    new, drive = setup
+    first = new('first')
+    node = add(first)
+    (node / '.env').write_text('sensitive=hidden')
+    assert '.env' not in [str(path.relative_to(node)) for path, _ in p.files(node)]
+    (node / 'config.json').write_text('{"api_key": "secret123456789"}')
+    with pytest.raises(RuntimeError, match='credential'):
+        sync(first)
+    (node / 'config.json').unlink()
+    (node / 'link').symlink_to(tmp_path)
+    # Directory links must fail, never silently omit code needed for restore.
+    with pytest.raises(RuntimeError, match='symlink'):
+        list(p.files(node))
+
+
+@pytest.mark.parametrize('returncode,log', [(1, 'pip cannot resolve dependency'), (0, 'ERROR: Cannot install incompatible torch')])
+def test_dependency_errors_report_plugins_and_do_not_stamp(setup, monkeypatch, returncode, log):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    monkeypatch.setattr(p, 'manager_cli', lambda comfy: Path('/fake/cm-cli.py'))
+    monkeypatch.setattr(p, 'protect_environment', lambda root: {'torch': '2.8'})
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=returncode, stdout=log, stderr=''))
+    with pytest.raises(RuntimeError, match='Manager dependency restore failed'):
+        first.dependencies()
+    assert not (first.root / 'plugin-dependencies.json').exists()
+    error = p.read(first.root / 'plugin-errors.json')
+    assert error['plugins'] == ['demo']
+    assert log in (first.root / 'plugin-dependencies.log').read_text()
+
+
+def test_dependency_stamp_is_local_and_respects_gpu_version(setup, monkeypatch):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    calls = []
+    gpu = {'torch': '2.8'}
+    monkeypatch.setattr(p, 'manager_cli', lambda comfy: Path('/fake/cm-cli.py'))
+    monkeypatch.setattr(p, 'protect_environment', lambda root: dict(gpu))
+    def run(args, **kw):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+    monkeypatch.setattr(p.subprocess, 'run', run)
+    first.dependencies()
+    first.dependencies()
+    assert len(calls) == 2  # One Manager restore plus pip check.
+    gpu['torch'] = '2.9'
+    first.dependencies()
+    assert len(calls) == 4
+    assert all('restore-snapshot' not in c for c in calls)
+
+
+def test_vps_manifest_is_committed_in_existing_settings_only_after_drive_head(setup, monkeypatch):
+    from app.db import Store
+    from app.gpu import native
+    from app.gpu.repository import Repository
+    new, drive = setup
+    first = new('first')
+    add(first)
+    status = sync(first)
+    store = Store('sqlite:///:memory:')
+    repo = Repository(store)
+    monkeypatch.setattr(native, 'backend', lambda: ('https://internal.example', {}))
+    with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={'plugins': status}))) as client:
+        native.sync_plugins(repo, {'owner_id': 'owner'}, client)
+    row = store.list('settings', 'owner')[0]
+    assert row['manifest'] == json.loads((drive.path / 'head.json').read_text())
+
+
+def test_modern_manager_disabled_git_repo_and_single_file_restore(setup):
+    new, drive = setup
+    first = new('first')
+    node = add(first)
+    subprocess.run(['git', 'init', str(node)], check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(node), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(node), '-c', 'user.name=Test', '-c', 'user.email=test@example.test',
+                    'commit', '-m', 'initial'], check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(node), 'remote', 'add', 'origin', 'https://github.com/example/demo'], check=True)
+    disabled = first.nodes / '.disabled'
+    disabled.mkdir()
+    node.rename(disabled / 'demo')
+    (first.nodes / 'single.py.disabled').write_text('NODE_CLASS_MAPPINGS = {}\n')
+    manifest = sync(first)['manifest']
+    assert not any(item['enabled'] for item in manifest['plugins'])
+    assert manifest['plugins'][0]['commit']
+    second = new('second')
+    second.restore()
+    assert (second.nodes / '.disabled/demo/.git/shallow').exists()
+    assert (second.nodes / 'single.py.disabled').is_file()
+
+
+def test_official_cli_false_return_becomes_failure(tmp_path):
+    fake = tmp_path / 'cm-cli.py'
+    fake.write_text('''class Manager:
+    def execute_install_script(self, *args, **kwargs):
+        return False
+unified_manager = Manager()
+def app():
+    unified_manager.execute_install_script('', '/custom_nodes/broken')
+''')
+    result = subprocess.run([__import__('sys').executable, '-c', p.DEPENDENCY_LAUNCHER, str(fake),
+                             'restore-dependencies'], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert '/custom_nodes/broken' in result.stdout
+
+
+def test_corrupt_generation_can_recover_using_an_intact_historical_version(setup):
+    new, drive = setup
+    first = new('first')
+    add(first)
+    good = sync(first)['manifest']
+    add(first, version=2)
+    broken = sync(first)['manifest']
+    (drive.path / 'objects' / (broken['plugins'][0]['archive'] + '.tar.gz')).write_bytes(b'broken')
+    second = new('second')
+    with pytest.raises(RuntimeError, match='Corrupt'):
+        second.restore()
+    second.restore(good['generation'])
+    assert 'VERSION = 1' in (second.nodes / 'demo/__init__.py').read_text()
+
+
+def test_archive_traversal_is_rejected_even_with_valid_object_hash(setup, tmp_path):
+    import io
+    import tarfile
+    new, drive = setup
+    first = new('first')
+    archive = tmp_path / 'bad.tar.gz'
+    with tarfile.open(archive, 'w:gz') as target:
+        entry = tarfile.TarInfo('../../escaped')
+        entry.size = 1
+        target.addfile(entry, io.BytesIO(b'x'))
+    item = {'path': 'demo', 'archive': p.file_hash(archive), 'checksum': 'fake', 'enabled': True}
+    drive.put(archive, 'objects/' + item['archive'] + '.tar.gz')
+    manifest = {'schema': 1, 'plugins': [item], 'generation': p.digest([item])}
+    first.publish_json(manifest, 'pending.json')
+    with pytest.raises(RuntimeError, match='Unsafe plugin archive'):
+        first.restore()
+    assert not (first.root / 'escaped').exists()
+
+
+def test_pack_does_not_include_repository_history_or_git_credentials(setup):
+    new, drive = setup
+    first = new('first')
+    node = add(first)
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(node), '-c', 'user.name=Test',
+                                        '-c', 'user.email=test@example.test', *args], stderr=subprocess.DEVNULL)
+    git('init')
+    (node / 'old.txt').write_text('refresh_token=historicalSecret12345')
+    git('add', '.')
+    git('commit', '-m', 'old')
+    (node / 'old.txt').unlink()
+    git('add', '.')
+    git('commit', '-m', 'clean')
+    git('remote', 'add', 'origin', 'https://github.com/example/demo.git')
+    git('config', 'http.extraheader', 'Authorization: Bearer private-git-token')
+    manifest = sync(first)['manifest']
+    second = new('second')
+    second.restore()
+    config = (second.nodes / 'demo/.git/config').read_text()
+    assert 'private-git-token' not in config
+    result = subprocess.run(['git', '-C', str(second.nodes / 'demo'), 'rev-list', 'HEAD'], capture_output=True, text=True)
+    assert result.stdout.splitlines() == [manifest['plugins'][0]['commit']]

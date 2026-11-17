@@ -68,6 +68,17 @@ def manager_busy():
 
 def probe():
     try:
+        config = Path("/content/ai-studio/native/plugins-config.json")
+        if config.exists():
+            import sys
+            sys.path.insert(0, "/content/ai-studio/native")
+            from node_persistence import inventory, digest, read
+            root = config.parent
+            pending = read(root / "plugins-pending.json", {})
+            status = read(root / "plugins-status.json", {})
+            nodes = Path(read(config)["comfy"]) / "custom_nodes"
+            if status.get("error") or pending.get("source") != digest(inventory(nodes)):
+                return {"busy": True}
         def rpc(path):
             with urlopen(Request("http://127.0.0.1:5572/" + path, data=b"{}", headers={"Content-Type":"application/json"}), timeout=5) as r:
                 return json.load(r)
@@ -81,8 +92,17 @@ def probe():
 @PromptServer.instance.routes.get("/studio_native/state")
 async def state(request):
     Path("/content/ai-studio/native/heartbeat").write_text(str(time.time()))
-    return web.json_response(await asyncio.to_thread(probe))
+    result = await asyncio.to_thread(probe)
+    status_file = Path("/content/ai-studio/native/plugins-status.json")
+    if status_file.exists():
+        result["plugins"] = await asyncio.to_thread(PERSISTENCE.status)
+        result["busy"] = bool(result["busy"] or not result["plugins"].get("durable") or result["plugins"].get("error"))
+    return web.json_response(result)
 
+import sys
+sys.path.insert(0, "/content/ai-studio/native")
+from node_persistence import install
+PERSISTENCE = install(PromptServer.instance, Path("/content/ai-studio/native"), manager_busy)
 NODE_CLASS_MAPPINGS = {}
 '''
 
@@ -252,7 +272,7 @@ def prepare_paths(comfy, mount):
     # Keep Manager-created models under the existing persistent models directory.
     for category in CATEGORIES:
         (mount / "models" / category).mkdir(parents=True, exist_ok=True)
-    for name, target in (("models", mount / "models"), ("custom_nodes", data / "custom_nodes"), ("input", data / "input")):
+    for name, target in (("models", mount / "models"), ("input", data / "input")):
         link = comfy / name
         if link.is_symlink():
             if link.resolve() != target.resolve():
@@ -265,6 +285,18 @@ def prepare_paths(comfy, mount):
                 raise RuntimeError("Existing native directory must be inspected")
             link.rename(backup)
         link.symlink_to(target, target_is_directory=True)
+    # Plugins execute from local SSD; Drive holds archives rather than live code.
+    nodes = comfy / "custom_nodes"
+    if nodes.is_symlink():
+        if nodes.resolve() != (data / "custom_nodes").resolve():
+            raise RuntimeError("Unexpected custom_nodes symlink")
+        nodes.unlink()
+    nodes.mkdir(exist_ok=True)
+    # One-time import of the old Drive layout. Preserve the original as a backup.
+    legacy = data / "custom_nodes"
+    if legacy.exists() and not (comfy.parent / "plugins-legacy-imported").exists():
+        shutil.copytree(legacy, nodes, dirs_exist_ok=True, symlinks=True)
+        (comfy.parent / "plugins-legacy-imported").touch()
     return data
 
 
@@ -343,16 +375,46 @@ def run(root, payload, stages):
             extra = ROOT / "extra_model_paths.yaml"
             extra.write_text(json.dumps(model_paths(mount)))
             stages.start("native_environment")
+            try:
+                from node_persistence import protect_environment
+            except ImportError:
+                from .node_persistence import protect_environment
+            protect_environment(ROOT)
             worker._run([sys.executable, "-m", "pip", "install", "-q", "-r", str(comfy / "requirements.txt")], timeout=600)
             manager = comfy / "manager_requirements.txt"
             if not manager.is_file():
                 raise RuntimeError("Pinned ComfyUI must support the official Manager (--enable-manager)")
             print(f"[studio-native] Installing Manager requirements: {manager}; Python: {sys.executable}", flush=True)
             worker._run([sys.executable, "-m", "pip", "install", "-q", "-r", str(manager)], timeout=300)
-            # Restore node requirements in this runtime; never reuse another GPU's site-packages.
-            for requirement in sorted((data / "custom_nodes").glob("*/requirements.txt")):
-                worker._run([sys.executable, "-m", "pip", "install", "-q", "-r", str(requirement)], timeout=600)
-            (data / "custom_nodes" / "studio_native_state.py").write_text(EXTENSION)
+            try:
+                from node_persistence import Persistence, protect_environment
+            except ImportError:
+                from .node_persistence import Persistence, protect_environment
+            shutil.copyfile(Path(__file__).with_name("node_persistence.py"), ROOT / "node_persistence.py")
+            persistence = Persistence(ROOT, comfy, data / "user")
+            persistence.restore(payload.get("native_plugin_generation"))
+            protect_environment(ROOT)
+            persistence.dependencies()
+            (comfy / "custom_nodes" / "studio_native_state.py").write_text(EXTENSION)
+            guard = comfy / "custom_nodes" / "studio_native_guard"
+            guard.mkdir(exist_ok=True)
+            (guard / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n")
+            (guard / "prestartup_script.py").write_text(
+                "import sys, os\nfrom pathlib import Path\n"
+                "sys.path.insert(0, '/content/ai-studio/native')\n"
+                "from node_persistence import read, atomic, protect_environment, Persistence\n"
+                "root = Path('/content/ai-studio/native')\n"
+                "config = read(root / 'plugins-config.json')\n"
+                "if config and config.get('pid') != os.getpid():\n"
+                "    config['log_offset'] = Path(config['log']).stat().st_size\n"
+                "    config['pid'] = os.getpid()\n"
+                "    atomic(root / 'plugins-config.json', config)\n"
+                "protect_environment(root)\n"
+                "try:\n"
+                "    Persistence(root, Path(config['comfy']), Path(config['user'])).dependencies()\n"
+                "except Exception as exc:\n"
+                "    atomic(root / 'plugin-errors.json', {'error': str(exc)})\n"
+                "    raise\n")
             probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("@PromptServer")]
             (ROOT / "probe.py").write_text("import os, json\nfrom pathlib import Path\nfrom urllib.request import Request, urlopen\n" + probe)
             stages.start("comfy_start")
@@ -364,6 +426,8 @@ def run(root, payload, stages):
             comfy_log = root / "comfy.log"
             with comfy_log.open("ab") as log:
                 log_offset = log.tell()
+                worker._atomic_json(ROOT / "plugins-config.json", {"comfy": str(comfy), "user": str(data / "user"),
+                                                                  "log": str(comfy_log), "log_offset": log_offset})
                 process = subprocess.Popen(args, cwd=comfy, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             for _ in range(180):
                 try:
@@ -377,6 +441,12 @@ def run(root, payload, stages):
                 raise RuntimeError("Native ComfyUI health check timed out")
             try:
                 verify_manager(worker, comfy_log, log_offset)
+                with comfy_log.open("rb") as source:
+                    source.seek(log_offset)
+                    failed = [line.decode(errors="replace").strip() for line in source
+                              if b"(IMPORT FAILED)" in line or b"Cannot import " in line]
+                if failed:
+                    raise RuntimeError("Custom node load failed: " + "; ".join(failed)[-2000:])
             except BaseException:
                 # A retry must not leave a second, unverified ComfyUI on the same port.
                 process.terminate()

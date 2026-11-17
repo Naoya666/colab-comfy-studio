@@ -95,6 +95,9 @@ def admit(repo, owner, body, key):
         raise APIError("NATIVE_CONFIG", "NATIVE_COMFY_COMMIT 必须锁定 40 位官方提交", 503)
     if not key or len(key) > 200:
         raise APIError("IDEMPOTENCY_REQUIRED", "必须提供固定幂等键", 422)
+    generation = body.get("plugin_generation")
+    if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
+        raise APIError("NATIVE_INPUT", "plugin_generation 必须为历史清单的 64 位 SHA256", 422)
     account = body.get("account_id")
     if not account or not isinstance(body.get("spec"), dict):
         raise APIError("NATIVE_INPUT", "请选择账号和 GPU 规格", 422)
@@ -153,7 +156,7 @@ def admit(repo, owner, body, key):
             "model_id": "native-comfy", "workflow_key": "system/native-comfy", "workflow_version": 1,
             "max_runtime_minutes": cfg.max_runtime_minutes, "unit_rate": cfg.unit_rate,
             "estimated_units": cfg.max_runtime_minutes * cfg.unit_rate,
-            "snapshot": {"native_comfy": True, "bound_graph": {},
+            "snapshot": {"native_comfy": True, "native_plugin_generation": body.get("plugin_generation"), "bound_graph": {},
                          "manifest": {"reviewed": True, "state": "published", "comfy_commit": commit,
                                       "compute_spec": body["spec"].get("key", body["spec"])}}}, owner)
 
@@ -209,6 +212,14 @@ def protect_lease(repo, lease, clock=time.time):
     """Fence idle shutdown against new uploads/prompts under the existing dispatch lock."""
     if not lease.get("native_comfy"):
         return False
+    if GpuConfig.from_env().real_enabled:
+        try:
+            sync_plugins(repo, lease)
+        except Exception as exc:
+            repo.update("leases", lease["id"], {"native_plugin_sync_error": type(exc).__name__}, lease["owner_id"])
+            # Busy probe fails closed if persistence has an error or dirty files.
+            # A VPS mirror outage must not replace the last committed manifest.
+            pass
     identity = _lease_identity(lease)
     upstream_busy = busy()
     # An offline tunnel also reports "busy". It cannot veto reconciliation of
@@ -271,3 +282,33 @@ def ready(client=None):
             return isinstance(response.json().get("system"), dict) and isinstance(state.json().get("busy"), bool)
     except Exception:
         return False
+
+
+def sync_plugins(repo, lease, client=None):
+    """Pull committed metadata over the existing authenticated tunnel; no GPU token on VPS."""
+    url, headers = backend()
+    with httpx.Client(timeout=15) if client is None else _borrow(client) as c:
+        response = c.get(url + '/studio_native/state', headers=headers)
+        response.raise_for_status()
+        status = response.json().get('plugins') or {}
+    manifest = status.get('manifest')
+    from .node_persistence import digest
+    if manifest and (manifest.get('schema') != 1 or manifest.get('generation') != digest(manifest.get('plugins'))):
+        raise ValueError('Invalid runtime plugin manifest')
+    # Existing settings table: each update commits the entire manifest in one transaction.
+    owner = lease['owner_id']
+    key = 'native-plugins-' + digest(owner)[:32]
+    with repo.store.dispatch_lock() as acquired:
+        if not acquired:
+            return status
+        saved = repo.store.get('settings', key, owner) or {}
+        history = saved.get('history', [])
+        if manifest and (not history or history[-1]['generation'] != manifest['generation']):
+            history = [*history, manifest][-20:]
+        data = {'manifest': manifest or saved.get('manifest'), 'status': status, 'history': history}
+        if saved:
+            if any(saved.get(k) != value for k, value in data.items()):
+                repo.store.update('settings', key, data, owner)
+        else:
+            repo.store.create('settings', owner, data, record_id=key)
+    return status

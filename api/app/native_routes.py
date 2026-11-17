@@ -39,7 +39,7 @@ async def status(request: Request, user=Depends(current_user)):
 
 @router.post("/start", status_code=202)
 def start(body: dict, request: Request, user=Depends(current_user)):
-    unknown = set(body) - {"account_id", "spec", "instance_id"}
+    unknown = set(body) - {"account_id", "spec", "instance_id", "plugin_generation"}
     if unknown:
         raise APIError("NATIVE_INPUT", "不支持的启动参数", 422)
     job = native.admit(request.app.state.repo, user["id"], body, request.headers.get("Idempotency-Key"))
@@ -56,3 +56,20 @@ def ticket(request: Request, user=Depends(current_user)):
     return ok({"url": url + "/_studio/session",
                "ticket": sign_session({"uid": user["id"], "aud": url, "purpose": "native-handoff",
                                        "iat": now, "exp": now + 60})}, request)
+
+
+@router.get("/plugins")
+def plugins(request: Request, user=Depends(current_user)):
+    from .gpu.node_persistence import digest
+    repo = request.app.state.repo
+    lease = native.active_lease(repo, user["id"])
+    online = False
+    if lease and lease.get("native_ready"):
+        try:
+            native.sync_plugins(repo, lease)
+            online = True
+        except (httpx.HTTPError, ValueError, APIError):
+            pass
+    saved = repo.store.get("settings", "native-plugins-" + digest(user["id"])[:32], user["id"]) or {}
+    return ok({**saved.get("status", {}), "manifest": saved.get("manifest"), "history": saved.get("history", []),
+               "offline": not online}, request)
