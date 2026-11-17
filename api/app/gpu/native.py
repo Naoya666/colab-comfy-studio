@@ -25,8 +25,7 @@ def timeout_options():
     return {
         "defaults": {"retain_idle_minutes": settings.native_comfy_idle_minutes,
                      "max_runtime_minutes": max_runtime},
-        "limits": {"retain_idle_minutes": 30,
-                   "max_runtime_minutes": max_runtime},
+        "limits": {"retain_idle_minutes": None, "max_runtime_minutes": None},
     }
 
 
@@ -98,10 +97,10 @@ def admit(repo, owner, body, key):
     cfg = GpuConfig.from_env()
     timeouts = {"retain_idle_minutes": settings.native_comfy_idle_minutes,
                 "max_runtime_minutes": cfg.max_runtime_minutes}
-    for field, maximum in (("retain_idle_minutes", 30), ("max_runtime_minutes", cfg.max_runtime_minutes)):
+    for field in timeouts:
         value = body.get(field, timeouts[field])
-        if type(value) is not int or not 1 <= value <= maximum:
-            raise APIError("NATIVE_INPUT", f"{field} 必须为 1–{maximum} 的整数（分钟）", 422)
+        if type(value) is not int or value < 1:
+            raise APIError("NATIVE_INPUT", f"{field} 必须为正整数（分钟）", 422)
         timeouts[field] = value
     if not settings.native_comfy_url or not cfg.real_enabled:
         raise APIError("NATIVE_DISABLED", "请先配置原生 ComfyUI 域名并启用真实 GPU", 503)

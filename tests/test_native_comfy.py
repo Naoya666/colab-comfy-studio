@@ -258,7 +258,8 @@ def test_persistent_directories_restore_after_checkout_recreation(tmp_path):
     compile(EXTENSION, "native_extension", "exec")
 
 
-@pytest.mark.parametrize("timeouts", [{}, {"retain_idle_minutes": 7, "max_runtime_minutes": 20}])
+@pytest.mark.parametrize("timeouts", [{}, {"retain_idle_minutes": 7, "max_runtime_minutes": 20},
+                                     {"retain_idle_minutes": 90, "max_runtime_minutes": 120}])
 def test_native_admission_idempotent_across_restart_and_gpu_switch(proxy, monkeypatch, timeouts):
     from app.common import APIError
     from app.db import Store
@@ -293,8 +294,8 @@ def test_native_admission_idempotent_across_restart_and_gpu_switch(proxy, monkey
 
 
 @pytest.mark.parametrize("field,value", [
-    ("retain_idle_minutes", 0), ("retain_idle_minutes", 31),
-    ("max_runtime_minutes", -1), ("max_runtime_minutes", 31),
+    ("retain_idle_minutes", 0), ("retain_idle_minutes", -1),
+    ("max_runtime_minutes", -1), ("max_runtime_minutes", 0),
     ("retain_idle_minutes", True), ("max_runtime_minutes", 1.5),
     ("retain_idle_minutes", "5"), ("max_runtime_minutes", None),
 ])
@@ -313,6 +314,7 @@ def test_native_admission_rejects_invalid_timeouts(monkeypatch, field, value):
     (2, 10000, 219, True), (2, 10000, 220, False),
     (20, 10000, 1000, True), (20, 10000, 1300, False),
     (20, 500, 500, False),
+    (90, 10000, 5499, True), (90, 10000, 5500, False),
 ])
 def test_native_reclamation_uses_session_timeouts(proxy, monkeypatch, idle_minutes, deadline, now, protected):
     repo = proxy.state.repo
@@ -344,7 +346,7 @@ def test_native_status_exposes_timeout_defaults_and_limits(proxy, monkeypatch):
     assert response.status_code == 200
     assert response.json()["data"]["timeouts"] == {
         "defaults": {"retain_idle_minutes": 8, "max_runtime_minutes": 60},
-        "limits": {"retain_idle_minutes": 30, "max_runtime_minutes": 60},
+        "limits": {"retain_idle_minutes": None, "max_runtime_minutes": None},
     }
 
 
@@ -401,7 +403,8 @@ def test_runtime_probe_and_watchdog_compile():
 
 
 @pytest.mark.parametrize("fail_start", [False, True])
-def test_native_boot_job_retains_one_lease_and_watchdog_waits_for_video(monkeypatch, fail_start):
+@pytest.mark.parametrize("runtime_minutes", [10, 120])
+def test_native_boot_job_retains_one_lease_and_watchdog_waits_for_video(monkeypatch, fail_start, runtime_minutes):
     from app.db import Store
     from app.gpu.compute import GpuConfig, MockColabProvider, MockGPUExecutor
     from app.gpu.repository import Repository
@@ -417,8 +420,9 @@ def test_native_boot_job_retains_one_lease_and_watchdog_waits_for_video(monkeypa
     spec = provider.list_specs()[0]
     job, _ = repo.create_job("owner", {"project_id": "native", "execution_policy": {"provider": "mock"}}, "boot-native")
     job = repo.update("jobs", job["id"], {"provider": "mock", "project_id": "native", "lifecycle": "retain",
-        "execution_policy": {"provider": "mock", "lifecycle": "retain", "retain_idle_minutes": 15},
-        "native_session_deadline_epoch": 1600,
+        "execution_policy": {"provider": "mock", "lifecycle": "retain", "retain_idle_minutes": 90,
+                             "max_runtime_minutes": runtime_minutes},
+        "native_session_deadline_epoch": 1000 + runtime_minutes * 60,
         "snapshot": {"native_comfy": True, "manifest": {}, "bound_graph": {}}, "requested_spec": spec}, "owner")
     config = GpuConfig(max_runtime_minutes=30, unit_rate=0.01)
 
@@ -438,11 +442,13 @@ def test_native_boot_job_retains_one_lease_and_watchdog_waits_for_video(monkeypa
     leases = repo.list("leases", "owner")
     assert len(leases) == 1
     assert leases[0]["native_ready"] and leases[0]["state"] == "idle"
-    assert leases[0]["native_idle_minutes"] == 15
-    assert leases[0]["deadline_epoch"] == 1600
-    assert repo.list("instances", "owner")[0]["hard_deadline_at"] == 1600
+    assert leases[0]["native_idle_minutes"] == 90
+    assert job["max_runtime_minutes"] == runtime_minutes
+    assert leases[0]["deadline_epoch"] == 1000 + runtime_minutes * 60
+    assert repo.list("instances", "owner")[0]["hard_deadline_at"] == 1000 + runtime_minutes * 60
+    assert repo.list("instances", "owner")[0]["retain_idle_minutes"] == 90
     assert len(repo.list("instances", "owner")) == 1
-    now[0] += 5000  # Past both idle and hard deadline: an active video still must finish.
+    now[0] += max(6000, runtime_minutes * 60 + 1000)  # Busy work survives both deadlines.
     monkeypatch.setattr(native, "busy", lambda: True)
     scheduler().watchdog()
     assert repo.get("leases", leases[0]["id"], "owner")["state"] != "deleted"

@@ -5,7 +5,7 @@ import type { GpuAccount } from '../components/AccountDirectory';
 import { submitNativeHandoff } from '../lib/native-handoff';
 
 type Timeouts = { retain_idle_minutes: number; max_runtime_minutes: number };
-type NativeStatus = { configured: boolean; ready: boolean; state: string; url: string; instance_id?: string; error?: string; timeouts: { defaults: Timeouts; limits: Timeouts }; events: { state?: string; message?: string }[] };
+type NativeStatus = { configured: boolean; ready: boolean; state: string; url: string; instance_id?: string; error?: string; timeouts: { defaults: Timeouts }; events: { state?: string; message?: string }[] };
 
 export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
   const [account, setAccount] = useState(accounts.find(a => a.enabled !== false && a.allow_allocation !== false)?.account_id || '');
@@ -48,12 +48,9 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
     void poll();
     return () => { live = false; clearTimeout(timer); };
   }, [autoOpen]);
-  const validTimeouts = status && [
-    [idleMinutes, status.timeouts.limits.retain_idle_minutes],
-    [runtimeMinutes, status.timeouts.limits.max_runtime_minutes],
-  ].every(([value, maximum]) => Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= Number(maximum));
+  const validTimeouts = [idleMinutes, runtimeMinutes].every(value => Number.isInteger(Number(value)) && Number(value) >= 1);
   async function start() {
-    if (!validTimeouts) { setError('请在允许范围内填写整数分钟数。'); return; }
+    if (!validTimeouts) { setError('请填写正整数分钟数。'); return; }
     setStarting(true); setError('');
     try {
       await apiFetch('/api/gpu/native/start', { method: 'POST', headers: { 'Idempotency-Key': key.current }, body: JSON.stringify({ account_id: account, spec: { key: spec }, retain_idle_minutes: Number(idleMinutes), max_runtime_minutes: Number(runtimeMinutes) }) });
@@ -73,12 +70,12 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
       </select></label>
       <WorkflowGpuSelection manifest={null} accountId={account} value={spec} onChange={value => { setSpec(value); key.current = crypto.randomUUID(); }} />
       <label className="field">空闲回收时间（分钟）
-        <input type="number" min={1} max={status?.timeouts.limits.retain_idle_minutes} step={1} required value={idleMinutes} onChange={e => { setIdleMinutes(e.target.value); key.current = crypto.randomUUID(); }} />
-        <span className="muted small">范围 1–{status?.timeouts.limits.retain_idle_minutes ?? '…'} 分钟；生成、安装和同步等活动结束后开始计时。</span>
+        <input type="number" min={1} step={1} required value={idleMinutes} onChange={e => { setIdleMinutes(e.target.value); key.current = crypto.randomUUID(); }} />
+        <span className="muted small">填写正整数分钟数，无最大值限制；生成、安装和同步等活动结束后开始计时。</span>
       </label>
       <label className="field">会话上限时间（分钟）
-        <input type="number" min={1} max={status?.timeouts.limits.max_runtime_minutes} step={1} required value={runtimeMinutes} onChange={e => { setRuntimeMinutes(e.target.value); key.current = crypto.randomUUID(); }} />
-        <span className="muted small">范围 1–{status?.timeouts.limits.max_runtime_minutes ?? '…'} 分钟，从提交启动时计时；复用 GPU 时仍受原实例截止时间限制。</span>
+        <input type="number" min={1} step={1} required value={runtimeMinutes} onChange={e => { setRuntimeMinutes(e.target.value); key.current = crypto.randomUUID(); }} />
+        <span className="muted small">填写正整数分钟数，无最大值限制，从提交启动时计时；复用 GPU 时仍受原实例截止时间限制。</span>
       </label>
       <p className="muted small">参数在本次启动时生效。到期后停止接收新任务，等待生成和同步完成后释放 GPU。调整已有原生会话的参数需先停止旧实例。</p>
       <button className="button" disabled={starting || !account || !spec || !status?.configured || !validTimeouts} onClick={() => void start()}>{starting ? '正在提交…' : '启动 / 复用 GPU 并进入'}</button>

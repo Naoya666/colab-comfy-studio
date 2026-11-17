@@ -485,6 +485,8 @@ class Scheduler:
         requested = self.config.max_runtime_minutes if requested is None else int(requested)
         if requested <= 0:
             raise SchedulerError("max runtime must be positive")
+        if (job.get("snapshot") or {}).get("native_comfy"):
+            return requested
         return min(requested, self.config.max_runtime_minutes)
 
     def _usage_totals(self, owner_id: str) -> tuple[float, float]:

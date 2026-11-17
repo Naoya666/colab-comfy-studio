@@ -568,7 +568,9 @@ class InstanceService:
                     or data.get("retain_idle_minutes")
                     or self._cfg("default_idle_minutes", self._cfg("max_idle_minutes", 15))
                 )
-                minutes = min(30.0, max(1.0, float(minutes)))
+                minutes = max(1.0, float(minutes))
+                if not data.get("native_comfy"):
+                    minutes = min(30.0, minutes)
                 data["retain_idle_minutes"] = minutes
                 data["idle_deadline_at"] = min(self.clock() + float(minutes) * 60, float(hard)) if hard is not None else self.clock() + float(minutes) * 60
             self._set(instance, data, state=state, session=session)

@@ -49,7 +49,7 @@
 | `NATIVE_COMFY_COMMIT` | 官方 ComfyUI 的 40 位提交，且支持 `--enable-manager` 与 `manager_requirements.txt` |
 | `NATIVE_COMFY_ACCESS_FILE` | `/run/studio-secrets/comfy-access.json`，内容 `{"client_id":"…","client_secret":"…"}` |
 | `NATIVE_COMFY_TUNNEL_TOKEN_FILE` | `/run/studio-secrets/comfy-tunnel.token`，内容为 tunnel connector token |
-| `NATIVE_COMFY_IDLE_MINUTES` | `15`，范围 1–30，原生队列/写入活动结束后才开始计时 |
+| `NATIVE_COMFY_IDLE_MINUTES` | `15`，正整数分钟，无最大值限制，原生队列/写入活动结束后才开始计时 |
 | `NATIVE_COMFY_CACHE_GB` | `20`，按需 VFS 缓存回收目标；活动文件可能暂时超过该值；另外保留 5GiB 本地可用空间 |
 | `NATIVE_COMFY_MAX_UPLOAD_MB` | `2048`，传给 ComfyUI `--max-upload-size`；Cloudflare 套餐仍可能限制单次请求大小 |
 | `STUDIO_API_TOKEN` | 标准 API 客户端使用的现有 Bearer Token |
@@ -77,7 +77,7 @@ Colab 回收后 `/content` 中的状态和 Python 包不再保留；下一次初
 
 在已登录 Studio 点击「原生 ComfyUI」。已有健康会话直接进入；没有会话时选择账号与实际可申请 GPU，提交后查看现有任务事件，健康检查通过后跳转。跨域名通过 60 秒签名票据的 POST 建立专用 HttpOnly/Secure cookie，票据不放进 URL；原生 API 写入和 WS 使用此 cookie。服务不向浏览器发送 Colab、Drive 或 tunnel 凭据。
 
-启动页可设置「空闲回收时间」和「会话上限时间」，单位为整数分钟。空闲回收范围为 1–30，默认使用 `NATIVE_COMFY_IDLE_MINUTES`；会话上限范围为 1–`GPU_MAX_RUNTIME_MINUTES`，默认使用该服务端上限，从提交启动时计时，并按所选时长估算预算。`POST /api/gpu/native/start` 对应可选字段为 `retain_idle_minutes` 和 `max_runtime_minutes`，省略时沿用默认值。参数随会话持久化，重启服务后仍生效；修改已有原生会话的时间参数需先停止旧实例。复用 Studio GPU 时取本次会话截止与原实例截止的较早时间。会话到期后等待生成和同步完成再回收。
+启动页可设置「空闲回收时间」和「会话上限时间」，单位为正整数分钟，均无最大值限制。空闲回收默认使用 `NATIVE_COMFY_IDLE_MINUTES`；会话上限默认使用 `GPU_MAX_RUNTIME_MINUTES`，原生会话可设置超过该默认值的时长，从提交启动时计时，并按所选时长估算预算，仍需满足已有预算配置。`POST /api/gpu/native/start` 对应可选字段为 `retain_idle_minutes` 和 `max_runtime_minutes`，省略时沿用默认值。参数随会话持久化，重启服务后仍生效；修改已有原生会话的时间参数需先停止旧实例。复用 Studio GPU 时取本次会话截止与原实例截止的较早时间。会话到期后等待生成和同步完成再回收。
 
 API 客户端使用相同外部源地址和 `Authorization: Bearer <STUDIO_API_TOKEN>`。未授权请求返回 401，不跳转 OAuth。所有原生 API、静态资源和扩展路径由完整代理处理，路由不使用 API 白名单。内置 ComfyUI API 版本也可能有 `/api/` 前缀，仍原样转发。
 
