@@ -284,6 +284,27 @@ def _index_models(secret, worker):
                 "shortcutDetails": {"targetId": model["file_id"]}})
 
 
+def verify_manager(worker, log_path, log_offset=0):
+    """Require this process's startup log and a live Manager API, not just Comfy health."""
+    try:
+        with log_path.open("rb") as log:
+            log.seek(log_offset)
+            loaded = any(b"[START] ComfyUI-Manager" in line for line in log)
+    except OSError as exc:
+        raise RuntimeError("Cannot verify native Manager startup; inspect comfy.log") from exc
+    if not loaded:
+        raise RuntimeError("Native Manager startup marker missing; inspect comfy.log")
+    for path in ("/v2/manager/queue/status", "/manager/queue/status"):
+        try:
+            state = worker._http_json("http://127.0.0.1:8188" + path, timeout=5)
+        except worker.WorkerError:
+            continue
+        if isinstance(state.get("is_processing"), bool):
+            print(f"[studio-native] Manager loaded: {path}; startup log: {log_path}", flush=True)
+            return
+    raise RuntimeError("Native Manager API unavailable; inspect comfy.log")
+
+
 def run(root, payload, stages):
     import runtime_worker as worker
     secret = payload["native_secrets"]
@@ -296,6 +317,9 @@ def run(root, payload, stages):
             if state.get("commit") != commit:
                 raise RuntimeError("Native ComfyUI version differs; stop the old session first")
             worker._http_json("http://127.0.0.1:8188/system_stats", timeout=5)
+            if not state.get("comfy_log"):
+                raise RuntimeError("Native Manager verification metadata missing; stop the old session first")
+            verify_manager(worker, Path(state["comfy_log"]), state.get("comfy_log_offset", 0))
         else:
             stages.start("native_environment")
             worker._run(["apt-get", "update", "-qq"], timeout=180)
@@ -321,8 +345,9 @@ def run(root, payload, stages):
             stages.start("native_environment")
             worker._run([sys.executable, "-m", "pip", "install", "-q", "-r", str(comfy / "requirements.txt")], timeout=600)
             manager = comfy / "manager_requirements.txt"
-            if not manager.exists():
+            if not manager.is_file():
                 raise RuntimeError("Pinned ComfyUI must support the official Manager (--enable-manager)")
+            print(f"[studio-native] Installing Manager requirements: {manager}; Python: {sys.executable}", flush=True)
             worker._run([sys.executable, "-m", "pip", "install", "-q", "-r", str(manager)], timeout=300)
             # Restore node requirements in this runtime; never reuse another GPU's site-packages.
             for requirement in sorted((data / "custom_nodes").glob("*/requirements.txt")):
@@ -336,7 +361,9 @@ def run(root, payload, stages):
                     "--output-directory", str(data / "output"), "--temp-directory", str(ROOT / "temp"),
                     "--max-upload-size", str(secret["max_upload_mb"]),
                     "--extra-model-paths-config", str(extra), "--preview-method", "auto", "--disable-auto-launch"]
-            with (root / "comfy.log").open("ab") as log:
+            comfy_log = root / "comfy.log"
+            with comfy_log.open("ab") as log:
+                log_offset = log.tell()
                 process = subprocess.Popen(args, cwd=comfy, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             for _ in range(180):
                 try:
@@ -348,6 +375,17 @@ def run(root, payload, stages):
                     time.sleep(1)
             else:
                 raise RuntimeError("Native ComfyUI health check timed out")
+            try:
+                verify_manager(worker, comfy_log, log_offset)
+            except BaseException:
+                # A retry must not leave a second, unverified ComfyUI on the same port.
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                raise
             stages.start("native_tunnel")
             tunnel_file = ROOT / "tunnel.token"
             _write_secret(tunnel_file, secret["tunnel_token"])
@@ -361,7 +399,8 @@ def run(root, payload, stages):
                 subprocess.Popen([sys.executable, str(ROOT / "watchdog.py")], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             worker._atomic_json(marker, {"commit": commit, "pid": process.pid, "tunnel_pid": tunnel.pid,
                                          "tunnel_start_id": worker._process_metadata(tunnel.pid)["start_id"], "tunnel_binary": binary,
-                                         "comfy": str(comfy), "started": time.time()})
+                                         "comfy": str(comfy), "comfy_log": str(comfy_log),
+                                         "comfy_log_offset": log_offset, "started": time.time()})
         stages.end()
         report = root / "outputs" / "native-ready.json"
         report.parent.mkdir(exist_ok=True)

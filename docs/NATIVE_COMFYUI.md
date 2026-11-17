@@ -57,6 +57,22 @@
 
 Colab 初始化安装 fuse3、固定 rclone v1.70.3（核对 [官方 release SHA256SUMS](https://github.com/rclone/rclone/releases/download/v1.70.3/SHA256SUMS)）和 cloudflared；需 Colab 支持 FUSE、系统包安装以及访问官方依赖源。这部分必须在真实 runtime 验证，不支持时启动任务会明确失败并走已有清理流程。GPU 参数保持自动选择，不使用固定 L4/highvram/tmpfs 优化。
 
+### 内置 Manager 启动与验证
+
+实际调用链为 `mcp.build_bootstrap_code` → Colab 内核的 `sys.executable` 启动 `runtime_worker.py` → `run_job` 的 `native_comfy` 分支 → `native_runtime.run`。官方 ComfyUI checkout 位于 `/content/ai-studio/native/ComfyUI`，版本由 `NATIVE_COMFY_COMMIT` 锁定。项目不包含该 checkout，因此 `manager_requirements.txt` 在 Colab checkout 校验后检查；缺少文件会明确失败。
+
+初始化阶段使用运行 worker 的同一个 `sys.executable -m pip install -q -r <ComfyUI>/manager_requirements.txt` 安装依赖；安装前在 `worker.log` 输出实际 Python 路径和 requirements 路径。启动仍为同一个 Python 在该 checkout 下执行 `main.py --listen 127.0.0.1 --port 8188 --enable-manager`，保留用户/输入/输出/临时目录、上传大小、模型路径、预览和禁止自动打开浏览器等原有参数。没有新增端口、GPU 参数、第二个 ComfyUI 进程或旧版 Manager 的 clone/install 步骤。
+
+ComfyUI 健康检查成功后，还要求本次启动的 `comfy.log` 包含官方 `[START] ComfyUI-Manager` 标记，并且本机 `/v2/manager/queue/status`（兼容 `/manager/queue/status`）返回布尔 `is_processing`。通过后 `worker.log` 输出 `[studio-native] Manager loaded: …`，之后才继续 tunnel/watchdog 和就绪报告。校验失败会报错并回收本次启动的 ComfyUI 子进程；历史日志中的标记不能冒充本次成功。日志位于 `/content/ai-studio/<execution_id>/comfy.log`，其路径和本次日志起点保存在 `native/state.json`；复用时校验原进程的日志及实时 Manager API，不另起进程。升级前缺少日志元数据的旧会话需正常停止后重新启动。
+
+Colab 回收后 `/content` 中的状态和 Python 包不再保留；下一次初始化会再次安装官方和 Manager requirements，并携带 `--enable-manager`。Drive 上的用户数据及节点 requirements 仍按原流程恢复。
+
+安全边界为公网 Comfy 域名的 Studio 登录/Bearer 鉴权与写请求 Origin 校验，加内部 tunnel 全路径的 Access Service Auth。Manager 自身的 security level 不能替代这些鉴权。就绪检查除了 `/system_stats`，还对 Manager 队列及安装路径发起**无凭据 GET**，要求得到 401/403/302；不会提交安装操作。不要给 `/manager/*`、`/v2/*`、`/customnode/*` 或 `/api/*` 配置 Access Bypass，也不要降低 Manager 安全等级来绕过安装限制。
+
+真实部署验收：检查上述两类日志证据；从公网未登录访问 Manager 安装路径应被 Studio 返回 401，已登录的跨站写请求应返回 403；内部 tunnel 上同一路径的无 service token 请求必须被 Access 拦截。然后正常释放并在新 Colab VM 再启动，重复检查日志和 Manager UI。当前本地只有模拟测试，不能据此认定真实 GPU、外部 Access 策略及重建后启动已经验收。
+
+2026-11-17 验证：`pytest -q tests/test_native_comfy.py` 为 **69 passed**；完整 `pytest -q` 为 **677 passed、3 subtests passed**（56.23 秒，1 个既有 Starlette/httpx 弃用警告）。改动 Python 文件的 Ruff 检查和 `git diff --check` 通过。新增模拟覆盖 Manager requirements 缺失、同一 Python 安装与启动、启动日志/API 缺失、历史日志隔离、重复调用复用、清除运行时状态后重新安装启用、安装接口鉴权和内部 Access 路径绕过检测。
+
 ## 使用与生命周期
 
 在已登录 Studio 点击「原生 ComfyUI」。已有健康会话直接进入；没有会话时选择账号与实际可申请 GPU，提交后查看现有任务事件，健康检查通过后跳转。跨域名通过 60 秒签名票据的 POST 建立专用 HttpOnly/Secure cookie，票据不放进 URL；原生 API 写入和 WS 使用此 cookie。服务不向浏览器发送 Colab、Drive 或 tunnel 凭据。

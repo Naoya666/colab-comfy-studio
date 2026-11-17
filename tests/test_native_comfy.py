@@ -575,3 +575,146 @@ def test_http_pool_reuses_connections_closes_and_never_replays_cookies(proxy, mo
         assert not clients[0].is_closed
     assert len(seen) == 3
     assert clients[0].is_closed
+
+
+@pytest.mark.parametrize('path', [
+    '/customnode/install', '/manager/queue/install', '/v2/manager/queue/install_model',
+    '/v2/customnode/install', '/api/v2/manager/queue/install_model',
+])
+def test_manager_install_requires_login_and_same_origin(proxy, monkeypatch, path):
+    seen = []
+
+    async def handler(req):
+        seen.append(req)
+        return httpx.Response(200, stream=BytesStream(b'{}'))
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, 'AsyncClient', lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs))
+    now = int(time.time())
+    cookie = sign_session({'uid': 'owner', 'aud': settings.native_comfy_url, 'purpose': 'native-session',
+                           'iat': now, 'exp': now + 60})
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        assert c.post(path, json={}).status_code == 401
+        assert c.post(path, json={}, headers={'Authorization': 'Bearer invalid'}).status_code == 401
+        c.cookies.set('studio_native', cookie)
+        assert c.post(path, json={}, headers={'Origin': 'https://evil.example'}).status_code == 403
+        assert not seen
+        assert c.post(path, json={}, headers={'Origin': settings.native_comfy_url}).status_code == 200
+    assert len(seen) == 1
+
+
+def test_ready_rejects_manager_access_bypass(proxy):
+    def handler(req):
+        if 'CF-Access-Client-Secret' not in req.headers and req.url.path == '/system_stats':
+            return httpx.Response(403)
+        return httpx.Response(200, json={'system': {}, 'busy': False})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert not native.ready(client)
+
+
+@pytest.mark.parametrize('failure', [None, 'requirements', 'log', 'api', 'stale-log'])
+def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_path, failure):
+    import json
+    import sys
+    from types import SimpleNamespace
+
+    from app.gpu import native_runtime as runtime
+    from app.gpu import runtime_worker as worker
+
+    monkeypatch.setitem(sys.modules, 'runtime_worker', worker)
+    service = tmp_path / 'native'
+    comfy = service / 'ComfyUI'
+    comfy.mkdir(parents=True)
+    (comfy / 'requirements.txt').touch()
+    if failure != 'requirements':
+        (comfy / 'manager_requirements.txt').touch()
+    job = tmp_path / 'job'
+    job.mkdir()
+    if failure == 'stale-log':
+        (job / 'comfy.log').write_text('[START] ComfyUI-Manager\n')
+    drive = tmp_path / 'drive'
+    drive.mkdir()
+    monkeypatch.setattr(runtime, 'ROOT', service)
+    monkeypatch.setattr(runtime, 'install_rclone', lambda *args: None)
+    monkeypatch.setattr(runtime.shutil, 'which', lambda name: '/usr/bin/' + name)
+    monkeypatch.setattr(runtime, '_index_models', lambda *args: None)
+    monkeypatch.setattr(runtime, 'mount_drive', lambda *args: drive)
+    monkeypatch.setattr(worker, '_verify_checkout', lambda *args: None)
+    monkeypatch.setattr(worker, '_process_metadata', lambda *args: {'start_id': '1'})
+    commands, launches = [], []
+    monkeypatch.setattr(worker, '_run', lambda args, **kwargs: commands.append(args))
+
+    def http(url, **kwargs):
+        if url.endswith('/system_stats'):
+            return {'system': {}}
+        if failure == 'api':
+            raise worker.WorkerError('Manager missing')
+        return {'is_processing': False}
+    monkeypatch.setattr(worker, '_http_json', http)
+    process = SimpleNamespace(pid=123, stopped=False, killed=False)
+    process.terminate = lambda: setattr(process, 'stopped', True)
+    process.wait = lambda **kwargs: 0
+    process.kill = lambda: setattr(process, 'killed', True)
+
+    def launch(args, **kwargs):
+        launches.append((args, kwargs))
+        if 'main.py' in args and failure not in {'log', 'stale-log'}:
+            kwargs['stdout'].write(b'[START] ComfyUI-Manager\n')
+            kwargs['stdout'].flush()
+        return process
+    monkeypatch.setattr(runtime.subprocess, 'Popen', launch)
+    stages = SimpleNamespace(start=lambda name: None, end=lambda: None, timings={})
+    payload = {'snapshot': {'manifest': {'comfy_commit': 'a' * 40}},
+               'native_secrets': {'max_upload_mb': 2048, 'tunnel_token': 'fake-token'}}
+    if failure:
+        with pytest.raises(RuntimeError, match='Manager'):
+            runtime.run(job, payload, stages)
+        assert not (service / 'state.json').exists()
+        assert len(launches) == (0 if failure == 'requirements' else 1)
+        assert process.stopped is (failure != 'requirements')
+        return
+
+    runtime.run(job, payload, stages)
+    manager_pip = [args for args in commands if str(comfy / 'manager_requirements.txt') in args]
+    assert manager_pip == [[sys.executable, '-m', 'pip', 'install', '-q', '-r',
+                            str(comfy / 'manager_requirements.txt')]]
+    args, kwargs = launches[0]
+    data = drive / 'native-comfy'
+    assert args == [sys.executable, 'main.py', '--listen', '127.0.0.1', '--port', '8188', '--enable-manager',
+                    '--user-directory', str(data / 'user'), '--input-directory', str(data / 'input'),
+                    '--output-directory', str(data / 'output'), '--temp-directory', str(service / 'temp'),
+                    '--max-upload-size', '2048', '--extra-model-paths-config', str(service / 'extra_model_paths.yaml'),
+                    '--preview-method', 'auto', '--disable-auto-launch']
+    assert kwargs['cwd'] == comfy
+    marker = json.loads((service / 'state.json').read_text())
+    assert marker['comfy_log'] == str(job / 'comfy.log')
+    # A different bootstrap job reuses the existing process and its original log.
+    second_job = tmp_path / 'second-job'
+    second_job.mkdir()
+    runtime.run(second_job, payload, stages)
+    assert len(launches) == 3  # ComfyUI, tunnel and watchdog; no further launches.
+    assert len([args for args in commands if str(comfy / 'manager_requirements.txt') in args]) == 1
+    # A reclaimed VM has no native state: a fresh bootstrap reinstalls dependencies.
+    (service / 'state.json').unlink()
+    runtime.run(second_job, payload, stages)
+    assert len([args for args in commands if str(comfy / 'manager_requirements.txt') in args]) == 2
+    assert sum('main.py' in args for args, _ in launches) == 2
+
+
+def test_manager_probe_supports_legacy_queue_path(monkeypatch, tmp_path):
+    from app.gpu import native_runtime as runtime
+    from app.gpu import runtime_worker as worker
+
+    log = tmp_path / 'comfy.log'
+    log.write_text('[START] ComfyUI-Manager\n')
+    seen = []
+
+    def http(url, **kwargs):
+        seen.append(url)
+        if '/v2/' in url:
+            raise worker.WorkerError('404')
+        return {'is_processing': False}
+    monkeypatch.setattr(worker, '_http_json', http)
+    runtime.verify_manager(worker, log)
+    assert len(seen) == 2

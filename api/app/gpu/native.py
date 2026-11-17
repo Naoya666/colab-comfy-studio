@@ -257,9 +257,13 @@ def ready(client=None):
         url, headers = backend()
         with httpx.Client(timeout=8, follow_redirects=False) if client is None else _borrow(client) as c:
             # Service-token protection of the internal tunnel is mandatory.
-            unauthenticated = c.get(url + "/system_stats")
-            if unauthenticated.status_code not in {401, 403, 302}:
-                return False
+            # Probe installation paths with GET only: never submit an installation.
+            # Access must protect Manager too, including deployments with path-based rules.
+            for path in ("/system_stats", "/v2/manager/queue/status", "/manager/queue/status",
+                         "/v2/manager/queue/install_model", "/customnode/install"):
+                unauthenticated = c.get(url + path)
+                if unauthenticated.status_code not in {401, 403, 302}:
+                    return False
             response = c.get(url + "/system_stats", headers=headers)
             response.raise_for_status()
             state = c.get(url + "/studio_native/state", headers=headers)
