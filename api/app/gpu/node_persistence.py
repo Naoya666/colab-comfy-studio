@@ -103,7 +103,7 @@ def source_stamp(path):
 
 
 @lru_cache(maxsize=4096)
-def _cached_checked_source(path, stamp):
+def _cached_checked_source(path, stamp, expected_checksum=None):
     """Reuse scans only while content metadata (including ctime) is unchanged."""
     checksum = hashlib.sha256()
     with path.open('rb') as source:
@@ -115,14 +115,21 @@ def _cached_checked_source(path, stamp):
             previous = block[-512:]
     if source_stamp(path) != stamp:
         raise RuntimeError(f'Plugin file changed during scan: {path}; retrying after settling')
-    return checksum.hexdigest()
+    result = checksum.hexdigest()
+    if expected_checksum is not None and result != expected_checksum:
+        raise RuntimeError(f'Plugin file changed during scan: {path}; retrying after settling')
+    return result
 
 
 def checked_source(path, stamp):
-    # Small code/config writes may share coarse filesystem timestamps. Always scan
-    # them; reserve the metadata cache for large assets such as the CSV dictionary.
-    scan = _cached_checked_source if stamp[2] >= 1024**2 else _cached_checked_source.__wrapped__
-    return scan(path, stamp)
+    # Small writes may share coarse timestamps. Hash their content on every read,
+    # then reuse credential validation only for the exact same content/metadata.
+    # This avoids repeated regex/AST scans of thousands of unchanged source files.
+    checksum = file_hash(path) if stamp[2] < 1024**2 else None
+    result = _cached_checked_source(path, stamp, checksum)
+    if source_stamp(path) != stamp:
+        raise RuntimeError(f'Plugin file changed during scan: {path}; retrying after settling')
+    return result
 
 
 def files(folder):

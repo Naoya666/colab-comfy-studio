@@ -248,6 +248,7 @@ def admit_job(st, user, body, key, *, validate_only=False):
         job, created = repo.create_job(user["id"], body, key, admitted={
             **compute_fields,
             "execution_policy": policy,
+            **({"account_id": policy.get("account_id")} if policy.get("account_id") else {}),
             "requested_account_id": policy.get("account_id"),
             "requested_instance_id": policy.get("instance_id"),
             **(baseline_fields),

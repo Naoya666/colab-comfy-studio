@@ -107,6 +107,29 @@ def test_provider_and_executor_factories_route_account_id(monkeypatch):
     assert captured["provider"] == {"store": "repo", "owner_id": "owner-1", "account_id": "account-a"}
     assert captured["executor"] == {"store": "repo", "owner_id": "owner-1", "account_id": "account-a"}
 
+    captured.clear()
+    fallback_job = {
+        "provider": "colab",
+        "owner_id": "owner-1",
+        "requested_account_id": "account-req",
+        "execution_policy": {"account_id": "account-pol"},
+    }
+    default_provider_factory(fallback_job, config, store="repo")
+    default_executor_factory(fallback_job, config, store="repo")
+    assert captured["provider"] == {"store": "repo", "owner_id": "owner-1", "account_id": "account-req"}
+    assert captured["executor"] == {"store": "repo", "owner_id": "owner-1", "account_id": "account-req"}
+
+    captured.clear()
+    policy_only_job = {
+        "provider": "colab",
+        "owner_id": "owner-1",
+        "execution_policy": {"account_id": "account-pol"},
+    }
+    default_provider_factory(policy_only_job, config, store="repo")
+    default_executor_factory(policy_only_job, config, store="repo")
+    assert captured["provider"] == {"store": "repo", "owner_id": "owner-1", "account_id": "account-pol"}
+    assert captured["executor"] == {"store": "repo", "owner_id": "owner-1", "account_id": "account-pol"}
+
 
 def test_drive_file_cache_isolated_by_account():
     repo = MemoryRepo()

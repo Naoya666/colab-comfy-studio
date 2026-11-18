@@ -258,22 +258,23 @@ def protect_lease(repo, lease, clock=time.time):
                 "native_remote_deleted_verified_at": clock(),
             }, lease["owner_id"])
             return False  # Existing scheduler cleanup still confirms deletion.
-        if upstream_busy:
-            repo.update("leases", lease["id"], {"native_last_busy": clock()}, lease["owner_id"])
-            return True
-        if clock() - float(lease.get("native_http_heartbeat") or 0) < 30:
-            return True
         instance = repo.get("instances", lease.get("instance_id"), lease["owner_id"]) or {}
-        manual = instance.get("manual_stop_requested")
-        last = max(float(lease.get("native_last_busy") or 0), float(lease.get("native_last_write") or 0))
-        idle_minutes = lease.get("native_idle_minutes")
-        if idle_minutes is None:
-            job = repo.get("jobs", lease.get("owner_job_id"), lease["owner_id"]) if lease.get("owner_job_id") else None
-            idle_minutes = ((job or {}).get("execution_policy") or {}).get("retain_idle_minutes", settings.native_comfy_idle_minutes)
-        deadline = lease.get("deadline_epoch")
-        expired = deadline is not None and clock() >= float(deadline)
-        if not manual and not expired and clock() - last < idle_minutes * 60:
-            return True
+        manual = bool(instance.get("manual_stop_requested"))
+        if not manual:
+            if upstream_busy:
+                repo.update("leases", lease["id"], {"native_last_busy": clock()}, lease["owner_id"])
+                return True
+            if clock() - float(lease.get("native_http_heartbeat") or 0) < 30:
+                return True
+            last = max(float(lease.get("native_last_busy") or 0), float(lease.get("native_last_write") or 0))
+            idle_minutes = lease.get("native_idle_minutes")
+            if idle_minutes is None:
+                job = repo.get("jobs", lease.get("owner_job_id"), lease["owner_id"]) if lease.get("owner_job_id") else None
+                idle_minutes = ((job or {}).get("execution_policy") or {}).get("retain_idle_minutes", settings.native_comfy_idle_minutes)
+            deadline = lease.get("deadline_epoch")
+            expired = deadline is not None and clock() >= float(deadline)
+            if not expired and clock() - last < idle_minutes * 60:
+                return True
         repo.update("leases", lease["id"], {"native_draining": True}, lease["owner_id"])
         if lease.get("instance_id") and instance:
             repo.update("instances", lease["instance_id"], {"native_draining": True}, lease["owner_id"])

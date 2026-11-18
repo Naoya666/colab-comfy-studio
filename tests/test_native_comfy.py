@@ -1056,3 +1056,51 @@ def test_begin_write_waits_for_real_sqlite_dispatch_lock(tmp_path):
     assert repo.get('leases', lease['id'], 'owner')['native_http_heartbeat']
     holder.engine.dispose()
     contender.engine.dispose()
+
+
+def test_manual_stop_bypasses_busy_and_heartbeat_protection(proxy, monkeypatch):
+    repo = proxy.state.repo
+    repo.instance['manual_stop_requested'] = True
+    repo.lease['native_http_heartbeat'] = 10000
+    monkeypatch.setattr(native, 'busy', lambda: True)
+    monkeypatch.setattr(native, '_runtime_deleted', lambda repo, lease: False)
+    assert not native.protect_lease(repo, repo.lease, clock=lambda: 10005)
+    assert repo.lease['native_draining'] is True
+
+
+def test_native_cold_start_can_outlast_three_minutes(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.gpu import native_runtime as runtime
+
+    class NotReady(Exception):
+        pass
+    clock = [0]
+    def health(*args, **kwargs):
+        if clock[0] < 240:
+            raise NotReady
+        return {'system': {}}
+    monkeypatch.setattr(runtime.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(runtime.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    worker = SimpleNamespace(_http_json=health, WorkerError=NotReady)
+    runtime.wait_for_comfy(worker, SimpleNamespace(poll=lambda: None))
+    assert clock[0] == 240
+
+
+@pytest.mark.parametrize('exit_code,timeout,error', [(1, 2100, 'exited'), (None, 2, 'timed out')])
+def test_native_startup_still_fails_on_exit_or_deadline(monkeypatch, exit_code, timeout, error):
+    from types import SimpleNamespace
+
+    from app.gpu import native_runtime as runtime
+
+    class NotReady(Exception):
+        pass
+    clock = [0]
+    def health(*args, **kwargs):
+        raise NotReady
+    monkeypatch.setattr(runtime.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(runtime.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    worker = SimpleNamespace(_http_json=health, WorkerError=NotReady)
+    with pytest.raises(RuntimeError, match=error):
+        runtime.wait_for_comfy(worker, SimpleNamespace(poll=lambda: exit_code), timeout)
+    assert clock[0] == (0 if exit_code is not None else timeout)

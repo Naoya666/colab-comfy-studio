@@ -346,6 +346,21 @@ def verify_manager(worker, log_path, log_offset=0):
     raise RuntimeError("Native Manager API unavailable; inspect comfy.log")
 
 
+def wait_for_comfy(worker, process, timeout=2100):
+    """Allow the 30-minute dependency restore plus imports during prestartup."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            worker._http_json("http://127.0.0.1:8188/system_stats", timeout=3)
+            return
+        except worker.WorkerError:
+            if process.poll() is not None:
+                raise RuntimeError("Native ComfyUI exited during startup; inspect comfy.log") from None
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Native ComfyUI health check timed out; inspect comfy.log") from None
+            time.sleep(1)
+
+
 def run(root, payload, stages):
     import runtime_worker as worker
     secret = payload["native_secrets"]
@@ -430,17 +445,8 @@ def run(root, payload, stages):
                 worker._atomic_json(ROOT / "plugins-config.json", {"comfy": str(comfy), "user": str(data / "user"),
                                                                   "log": str(comfy_log), "log_offset": log_offset})
                 process = subprocess.Popen(args, cwd=comfy, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            for _ in range(180):
-                try:
-                    worker._http_json("http://127.0.0.1:8188/system_stats", timeout=3)
-                    break
-                except worker.WorkerError:
-                    if process.poll() is not None:
-                        raise RuntimeError("Native ComfyUI exited during startup; inspect comfy.log")
-                    time.sleep(1)
-            else:
-                raise RuntimeError("Native ComfyUI health check timed out")
             try:
+                wait_for_comfy(worker, process)
                 verify_manager(worker, comfy_log, log_offset)
                 with comfy_log.open("rb") as source:
                     source.seek(log_offset)

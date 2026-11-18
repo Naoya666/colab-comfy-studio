@@ -546,3 +546,38 @@ async def test_boot_scan_failure_keeps_loop_alive_and_recovers_after_repair(setu
     with pytest.raises(asyncio.CancelledError):
         await tasks[0]
     assert iteration[0] == 3
+
+
+def test_small_file_validation_reuses_only_content_identical_scans(tmp_path, monkeypatch):
+    source = tmp_path / 'asset.bin'
+    source.write_bytes(b'x' * (512 * 1024))
+    original = p.SECRET
+    scans = []
+    class Pattern:
+        def search(self, data):
+            scans.append(len(data))
+            return original.search(data)
+        def finditer(self, data):
+            return original.finditer(data)
+    monkeypatch.setattr(p, 'SECRET', Pattern())
+    for _ in range(3):
+        p.checked_source(source, p.source_stamp(source))
+    assert len(scans) == 1
+    before = source.stat()
+    source.write_bytes(b'api_key="secret123456789"'.ljust(512 * 1024, b' '))
+    p.os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(RuntimeError, match='credential'):
+        p.checked_source(source, p.source_stamp(source))
+
+
+def test_content_change_between_hash_and_validation_is_rejected(tmp_path, monkeypatch):
+    source = tmp_path / 'config.py'
+    source.write_text('value = 1\n')
+    original = p.file_hash
+    def changed(path):
+        checksum = original(path)
+        path.write_text('value = 2\n')
+        return checksum
+    monkeypatch.setattr(p, 'file_hash', changed)
+    with pytest.raises(RuntimeError, match='changed during scan'):
+        p.checked_source(source, p.source_stamp(source))
