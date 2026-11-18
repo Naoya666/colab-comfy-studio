@@ -135,12 +135,15 @@ def instances(
     request: Request,
     state: str | None = None,
     detail: bool = False,
+    include_cleared: bool = False,
     user=Depends(current_user),
 ):
     service = _service(request)
     rows = service.list(user["id"], state=state)
     result = []
     for row in rows:
+        if not include_cleared and row.get("state") == "deleted" and row.get("history_cleared_at") is not None:
+            continue
         item = _public(service, row)
         if detail:
             jobs, events = _related(request, row["id"], user["id"])
@@ -148,6 +151,15 @@ def instances(
             item["events"] = [_safe_public(event) for event in events]
         result.append(item)
     return ok(result, request)
+
+
+@router.post("/instances/history/clear")
+def clear_instance_history(request: Request, user=Depends(current_user)):
+    try:
+        cleared = _service(request).clear_history(user["id"])
+    except InstanceServiceError as exc:
+        raise _domain_error(exc) from exc
+    return ok({"cleared": cleared}, request)
 
 
 @router.get("/instances/{instance_id}")

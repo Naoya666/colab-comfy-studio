@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, RefreshCw, Square, Timer, Wrench } from 'lucide-react';
-import { apiMessage, getGpuInstance, setInstanceRetention, stopInstance } from '../lib/gpu-api';
+import { ChevronDown, RefreshCw, Square, Timer, Trash2, Wrench } from 'lucide-react';
+import { apiMessage, clearGpuInstanceHistory, getGpuInstance, setInstanceRetention, stopInstance } from '../lib/gpu-api';
 import type { GpuInstance } from './AccountDirectory';
 import { InstanceWorkbench } from './InstanceWorkbench';
 import { formatInstanceTime as formatTime } from '../lib/instance-time';
@@ -9,6 +9,7 @@ import styles from './v020.module.css';
 
 type Filter = 'all' | 'active' | 'retained' | 'history';
 type Action = 'retain' | 'stop';
+const COLLAPSED_LIMIT = 5;
 type Detail = GpuInstance & {
   jobs?: Array<Record<string, unknown>>;
   events?: Array<Record<string, unknown>>;
@@ -73,6 +74,8 @@ function errorText(cause: unknown): string {
 
 export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, onRefresh }: InstanceCenterProps) {
   const [filter, setFilter] = useState<Filter>('all');
+  const [expanded, setExpanded] = useState(false);
+  const [clearingHistory, setClearingHistory] = useState(false);
   const [selectedId, setSelectedId] = useState('');
   const [detail, setDetail] = useState<Detail | null>(null);
   const [workbench, setWorkbench] = useState<GpuInstance | null>(null);
@@ -91,7 +94,7 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
       if (!id || seen.has(id)) return false;
       seen.add(id);
       return true;
-    });
+    }).sort((a, b) => (Date.parse(b.created_at || '') || 0) - (Date.parse(a.created_at || '') || 0));
   }, [instances]);
 
   useEffect(() => {
@@ -102,12 +105,31 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
 
   const activeCount = rows.filter((instance) => isActive(instance) && !isHistory(instance)).length;
   const retainedCount = rows.filter(isRetained).length;
+  const hasClearableHistory = rows.some((instance) => instance.state === 'deleted');
   const filtered = rows.filter((instance) => {
     if (filter === 'active') return isActive(instance) && !isHistory(instance);
     if (filter === 'retained') return isRetained(instance);
     if (filter === 'history') return isHistory(instance);
     return true;
   });
+  const visibleRows = expanded ? filtered : filtered.slice(0, COLLAPSED_LIMIT);
+
+  async function clearHistory() {
+    if (clearingHistory || !hasClearableHistory
+      || !window.confirm('清除已释放实例的列表记录？任务和用量仍可查询。')) return;
+    setClearingHistory(true);
+    setError('');
+    setStatus('');
+    try {
+      const { cleared } = await clearGpuInstanceHistory();
+      onRefresh?.();
+      setStatus(cleared ? `已清除 ${cleared} 条实例历史。` : '没有可清除的实例历史。');
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setClearingHistory(false);
+    }
+  }
 
   function keyFor(action: Action, id: string) {
     const operation = `${action}:${id}`;
@@ -194,11 +216,14 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
     </div>
     <div className={styles.toolbar}>
       <div className={styles.filterGroup} role="group" aria-label="实例筛选">
-        {([['all', '全部'], ['active', '活动'], ['retained', '保留'], ['history', '历史']] as const).map(([value, text]) => <button key={value} type="button" className={styles.filterButton} aria-pressed={filter === value} onClick={() => setFilter(value)}>{text}</button>)}
+        {([['all', '全部'], ['active', '活动'], ['retained', '保留'], ['history', '历史']] as const).map(([value, text]) => <button key={value} type="button" className={styles.filterButton} aria-pressed={filter === value} onClick={() => { setFilter(value); setExpanded(false); }}>{text}</button>)}
       </div>
+      <button type="button" className={styles.buttonSecondary} disabled={!hasClearableHistory || clearingHistory} onClick={() => void clearHistory()}>
+        <Trash2 size={15} aria-hidden />{clearingHistory ? '正在清除…' : '清除历史'}
+      </button>
     </div>
-    {!filtered.length ? <div className={styles.empty}><strong>{rows.length ? '当前筛选没有实例' : '还没有实例'}</strong><span>{rows.length ? '切换筛选查看其他状态。' : '提交任务后，服务端分配的实例会显示在这里。'}</span></div> : <div className={styles.instanceMeta}>
-      {filtered.map((instance) => {
+    {!filtered.length ? <div className={styles.empty}><strong>{rows.length ? '当前筛选没有实例' : '还没有实例'}</strong><span>{rows.length ? '切换筛选查看其他状态。' : '提交任务后，服务端分配的实例会显示在这里。'}</span></div> : <div className={styles.instanceMeta} id="instance-center-list">
+      {visibleRows.map((instance) => {
         const id = instanceId(instance);
         const isSelected = selectedId === id;
         const canMutate = !isHistory(instance) && instance.state !== 'releasing';
@@ -228,6 +253,10 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
         </article>;
       })}
     </div>}
+    {filtered.length > COLLAPSED_LIMIT && <button type="button" className={styles.buttonSecondary} aria-controls="instance-center-list"
+      aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>
+      {expanded ? '收起，仅显示最新 5 条' : `展开其余 ${filtered.length - COLLAPSED_LIMIT} 条`}
+    </button>}
     {confirm && <div className={styles.sheetBackdrop} role="presentation"><div className={styles.sheet} role="dialog" aria-modal="true" aria-labelledby="instance-confirm-title"><h3 id="instance-confirm-title">{confirm.action === 'stop' ? '确认停止实例？' : '确认保留实例？'}</h3><p className={styles.muted}>{confirm.action === 'stop' ? '服务端会将实例标记为释放中；远端删除完成前不会显示为已删除。' : '实例会保持可续用状态，并按服务端策略在空闲后释放。'}</p>{confirm.action === 'retain' && <label className={styles.field}>空闲保留分钟数<input type="number" min={0} max={30} value={retainMinutes} onChange={(event) => setRetainMinutes(Number(event.target.value) || 0)} /></label>}{error && <p className={styles.error} role="alert">{error}</p>}<div className={styles.sheetActions}><button type="button" className={styles.buttonSecondary} onClick={() => { if (!busy) setConfirm(null); }}>取消</button><button type="button" className={confirm.action === 'stop' ? styles.buttonDanger : styles.button} disabled={Boolean(busy)} onClick={() => void submitAction()}>{busy ? '提交中…' : confirm.action === 'stop' ? '确认停止' : '确认保留'}</button></div></div></div>}
   </section>;
 }

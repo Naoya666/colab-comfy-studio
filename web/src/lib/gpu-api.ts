@@ -292,6 +292,8 @@ export const listGpuInstances = (filters: GpuInstanceFilters = {}) => {
 };
 export const getGpuInstance = (instanceId: string) =>
   apiFetch<GpuInstance>(`/api/gpu/instances/${encodeURIComponent(instanceId)}`);
+export const clearGpuInstanceHistory = () =>
+  apiFetch<{ cleared: number }>('/api/gpu/instances/history/clear', { method: 'POST' });
 export const getInstanceJobs = (instanceId: string) =>
   apiFetch<GpuJob[]>(`/api/gpu/instances/${encodeURIComponent(instanceId)}/jobs`);
 export const getInstanceEvents = (instanceId: string) =>

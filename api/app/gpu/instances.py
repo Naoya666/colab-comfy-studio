@@ -60,7 +60,7 @@ class InstanceService:
         "lease_id", "hard_deadline_at", "idle_deadline_at", "retention_mode", "manual_stop_requested",
         "created_at", "updated_at", "last_seen_at", "generation", "selection_reason", "runtime_deleted",
         "allocation_key", "budget_reserved", "retention_reserved", "allocation_requested_at", "deletion_confirmed_at",
-        "remote_delete_source",
+        "remote_delete_source", "history_cleared_at",
     }
 
     def __init__(self, repo, clock=time.time, config=None):
@@ -985,7 +985,21 @@ class InstanceService:
     def list(self, owner, state=None):
         with self._tx() as session:
             rows = self._rows(session, "instances", owner)
+            rows.sort(key=lambda row: (row.created_at, row.id), reverse=True)
             return [self.public(self._dict(row)) for row in rows if state is None or row.state == state]
+
+    def clear_history(self, owner):
+        with self._admission(), self._tx() as session:
+            model = self._model("instances")
+            deleted = session.scalars(select(model).where(model.owner_id == owner, model.state == "deleted")).all()
+            cleared = 0
+            now = self.clock()
+            for row in deleted:
+                data = self._data(row)
+                if data.get("history_cleared_at") is None:
+                    self._set(row, {**data, "history_cleared_at": now}, session=session)
+                    cleared += 1
+            return cleared
 
     def events(self, owner, id):
         with self._tx() as session:
