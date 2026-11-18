@@ -83,6 +83,9 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
     with st.dispatch_lock() as acquired:
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "调度正在同步，请稍后用相同幂等键重试", 503, True)
+        from .gpu.native import guard_generation
+
+        guard_generation(repo, user["id"], raw["execution_policy"])
         if not st.get("projects", project_id, user["id"]):
             st.create(
                 "projects", user["id"], {"title": "GPU 可行性检查", "system": True}, record_id=project_id

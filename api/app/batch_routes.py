@@ -91,6 +91,10 @@ def build_batch_router(JobInput, admit_job, public_job):
         with st.admission_lock() as acquired:
             if not acquired:
                 raise APIError("SCHEDULER_BUSY", "请沿用幂等键重试", 503, True)
+            from .gpu.native import guard_generation
+
+            for job in validated:
+                guard_generation(repo, user["id"], job["execution_policy"])
             try:
                 storage_mode = "batch" if lifecycle == "retain" else lifecycle
                 batch, _ = repo.create_batch(user['id'],validated,key,

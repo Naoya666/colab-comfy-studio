@@ -5,6 +5,7 @@ on redirects. No environment proxy, automatic redirect, or cross-host auth.
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -71,7 +72,7 @@ class SourceHTTP:
         self.resolver = resolver
 
     @contextmanager
-    def stream(self, url):
+    def stream(self, url, *, offset=0, validator=None):
         initial_host = urlsplit(https_url(url, persisted=False)).hostname
         for _ in range(6):
             parsed = urlsplit(https_url(url, persisted=False))
@@ -80,6 +81,10 @@ class SourceHTTP:
             original = httpx.URL(url)
             pinned = original.copy_with(host=address)
             headers = {"Host": host, "Accept-Encoding": "identity"}
+            if offset:
+                headers["Range"] = f"bytes={offset}-"
+                if validator:
+                    headers["If-Range"] = validator
             source = {"huggingface.co": "huggingface", "civitai.com": "civitai"}.get(host)
             if host == initial_host and source and self.tokens.get(source):
                 headers["Authorization"] = "Bearer " + self.tokens[source]
@@ -92,7 +97,11 @@ class SourceHTTP:
                             raise ModelError("下载来源重定向缺少目标")
                         url = urljoin(url, location)
                         continue
-                    self.check(response)
+                    if not (offset and response.status_code in {206, 416}):
+                        self.check(response)
+                    response.extensions["studio_source_resource"] = hashlib.sha256(
+                        f"{host}{parsed.path}".encode()
+                    ).hexdigest()
                     yield response
                     return
             except httpx.HTTPError as exc:

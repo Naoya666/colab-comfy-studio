@@ -15,6 +15,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from urllib.parse import urlencode
 from urllib.request import urlopen
 
 ROOT = Path("/content/ai-studio/native")
@@ -33,6 +34,12 @@ from server import PromptServer
 import os
 from pathlib import Path
 import time
+import uuid
+
+ROOT = Path("/content/ai-studio/native")
+BOOT_ID = uuid.uuid4().hex
+LEASE_ID = (ROOT / "restart-lease").read_text() if (ROOT / "restart-lease").is_file() else None
+REBOOT_ID = None
 
 def open_writes():
     for process in Path("/proc").glob("[0-9]*"):
@@ -75,6 +82,8 @@ def manager_busy():
 
 def probe():
     try:
+        if manager_busy():
+            return {"busy": True, "busy_reason": "manager"}
         config = Path("/content/ai-studio/native/plugins-config.json")
         if config.exists():
             import sys
@@ -85,7 +94,7 @@ def probe():
             status = read(root / "plugins-status.json", {})
             nodes = Path(read(config)["comfy"]) / "custom_nodes"
             if status.get("error") or pending.get("source") != digest(inventory(nodes)):
-                return {"busy": True}
+                return {"busy": True, "busy_reason": "plugins"}
         def rpc(path):
             with urlopen(Request("http://127.0.0.1:5572/" + path, data=b"{}", headers={"Content-Type":"application/json"}), timeout=5) as r:
                 return json.load(r)
@@ -94,9 +103,40 @@ def probe():
         io = rpc("core/stats")
         # core/stats.errors is cumulative, including recovered reads and renamed
         # temporary files. Current VFS errors and pending writes still fence shutdown.
-        return {"busy": bool(manager_busy() or open_writes() or d.get("uploadsQueued", 0) or d.get("uploadsInProgress", 0) or d.get("erroredFiles", 0) or d.get("outOfSpace", False) or io.get("transferring"))}
+        busy = bool(open_writes() or d.get("uploadsQueued", 0) or d.get("uploadsInProgress", 0)
+                    or d.get("erroredFiles", 0) or d.get("outOfSpace", False) or io.get("transferring"))
+        return {"busy": busy, "busy_reason": "drive" if busy else None}
     except Exception:
-        return {"busy": True}
+        return {"busy": True, "busy_reason": "unknown"}
+
+
+def index_status(models, refresh):
+    from folder_paths import get_filename_list
+
+    if refresh:
+        for path, recursive in (("models", "false"), ("models/native-index", "true")):
+            with urlopen(Request("http://127.0.0.1:5572/vfs/refresh",
+                                 data=json.dumps({"dir": path, "recursive": recursive}).encode(),
+                                 headers={"Content-Type": "application/json"}), timeout=20) as response:
+                if json.load(response).get("result", {}).get(path) != "OK":
+                    raise RuntimeError("无法刷新 Drive 挂载的模型目录")
+    available = {}
+    missing = []
+    for model in models:
+        category, alias = model["category"], model["alias"]
+        if refresh:
+            if not (ROOT / "drive" / "models" / "native-index" / category / alias).is_file():
+                missing.append(alias)
+            continue
+        loader = {"unet": "diffusion_models", "clip": "text_encoders"}.get(category, category)
+        if loader not in available:
+            try:
+                available[loader] = set(get_filename_list(loader))
+            except KeyError:
+                available[loader] = set()
+        if alias not in available[loader]:
+            missing.append(alias)
+    return missing
 
 @PromptServer.instance.routes.get("/studio_native/state")
 async def state(request):
@@ -105,8 +145,50 @@ async def state(request):
     status_file = Path("/content/ai-studio/native/plugins-status.json")
     if status_file.exists():
         result["plugins"] = await asyncio.to_thread(PERSISTENCE.status)
-        result["busy"] = bool(result["busy"] or not result["plugins"].get("durable") or result["plugins"].get("error"))
+        if not result["busy"] and (not result["plugins"].get("durable") or result["plugins"].get("error")):
+            result.update(busy=True, busy_reason="plugins")
+    result.update(boot_id=BOOT_ID, lease_id=LEASE_ID, reboot_id=REBOOT_ID)
     return web.json_response(result)
+
+
+@PromptServer.instance.routes.post("/studio_native/index")
+async def index(request):
+    body = await request.json()
+    if not LEASE_ID or body.get("lease_id") != LEASE_ID or body.get("boot_id") != BOOT_ID:
+        return web.json_response({"error": "会话或进程已切换"}, status=409)
+    models = body.get("models", [])
+    for model in models:
+        if any(not value or Path(value).name != value or value in {".", ".."}
+               for value in (model["category"], model["alias"])):
+            return web.json_response({"error": "模型索引路径无效"}, status=422)
+    try:
+        missing = await asyncio.to_thread(index_status, models, body.get("refresh") is True)
+    except Exception:
+        return web.json_response({"error": "无法读取 Drive 挂载或刷新模型目录"}, status=503)
+    return web.json_response({"missing": missing})
+
+
+@web.middleware
+async def bind_restart(request, handler):
+    global REBOOT_ID
+    restart_id = request.headers.get("X-Studio-Restart-Id")
+    if request.path.removeprefix("/api") != "/v2/manager/reboot" or not restart_id:
+        return await handler(request)
+    if (not LEASE_ID or request.headers.get("X-Studio-Restart-Lease") != LEASE_ID
+            or request.headers.get("X-Studio-Restart-Boot") != BOOT_ID or REBOOT_ID):
+        return web.json_response({"error": "会话或进程已切换，或已受理重启"}, status=409)
+    REBOOT_ID = restart_id
+    try:
+        response = await handler(request)
+    except web.HTTPClientError:
+        REBOOT_ID = None
+        raise
+    if 400 <= response.status < 500:
+        REBOOT_ID = None
+    return response
+
+
+PromptServer.instance.app.middlewares.append(bind_restart)
 
 import sys
 sys.path.insert(0, "/content/ai-studio/native")
@@ -311,7 +393,11 @@ def prepare_paths(comfy, mount):
 
 def _index_models(secret, worker):
     cache = worker.DriveCache(secret["access_token"], secret["models_folder_id"])
+    if not secret.get("models"):
+        return []
     index = cache._folder("native-index", cache.folder_id, True)
+    aliases = []
+    shortcut_mime = "application/vnd.google-apps.shortcut"
     for model in secret.get("models", []):
         category, name = model.get("category"), model.get("filename")
         if category not in CATEGORIES or not name or Path(name).name != name:
@@ -319,10 +405,26 @@ def _index_models(secret, worker):
         parent = cache._folder(category, index, True)
         # ID-based aliases avoid moving, copying, or overwriting existing model files.
         alias = model["file_id"] + "-" + name
-        if not cache._list(alias, parent, False):
+        query = f"name = '{cache._q(alias)}' and '{cache._q(parent)}' in parents and trashed = false"
+        params = {"q": query, "fields": "nextPageToken,files(mimeType,shortcutDetails(targetId))"}
+        matches = []
+        while True:
+            page = cache._json("GET", worker.DRIVE_API + "/files?" + urlencode(params))
+            matches.extend(page.get("files") or [])
+            if not page.get("nextPageToken"):
+                break
+            params["pageToken"] = page["nextPageToken"]
+        if any(item.get("mimeType") != shortcut_mime
+               or (item.get("shortcutDetails") or {}).get("targetId") != model["file_id"] for item in matches):
+            raise ValueError(f"Drive 模型快捷方式目标冲突：{alias}")
+        if not matches:
             cache._json("POST", worker.DRIVE_API + "/files", {
-                "name": alias, "mimeType": "application/vnd.google-apps.shortcut", "parents": [parent],
+                "name": alias, "mimeType": shortcut_mime, "parents": [parent],
                 "shortcutDetails": {"targetId": model["file_id"]}})
+        item = {"category": category, "alias": alias}
+        if item not in aliases:
+            aliases.append(item)
+    return aliases
 
 
 def verify_manager(worker, log_path, log_offset=0):
@@ -422,6 +524,7 @@ def run(root, payload, stages):
             persistence.restore(payload.get("native_plugin_generation"))
             protect_environment(ROOT)
             persistence.dependencies()
+            _write_secret(ROOT / "restart-lease", secret.get("lease_id") or "")
             (comfy / "custom_nodes" / "studio_native_state.py").write_text(EXTENSION)
             guard = comfy / "custom_nodes" / "studio_native_guard"
             guard.mkdir(exist_ok=True)
@@ -431,7 +534,7 @@ def run(root, payload, stages):
                 "sys.path.insert(0, '/content/ai-studio/native')\n"
                 "from node_persistence import prestartup\n"
                 "prestartup(Path('/content/ai-studio/native'))\n")
-            probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("@PromptServer")]
+            probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("def index_status(")]
             (ROOT / "probe.py").write_text("import os, json\nfrom pathlib import Path\nfrom urllib.request import Request, urlopen\n" + probe)
             stages.start("comfy_start")
             args = [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188", "--enable-manager",

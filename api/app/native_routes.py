@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Request
 
 from .common import APIError, current_user, ok
 from .config import settings
-from .gpu import native
+from .gpu import native, native_restart
 from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
 from .security import sign_session
 
@@ -18,6 +18,11 @@ router = APIRouter(prefix="/api/gpu/native")
 async def status(request: Request, user=Depends(current_user)):
     repo = request.app.state.repo
     lease = native.active_lease(repo, user["id"])
+    restart_lease = lease or max(
+        (row for row in repo.list("leases", user["id"]) if row.get("native_restart")),
+        key=lambda row: row["native_restart"]["created_at"], default=None,
+    )
+    restart = native_restart.public_restart(restart_lease)
     native_jobs = [j for j in repo.list("jobs", user["id"]) if (j.get("snapshot") or {}).get("native_comfy")]
     job = max(native_jobs, key=lambda j: j.get("created_at") or "", default=None)
     last_instance_id = (job or {}).get("instance_id")
@@ -25,23 +30,34 @@ async def status(request: Request, user=Depends(current_user)):
     reclaimed = bool(instance and instance.get("state") == "deleted"
                      and instance.get("remote_delete_source") == RUNTIME_MISSING)
     ready = False
-    if lease and lease.get("native_ready"):
+    if lease and lease.get("native_ready") and not native.restart_active(lease):
         try:
             url, headers = native.backend()
             async with httpx.AsyncClient(timeout=8) as client:
                 response = await client.get(url + "/system_stats", headers=headers)
                 ready = response.status_code == 200 and isinstance(response.json().get("system"), dict)
-        except (httpx.HTTPError, ValueError, APIError):
+        except (httpx.HTTPError, ValueError, AttributeError, APIError):
             pass
     events = repo.list("events", user["id"]) if job else []
+    can_restart = ready and native_restart.can_restart(repo, lease)
     return ok({"configured": bool(settings.native_comfy_url), "url": settings.native_comfy_url,
                "timeouts": native.timeout_options(),
                "ready": ready, "instance_id": lease.get("instance_id") if lease else None,
                "job_id": job["id"] if job else None, "state": job["state"] if job else "stopped",
+               "restart": restart, "can_restart": can_restart,
                "reason": RUNTIME_MISSING if reclaimed else None,
                "error": RUNTIME_MISSING_MESSAGE if reclaimed else (job or {}).get("error_message"),
                "events": [{"message": e.get("message"), "state": e.get("state")}
                           for e in events if e.get("job_id") == (job or {}).get("id")][-30:]}, request)
+
+
+@router.post("/restart", status_code=202)
+def restart(body: dict, request: Request, user=Depends(current_user)):
+    if set(body) != {"instance_id"}:
+        raise APIError("NATIVE_INPUT", "必须提供当前原生实例 ID", 422)
+    restart_id = native_restart.submit(request.app.state.repo, user["id"], body["instance_id"],
+                                       request.headers.get("Idempotency-Key"))
+    return ok({"restart_id": restart_id}, request, 202)
 
 
 @router.post("/start", status_code=202)

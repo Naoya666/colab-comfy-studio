@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 import time
+import uuid
 from urllib.parse import urlsplit
 
 import httpx
@@ -31,7 +32,7 @@ def clean_headers(headers, *, request=False):
     connection = set(headers.get("connection", "").lower().replace(" ", "").split(","))
     return [(k, v) for k, v in headers.multi_items()
             if k.lower() not in HOP | connection
-            and not (request and (k.lower() in PRIVATE or k.lower().startswith(("cf-", "sec-websocket"))))
+            and not (request and (k.lower() in PRIVATE or k.lower().startswith(("cf-", "sec-websocket", "x-studio-restart-"))))
             and not (not request and k.lower() == "set-cookie")]
 
 
@@ -102,6 +103,9 @@ class NativeHostMiddleware:
             owner = identity(headers, request.cookies)
             if not owner:
                 raise APIError("UNAUTHENTICATED", "请从 Studio 的原生 ComfyUI 入口登录，API 使用 Bearer Token", 401)
+            internal_path = scope["path"].removeprefix("/api").rstrip("/")
+            if internal_path == "/studio_native/index":
+                raise APIError("NOT_FOUND", "接口不存在", 404)
             if request.method not in {"GET", "HEAD", "OPTIONS"}:
                 check_origin(headers)
             lease = await asyncio.to_thread(native.active_lease, self.studio_app.state.repo, owner)
@@ -128,27 +132,31 @@ class NativeHostMiddleware:
         headers += list(auth.items()) + [("Origin", base)]
         # Do not forward a browser Referer containing the public host to Comfy's origin checker.
         headers = [(k, v) for k, v in headers if k.lower() != "referer"]
-        mutating = request.method not in {"GET", "HEAD", "OPTIONS"}
+        path = scope["path"].removeprefix("/api").rstrip("/")
+        mutating = request.method not in {"GET", "HEAD", "OPTIONS"} or (
+            request.method == "GET" and path in {"/manager/reboot", "/v2/manager/reboot", "/manager/queue/start"}
+        )
         repo = self.studio_app.state.repo
         stop_heartbeat = asyncio.Event()
+        write_id = uuid.uuid4().hex if mutating else None
 
         async def activity():
             while not stop_heartbeat.is_set():
-                await asyncio.to_thread(repo.update, "leases", lease["id"], {"native_last_write": time.time(), "native_http_heartbeat": time.time()}, lease["owner_id"])
                 try:
                     await asyncio.wait_for(stop_heartbeat.wait(), 10)
                 except TimeoutError:
-                    pass
+                    await asyncio.to_thread(native.update_write, repo, lease, write_id)
         if mutating:
             await asyncio.to_thread(
                 native.begin_write, repo, lease,
                 allow_stopping=scope["path"] in {"/interrupt", "/api/interrupt", "/queue", "/api/queue"},
+                write_id=write_id,
             )
         heartbeat = asyncio.create_task(activity()) if mutating else None
         downstream_started = False
         try:
             client = self.http_client()
-            retryable = (request.method in {"GET", "HEAD"}
+            retryable = (not mutating and request.method in {"GET", "HEAD"}
                          and request.headers.get("content-length", "0") == "0"
                          and "transfer-encoding" not in request.headers)
             for attempt in range(3 if retryable else 1):
@@ -186,7 +194,10 @@ class NativeHostMiddleware:
         finally:
             stop_heartbeat.set()
             if heartbeat:
-                await heartbeat
+                try:
+                    await heartbeat
+                finally:
+                    await asyncio.to_thread(native.update_write, repo, lease, write_id, finished=True)
 
     async def websocket(self, scope, receive, send):
         ws = WebSocket(scope, receive, send)

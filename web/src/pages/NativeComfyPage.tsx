@@ -5,7 +5,17 @@ import type { GpuAccount } from '../components/AccountDirectory';
 import { submitNativeHandoff } from '../lib/native-handoff';
 
 type Timeouts = { retain_idle_minutes: number; max_runtime_minutes: number };
-type NativeStatus = { configured: boolean; ready: boolean; state: string; url: string; instance_id?: string; error?: string; timeouts: { defaults: Timeouts }; events: { state?: string; message?: string }[] };
+type RestartPhase = 'checking' | 'syncing' | 'rebooting' | 'recovering' | 'succeeded' | 'failed';
+type NativeRestart = { restart_id: string; instance_id: string; phase: RestartPhase; failed_phase?: RestartPhase; error?: string };
+type NativeStatus = { configured: boolean; ready: boolean; can_restart: boolean; restart?: NativeRestart; state: string; url: string; instance_id?: string; error?: string; timeouts: { defaults: Timeouts }; events: { state?: string; message?: string }[] };
+const restartMessages: Record<RestartPhase, string> = {
+  checking: '检查生成、安装和 Drive 同步状态',
+  syncing: '同步模型索引',
+  rebooting: '重启 ComfyUI',
+  recovering: '等待服务恢复',
+  succeeded: 'ComfyUI 已重启，模型列表已刷新',
+  failed: 'ComfyUI 重启失败',
+};
 
 export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
   const [account, setAccount] = useState(accounts.find(a => a.enabled !== false && a.allow_allocation !== false)?.account_id || '');
@@ -14,12 +24,16 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
   const [error, setError] = useState('');
   const [starting, setStarting] = useState(false);
   const [stopConfirm, setStopConfirm] = useState(false);
+  const [submittingRestart, setSubmittingRestart] = useState(false);
+  const [pendingRestart, setPendingRestart] = useState<{ id: string; previous?: string }>();
   const [autoOpen, setAutoOpen] = useState(false);
   const [idleMinutes, setIdleMinutes] = useState('');
   const [runtimeMinutes, setRuntimeMinutes] = useState('');
   const timeoutsInitialized = useRef(false);
   const key = useRef(crypto.randomUUID());
   const opening = useRef(false);
+  const restartDialog = useRef<HTMLDialogElement>(null);
+  const sendingRestart = useRef(false);
   async function enter() {
     if (opening.current) return;
     opening.current = true;
@@ -36,6 +50,10 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
         const data = await apiFetch<NativeStatus>('/api/gpu/native/status');
         if (!live) return;
         setStatus(data);
+        setPendingRestart(pending => {
+          const observed = data.restart?.restart_id;
+          return pending && data.instance_id && observed !== pending.id && observed === pending.previous ? pending : undefined;
+        });
         if (!timeoutsInitialized.current) {
           setIdleMinutes(String(data.timeouts.defaults.retain_idle_minutes));
           setRuntimeMinutes(String(data.timeouts.defaults.max_runtime_minutes));
@@ -49,6 +67,30 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
     return () => { live = false; clearTimeout(timer); };
   }, [autoOpen]);
   const validTimeouts = [idleMinutes, runtimeMinutes].every(value => Number.isInteger(Number(value)) && Number(value) >= 1);
+  const restart = status?.restart;
+  const restartInProgress = submittingRestart || Boolean(pendingRestart)
+    || restart?.phase === 'checking' || restart?.phase === 'syncing'
+    || restart?.phase === 'rebooting' || restart?.phase === 'recovering';
+  const restartError = restart?.phase === 'failed'
+    ? `${restartMessages[restart.failed_phase || 'failed']}：${restart.error || 'ComfyUI 重启失败'}`
+    : '';
+  async function restartNative() {
+    const instance = status?.instance_id;
+    if (!instance || !status?.can_restart || sendingRestart.current) return;
+    sendingRestart.current = true;
+    restartDialog.current?.close();
+    setSubmittingRestart(true);
+    setError('');
+    try {
+      const result = await apiFetch<{ restart_id: string }>('/api/gpu/native/restart', {
+        method: 'POST',
+        headers: { 'Idempotency-Key': `native-restart:${instance}:${restart?.restart_id || 'first'}` },
+        body: JSON.stringify({ instance_id: instance }),
+      }, 40_000);
+      setPendingRestart({ id: result.restart_id, previous: restart?.restart_id });
+    } catch (cause) { setError(apiMessage(cause)); }
+    finally { sendingRestart.current = false; setSubmittingRestart(false); }
+  }
   async function start() {
     if (!validTimeouts) { setError('请填写正整数分钟数。'); return; }
     setStarting(true); setError('');
@@ -63,7 +105,11 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
     <h1>原生 ComfyUI</h1>
     <p>打开官方节点编辑器。可以直接导入工作流 JSON 或拖入带工作流的原图，使用原生保存、扩展和 Manager。</p>
     <p className="muted">与 Studio 共用 GPU。工作流、设置、素材、结果、节点源码和模型保存至 Google Drive。页面打开时仍会按任务活动判断空闲。</p>
-    {status?.ready ? <button className="button" onClick={() => void enter()}>进入原生 ComfyUI</button> : <>
+    {(status?.ready || restartInProgress || (status?.instance_id && restart)) ? <div className="actions">
+      <button className="button" disabled={!status?.ready || restartInProgress} onClick={() => void enter()}>进入原生 ComfyUI</button>
+      <button className="button secondary" disabled={!status?.can_restart || restartInProgress}
+        onClick={() => restartDialog.current?.showModal()}>{restartInProgress ? '正在重启…' : '重启原生 ComfyUI'}</button>
+    </div> : <>
       <label className="field">Google 账号<select value={account} onChange={e => { setAccount(e.target.value); key.current = crypto.randomUUID(); }}>
         <option value="">选择账号</option>
         {accounts.filter(a => a.enabled !== false && a.allow_allocation !== false).map(a => <option key={a.account_id} value={a.account_id}>{a.alias || a.account_id}</option>)}
@@ -81,8 +127,20 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
       <button className="button" disabled={starting || !account || !spec || !status?.configured || !validTimeouts} onClick={() => void start()}>{starting ? '正在提交…' : '启动 / 复用 GPU 并进入'}</button>
       {status && !status.configured && <p className="status">请按部署文档配置原生 ComfyUI 域名和隧道。</p>}
     </>}
-    {status && <p role="status">{status.ready ? '服务就绪' : `当前状态：${status.state}`}</p>}
-    {(error || status?.error) && <p className="status error" role="alert">{error || status?.error}</p>}
+    <dialog className="nativeRestartDialog" ref={restartDialog} aria-labelledby="native-restart-title" aria-describedby="native-restart-description">
+      <h2 id="native-restart-title">重启原生 ComfyUI</h2>
+      <p id="native-restart-description">将重启当前 GPU 实例上的 ComfyUI，并同步已就绪的模型。页面会短暂断开，请先保存工作流。</p>
+      <div className="actions">
+        <button type="button" className="button secondary" autoFocus onClick={() => restartDialog.current?.close()}>取消</button>
+        <button type="button" className="button" onClick={() => void restartNative()}>重启</button>
+      </div>
+    </dialog>
+    {status && <p role="status">{restartInProgress
+      ? (restart && !['failed', 'succeeded'].includes(restart.phase) ? restartMessages[restart.phase] : restartMessages.checking)
+      : status.ready && restart?.phase === 'succeeded' ? restartMessages.succeeded
+      : status.ready ? '服务就绪' : `当前状态：${status.state}`}</p>}
+    {(error || restartError || status?.error) &&
+      <p className="status error" role="alert">{error || restartError || status?.error}</p>}
     <ol aria-label="启动进度">{status?.events.map((event, i) => <li key={i}>{event.message}</li>)}</ol>
     {status?.instance_id && <div className="actions">
       <button className="button secondary" onClick={() => { setAutoOpen(false); setStopConfirm(true); }}>停止当前原生实例</button>

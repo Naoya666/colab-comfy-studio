@@ -87,7 +87,16 @@ export function ModelLibraryPage() {
     {!items.length && <p className="muted">暂无符合条件的模型。添加来源链接、上传文件或从工作流迁移旧缓存。</p>}
     {items.map(m => { const task = tasks.find(t => t.model_id === m.id); return <article className={styles.card} key={m.id}>
       <h3>{m.display_name}</h3><p>{m.filename} · {m.model_type} · {m.architecture}</p><p>{modelStatus[m.state] || m.state} · {bytesLabel(m.size)}</p>
-      {task && ['pending','downloading','verifying','uploading'].includes(task.state) && <div><progress aria-label="模型准备进度" max={task.total || 1} value={task.total ? task.bytes : undefined} /><p>{bytesLabel(task.bytes)} / {bytesLabel(task.total)} · {task.speed ? `${(task.speed / 1024**2).toFixed(1)} MB/s` : '等待进度'}</p><button className="button secondary small" onClick={() => void action(() => libraryApi(`/tasks/${task.id}/cancel`, {}))}>取消准备</button></div>}
+      {task && ['pending','downloading','verifying','uploading'].includes(task.state) && <div>
+        <progress aria-label="模型准备进度" max={task.total || 1} value={task.total ? task.bytes : undefined} />
+        <p>{modelStatus[task.state]} · {task.bytes ? bytesLabel(task.bytes) : '0 B'} / {bytesLabel(task.total)} · {task.speed ? `${(task.speed / 1024**2).toFixed(1)} MB/s` : '等待进度'}</p>
+        {!!task.attempt && task.attempt > 1 && <p className="muted small">第 {task.attempt} 次尝试
+          {task.resume_phase && task.resume_offset !== undefined
+            && ` · ${modelStatus[task.resume_phase]}从 ${task.resume_offset.toLocaleString()} 字节继续`}
+        </p>}
+        {task.restart_reason && <p className="muted small">{task.restart_reason}</p>}
+        <button className="button secondary small" onClick={() => void action(() => libraryApi(`/tasks/${task.id}/cancel`, {}))}>取消准备</button>
+      </div>}
       {m.error && <p className="status error">{m.error}</p>}
       <div className="actions"><button className="button secondary small" onClick={() => void action(async () => setDetail(await libraryApi('/' + m.id)))}>详情与引用</button>
         <button disabled={busy} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/prepare`, {action:'prepare'}))}>准备 / 重试</button>

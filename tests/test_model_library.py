@@ -208,6 +208,8 @@ class FakeDrive:
             raise ModelError("Drive " + action + "失败")
         return response.json()
     def _request(self, method, url, **kwargs):
+        if method == "GET" and url.endswith('/generateIds'):
+            return httpx.Response(200, json={"ids": ["remote"]})
         if method == "GET" and url.endswith('/files'):
             return httpx.Response(200, json={"files":list(self.files.values())})
         if method == "GET":
@@ -216,9 +218,10 @@ class FakeDrive:
         if method == "POST":
             self.uploads += 1
             self.bytes = bytearray()
-            return httpx.Response(200, headers={"location":"https://www.googleapis.com/upload/session"})
+            return httpx.Response(200, headers={"location":"https://www.googleapis.com/upload/drive/v3/files?upload_id=session"})
         if method == "PUT":
-            self.bytes.extend(kwargs["content"])
+            for chunk in kwargs["content"]:
+                self.bytes.extend(chunk)
             self.files["remote"]={"id":"remote","size":str(len(self.bytes)),"mimeType":"application/octet-stream", "trashed":False,
                                   "md5Checksum":hashlib.md5(self.bytes,usedforsecurity=False).hexdigest()}
             return httpx.Response(200,json=self.files["remote"])
@@ -433,3 +436,149 @@ def test_drive_import_uses_native_sha_without_staging_large_file(repo,monkeypatc
     monkeypatch.setattr(ModelTransfer,'read_drive',lambda *a:pytest.fail('native Drive SHA should avoid media transfer'))
     ModelTransfer(lib,lib.enqueue(m['id'])).run()
     assert lib.get(m['id'])['state'] == 'ready' and drive.uploads == 0
+
+
+class WorkerKilled(BaseException):
+    pass
+
+
+class InterruptedDownload(httpx.SyncByteStream):
+    def __init__(self, prefix):
+        self.prefix = prefix
+
+    def __iter__(self):
+        yield self.prefix
+        raise WorkerKilled
+
+
+@pytest.mark.parametrize("range_behavior", ["resume", "ignored", "changed", "invalid", "corrupt"])
+def test_interrupted_download_checks_prefix_and_range(repo, monkeypatch, range_behavior):
+    from app.gpu import model_library
+
+    monkeypatch.setattr(model_library, "CHECKPOINT_BYTES", model_library.BUFFER)
+    prefix = b"p" * model_library.BUFFER
+    payload = prefix + DATA
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(200, stream=InterruptedDownload(prefix), headers={
+                "ETag": '"fixed-v1"', "Content-Length": str(len(payload))
+            })
+        if "Range" not in request.headers or range_behavior == "ignored":
+            return httpx.Response(200, content=payload, headers={"ETag": '"fixed-v1"'})
+        assert request.headers["Range"] == f"bytes={len(prefix)}-"
+        assert request.headers["If-Range"] == '"fixed-v1"'
+        start = len(prefix) - int(range_behavior == "invalid")
+        return httpx.Response(206, content=DATA, headers={
+            "Content-Range": f"bytes {start}-{len(payload)-1}/{len(payload)}",
+            "ETag": '"fixed-v2"' if range_behavior == "changed" else '"fixed-v1"',
+        })
+
+    drive = FakeDrive()
+    lib = ModelLibrary(repo, "owner", drive=drive, http=source_http(handler))
+    row = model(lib, expected_sha256=hashlib.sha256(payload).hexdigest(), expected_size=len(payload))
+    task = lib.enqueue(row["id"])
+    with pytest.raises(WorkerKilled):
+        ModelTransfer(lib, task).run()
+    if range_behavior == "corrupt":
+        with (model_library.transfer_directory(task["id"]) / "weight.partial").open("r+b") as stream:
+            stream.write(b"x")
+    task = repo.get("model_downloads", task["id"], "owner")
+    ModelTransfer(lib, task).run()
+    state = repo.get("model_downloads", task["id"], "owner")
+    assert state["state"] == "ready" and state["attempt"] == 2
+    assert bytes(drive.bytes) == payload
+    assert bool(state["restart_reason"]) == (range_behavior != "resume")
+    assert state["resume_offset"] == (len(prefix) if range_behavior == "resume" else 0)
+    if range_behavior == "corrupt":
+        assert "Range" not in requests[1].headers
+
+
+def test_complete_download_reused_after_worker_killed(repo, monkeypatch):
+    drive = FakeDrive()
+    calls = []
+    lib = ModelLibrary(repo, "owner", drive=drive, http=source_http(
+        lambda req: (calls.append(req), httpx.Response(200, content=DATA))[1]
+    ))
+    row = model(lib, expected_sha256=HASH, expected_size=len(DATA))
+    task = lib.enqueue(row["id"])
+    original = ModelTransfer.hash_file
+
+    def killed(self, path, limit=None):
+        raise WorkerKilled
+
+    monkeypatch.setattr(ModelTransfer, "hash_file", killed)
+    with pytest.raises(WorkerKilled):
+        ModelTransfer(lib, task).run()
+    monkeypatch.setattr(ModelTransfer, "hash_file", original)
+    ModelTransfer(lib, repo.get("model_downloads", task["id"], "owner")).run()
+    assert lib.get(row["id"])["state"] == "ready" and len(calls) == 1 and drive.uploads == 1
+
+
+@pytest.mark.parametrize("mode", ["resume", "expired", "final-response-lost"])
+def test_drive_resumes_confirmed_offset_and_dedupes_final_response(repo, monkeypatch, mode):
+    from app.gpu import model_library
+    from app.gpu.drive import DriveStorage, _DriveTransportError
+
+    monkeypatch.setattr(model_library, "UPLOAD_CHUNK", 8)
+
+    class ResumingDrive(FakeDrive):
+        _file_resume_status = DriveStorage._file_resume_status
+        _file_upload_offset = staticmethod(DriveStorage._file_upload_offset)
+        _json = staticmethod(DriveStorage._json)
+
+        def __init__(self):
+            super().__init__()
+            self.killed = False
+            self.lost = False
+            self.ranges = []
+
+        def _request(self, method, url, **kwargs):
+            if method != "PUT":
+                return super()._request(method, url, **kwargs)
+            content_range = kwargs["headers"]["Content-Range"]
+            if content_range.startswith("bytes */"):
+                if mode == "expired" or self.lost:
+                    return httpx.Response(404)
+                return httpx.Response(308, headers={"Range": f"bytes=0-{len(self.bytes)-1}"})
+            self.ranges.append(content_range)
+            begin = int(content_range.split()[1].split("-")[0])
+            assert begin == len(self.bytes)
+            for chunk in kwargs["content"]:
+                assert len(chunk) <= model_library.BUFFER
+                self.bytes.extend(chunk)
+            assert int(kwargs["headers"]["Content-Length"]) == len(self.bytes) - begin
+            if len(self.bytes) < len(DATA):
+                if not self.killed and mode != "final-response-lost":
+                    self.killed = True
+                    raise WorkerKilled
+                return httpx.Response(308, headers={"Range": f"bytes=0-{len(self.bytes)-1}"})
+            self.files["remote"] = {
+                "id": "remote", "size": str(len(self.bytes)), "md5Checksum": MD5, "sha256Checksum": HASH
+            }
+            if mode == "final-response-lost":
+                self.lost = True
+                raise _DriveTransportError("response disconnected")
+            return httpx.Response(200, json=self.files["remote"])
+
+    drive = ResumingDrive()
+    source_calls = []
+    lib = ModelLibrary(repo, "owner", drive=drive, http=source_http(
+        lambda req: (source_calls.append(req), httpx.Response(200, content=DATA))[1]
+    ))
+    row = model(lib, expected_sha256=HASH, expected_size=len(DATA))
+    task = lib.enqueue(row["id"])
+    if mode == "final-response-lost":
+        ModelTransfer(lib, task).run()
+    else:
+        with pytest.raises(WorkerKilled):
+            ModelTransfer(lib, task).run()
+        ModelTransfer(lib, repo.get("model_downloads", task["id"], "owner")).run()
+    assert lib.get(row["id"])["state"] == "ready"
+    assert len(repo.list("model_downloads", "owner")) == len(drive.files) == len(source_calls) == 1
+    assert drive.uploads == (2 if mode == "expired" else 1)
+    if mode == "resume":
+        assert repo.get("model_downloads", task["id"], "owner")["resume_offset"] == 8
+        assert drive.ranges[1] == f"bytes 8-15/{len(DATA)}"

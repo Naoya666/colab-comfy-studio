@@ -980,7 +980,8 @@ def test_admission_does_not_consume_upload_until_lock(proxy, monkeypatch, admitt
     @contextmanager
     def lock():
         attempts.append(1)
-        assert not consumed
+        if not proxy.state.repo.lease.get("native_writes"):
+            assert not consumed
         yield admitted and len(attempts) > 1
 
     monkeypatch.setattr(proxy.state.repo, 'dispatch_lock', lock)

@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import settings
 from .db import Store
@@ -33,15 +34,28 @@ def main():
     signal.signal(signal.SIGINT, stop)
     store = Store(settings.database_url)
     last_ccu_tick = 0.0
+    restart_pool = ThreadPoolExecutor(max_workers=1) if args.mode == "worker" and not args.once else None
+    restart_future = None
     while running:
         try:
             scheduler = Scheduler(store)
             if args.mode == "model-worker":
                 from .gpu.model_library import transfer_tick
                 from .gpu.repository import Repository
-                result = transfer_tick(Repository(store))
+                result = transfer_tick(Repository(store), stopping=lambda: not running)
             else:
                 result = scheduler.watchdog() if args.mode == "watchdog" else scheduler.tick()
+            if args.mode == "worker" and (restart_future is None or restart_future.done()):
+                from .gpu.native_restart import tick as restart_tick
+                from .gpu.repository import Repository
+
+                if restart_future is not None:
+                    completed, restart_future = restart_future, None
+                    completed.result()
+                if restart_pool:
+                    restart_future = restart_pool.submit(restart_tick, Repository(store))
+                else:
+                    restart_tick(Repository(store))
             if args.mode == "worker" and os.getenv("STUDIO_ATELIER_ENABLED", "0") == "1":
                 from .atelier_routes import auto_export_tick
 
@@ -69,6 +83,8 @@ def main():
         if args.once:
             break
         time.sleep(max(0.1, args.interval))
+    if restart_pool:
+        restart_pool.shutdown()
 
 
 if __name__ == "__main__":

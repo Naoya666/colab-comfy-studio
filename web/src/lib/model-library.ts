@@ -4,7 +4,10 @@ export interface LibraryModel {
   state: string; size?: number; sha256?: string; expected_sha256?: string; error?: string;
   tags?: string[]; trigger_words?: string[]; drive_file_id?: string; source?: string; version_name?: string;
 }
-export interface ModelTask { id: string; model_id: string; state: string; bytes: number; total?: number; speed?: number; error?: string; }
+export interface ModelTask {
+  id: string; model_id: string; state: string; bytes: number; total?: number; speed?: number; error?: string;
+  attempt?: number; resume_offset?: number; resume_phase?: string; restart_reason?: string;
+}
 export interface Dependency {
   id: string; node_id: string; node_type: string; field: string; reference: string; model_type: string;
   architecture: string; model_id?: string; status: string; required: boolean; disabled?: boolean;
@@ -17,7 +20,7 @@ export const libraryApi = <T,>(path = '', body?: unknown, method = body === unde
 export const dependencyApi = <T,>(workflow: string, action = '', body?: unknown) =>
   apiFetch<T>(`/api/gpu/workflows/${encodeURIComponent(workflow)}/model-dependencies${action ? '/' + action : ''}`, body === undefined && !action ? {} : {method: 'POST', body: JSON.stringify(body || {})});
 export const bytesLabel = (value?: number) => value ? `${(value / 1024 ** 3).toFixed(2)} GB` : '大小待确认';
-export const modelStatus: Record<string, string> = {pending:'待准备', resolving:'解析中', downloading:'下载中', verifying:'校验中', uploading:'写入 Drive', ready:'Drive 已就绪', failed:'失败', missing:'Drive 文件缺失', unverified:'待校验', cancelled:'已取消', matched:'已绑定', unresolved:'待补充来源', needs_confirmation:'候选待确认', manual_review:'节点待人工确认'};
+export const modelStatus: Record<string, string> = {pending:'待准备', resolving:'解析中', downloading:'下载中', verifying:'校验中', uploading:'上传至 Drive', ready:'Drive 已就绪', failed:'失败', missing:'Drive 文件缺失', unverified:'待校验', cancelled:'已取消', matched:'已绑定', unresolved:'待补充来源', needs_confirmation:'候选待确认', manual_review:'节点待人工确认'};
 
 // Drive resumable sessions are bearer capabilities. Keep them out of localStorage and logs.
 export async function uploadModel(file: File, onProgress: (sent: number) => void) {

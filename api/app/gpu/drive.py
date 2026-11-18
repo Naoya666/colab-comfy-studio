@@ -696,13 +696,18 @@ class DriveStorage:
             raise _DriveSessionExpired('Drive file session expired')
         if response.status_code != 308:
             raise DriveError("Drive file session recovery failed")
-        acknowledged = self._range_end(response)
-        if response.headers.get('Range') and acknowledged is None:
+        return self._file_upload_offset(response, size), None
+
+    @staticmethod
+    def _file_upload_offset(response, size):
+        value = response.headers.get("Range")
+        match = re.fullmatch(r"bytes=0-(\d+)", value or "", re.IGNORECASE)
+        if value and not match:
             raise DriveError("Drive file session range invalid")
-        offset = acknowledged + 1 if acknowledged is not None else 0
+        offset = int(match[1]) + 1 if match else 0
         if not 0 <= offset <= size:
             raise DriveError("Drive file session offset invalid")
-        return offset, None
+        return offset
 
     def put(self, key: str, content: bytes, mime: str) -> dict:
         normalized = self._normalize_key(key)

@@ -779,6 +779,9 @@ def real_smoke(
         reusable = _reusable_smoke_job(repo, user["id"], workflow_id, row, model, compatibility)
         if reusable:
             return _smoke_response(reusable, request, resumed=True)
+        from .gpu.native import guard_generation
+
+        guard_generation(repo, user["id"], raw["execution_policy"])
         _budget_check(st, user["id"], cfg, estimated)
         job, created = repo.create_job(user["id"], raw, key)
         if created:

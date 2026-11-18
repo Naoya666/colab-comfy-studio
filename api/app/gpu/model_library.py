@@ -1,16 +1,16 @@
 """Durable model catalog and a bounded, CPU-only transfer queue.
 
-Large files live in temporary scratch only during a transfer. One dedicated
+Task-owned scratch preserves download checkpoints across worker restarts. One dedicated
 worker owns the queue lock, enabling safe restart/retry across API processes.
 """
 from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import re
 import shutil
-import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,10 +21,13 @@ from app.filelocks import file_lock
 from app.security import decrypt_secret, encrypt_secret
 
 from . import model_dependencies as deps
-from .drive import DriveError, DriveStorage
+from .drive import _RETRYABLE_STATUSES, DriveError, DriveStorage, _DriveSessionExpired, _DriveTransportError
 from .model_sources import SHA, ModelError, SourceHTTP, Sources, filename, https_url, relative_path
 
 ACTIVE = {"pending", "downloading", "verifying", "uploading"}
+BUFFER = 1024 ** 2
+CHECKPOINT_BYTES = 32 * BUFFER
+UPLOAD_CHUNK = 8 * BUFFER
 FIELDS = "id,name,size,mimeType,trashed,md5Checksum,sha256Checksum,appProperties"
 
 
@@ -185,6 +188,13 @@ class ModelLibrary:
                              if t["model_id"] == ident and t.get("state") in ACTIVE), None)
             if existing:
                 return existing
+            failed = next((t for t in self.repo.list("model_downloads", self.owner)
+                           if t["model_id"] == ident and t.get("state") == "failed" and t.get("action") == action), None)
+            if failed:
+                task = self.repo.update("model_downloads", failed["id"],
+                                        {"state": "pending", "error": None, "cancel_requested": False}, self.owner)
+                self.update(ident, state="pending", error=None)
+                return task
             task = self.repo.create("model_downloads", self.owner,
                                     {"model_id": ident, "action": action, "state": "pending", "bytes": 0,
                                      "total": None, "speed": None, "error": None, "attempt": 0, "cancel_requested": False})
@@ -409,6 +419,11 @@ def max_file_bytes():
     return int(os.getenv("MODEL_LIBRARY_MAX_FILE_BYTES", str(150 * 1024**3)))
 
 
+def transfer_directory(task_id):
+    scratch = Path(os.getenv("MODEL_LIBRARY_SCRATCH", str(settings.data_dir / "model-scratch")))
+    return scratch / ("transfer-" + hashlib.sha256(task_id.encode()).hexdigest())
+
+
 @contextmanager
 def transfer_lock():
     directory = settings.data_dir / "locks"
@@ -417,16 +432,24 @@ def transfer_lock():
         yield acquired
 
 
+class TransferPaused(Exception):
+    """The worker is shutting down; leave the task active for its replacement."""
+
+
 class ModelTransfer:
-    def __init__(self, library, task):
+    def __init__(self, library, task, *, stopping=lambda: False):
         self.lib, self.task = library, task
+        self.stopping = stopping
         self.model = library.get(task["model_id"])
         self.started = time.monotonic()
         self.last_progress = 0.0
         self.phase = None
         self.phase_started = self.started
+        self.phase_offset = 0
 
     def progress(self, phase, written=0, total=None, *, force=False):
+        if self.stopping():
+            raise TransferPaused
         current = self.lib.repo.get("model_downloads", self.task["id"], self.lib.owner)
         if current.get("cancel_requested"):
             raise ModelError("模型准备已取消，可重试")
@@ -434,9 +457,10 @@ class ModelTransfer:
         if self.phase != phase:
             self.phase = phase
             self.phase_started = now
+            self.phase_offset = written
         if force or now - self.last_progress >= 1:
             self.lib.repo.update("model_downloads", self.task["id"], {"state": phase, "bytes": written, "total": total,
-                                 "speed": round(written / max(now - self.phase_started, 0.01)), "heartbeat": time.time()}, self.lib.owner)
+                                 "speed": round(max(0, written - self.phase_offset) / max(now - self.phase_started, 0.01)), "heartbeat": time.time()}, self.lib.owner)
             self.lib.update(self.model["id"], state=phase)
             self.last_progress = now
 
@@ -450,12 +474,15 @@ class ModelTransfer:
         cache = DriveCache(token, self.lib.drive.model_cache()["folder_id"])
         written = 0
         with cache._open("GET", f"https://www.googleapis.com/drive/v3/files/{quote(meta['id'])}?alt=media") as response, path.open("wb") as output:
-            for block in iter(lambda: response.read(8 * 1024 * 1024), b""):
+            for block in iter(lambda: response.read(BUFFER), b""):
                 written += len(block)
                 if written > total:
                     raise ModelError("Drive 文件大小变化，请重试")
                 output.write(block)
+                if written % CHECKPOINT_BYTES == 0:
+                    self.flush_data(output)
                 self.progress("verifying", written, total)
+            self.flush_data(output)
         if written != total:
             raise ModelError("Drive 文件读取不完整，请重试")
         return meta
@@ -466,72 +493,315 @@ class ModelTransfer:
         if shutil.disk_usage(path.parent).free < size + 512 * 1024**2:
             raise ModelError("模型临时下载磁盘不足，请扩容 MODEL_LIBRARY_SCRATCH 或导入已有 Drive 文件")
 
+    def task_update(self, **patch):
+        self.lib.repo.update("model_downloads", self.task["id"], patch, self.lib.owner)
+
+    @staticmethod
+    def discard_cache(stream, offset=0, length=0):
+        if hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(stream.fileno(), offset, length, os.POSIX_FADV_DONTNEED)
+
+    @classmethod
+    def flush_data(cls, stream):
+        stream.flush()
+        os.fsync(stream.fileno())
+        cls.discard_cache(stream)
+
+    def source_key(self):
+        from .manifest import digest
+
+        return digest({key: self.model.get(key) for key in
+                       ("download_url", "source_identity", "expected_size", "expected_sha256")})
+
+    def hash_file(self, path, limit=None):
+        sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
+        total = path.stat().st_size if limit is None else limit
+        with path.open("rb", buffering=0) as stream:
+            while stream.tell() < total:
+                block = stream.read(min(BUFFER, total - stream.tell()))
+                if not block:
+                    raise ModelError("模型暂存文件读取不完整")
+                sha.update(block)
+                md5.update(block)
+                position = stream.tell()
+                if position % CHECKPOINT_BYTES == 0:
+                    self.discard_cache(stream, position - CHECKPOINT_BYTES, CHECKPOINT_BYTES)
+                self.progress("verifying", position, total)
+            self.discard_cache(stream)
+        return sha, md5, total
+
+    def checkpoint(self, path, stream, identity, sha, total, *, complete=False):
+        self.flush_data(stream)
+        marker = path.with_suffix(".json")
+        tmp = marker.with_suffix(".tmp")
+        with tmp.open("w") as output:
+            json.dump({**identity, "bytes": stream.tell(), "sha256": sha.hexdigest(),
+                       "total": total, "complete": complete}, output)
+            output.flush()
+            os.fsync(output.fileno())
+        tmp.replace(marker)
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def read_checkpoint(self, path):
+        try:
+            data = json.loads(path.with_suffix(".json").read_text())
+            size = path.stat().st_size
+            if (data["source_key"] != self.source_key() or type(data["bytes"]) is not int
+                    or not 0 < data["bytes"] <= min(size, max_file_bytes())):
+                return None, None
+            sha, md5, _ = self.hash_file(path, data["bytes"])
+            if sha.hexdigest() == data["sha256"]:
+                return data, (sha, md5)
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            pass
+        return None, None
+
+    @staticmethod
+    def response_etag(response):
+        etag = response.headers.get("etag", "")
+        return etag if re.fullmatch(r'"[^"\r\n]+"', etag) else None
+
+    def response_total(self, response, checkpoint):
+        if response.headers.get("content-encoding", "identity").lower() != "identity":
+            if checkpoint:
+                return None
+            raise ModelError("下载来源返回了压缩传输，无法验证文件字节范围")
+        length = response.headers.get("content-length")
+        expected = self.model.get("expected_size")
+        if checkpoint:
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("content-range", ""))
+            if response.status_code != 206 or not match:
+                return None
+            start, end, total = map(int, match.groups())
+            if (start != checkpoint["bytes"] or end != total - 1 or start >= total
+                    or checkpoint.get("total") not in {None, total} or expected not in {None, total}
+                    or (length and length != str(total - start))
+                    or (checkpoint.get("etag") and (self.response_etag(response) != checkpoint["etag"]
+                        or response.extensions.get("studio_source_resource") != checkpoint.get("resource")))):
+                return None
+            return total
+        if length and length.isdecimal():
+            total = int(length)
+            if expected is not None and total != expected:
+                raise ModelError("来源声明的文件大小与预期不匹配")
+            return total
+        return expected
+
+    def consume_download(self, path, response, checkpoint, sha, total):
+        written = checkpoint["bytes"] if checkpoint else 0
+        if total is not None and total > max_file_bytes():
+            raise ModelError("模型文件超过管理员设置的单文件大小限制")
+        self.ensure_space(path, (total - written) if total is not None else BUFFER)
+        self.task_update(resume_offset=written, resume_phase="downloading")
+        self.progress("downloading", written, total, force=True)
+        identity = {"source_key": self.source_key(), "etag": self.response_etag(response),
+                    "resource": response.extensions.get("studio_source_resource")}
+        with path.open("r+b" if checkpoint else "wb", buffering=0) as output:
+            output.seek(written)
+            output.truncate()
+            checkpoint_at = written
+            for block in response.iter_bytes(BUFFER):
+                written += len(block)
+                if written > max_file_bytes() or (total is not None and written > total):
+                    raise ModelError("下载文件大小超过预期或限制")
+                output.write(block)
+                sha.update(block)
+                if written - checkpoint_at >= CHECKPOINT_BYTES:
+                    self.ensure_space(path, 0)
+                    self.checkpoint(path, output, identity, sha, total)
+                    checkpoint_at = written
+                if self.stopping():
+                    self.checkpoint(path, output, identity, sha, total)
+                self.progress("downloading", written, total)
+            if not written or (total is not None and written != total):
+                raise ModelError("下载中断或文件不完整，请重试")
+            self.checkpoint(path, output, identity, sha, written, complete=True)
+
     def download(self, path):
-        url = self.model["download_url"]
-        written = 0
-        with self.lib.http.stream(url) as response:
-            raw_size = response.headers.get("content-length")
-            total = int(raw_size) if raw_size and raw_size.isdigit() else self.model.get("expected_size")
-            self.ensure_space(path, total or 512 * 1024**2)
-            self.progress("downloading", 0, total, force=True)
-            with path.open("wb") as output:
-                for block in response.iter_bytes(8 * 1024 * 1024):
-                    written += len(block)
-                    self.ensure_space(path, len(block))
-                    if written > max_file_bytes() or (total and written > total):
-                        raise ModelError("下载文件大小超过预期/限制")
-                    output.write(block)
-                    self.progress("downloading", written, total)
-        if total and written != total:
-            raise ModelError("下载中断或文件不完整，请重试")
+        prior = path.exists()
+        checkpoint, hashes = self.read_checkpoint(path)
+        if checkpoint:
+            sha, md5 = hashes
+            offset = checkpoint["bytes"]
+            expected_hash = self.model.get("expected_sha256")
+            if checkpoint.get("complete") or (
+                expected_hash and offset == checkpoint.get("total") and sha.hexdigest() == expected_hash
+            ):
+                with path.open("r+b") as stream:
+                    stream.truncate(offset)
+                self.task_update(resume_offset=offset, resume_phase="verifying", restart_reason=None)
+                return sha, md5, offset
+            # A pinned upstream object with a known digest can resume without a strong ETag.
+            pinned = (self.model.get("source") in {"huggingface", "civitai"}
+                      and self.model.get("source_identity") and expected_hash)
+            if checkpoint.get("etag") or pinned:
+                with self.lib.http.stream(self.model["download_url"], offset=offset, validator=checkpoint.get("etag")) as response:
+                    total = self.response_total(response, checkpoint)
+                    if total is not None:
+                        self.task_update(restart_reason=None)
+                        self.consume_download(path, response, checkpoint, sha, total)
+                        return None
+                    if response.status_code == 200:
+                        self.task_update(restart_reason="来源版本变化或忽略了 HTTP Range，已从头下载")
+                        path.with_suffix(".json").unlink(missing_ok=True)
+                        self.consume_download(path, response, None, hashlib.sha256(), self.response_total(response, None))
+                        return None
+                reason = "来源版本变化或未返回匹配的 HTTP Range，已从头下载"
+            else:
+                reason = "无法确认下载来源版本，已从头下载"
+        else:
+            reason = "下载检查点缺失或校验失败，已从头下载"
+        if prior or self.task.get("state") in {"downloading", "verifying", "uploading"}:
+            self.task_update(restart_reason=reason)
+        path.with_suffix(".json").unlink(missing_ok=True)
+        with self.lib.http.stream(self.model["download_url"]) as response:
+            self.consume_download(path, response, None, hashlib.sha256(), self.response_total(response, None))
+        return None
+
+    @staticmethod
+    def matches(entry, sha, md5, size):
+        return (not entry.get("trashed") and str(entry.get("size")) == str(size)
+                and entry.get("md5Checksum") == md5 and entry.get("sha256Checksum") in {None, sha})
+
+    def find_uploaded(self, drive, parent, sha, md5, size):
+        query = f"'{drive._q(parent)}' in parents and trashed = false and name = '{sha}'"
+        params = {"q": query, "fields": f"nextPageToken,files({FIELDS})"}
+        while True:
+            response = drive._request("GET", drive.base_url + "/files", params=params)
+            data = drive._ensure_ok(response, "模型去重查询")
+            for entry in data.get("files") or []:
+                if self.matches(entry, sha, md5, size):
+                    return entry
+            if not data.get("nextPageToken"):
+                return None
+            params["pageToken"] = data["nextPageToken"]
+
+    def uploaded_by_id(self, drive, file_id, sha, md5, size):
+        if not file_id:
+            return None
+        response = drive._request("GET", drive.base_url + "/files/" + quote(file_id), params={"fields": FIELDS})
+        if response.status_code == 404:
+            return None
+        entry = drive._ensure_ok(response, "模型完整性核对")
+        if not self.matches(entry, sha, md5, size):
+            raise ModelError("Drive 已存在的上传对象大小或校验值不匹配")
+        return entry
 
     def upload(self, path, sha, md5, size):
         drive = self.lib.drive
         root = drive.model_cache()["folder_id"]
-        content = drive._folder("by-sha256", root)
-        parent = drive._folder(sha[:2], content)
-        # Content-addressed physical identity, independent of filename/category/GPU.
-        query = f"'{drive._q(parent)}' in parents and trashed = false and name = '{sha}'"
-        response = drive._request("GET", drive.base_url + "/files", params={"q": query, "fields": f"files({FIELDS})"})
-        for entry in drive._ensure_ok(response, "模型去重查询").get("files") or []:
-            if int(entry.get("size") or 0) == size and entry.get("md5Checksum") == md5:
-                return entry
-        response = drive._request("POST", drive.upload_url + "/files",
-                                  params={"uploadType": "resumable", "fields": FIELDS},
-                                  json_body={"name": sha, "parents": [parent],
-                                             "appProperties": {"sha256": sha, "size": str(size)}},
-                                  headers={"X-Upload-Content-Length": str(size), "X-Upload-Content-Type": "application/octet-stream"})
-        location = response.headers.get("location") or ""
-        parsed = urlsplit(location)
-        if response.status_code >= 300 or parsed.scheme != "https" or parsed.hostname not in {"www.googleapis.com", "content.googleapis.com"}:
-            raise ModelError("Drive 模型上传会话创建失败，请重新授权后重试")
-        # Persist encrypted upload URL for diagnostics/reconciliation; never expose its bearer capability.
-        self.lib.repo.update("model_downloads", self.task["id"], {"encrypted_upload_session": encrypt_secret(location)}, self.lib.owner)
+        parent = drive._folder(sha[:2], drive._folder("by-sha256", root))
+        mime = "application/octet-stream"
+        identity = [root, sha, size]
+        file_id = self.task.get("upload_file_id") if self.task.get("upload_identity") == identity else None
+        location = None
+        if self.task.get("encrypted_upload_session") and self.task.get("upload_identity") in (None, identity):
+            location = decrypt_secret(self.task["encrypted_upload_session"])
+            if not DriveStorage._controlled_upload_location(location):
+                raise ModelError("Drive 模型上传会话地址无效")
         offset = 0
-        with path.open("rb") as stream:
+        expired = False
+        for _ in range(3):
+            try:
+                if location:
+                    offset, result = drive._file_resume_status(location, size, mime)
+                    self.task_update(resume_phase="uploading", resume_offset=offset)
+                    if result:
+                        return result
+                else:
+                    existing = self.uploaded_by_id(drive, file_id, sha, md5, size) or self.find_uploaded(drive, parent, sha, md5, size)
+                    if existing:
+                        return existing
+                    if expired:
+                        self.task_update(resume_phase="uploading", resume_offset=0,
+                                         restart_reason="Drive 上传会话已过期，已用校验后的文件重新上传")
+                    if not file_id:
+                        response = drive._request("GET", drive.base_url + "/files/generateIds", params={"count": 1})
+                        ids = drive._ensure_ok(response, "模型上传文件 ID 分配").get("ids") or []
+                        if len(ids) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]+", ids[0]):
+                            raise ModelError("Drive 未返回有效的上传文件 ID")
+                        file_id = ids[0]
+                        self.task_update(upload_file_id=file_id, upload_identity=identity, encrypted_upload_session=None)
+                    response = drive._request("POST", drive.upload_url + "/files",
+                                              params={"uploadType": "resumable", "fields": FIELDS},
+                                              json_body={"id": file_id, "name": sha, "parents": [parent],
+                                                         "appProperties": {"sha256": sha, "size": str(size)}},
+                                              headers={"X-Upload-Content-Length": str(size), "X-Upload-Content-Type": mime})
+                    if response.status_code == 409:
+                        existing = self.uploaded_by_id(drive, file_id, sha, md5, size)
+                        if existing:
+                            return existing
+                    location = response.headers.get("location") or ""
+                    if response.status_code not in {200, 201} or not DriveStorage._controlled_upload_location(location):
+                        raise ModelError(f"Drive 模型上传会话创建失败（HTTP {response.status_code}）")
+                    self.task_update(encrypted_upload_session=encrypt_secret(location), upload_identity=identity)
+                self.progress("uploading", offset, size, force=True)
+                return self.upload_chunks(drive, location, path, offset, size, mime)
+            except _DriveSessionExpired:
+                location, offset = None, 0
+                expired = True
+            except _DriveTransportError:
+                existing = self.uploaded_by_id(drive, file_id, sha, md5, size) or self.find_uploaded(drive, parent, sha, md5, size)
+                if existing:
+                    return existing
+                raise
+        raise ModelError("Drive 上传会话反复失效，请稍后重试")
+
+    def upload_chunks(self, drive, location, path, offset, size, mime):
+        stalled = 0
+        with path.open("rb", buffering=0) as stream:
+            def chunks(length):
+                while length > 0:
+                    data = stream.read(min(BUFFER, length))
+                    if not data:
+                        raise ModelError("模型暂存文件在上传时发生变化")
+                    yield data
+                    length -= len(data)
+
             while offset < size:
-                block = stream.read(8 * 1024 * 1024)
-                end = offset + len(block) - 1
-                response = drive._request("PUT", location, content=block,
-                                          headers={"Content-Type": "application/octet-stream", "Content-Range": f"bytes {offset}-{end}/{size}"},
-                                          retryable=False)
-                offset = end + 1
-                if offset < size and response.status_code != 308:
-                    raise ModelError(f"Drive 分块上传失败（HTTP {response.status_code}），请重试")
+                stream.seek(offset)
+                previous = offset
+                length = min(UPLOAD_CHUNK, size - offset)
+                end = offset + length - 1
+                try:
+                    response = drive._request("PUT", location, content=chunks(length), retryable=False,
+                                              headers={"Content-Type": mime, "Content-Length": str(length),
+                                                       "Content-Range": f"bytes {offset}-{end}/{size}"})
+                except _DriveTransportError:
+                    response = None
+                if response is None or response.status_code in _RETRYABLE_STATUSES:
+                    offset, result = drive._file_resume_status(location, size, mime)
+                    if result:
+                        return result
+                elif response.status_code in {404, 410}:
+                    raise _DriveSessionExpired("Drive 模型上传会话已过期")
+                elif response.status_code in {200, 201}:
+                    return drive._ensure_ok(response, "模型上传")
+                elif response.status_code == 308:
+                    offset = DriveStorage._file_upload_offset(response, size)
+                    if not previous <= offset <= end + 1:
+                        raise ModelError("Drive 返回的模型上传偏移无效")
+                else:
+                    raise ModelError(f"Drive 分块上传失败（HTTP {response.status_code}）")
+                self.discard_cache(stream, previous, length)
+                stalled = stalled + 1 if offset <= previous else 0
+                if stalled >= 3:
+                    raise ModelError("Drive 模型上传未继续推进，请重试")
                 self.progress("uploading", offset, size)
-        entry = drive._ensure_ok(response, "模型上传")
-        if int(entry.get("size") or 0) != size or entry.get("md5Checksum") != md5:
-            raise ModelError("Drive 上传结果大小或校验和不匹配，未提交 ready")
-        return entry
+        _, result = drive._file_resume_status(location, size, mime)
+        if not result:
+            raise ModelError("Drive 尚未确认模型已完整上传，请重试")
+        return result
 
     def run(self):
-        scratch = Path(os.getenv("MODEL_LIBRARY_SCRATCH", str(settings.data_dir / "model-scratch")))
-        scratch.mkdir(parents=True, exist_ok=True)
-        # Any previous process holding the global lock has exited. Its scratch can be safely removed.
-        for old in scratch.glob("transfer-*"):
-            if old.is_dir():
-                shutil.rmtree(old)
-        self.lib.repo.update("model_downloads", self.task["id"], {"attempt": self.task.get("attempt", 0) + 1}, self.lib.owner)
+        directory = transfer_directory(self.task["id"])
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = directory / "weight.partial"
+        self.task_update(attempt=self.task.get("attempt", 0) + 1)
         try:
             self.progress("verifying", force=True)
             # Reuse verified catalog content before any download. Check actual Drive metadata first.
@@ -554,42 +824,37 @@ class ModelTransfer:
                         raise ModelError("Drive 原生 SHA-256 或大小不匹配，未提交 ready")
                     self.finish(remote["id"], native_hash, size, remote["md5Checksum"], self.model.get("managed_file", False))
                     return
-            with tempfile.TemporaryDirectory(prefix="transfer-", dir=scratch) as directory:
-                path = Path(directory) / "weight.partial"
-                legacy = False
-                if self.model.get("legacy_target") and self.model.get("expected_sha256") and not self.model.get("drive_file_id"):
-                    from .runtime_worker import DriveCache
-                    config = self.lib.drive.model_cache()
-                    cache = DriveCache(config["access_token"], config["folder_id"])
-                    entry = cache.lookup(self.model["legacy_target"], self.model["expected_sha256"], self.model.get("expected_size"))
-                    if entry:
-                        self.model["drive_file_id"] = entry["id"]
-                        legacy = True
-                imported = legacy or self.model.get("source") in {"drive", "upload", "legacy_cache"} or (self.task.get("action") == "verify" and bool(self.model.get("drive_file_id")))
-                meta = self.read_drive(path) if imported else None
-                if not imported:
-                    self.download(path)
-                self.progress("verifying", force=True)
-                sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
-                with path.open("rb") as stream:
-                    for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                        sha.update(block)
-                        md5.update(block)
-                        self.progress("verifying", stream.tell(), path.stat().st_size)
-                sha, md5, size = sha.hexdigest(), md5.hexdigest(), path.stat().st_size
-                if not size or (expected and sha != expected) or (self.model.get("expected_size") and size != self.model["expected_size"]):
-                    raise ModelError("模型 SHA-256 或文件大小不匹配，未提交 ready；请核对来源和预期值")
-                if imported and meta.get("md5Checksum") and md5 != meta["md5Checksum"]:
-                    raise ModelError("Drive 文件传输校验失败，请重试")
-                if not imported:
-                    self.progress("uploading", 0, size, force=True)
-                    meta = self.upload(path, sha, md5, size)
-                self.progress("verifying", size, size, force=True)
-                # Confirm remote commit, not just the final upload response.
-                remote = self.lib.metadata(meta["id"])
-                if int(remote["size"]) != size or remote.get("md5Checksum") != md5:
-                    raise ModelError("Drive 最终完整性检查失败，未提交 ready")
-                self.finish(meta["id"], sha, size, md5, self.model.get("managed_file", False) if imported else True)
+            legacy = False
+            if self.model.get("legacy_target") and self.model.get("expected_sha256") and not self.model.get("drive_file_id"):
+                from .runtime_worker import DriveCache
+                config = self.lib.drive.model_cache()
+                cache = DriveCache(config["access_token"], config["folder_id"])
+                entry = cache.lookup(self.model["legacy_target"], self.model["expected_sha256"], self.model.get("expected_size"))
+                if entry:
+                    self.model["drive_file_id"] = entry["id"]
+                    legacy = True
+            imported = legacy or self.model.get("source") in {"drive", "upload", "legacy_cache"} or (self.task.get("action") == "verify" and bool(self.model.get("drive_file_id")))
+            meta = self.read_drive(path) if imported else None
+            verified = None if imported else self.download(path)
+            self.progress("verifying", force=True)
+            sha, md5, size = verified or self.hash_file(path)
+            sha, md5 = sha.hexdigest(), md5.hexdigest()
+            if not size or (expected and sha != expected) or (self.model.get("expected_size") and size != self.model["expected_size"]):
+                path.unlink(missing_ok=True)
+                path.with_suffix(".json").unlink(missing_ok=True)
+                raise ModelError("模型 SHA-256 或文件大小不匹配，未提交 ready；请核对来源和预期值")
+            if imported and meta.get("md5Checksum") and md5 != meta["md5Checksum"]:
+                raise ModelError("Drive 文件传输校验失败，请重试")
+            if not imported:
+                meta = self.upload(path, sha, md5, size)
+            self.progress("verifying", size, size, force=True)
+            # Confirm remote commit, not just the final upload response.
+            remote = self.lib.metadata(meta["id"])
+            if not self.matches(remote, sha, md5, size):
+                raise ModelError("Drive 最终完整性检查失败，未提交 ready")
+            self.finish(meta["id"], sha, size, md5, self.model.get("managed_file", False) if imported else True)
+        except TransferPaused:
+            return
         except Exception as exc:
             # Provider exception messages/responses may contain signed URLs or credentials.
             error = str(exc) if isinstance(exc, ModelError) else (
@@ -598,29 +863,46 @@ class ModelTransfer:
             self.lib.update(self.model["id"], state="failed", error=error)
             self.lib.repo.update("model_downloads", self.task["id"], {"state": "cancelled" if cancelled else "failed", "error": error}, self.lib.owner)
 
+        finally:
+            current = self.lib.repo.get("model_downloads", self.task["id"], self.lib.owner) or {}
+            if current.get("state") in {"ready", "cancelled"} or not path.exists():
+                shutil.rmtree(directory, ignore_errors=True)
+
     def finish(self, file_id, sha, size, md5, managed):
         from .accounts import AccountService
+
+        current = self.lib.repo.get("model_downloads", self.task["id"], self.lib.owner)
+        if current.get("cancel_requested"):
+            raise ModelError("模型准备已取消，可重试")
         storage_account = getattr(self.lib.drive, "account_id", None) or AccountService.default_account_id(self.lib.owner)
         self.lib.update(self.model["id"], drive_account_id=storage_account, state="ready", drive_file_id=file_id, sha256=sha, size=size,
                         drive_md5=md5, managed_file=managed, error=None,
                         integrity="expected_hash_verified" if self.model.get("expected_sha256") else "computed_hash_only")
         self.lib.repo.update("model_downloads", self.task["id"], {"state": "ready", "bytes": size, "total": size,
-                             "error": None, "encrypted_upload_session": None}, self.lib.owner)
+                             "error": None, "encrypted_upload_session": None, "upload_identity": None,
+                             "upload_file_id": None}, self.lib.owner)
 
 
-def transfer_tick(repo):
+def transfer_tick(repo, *, stopping=lambda: False):
     """Run in a dedicated worker; one active transfer per shared data directory."""
     with transfer_lock() as acquired:
-        if not acquired:
+        if not acquired or stopping():
             return {"advanced": False}
-        tasks = [t for t in repo.list("model_downloads") if t.get("state") in ACTIVE]
+        tasks = []
+        for task in repo.list("model_downloads"):
+            if task.get("state") in ACTIVE:
+                tasks.append(task)
+            elif task.get("state") in {"ready", "cancelled"}:
+                directory = transfer_directory(task["id"])
+                if directory.is_dir():
+                    shutil.rmtree(directory)
         if not tasks:
             return {"advanced": False}
         task = sorted(tasks, key=lambda t: str(t.get("created_at")))[0]
         lib = ModelLibrary(repo, task["owner_id"])
         try:
             # Interrupted active tasks are safely retried; no ready state is inferred.
-            ModelTransfer(lib, task).run()
+            ModelTransfer(lib, task, stopping=stopping).run()
         finally:
             lib.close()
         return {"advanced": True, "job_id": task["id"], "state": "model_transfer"}

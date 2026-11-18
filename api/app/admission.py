@@ -245,6 +245,9 @@ def admit_job(st, user, body, key, *, validate_only=False):
     with st.admission_lock() as acquired:
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "队列正在同步，请用相同幂等键稍后重试", 503, True)
+        from .gpu.native import guard_generation
+
+        guard_generation(repo, user["id"], policy)
         job, created = repo.create_job(user["id"], body, key, admitted={
             **compute_fields,
             "execution_policy": policy,

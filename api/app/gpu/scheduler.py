@@ -1083,6 +1083,7 @@ class Scheduler:
                                float(job.get("native_session_deadline_epoch") or lease["deadline_epoch"]))
                 lease = self._update("leases", lease["id"], {
                     "native_ready": True, "native_last_busy": self.clock(),
+                    "native_bootstrap_job_id": job["id"],
                     "deadline_epoch": deadline,
                     "native_idle_minutes": (job.get("execution_policy") or {}).get(
                         "retain_idle_minutes", settings.native_comfy_idle_minutes),

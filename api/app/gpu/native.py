@@ -63,6 +63,17 @@ def active_lease(repo, owner="owner"):
                  if x.get("native_comfy") and x.get("state") not in {"deleted", "quarantined", "releasing", "deleting"}), None)
 
 
+def restart_active(lease):
+    return (lease.get("native_restart") or {}).get("phase") in {"checking", "syncing", "rebooting", "recovering"}
+
+
+def guard_generation(repo, owner, policy):
+    if policy.get("provider") == "colab":
+        lease = active_lease(repo, owner)
+        if lease and policy.get("instance_id") in {None, lease.get("instance_id")} and restart_active(lease):
+            raise APIError("NATIVE_RESTARTING", "原生 ComfyUI 正在重启，请等当前操作完成后重试", 409, True)
+
+
 def busy(client=None):
     """Unknown is busy: network errors must never stop a video or an upload."""
     try:
@@ -197,17 +208,25 @@ def runtime_secrets(repo, job):
         else:
             client_id, client_secret, _ = google._config()
         return {"owner_folder_id": drive._owner_folder_id, "models_folder_id": cache["folder_id"],
+                "lease_id": job.get("lease_id"),
                 "client_id": client_id, "client_secret": client_secret,
                 "refresh_token": decrypt_secret(cred["encrypted_refresh_token"]),
                 "access_token": cache["access_token"],
                 "tunnel_token": secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE"),
                 "cache_gb": settings.native_comfy_cache_gb, "max_upload_mb": settings.native_comfy_max_upload_mb,
-                "models": [dict(filename=m.get("filename"), category=m.get("model_type"), file_id=m["drive_file_id"])
-                           for m in repo.list("model_library", job["owner_id"])
-                           if m.get("state") == "ready" and m.get("drive_file_id")
-                           and m.get("drive_account_id") in {None, drive.account_id}]}
+                "models": ready_models(repo, job["owner_id"], drive.account_id)}
     finally:
         drive.close()
+
+
+def ready_models(repo, owner, account):
+    from .accounts import AccountService
+
+    default = AccountService.default_account_id(owner)
+    return [dict(filename=m.get("filename"), category=m.get("model_type"), file_id=m["drive_file_id"])
+            for m in repo.list("model_library", owner)
+            if m.get("state") == "ready" and m.get("drive_file_id")
+            and (m.get("drive_account_id") or default) == (account or default)]
 
 
 def _runtime_deleted(repo, lease):
@@ -365,8 +384,11 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
             return False  # Existing scheduler cleanup still confirms deletion.
         instance = repo.get("instances", lease.get("instance_id"), lease["owner_id"]) or {}
         manual = bool(instance.get("manual_stop_requested"))
+        expired = clock() >= float(lease.get("deadline_epoch") or float("inf"))
         if not manual:
-            if upstream_busy:
+            if restart_active(lease) and not expired:
+                retained = True
+            elif upstream_busy:
                 lease = repo.update("leases", lease["id"], {"native_last_busy": clock()}, lease["owner_id"])
                 retained = True
             elif clock() - float(lease.get("native_http_heartbeat") or 0) < 30:
@@ -390,7 +412,7 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
     return True
 
 
-def begin_write(repo, lease, *, allow_stopping=False, timeout=2.0):
+def begin_write(repo, lease, *, allow_stopping=False, timeout=2.0, write_id=None):
     """Wait only for local admission; never replay an upstream write.
 
     Keep the scheduler's nonblocking lock semantics. Sleep after releasing each
@@ -406,6 +428,8 @@ def begin_write(repo, lease, *, allow_stopping=False, timeout=2.0):
                 if (not fresh.get("native_ready") or fresh.get("native_draining")
                         or fresh.get("state") in {"deleted", "releasing", "deleting"}):
                     raise APIError("NATIVE_DRAINING", "实例正在释放，请回到 Studio 重启", 409)
+                if restart_active(fresh):
+                    raise APIError("NATIVE_RESTARTING", "原生 ComfyUI 正在重启，请等当前操作完成后重试", 409)
                 instance = repo.get("instances", fresh.get("instance_id"), fresh["owner_id"]) or {}
                 if (instance.get("native_draining")
                         or instance.get("state") in {"deleted", "releasing", "deleting"}):
@@ -414,14 +438,44 @@ def begin_write(repo, lease, *, allow_stopping=False, timeout=2.0):
                 if not allow_stopping and (instance.get("manual_stop_requested")
                         or now >= float(fresh.get("deadline_epoch") or float("inf"))):
                     raise APIError("NATIVE_DRAINING", "会话已到运行时限或正在停止；等待已有任务及同步结束后重启", 409)
-                repo.update("leases", fresh["id"], {
+                patch = {
                     "native_last_write": now, "native_http_heartbeat": now,
-                }, fresh["owner_id"])
+                }
+                if write_id:
+                    patch["native_writes"] = {**active_writes(fresh, now), write_id: now}
+                repo.update("leases", fresh["id"], patch, fresh["owner_id"])
                 return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise APIError("SCHEDULER_BUSY", "会话状态繁忙，请稍后重试", 503)
         time.sleep(min(0.02, remaining))
+
+
+def active_writes(lease, now):
+    return {key: stamp for key, stamp in (lease.get("native_writes") or {}).items() if now - stamp < 60}
+
+
+def update_write(repo, lease, write_id, *, finished=False):
+    deadline = time.monotonic() + 2
+    while True:
+        with repo.store.dispatch_lock() as acquired:
+            if acquired:
+                fresh = repo.get("leases", lease["id"], lease["owner_id"])
+                if not fresh or write_id not in (fresh.get("native_writes") or {}):
+                    return
+                now = time.time()
+                writes = active_writes(fresh, now)
+                if finished:
+                    writes.pop(write_id, None)
+                else:
+                    writes[write_id] = now
+                repo.update("leases", lease["id"], {
+                    "native_writes": writes, "native_last_write": now, "native_http_heartbeat": now,
+                }, lease["owner_id"])
+                return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.02)
 
 
 def ready(client=None):

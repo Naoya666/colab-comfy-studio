@@ -151,13 +151,13 @@ export function unwrapGpuResponse<T>(value: ApiEnvelope<T> | T): T {
   return envelope.data as T;
 }
 
-export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+export async function apiFetch<T>(path: string, init: RequestInit = {}, timeoutMs = 15000): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const token = sessionToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 15000);
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   const abortParent = () => controller.abort();
   init.signal?.addEventListener('abort', abortParent, { once: true });
   let response: Response;

@@ -82,11 +82,12 @@ def test_same_spec_reuse_and_busy_or_different_spec_rejected():
         data={"account_id": "a", "runtime_spec_requested": spec(), "compatibility_signature": "same"},
     )
     job = {"requested_spec": spec(), "compatibility_signature": "same"}
-    assert service._compatible(instance, job, "a")
-    assert not service._compatible(instance, {**job, "requested_spec": spec("A100")}, "a")
-    assert not service._compatible(instance, job, "other-account")
-    instance.data["current_job_id"] = "other-job"
-    assert not service._compatible(instance, job, "a")
+    with service.store.Session() as session:
+        assert service._compatible(session, instance, job, "a")
+        assert not service._compatible(session, instance, {**job, "requested_spec": spec("A100")}, "a")
+        assert not service._compatible(session, instance, job, "other-account")
+        instance.data["current_job_id"] = "other-job"
+        assert not service._compatible(session, instance, job, "a")
 
 
 def test_cache_signature_separates_gpu_not_parameters():
