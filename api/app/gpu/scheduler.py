@@ -1401,6 +1401,10 @@ class Scheduler:
             or lease.get("cleanup_claim_token")
         ):
             return None
+        # A CLI intent without an endpoint must go through cleanup's exact
+        # notebook lookup before it can use bound-runtime inspection.
+        if lease.get("tunnel_nbh") and not lease.get("tunnel_endpoint"):
+            return None
         owner = lease["owner_id"]
         instance = self._get("instances", lease["instance_id"], owner)
         if (
