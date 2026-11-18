@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Request
 from .common import APIError, current_user, ok
 from .config import settings
 from .gpu import native
+from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
 from .security import sign_session
 
 router = APIRouter(prefix="/api/gpu/native")
@@ -19,6 +20,10 @@ async def status(request: Request, user=Depends(current_user)):
     lease = native.active_lease(repo, user["id"])
     native_jobs = [j for j in repo.list("jobs", user["id"]) if (j.get("snapshot") or {}).get("native_comfy")]
     job = max(native_jobs, key=lambda j: j.get("created_at") or "", default=None)
+    last_instance_id = (job or {}).get("instance_id")
+    instance = repo.get("instances", last_instance_id, user["id"]) if not lease and last_instance_id else None
+    reclaimed = bool(instance and instance.get("state") == "deleted"
+                     and instance.get("remote_delete_source") == RUNTIME_MISSING)
     ready = False
     if lease and lease.get("native_ready"):
         try:
@@ -33,7 +38,8 @@ async def status(request: Request, user=Depends(current_user)):
                "timeouts": native.timeout_options(),
                "ready": ready, "instance_id": lease.get("instance_id") if lease else None,
                "job_id": job["id"] if job else None, "state": job["state"] if job else "stopped",
-               "error": job.get("error_message") if job else None,
+               "reason": RUNTIME_MISSING if reclaimed else None,
+               "error": RUNTIME_MISSING_MESSAGE if reclaimed else (job or {}).get("error_message"),
                "events": [{"message": e.get("message"), "state": e.get("state")}
                           for e in events if e.get("job_id") == (job or {}).get("id")][-30:]}, request)
 

@@ -78,6 +78,7 @@ test('activation uses the selected project instead of the first or a mock projec
 test('a released machine blocks submission and keeps the selected account', () => {
   const instances = [
     { id: 'dead', state: 'released', account_id: 'acct-user', instance_label: '旧机器' },
+    { id: 'reclaimed', state: 'retained_idle', runtime_deleted: true, account_id: 'acct-user' },
     { id: 'live', state: 'ready', account_id: 'acct-other', instance_label: '另一台' },
   ];
   const blocked = resolveInstanceSubmission({ accountId: 'acct-user', instanceId: 'dead' }, instances);
@@ -86,6 +87,7 @@ test('a released machine blocks submission and keeps the selected account', () =
   assert.equal(blocked.accountId, 'acct-user');
   assert.match(blocked.message, /没有提交/);
   assert.match(blocked.message, /没有换账号/);
+  assert.equal(resolveInstanceSubmission({ accountId: 'acct-user', instanceId: 'reclaimed' }, instances).ok, false);
 
   const automatic = resolveInstanceSubmission({ accountId: 'acct-user', instanceId: null }, instances);
   assert.equal(automatic.ok, true);

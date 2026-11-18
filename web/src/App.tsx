@@ -341,20 +341,24 @@ export default function App() {
   useEffect(() => {
     if (!loggedIn) return;
     let alive = true;
+    let resourceSequence = 0;
+    let appliedResourceSequence = 0;
     const refreshResources = async () => {
+      const seq = ++resourceSequence;
       try {
         const [accountResult, instanceResult] = await Promise.all([
           apiFetch<unknown>('/api/gpu/accounts'),
           listGpuInstances(),
         ]);
-        if (!alive) return;
+        if (!alive || seq < appliedResourceSequence) return;
+        appliedResourceSequence = seq;
         const nextAccounts = (Array.isArray(accountResult) ? accountResult : record(accountResult) && Array.isArray(accountResult.data) ? accountResult.data : []) as GpuAccount[];
         const nextInstances = instanceResult as unknown as GpuInstance[];
         setAccounts(uniqueBy(nextAccounts, (account) => account.account_id));
         setInstances(uniqueBy(nextInstances, (instance) => instanceIdOf(instance)));
         setResourceError('');
       } catch (cause) {
-        if (alive) setResourceError(`账号/实例：${apiMessage(cause)}`);
+        if (alive && seq === resourceSequence) setResourceError(`账号/实例：${apiMessage(cause)}`);
       }
     };
     resourceRefresh.current = () => void refreshResources();
@@ -739,11 +743,12 @@ export default function App() {
         const index = current.findIndex((item) => item.instance_id === updatedInstance.instance_id);
         const resolvedIndex = index >= 0 ? index : current.findIndex((item) => instanceIdOf(item) === instanceIdOf(updatedInstance));
         if (resolvedIndex < 0) return uniqueBy([updatedInstance, ...current], (instance) => instanceIdOf(instance));
+        if ((current[resolvedIndex].version ?? 0) > (updatedInstance.version ?? 0)) return current;
         const next = [...current];
         next[resolvedIndex] = { ...next[resolvedIndex], ...updatedInstance, id: instanceIdOf(updatedInstance), instance_id: instanceIdOf(updatedInstance) };
         return next;
       });
-      setJobs((current) => current.map((item) => item.instance_id === instanceId
+      setJobs((current) => current.map((item) => item.instance_id === instanceId && !item.runtime_deleted
         ? { ...item, lifecycle: 'retain', retained_until: updatedInstance.retained_until, instance_state: updatedInstance.state }
         : item));
       await refreshJobs();

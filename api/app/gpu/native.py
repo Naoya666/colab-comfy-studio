@@ -147,6 +147,8 @@ def admit(repo, owner, body, key):
         # Never create a second GPU while another live instance is already present.
         instances = [i for i in repo.list("instances", owner) if i.get("state") not in {"deleted"} and i.get("provider") == "colab"]
         requested_instance = body.get("instance_id")
+        if requested_instance and not instances:
+            raise APIError("INSTANCE_CONFLICT", "所选实例已释放或不能复用，请重新选择 GPU", 409)
         if instances:
             if len(instances) != 1 or (requested_instance and instances[0]["id"] != requested_instance):
                 raise APIError("INSTANCE_CONFLICT", "请明确选择唯一可复用实例，或先释放其他实例", 409)
@@ -214,22 +216,25 @@ def _runtime_deleted(repo, lease):
     handle = lease.get("handle")
     if lease.get("provider") != "colab" or not lease.get("account_id") or not isinstance(handle, dict):
         return False
-    from .colab import GoogleColabProvider
+    from .colab import GoogleColabProvider, runtime_status
 
     try:
         handle = {**handle, "job_id": lease.get("owner_job_id"), "owner_job_id": lease.get("owner_job_id")}
         with httpx.Client(timeout=10) as client:
             provider = GoogleColabProvider(repo, lease["owner_id"], account_id=lease["account_id"], client=client)
-            return provider.inspect(handle).get("deleted") is True
+            return runtime_status(provider.inspect(handle)) == "missing"
     except Exception:
         return False  # Provider outages are not deletion evidence.
 
 
 def _lease_identity(lease):
-    return tuple(lease.get(k) for k in ("owner_id", "owner_job_id", "instance_id", "account_id", "runtime_id", "request_id", "handle"))
+    return tuple(lease.get(k) for k in (
+        "id", "provider", "owner_id", "owner_job_id", "current_job_id", "instance_id", "account_id",
+        "runtime_id", "request_id", "handle", "tunnel_endpoint", "tunnel_nbh",
+    ))
 
 
-def protect_lease(repo, lease, clock=time.time):
+def protect_lease(repo, lease, clock=time.time, *, check_remote=True):
     """Fence idle shutdown against new uploads/prompts under the existing dispatch lock."""
     if not lease.get("native_comfy"):
         return False
@@ -245,14 +250,14 @@ def protect_lease(repo, lease, clock=time.time):
     upstream_busy = busy()
     # An offline tunnel also reports "busy". It cannot veto reconciliation of
     # a VM already confirmed absent by Colab's independent control plane.
-    remote_deleted = upstream_busy and _runtime_deleted(repo, lease)
+    remote_deleted = check_remote and upstream_busy and _runtime_deleted(repo, lease)
     with repo.store.dispatch_lock() as acquired:
         if not acquired:
             return True
-        lease = repo.get("leases", lease["id"], lease["owner_id"]) or lease
+        lease = repo.get("leases", lease["id"], lease["owner_id"])
+        if not lease or lease.get("state") == "deleted" or _lease_identity(lease) != identity:
+            return True
         if remote_deleted:
-            if _lease_identity(lease) != identity:
-                return True  # The lease was handed off while inspection ran.
             repo.update("leases", lease["id"], {
                 "native_ready": False, "native_draining": True,
                 "native_remote_deleted_verified_at": clock(),

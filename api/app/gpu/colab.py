@@ -13,6 +13,19 @@ from app.security import decrypt_secret, encrypt_secret
 
 from .google import GoogleError, GoogleService
 
+RUNTIME_MISSING = "provider_runtime_missing"
+RUNTIME_MISSING_MESSAGE = "Colab 运行时已回收"
+
+
+def runtime_status(result):
+    if not isinstance(result, dict) or any(
+        result.get(flag) for flag in ("allocation_unknown", "operation_pending", "ambiguous", "pending")
+    ):
+        return "unknown"
+    if result.get("deleted") is True:
+        return "missing"
+    return "present" if result.get("deleted") is False else "unknown"
+
 
 class ColabError(GoogleError):
     pass
@@ -149,9 +162,17 @@ class GoogleColabProvider:
             raise ColabError("Colab 隧道返回无效 JSON") from exc
 
     def _tunnel_assignments(self) -> list[dict]:
-        payload = self._tunnel_json(self._tunnel_request("GET", "/tun/m/assignments"))
+        response = self._tunnel_request("GET", "/tun/m/assignments")
+        if response.status_code != 200:
+            raise ColabError("Colab 隧道分配列表不可用")
+        payload = self._tunnel_json(response)
         rows = payload.get("assignments")
-        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("endpoint"), str) or not row["endpoint"]
+            for row in rows
+        ):
+            raise ColabError("Colab 隧道分配列表无效")
+        return rows
 
     def list_specs(self):
         if self._is_cli_tunnel():
@@ -255,9 +276,14 @@ class GoogleColabProvider:
         match = _RUNTIME.fullmatch(runtime)
         if not match or handle.get("runtime_id") != match.group(1):
             raise ColabError("Colab runtime 句柄无效")
-        return self._lease(
+        lease = self._lease(
             match.group(1), handle.get("request_id"), handle.get("owner_job_id") or handle.get("job_id")
         )
+        if handle.get("inspection_lease_id") and (
+            handle["inspection_lease_id"] != lease["id"] or lease.get("account_id") != self.account_id
+        ):
+            raise ColabError("Colab 检查租约绑定已改变")
+        return lease
 
     @staticmethod
     def _spec(spec):
@@ -498,12 +524,19 @@ class GoogleColabProvider:
     def inspect(self, handle):
         lease = self._owned(handle)
         if self._is_cli_tunnel(lease):
-            lease = self._reconcile_tunnel_intent(lease)
+            reclaim_check = bool(handle.get("inspection_lease_id"))
+            if not reclaim_check:
+                lease = self._reconcile_tunnel_intent(lease)
             endpoint = lease.get("tunnel_endpoint")
             if not endpoint:
-                unknown = int(lease.get("create_attempts", 0)) > 0 and not lease.get("operation_done")
+                unknown = reclaim_check or (
+                    int(lease.get("create_attempts", 0)) > 0 and not lease.get("operation_done")
+                )
                 return {"ready": False, "deleted": not unknown, "allocation_unknown": unknown}
-            matched = self._sync_tunnel_lease(lease)
+            if reclaim_check:
+                matched = next((row for row in self._tunnel_assignments() if row["endpoint"] == endpoint), None)
+            else:
+                matched = self._sync_tunnel_lease(lease)
             if matched is None:
                 return {"ready": False, "deleted": True}
             return {

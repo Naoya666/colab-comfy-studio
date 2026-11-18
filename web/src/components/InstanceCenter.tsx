@@ -63,6 +63,10 @@ function isActive(instance: GpuInstance): boolean {
   return ['requested', 'allocating', 'ready', 'busy', 'retained_idle', 'releasing'].includes(String(instance.state || '').toLowerCase());
 }
 
+function isRetained(instance: GpuInstance): boolean {
+  return instance.state === 'retained_idle' && !instance.runtime_deleted;
+}
+
 function errorText(cause: unknown): string {
   return apiMessage(cause);
 }
@@ -97,10 +101,10 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
   }, [rows, selectedId]);
 
   const activeCount = rows.filter((instance) => isActive(instance) && !isHistory(instance)).length;
-  const retainedCount = rows.filter((instance) => instance.state === 'retained_idle').length;
+  const retainedCount = rows.filter(isRetained).length;
   const filtered = rows.filter((instance) => {
     if (filter === 'active') return isActive(instance) && !isHistory(instance);
-    if (filter === 'retained') return instance.state === 'retained_idle' || instance.retained_until != null;
+    if (filter === 'retained') return isRetained(instance);
     if (filter === 'history') return isHistory(instance);
     return true;
   });
@@ -198,8 +202,9 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
         const id = instanceId(instance);
         const isSelected = selectedId === id;
         const canMutate = !isHistory(instance) && instance.state !== 'releasing';
+        const state = instance.remote_delete_source === 'provider_runtime_missing' ? '已回收' : stateLabel(instance.state);
         return <article className={styles.instanceCard} key={id}>
-          <div className={styles.cardTop}><div className={styles.minWidth}><h3 title={id}>{label(instance)}</h3><p className={styles.muted}>{instance.account_alias_snapshot || (instance.account_id ? `账号 ${shortId(instance.account_id)}` : '账号未确认')} · {instance.provider || '运行时未确认'}</p></div><span className={`${styles.badge} ${instance.state === 'ready' || instance.state === 'busy' || instance.state === 'retained_idle' ? styles.good : ''}`}>{stateLabel(instance.state)}</span></div>
+          <div className={styles.cardTop}><div className={styles.minWidth}><h3 title={id}>{label(instance)}</h3><p className={styles.muted}>{instance.account_alias_snapshot || (instance.account_id ? `账号 ${shortId(instance.account_id)}` : '账号未确认')} · {instance.provider || '运行时未确认'}</p></div><span className={`${styles.badge} ${instance.state === 'ready' || instance.state === 'busy' || instance.state === 'retained_idle' ? styles.good : ''}`}>{state}</span></div>
           <div className={styles.detailGrid}>
             <div className={styles.metaCell}><span>GPU</span><b>{gpuLabel(instance)}</b></div>
             <div className={styles.metaCell}><span>实例 ID</span><b title={id}>{shortId(id)}</b></div>

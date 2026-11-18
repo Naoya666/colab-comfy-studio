@@ -51,6 +51,8 @@ class InstanceService:
 
     _INSTANCE_STATES = {"requested", "allocating", "ready", "busy", "retained_idle", "releasing", "deleted", "unknown", "cleanup_pending", "quarantined"}
     _IDLE_STATES = {"ready", "retained_idle"}
+    _RUNTIME_CHECK_INTERVAL = 45
+    _RUNTIME_CHECK_MAX_BACKOFF = 300
     _SENSITIVE = {"token", "access_token", "refresh_token", "connectioninfo", "connection_info", "handle", "secret", "password", "authorization", "signed_url"}
     _PUBLIC = {
         "id", "owner_id", "project_id", "state", "version", "account_id", "account_alias_snapshot", "provider",
@@ -58,6 +60,7 @@ class InstanceService:
         "lease_id", "hard_deadline_at", "idle_deadline_at", "retention_mode", "manual_stop_requested",
         "created_at", "updated_at", "last_seen_at", "generation", "selection_reason", "runtime_deleted",
         "allocation_key", "budget_reserved", "retention_reserved", "allocation_requested_at", "deletion_confirmed_at",
+        "remote_delete_source",
     }
 
     def __init__(self, repo, clock=time.time, config=None):
@@ -527,8 +530,8 @@ class InstanceService:
             instance = self._instance_for_job(session, job)
             if instance is None:
                 raise AllocationError("job has no instance")
-            if instance.state == "unknown":
-                raise InstanceConflict("unknown instance cannot be advanced")
+            if instance.state in {"unknown", "deleted"}:
+                raise InstanceConflict("unknown or deleted instance cannot be advanced")
             data = self._data(instance)
             if data.get("current_job_id") not in {None, job.get("id")}:
                 raise InstanceConflict("instance is owned by another job")
@@ -549,6 +552,8 @@ class InstanceService:
             instance = self._instance_for_job(session, job)
             if instance is None:
                 raise AllocationError("job has no instance")
+            if instance.state == "deleted":
+                return self._dict(instance)
             data = self._data(instance)
             if data.get("current_job_id") not in {None, job.get("id")}:
                 raise InstanceConflict("instance is owned by another job")
@@ -744,8 +749,141 @@ class InstanceService:
             self._emit(session, owner, instance.project_id, id, None, "deleted", "remote deletion confirmed")
             return self._dict(instance)
 
+    def apply_runtime_inspection(self, lease_snapshot, instance_version, job_snapshot, identity, status, checked_at, claim_token):
+        """Commit a Colab observation only while the inspected binding still owns the runtime."""
+        from .native import _lease_identity
+
+        owner = lease_snapshot["owner_id"]
+        lease_id = lease_snapshot["id"]
+        job_id = lease_snapshot["owner_job_id"]
+        try:
+            with self.store.dispatch_lock() as acquired:
+                if not acquired:
+                    return False
+                with self._admission(), self._tx() as session:
+                    lease = self._find(session, "leases", lease_id, owner)
+                    instance = self._find(session, "instances", lease_snapshot["instance_id"], owner)
+                    if lease is None or instance is None:
+                        return False
+                    current = self.repo._row(lease)
+                    data = self.repo._row(instance)
+                    if (
+                        lease.version != lease_snapshot.get("version", 0)
+                        or instance.version != instance_version
+                        or lease.state == "deleted" or instance.state == "deleted"
+                        or digest(_lease_identity(current)) != identity
+                        or data.get("lease_id") != lease_id
+                        or data.get("provider") != "colab"
+                        or data.get("account_id") != current["account_id"]
+                        or data.get("current_job_id") not in {None, job_id}
+                        or self._data(instance).get("current_job_id") not in {None, job_id}
+                        or current.get("current_job_id") not in {None, job_id}
+                        or data.get("runtime_id") not in {None, current["runtime_id"]}
+                        or data.get("cleanup_claim_token") or current.get("cleanup_claim_token")
+                    ):
+                        return False
+                    if status != "missing":
+                        previous = current.get("provider_runtime_check") or {}
+                        failures = int(status == "unknown")
+                        if failures and previous.get("identity") == identity:
+                            failures += int(previous.get("failures") or 0)
+                        check = {
+                            "identity": identity, "instance_version": instance.version,
+                            "status": status, "checked_at": checked_at, "failures": failures,
+                            "next_check_at": checked_at + min(
+                                self._RUNTIME_CHECK_MAX_BACKOFF, self._RUNTIME_CHECK_INTERVAL * 2 ** min(failures, 3),
+                            ),
+                        }
+                        self._set(lease, {**self._data(lease), "provider_runtime_check": check}, session=session)
+                        return True
+                    job = self._find(session, "jobs", job_id)
+                    if job is not None and job.owner_id != owner:
+                        return False
+                    job_data = self.repo._row(job) or {}
+                    if (
+                        job_data.get("lease_id") not in {None, lease_id}
+                        or job_data.get("instance_id") not in {None, instance.id}
+                        or any(job_data.get(key) != job_snapshot.get(key) for key in (
+                            "id", "execution_id", "lease_id", "instance_id", "account_id",
+                        ))
+                        or (job_data.get("claim_token") not in {None, claim_token}
+                            and float(job_data.get("claim_until") or 0) > self.clock())
+                    ):
+                        return False
+                    for other in self._rows(session, "leases", owner):
+                        if other.id == lease_id or other.state == "deleted":
+                            continue
+                        binding = self.repo._row(other)
+                        if binding.get("instance_id") == instance.id or (
+                            binding.get("account_id") == current["account_id"]
+                            and binding.get("runtime_id") == current["runtime_id"]
+                        ):
+                            return False
+                    self._close_reclaimed_runtime(session, instance, lease, current, job_data, identity, checked_at)
+                    return True
+        except InstanceConflict:
+            return False
+
+    def _close_reclaimed_runtime(self, session, instance, lease, binding, job, identity, checked_at):
+        from .colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
+
+        owner = instance.owner_id
+        job_id = binding["owner_job_id"]
+        evidence = {
+            "schema_version": 1, "owner_id": owner, "account_id": binding["account_id"], "instance_id": instance.id,
+            "lease_id": lease.id, "owner_job_id": job_id, "runtime_id": binding["runtime_id"],
+            "identity": identity, "checked_at": checked_at, "source": "colab_inspect",
+            "lease_version": lease.version, "instance_version": instance.version,
+            "instance_generation": self._data(instance).get("generation"),
+        }
+        remote = {
+            "remote_deleted": True, "remote_deleted_at": checked_at, "remote_delete_source": RUNTIME_MISSING,
+            "native_ready": False, "native_draining": True, "current_job_id": None, "idle_deadline_at": None,
+        }
+        self._set(lease, {
+            **self._data(lease), **remote, "state": "deleted", "provider_runtime_delete_evidence": evidence,
+            "native_remote_deleted_verified_at": checked_at if binding.get("native_comfy") else None,
+            "cleanup_next_epoch": 0, "last_seen": checked_at,
+        }, state="deleted", session=session)
+        data = self._data(instance)
+        self._set(instance, {
+            **data, **remote, "state": "deleted", "runtime_deleted": True, "budget_reserved": 0.0,
+            "retention_reserved": 0.0, "deleted_at": checked_at, "deletion_confirmed_at": checked_at,
+            "last_seen_at": checked_at, "retained_until": None,
+        }, state="deleted", session=session)
+        for related in self._rows(session, "jobs", owner):
+            if related.id != job_id and self.repo._row(related).get("instance_id") != instance.id:
+                continue
+            payload = self._data(related)
+            payload.update(instance_state="deleted", runtime_deleted=True, retained_until=None,
+                           idle_deadline_at=None, instance_deleted_reason=RUNTIME_MISSING)
+            state = related.state
+            if related.id == job_id and state not in {"completed", "failed", "cancelled"}:
+                outcome = payload.get("cleanup_final_state") if state in {"cleaning_up", "cleanup_pending"} else None
+                state = "cleaning_up"
+                if outcome not in {"completed", "cancelled"}:
+                    payload.update(requested_outcome="failed", cleanup_final_state="failed",
+                                   error_code=RUNTIME_MISSING, error_message=RUNTIME_MISSING_MESSAGE)
+                payload["state"] = state
+            self._set(related, payload, state=state, session=session)
+        started = data.get("allocation_requested_at") or job.get("started_epoch")
+        rate = float(data.get("unit_rate") or job.get("unit_rate") or self._cfg("unit_rate", 0) or 0)
+        self._record_usage(session, owner, {
+            "instance_id": instance.id, "job_id": job_id, "segment_key": f"instance-lifetime:{instance.id}",
+            "started_at": started, "ended_at": checked_at, "allocation_requested_at": started,
+            "deletion_confirmed_at": checked_at, "actual_units": None,
+            "estimated_units": max(0.0, checked_at - float(started)) / 60 * rate if started else None,
+        })
+        self._emit(session, owner, instance.project_id, instance.id, job_id, "deleted",
+                   RUNTIME_MISSING_MESSAGE, reason=RUNTIME_MISSING, source="colab_inspect",
+                   checked_at=checked_at, lease_id=lease.id)
+
     # ---- accounting, events and safe reads ----------------------------------------
     def record_usage(self, owner, payload):
+        with self._tx() as session:
+            return self._record_usage(session, owner, payload)
+
+    def _record_usage(self, session, owner, payload):
         if not isinstance(payload, Mapping):
             raise ValueError("usage payload must be an object")
         instance_id = payload.get("instance_id")
@@ -755,67 +893,66 @@ class InstanceService:
         if not segment_key:
             segment_key = digest({k: payload.get(k) for k in ("job_id", "started_at", "ended_at", "kind")})
         segment_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"colab-gpu-usage:{owner}:{instance_id}:{segment_key}"))
-        with self._tx() as session:
-            instance = self._find(session, "instances", instance_id, owner)
-            if instance is None:
-                raise KeyError(instance_id)
-            model = self._model("instance_usage_segments")
-            existing = session.scalar(select(model).where(model.id == segment_id))
-            if existing is not None:
-                return self._public_usage(self._dict(existing))
-            instance_data = self._data(instance)
-            data = {k: copy.deepcopy(v) for k, v in dict(payload).items() if k not in self._SENSITIVE}
-            data.update(instance_id=instance_id, account_id=instance_data.get("account_id"), segment_key=str(segment_key))
-            requested_at = next(
-                (payload.get(name) for name in ("allocation_requested_at", "request_started_at", "requested_at") if payload.get(name) is not None),
-                instance_data.get("allocation_requested_at"),
-            )
-            confirmed_at = next(
-                (payload.get(name) for name in ("deletion_confirmed_at", "confirmed_deleted_at", "remote_deleted_at") if payload.get(name) is not None),
-                instance_data.get("deletion_confirmed_at") or instance_data.get("deleted_at"),
-            )
+        instance = self._find(session, "instances", instance_id, owner)
+        if instance is None:
+            raise KeyError(instance_id)
+        model = self._model("instance_usage_segments")
+        existing = session.scalar(select(model).where(model.id == segment_id))
+        if existing is not None:
+            return self._public_usage(self._dict(existing))
+        instance_data = self._data(instance)
+        data = {k: copy.deepcopy(v) for k, v in dict(payload).items() if k not in self._SENSITIVE}
+        data.update(instance_id=instance_id, account_id=instance_data.get("account_id"), segment_key=str(segment_key))
+        requested_at = next(
+            (payload.get(name) for name in ("allocation_requested_at", "request_started_at", "requested_at") if payload.get(name) is not None),
+            instance_data.get("allocation_requested_at"),
+        )
+        confirmed_at = next(
+            (payload.get(name) for name in ("deletion_confirmed_at", "confirmed_deleted_at", "remote_deleted_at") if payload.get(name) is not None),
+            instance_data.get("deletion_confirmed_at") or instance_data.get("deleted_at"),
+        )
 
-            def timestamp(value):
-                if value is None:
-                    return None
-                if isinstance(value, datetime):
-                    return value.timestamp()
+        def timestamp(value):
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value.timestamp()
+            try:
+                return float(value)
+            except (TypeError, ValueError):
                 try:
-                    return float(value)
+                    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
                 except (TypeError, ValueError):
-                    try:
-                        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-                    except (TypeError, ValueError):
-                        return None
+                    return None
 
-            requested_epoch = timestamp(requested_at)
-            confirmed_epoch = timestamp(confirmed_at)
-            if requested_epoch is not None:
-                data["allocation_requested_at"] = requested_at
-            if confirmed_epoch is not None:
-                data["deletion_confirmed_at"] = confirmed_at
-            if requested_epoch is not None and confirmed_epoch is not None:
-                total_seconds = max(0.0, confirmed_epoch - requested_epoch)
-                data["total_duration_seconds"] = total_seconds
-                data["total_duration_minutes"] = total_seconds / 60.0
-            # None means not supplied by the platform; it is intentionally not
-            # coerced to zero, which would present an actual bill as known.
-            data.setdefault("actual_units", None)
-            now = self._utcnow()
-            row = model(id=segment_id, owner_id=owner, project_id=instance.project_id, state="closed" if data.get("ended_at") is not None else "open", data=data, version=0, created_at=now, updated_at=now)
-            session.add(row)
-            session.flush()
-            return self._public_usage(self._dict(row))
+        requested_epoch = timestamp(requested_at)
+        confirmed_epoch = timestamp(confirmed_at)
+        if requested_epoch is not None:
+            data["allocation_requested_at"] = requested_at
+        if confirmed_epoch is not None:
+            data["deletion_confirmed_at"] = confirmed_at
+        if requested_epoch is not None and confirmed_epoch is not None:
+            total_seconds = max(0.0, confirmed_epoch - requested_epoch)
+            data["total_duration_seconds"] = total_seconds
+            data["total_duration_minutes"] = total_seconds / 60.0
+        # None means not supplied by the platform; it is intentionally not
+        # coerced to zero, which would present an actual bill as known.
+        data.setdefault("actual_units", None)
+        now = self._utcnow()
+        row = model(id=segment_id, owner_id=owner, project_id=instance.project_id, state="closed" if data.get("ended_at") is not None else "open", data=data, version=0, created_at=now, updated_at=now)
+        session.add(row)
+        session.flush()
+        return self._public_usage(self._dict(row))
 
     record_usage_segment = record_usage
     record_usage_once = record_usage
 
-    def _emit(self, session, owner, project_id, instance_id, job_id, state, message):
+    def _emit(self, session, owner, project_id, instance_id, job_id, state, message, **details):
         try:
             model = self._model("events")
         except ValueError:
             return
-        data = {"instance_id": instance_id, "job_id": job_id, "state": state, "message": str(message)[:500]}
+        data = {"instance_id": instance_id, "job_id": job_id, "state": state, "message": str(message)[:500], **details}
         now = self._utcnow()
         session.add(model(id=str(uuid.uuid4()), owner_id=owner, project_id=project_id, state=state, version=0, data=data, created_at=now, updated_at=now))
 

@@ -9,6 +9,7 @@ export type InstanceSnapshot = {
   state?: string | null;
   account_id?: string | null;
   current_job_id?: string | null;
+  runtime_deleted?: boolean | null;
   instance_label?: string | null;
   label?: string | null;
   gpu_reported?: string | null;
@@ -30,7 +31,7 @@ export function instanceIdentity(instance: InstanceSnapshot): string {
 }
 
 export function instanceReusable(instance: InstanceSnapshot | null | undefined): boolean {
-  if (!instance) return false;
+  if (!instance || instance.runtime_deleted) return false;
   const state = String(instance.state || '').toLowerCase();
   if (!REUSABLE.has(state)) return false;
   if (instance.current_job_id) return false;

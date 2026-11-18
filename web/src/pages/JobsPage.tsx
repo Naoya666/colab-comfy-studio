@@ -116,7 +116,8 @@ export function TasksPanel({
               accountSnapshot ? `账号 ${accountSnapshot}` : '',
               String(job.instance_label || instanceId.slice(0, 8)),
               gpuLabel(job),
-              instanceId ? readableState(String(job.instance_state || '未知')) : terminalStates.has(s) ? '未分配机器' : '等待分配机器',
+              instanceId ? job.instance_deleted_reason === 'provider_runtime_missing' ? '已回收' : readableState(job.instance_state || '未知')
+                : terminalStates.has(s) ? '未分配机器' : '等待分配机器',
             ].filter(Boolean).join(' · ');
             const liveInstance = canRetainJobInstance(job);
             const retained = liveInstance && Boolean(job.retained_until || job.instance_state === 'retained_idle');

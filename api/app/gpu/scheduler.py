@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from .colab import ColabAllocationError
+from .colab import RUNTIME_MISSING, ColabAllocationError, GoogleColabProvider, runtime_status
 from .compute import (
     ComputeError,
     DisabledProvider,
@@ -22,6 +22,7 @@ from .compute import (
     default_provider_factory,
 )
 from .google import GoogleError
+from .manifest import digest
 from .mcp import MCPError
 from .newgpu.executor_plugins import TrustedExecutorAdapter
 from .prep import PREP_SPEC_KEY, cache_key, create_prep_job, prep_idempotency_key, prep_jobs_for
@@ -1387,8 +1388,71 @@ class Scheduler:
             patch.update(error_code=None, error_message=None)
         return self._set_state(job, state, message, cleanup_next_epoch=0, **patch)
 
+    def _inspect_runtime(self, lease: dict, claim_token: str | None = None) -> str | None:
+        """Check a bound runtime independently of Comfy, retention and idle deadlines."""
+        from .native import _lease_identity
+
+        if (
+            lease.get("provider") != "colab"
+            or lease.get("state") not in {"active", "idle", "releasing", "cleanup_pending"}
+            or not all(lease.get(key) for key in ("account_id", "instance_id", "owner_job_id", "runtime_id", "request_id"))
+            or not isinstance(lease.get("handle"), dict)
+            or lease.get("cleanup_claim_token")
+        ):
+            return None
+        owner = lease["owner_id"]
+        instance = self._get("instances", lease["instance_id"], owner)
+        if (
+            not instance or instance.get("state") == "deleted"
+            or instance.get("lease_id") != lease["id"] or instance.get("account_id") != lease["account_id"]
+            or instance.get("current_job_id") not in {None, lease["owner_job_id"]}
+            or instance.get("cleanup_claim_token")
+        ):
+            return None
+        identity = digest(_lease_identity(lease))
+        instance_version = instance.get("version", 0)
+        check = lease.get("provider_runtime_check") or {}
+        if (
+            check.get("identity") == identity and check.get("instance_version") == instance_version
+            and self.clock() < float(check.get("next_check_at") or 0)
+        ):
+            return check["status"]
+        job_id = lease["owner_job_id"]
+        job_snapshot = self._get("jobs", job_id, owner) or {}
+        if (
+            job_snapshot.get("claim_token") not in {None, claim_token}
+            and float(job_snapshot.get("claim_until") or 0) > self.clock()
+        ):
+            return "stale"
+        handle = {**lease["handle"], "job_id": job_id, "owner_job_id": job_id, "inspection_lease_id": lease["id"]}
+        try:
+            provider = self._provider({
+                "id": job_id, "owner_id": owner, "provider": "colab", "account_id": lease["account_id"],
+            })
+            try:
+                status = runtime_status(provider.inspect(handle))
+            finally:
+                if isinstance(provider, GoogleColabProvider):
+                    provider.close()
+        except Exception:
+            # Transport, authentication and provider errors carry no deletion evidence.
+            status = "unknown"
+        if not self._instance_call(
+            "apply_runtime_inspection", lease, instance_version, job_snapshot, identity, status, self.clock(), claim_token,
+        ):
+            return "stale"
+        return status
+
     def _cleanup(self, job: dict) -> dict:
         lease = self._lease(job)
+        if lease:
+            observation = self._inspect_runtime(lease, job.get("claim_token"))
+            if observation == "stale":
+                return self._get("jobs", job["id"], job["owner_id"]) or job
+            if observation == "missing" or lease.get("remote_delete_source") == RUNTIME_MISSING:
+                current = self._get("jobs", job["id"], job["owner_id"]) or job
+                final_state = current.get("cleanup_final_state") or "failed"
+                return self._finish_cleanup(current, final_state, "GPU cleanup completed")
         job = self._trusted_plugin_cleanup(job, lease)
         if lease and job.get("batch_id") and job.get("cleanup_final_state") == "completed":
             waiting = [j for j in self._list("jobs", job["owner_id"])
@@ -1459,11 +1523,11 @@ class Scheduler:
             self._record_usage(job, lease, self.clock())
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         next_epoch = float(lease.get("cleanup_next_epoch") or 0)
-        if self.clock() < next_epoch:
+        if self.clock() < next_epoch or observation == "unknown":
             return job
         if lease.get("native_ready"):
             from .native import protect_lease
-            if protect_lease(self.store, lease, self.clock):
+            if protect_lease(self.store, lease, self.clock, check_remote=observation is None):
                 return job
         provider = self._provider(job)
         handle = self._lease_handle(lease) or self._intent_handle(job, lease)
@@ -1481,8 +1545,9 @@ class Scheduler:
             return self._set_state(job, "failed", "GPU cleanup was refused", error_code="gpu_cleanup_refused")
         try:
             status = provider.inspect(handle)
-            confirmed = bool(status.get("deleted"))
-            if not confirmed:
+            observation = runtime_status(status) if lease.get("provider") == "colab" else None
+            confirmed = observation == "missing" if observation else status.get("deleted") is True
+            if not confirmed and observation != "unknown":
                 response = provider.delete(handle)
                 # A truthy response is not enough: providers may return an
                 # accepted/pending response before the remote runtime is gone.
@@ -1666,9 +1731,14 @@ class Scheduler:
 
     def _cleanup_orphan_lease(self, lease: dict) -> bool:
         lease = self._get("leases", lease["id"], lease.get("owner_id")) or lease
+        if lease.get("state") == "deleted":
+            return False
+        observation = self._inspect_runtime(lease)
+        if observation in {"missing", "stale", "unknown"}:
+            return observation == "missing"
         if lease.get("native_ready"):
             from .native import protect_lease
-            if protect_lease(self.store, lease, self.clock):
+            if protect_lease(self.store, lease, self.clock, check_remote=False):
                 return False
         owner_job_id = lease.get("owner_job_id")
         owner_id = lease.get("owner_id")
@@ -1761,7 +1831,8 @@ class Scheduler:
             if hasattr(provider, "recover_handle"):
                 handle = provider.recover_handle(handle)
             status = provider.inspect(handle)
-            confirmed = bool(status.get("deleted"))
+            observation = runtime_status(status) if lease.get("provider") == "colab" else None
+            confirmed = observation == "missing" if observation else status.get("deleted") is True
             # Without a durable instance claim nothing fences a new lease on the
             # same instance, so recheck right before the remote delete.
             if not confirmed and not claimed and instance_id and any(
@@ -1772,7 +1843,7 @@ class Scheduler:
             ):
                 finish(False, "same instance acquired by another live lease")
                 return False
-            if not confirmed:
+            if not confirmed and observation != "unknown":
                 response = provider.delete(handle)
                 confirmed = response is True or (
                     isinstance(response, dict) and response.get("deleted") is True
@@ -1892,11 +1963,7 @@ class Scheduler:
             provider = self._provider(job)
             if hasattr(provider, "recover_handle"):
                 handle = provider.recover_handle(handle)
-            status = provider.inspect(handle)
-            confirmed = (
-                status.get("deleted") is True
-                and not any(status.get(key) for key in ("allocation_unknown", "operation_pending", "ambiguous", "pending"))
-            )
+            confirmed = runtime_status(provider.inspect(handle)) == "missing"
             error = None if confirmed else "remote deletion not unambiguously confirmed"
         except Exception as exc:
             confirmed, error = False, self._safe_error(exc)
@@ -1969,45 +2036,51 @@ class Scheduler:
         with self.db_store.dispatch_lock() as acquired:
             if not acquired:
                 return {"acquired": False, "recovered": 0, "reason": "busy"}
-            all_jobs = self._list("jobs")
-            jobs = [
-                x
-                for x in all_jobs
-                if x.get("state") in ACTIVE_STATES
-                and (x.get("state") in {"cleanup_pending", "cleaning_up"} or self._expired(x))
-            ]
-            job_by_id = {x["id"]: x for x in all_jobs}
-            all_leases = self._leases_for()
-            leases = [
-                x
-                for x in all_leases
-                if x.get("state") != "deleted"
-                and (
-                    x.get("owner_job_id") not in job_by_id
-                    or (
-                        job_by_id.get(x.get("owner_job_id"), {}).get("state") in TERMINAL_STATES
-                        and x.get("owner_id") == job_by_id.get(x.get("owner_job_id"), {}).get("owner_id")
-                    )
-                )
-            ]
+            candidates = self._leases_for()
         recovered = 0
+        observations = {lease["id"]: self._inspect_runtime(lease) for lease in candidates}
+        recovered += sum(result == "missing" for result in observations.values())
+        all_jobs = self._list("jobs")
+        jobs = [
+            job for job in all_jobs if job.get("state") in ACTIVE_STATES
+            and (job.get("state") in {"cleanup_pending", "cleaning_up"} or self._expired(job))
+        ]
         for job in jobs:
-            before = job.get("state")
-            self._advance(job)
-            current = self._get("jobs", job["id"], job.get("owner_id"))
-            if current and current.get("state") != before:
-                recovered += 1
-        for lease in leases:
-            instance = next((row for row in self._service_instances() if self._instance_id(row) == lease.get("instance_id")), None)
+            with self.db_store.dispatch_lock() as acquired:
+                if not acquired:
+                    continue
+                current = self._get("jobs", job["id"], job["owner_id"])
+                if not current or current.get("state") != job["state"] or (
+                    current.get("claim_token") and float(current.get("claim_until") or 0) > self.clock()
+                ):
+                    continue
+                token = uuid.uuid4().hex
+                claimed = self._update("jobs", job["id"], {
+                    "claim_token": token, "claim_until": self.clock() + self.config.claim_ttl_seconds,
+                }, job["owner_id"])
+            try:
+                recovered += self._advance(claimed).get("state") != claimed.get("state")
+            finally:
+                self._release_claim(job["id"], token, job["owner_id"])
+        job_by_id = {job["id"]: job for job in self._list("jobs")}
+        all_leases = self._leases_for()
+        for lease in all_leases:
+            observation = observations.get(lease["id"])
+            associated = job_by_id.get(lease.get("owner_job_id"))
+            if lease.get("state") == "deleted" or observation == "stale" or (
+                associated and (associated["owner_id"] != lease["owner_id"] or associated["state"] not in TERMINAL_STATES)
+            ):
+                continue
+            instance_id = lease.get("instance_id")
+            instance = self._get("instances", instance_id, lease["owner_id"]) if instance_id else None
             if lease.get("native_ready"):
                 from .native import protect_lease
-                if protect_lease(self.store, lease, self.clock):
+                if protect_lease(self.store, lease, self.clock, check_remote=observation is None):
                     continue
             stopping = bool(instance and (instance.get("manual_stop_requested") or instance.get("state") in {"releasing", "cleanup_pending"}))
             if lease.get('state')=='idle' and not stopping and self.clock()<min(
                     float(lease.get('idle_deadline_at') or 0),float(lease.get('deadline_epoch') or 0)):
                 continue
-            associated = job_by_id.get(lease.get("owner_job_id"))
             expired = float(lease.get("deadline_epoch") or 0) < self.clock()
             if (
                 associated is None and expired

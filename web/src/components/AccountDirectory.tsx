@@ -50,6 +50,8 @@ export interface GpuInstance {
   created_at?: string;
   last_seen_at?: string;
   retained_until?: string | null;
+  runtime_deleted?: boolean;
+  remote_delete_source?: string | null;
   idle_deadline_at?: string | null;
   hard_deadline_at?: string | null;
   estimated_units?: number | null;
