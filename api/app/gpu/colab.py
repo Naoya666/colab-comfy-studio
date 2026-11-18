@@ -6,6 +6,7 @@ import json
 import re
 import time
 import uuid
+from urllib.parse import urlencode
 
 import httpx
 
@@ -15,6 +16,9 @@ from .google import GoogleError, GoogleService
 
 RUNTIME_MISSING = "provider_runtime_missing"
 RUNTIME_MISSING_MESSAGE = "Colab 运行时已回收"
+KEEPALIVE_INTERVAL_SECONDS = 60.0
+KEEPALIVE_RETRY_SECONDS = 30.0
+KERNEL_EXEC_INTERVAL_SECONDS = 240.0
 
 
 def runtime_status(result):
@@ -590,6 +594,223 @@ class GoogleColabProvider:
         if not info.get("url") or not info.get("token"):
             raise ColabError("Colab connectionInfo 未就绪")
         return {"url": info["url"], "token": info["token"], "expire_time": info.get("expireTime")}
+
+    def _resolve_proxy_credentials(self, lease: dict, *, force_refresh: bool = False) -> tuple[str, str, dict]:
+        url = lease.get("proxy_url")
+        enc_tok = lease.get("encrypted_proxy_token")
+        exp = float(lease.get("proxy_token_expires_at") or 0)
+        if (
+            not force_refresh
+            and isinstance(url, str)
+            and url
+            and isinstance(enc_tok, str)
+            and enc_tok
+            and (exp == 0 or exp > time.time() + 180)
+        ):
+            return url.rstrip("/"), decrypt_secret(enc_tok), {}
+        if self._is_cli_tunnel(lease):
+            endpoint = lease.get("tunnel_endpoint")
+            if not isinstance(endpoint, str) or not endpoint:
+                raise ColabError("Colab 隧道缺少 endpoint")
+            matched = next((a for a in self._tunnel_assignments() if a.get("endpoint") == endpoint), None)
+            if matched is None:
+                raise ColabError("Colab 隧道运行时不存在")
+            proxy = matched.get("runtimeProxyInfo") or {}
+            new_url = proxy.get("url")
+            raw_tok = proxy.get("token")
+            patch: dict = {}
+            if isinstance(new_url, str) and new_url:
+                url = new_url.rstrip("/")
+                patch["proxy_url"] = url
+            if isinstance(raw_tok, str) and raw_tok:
+                ttl = int(proxy.get("tokenExpiresInSeconds") or 3600)
+                patch["encrypted_proxy_token"] = encrypt_secret(raw_tok)
+                patch["proxy_token_expires_at"] = time.time() + max(60, ttl - 60)
+                if not isinstance(url, str) or not url:
+                    raise ColabError("Colab 隧道缺少代理地址")
+                return url.rstrip("/"), raw_tok, patch
+            if isinstance(url, str) and url and isinstance(enc_tok, str) and enc_tok:
+                return url.rstrip("/"), decrypt_secret(enc_tok), patch
+            raise ColabError("Colab 隧道缺少代理凭据")
+        handle = lease.get("handle")
+        runtime_name = handle.get("runtime_name") if isinstance(handle, dict) else None
+        if not isinstance(runtime_name, str) or not runtime_name:
+            raise ColabError("Colab 运行时缺少 runtime_name")
+        info = self._json(self._request("GET", "/v1beta/" + runtime_name)).get("connectionInfo") or {}
+        if not info.get("url") or not info.get("token"):
+            raise ColabError("Colab connectionInfo 未就绪")
+        return str(info["url"]).rstrip("/"), str(info["token"]), {}
+
+    def keep_alive(self, lease: dict, *, run_kernel_exec: bool = False, ws_connect_fn=None) -> dict:
+        """Send dual-layer Colab keep-alive without mutating DB state directly."""
+        is_cli = self._is_cli_tunnel(lease)
+        tfe_status = "skipped"
+        if is_cli and isinstance(lease.get("tunnel_endpoint"), str) and lease["tunnel_endpoint"]:
+            endpoint = lease["tunnel_endpoint"]
+            try:
+                token = self.google.access_token("colab")
+                tfe_headers = {
+                    "Authorization": "Bearer " + token,
+                    "Accept": "application/json, text/plain, */*",
+                    "X-Colab-Client-Agent": "colab-cli",
+                    "X-Colab-Tunnel": "Google",
+                }
+                tfe_timeout = httpx.Timeout(connect=6.0, read=4.0, write=6.0, pool=6.0)
+                with self.client.stream(
+                    "GET",
+                    f"{_TUNNEL_BASE_URL}/tun/m/{endpoint}/keep-alive/",
+                    params={"authuser": "0"},
+                    headers=tfe_headers,
+                    timeout=tfe_timeout,
+                ) as resp:
+                    if 200 <= resp.status_code < 300:
+                        cl = resp.headers.get("Content-Length")
+                        if cl and cl.isdigit() and int(cl) <= 4096:
+                            resp.read()
+                        tfe_status = f"ok:{resp.status_code}"
+                    else:
+                        tfe_status = f"http:{resp.status_code}"
+            except httpx.ReadTimeout:
+                # TFE keep-alive streams may hold the response open after updating LastActiveTime.
+                tfe_status = "read_timeout_ack"
+            except Exception as exc:
+                tfe_status = f"err:{type(exc).__name__}"
+
+        proxy_status = "skipped"
+        kernel_exec_status = "skipped"
+        lease_patch: dict = {}
+        raw_kernel_id = lease.get("kernel_id")
+        kernel_id = raw_kernel_id if isinstance(raw_kernel_id, str) and raw_kernel_id else None
+        proxy_url = proxy_token = None
+        try:
+            proxy_url, proxy_token, patch = self._resolve_proxy_credentials(lease)
+            lease_patch.update(patch)
+            for attempt in range(2):
+                auth_params = {"colab-runtime-proxy-token": proxy_token, "authuser": "0"}
+                p_headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "X-Colab-Client-Agent": "colab-cli",
+                    "X-Colab-Runtime-Proxy-Token": proxy_token,
+                }
+                target = f"{proxy_url}/api/kernels/{kernel_id}" if kernel_id else f"{proxy_url}/api/kernels"
+                r = self.client.get(target, headers=p_headers, params=auth_params, timeout=8.0)
+                if r.status_code in {401, 403} and attempt == 0:
+                    proxy_url, proxy_token, patch = self._resolve_proxy_credentials(lease, force_refresh=True)
+                    lease_patch.update(patch)
+                    continue
+                if kernel_id and r.status_code == 404:
+                    kernel_id = None
+                    r = self.client.get(f"{proxy_url}/api/kernels", headers=p_headers, params=auth_params, timeout=8.0)
+                if r.status_code == 200:
+                    if not kernel_id:
+                        existing = r.json()
+                        if isinstance(existing, list) and existing and isinstance(existing[0].get("id"), str) and existing[0]["id"]:
+                            kernel_id = existing[0]["id"]
+                        else:
+                            rc = self.client.post(
+                                f"{proxy_url}/api/kernels",
+                                json={"name": "python3"},
+                                headers=p_headers,
+                                params=auth_params,
+                                timeout=10.0,
+                            )
+                            if rc.status_code < 400:
+                                created = rc.json().get("id")
+                                if isinstance(created, str) and created:
+                                    kernel_id = created
+                        if kernel_id:
+                            lease_patch["kernel_id"] = kernel_id
+                    proxy_status = "ok" if kernel_id else "no_kernel"
+                else:
+                    proxy_status = f"http:{r.status_code}"
+                break
+        except Exception as exc:
+            proxy_status = f"err:{type(exc).__name__}"
+
+        if run_kernel_exec and proxy_status == "ok" and kernel_id and proxy_url and proxy_token:
+            try:
+                from .mcp import MCPGPUExecutor
+
+                if ws_connect_fn is None:
+                    from websockets.sync.client import connect as ws_connect_fn
+                ws_base = re.sub(r"^http", "ws", proxy_url, count=1)
+                session_id = uuid.uuid4().hex
+                msg_id = uuid.uuid4().hex
+                query = urlencode({
+                    "colab-runtime-proxy-token": proxy_token,
+                    "authuser": "0",
+                    "session_id": session_id,
+                })
+                ws_url = f"{ws_base}/api/kernels/{kernel_id}/channels?{query}"
+                req_msg = {
+                    "header": {
+                        "msg_id": msg_id,
+                        "username": "studio",
+                        "session": session_id,
+                        "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "msg_type": "execute_request",
+                        "version": "5.3",
+                    },
+                    "parent_header": {},
+                    "metadata": {},
+                    "content": {
+                        "code": "1 + 1",
+                        "silent": False,
+                        "store_history": False,
+                        "user_expressions": {},
+                        "allow_stdin": False,
+                        "stop_on_error": True,
+                    },
+                    "channel": "shell",
+                }
+                reply_seen = False
+                idle_seen = False
+                has_error = False
+                deadline = time.monotonic() + 8.0
+                with ws_connect_fn(
+                    ws_url,
+                    additional_headers={
+                        "X-Colab-Client-Agent": "colab-cli",
+                        "X-Colab-Runtime-Proxy-Token": proxy_token,
+                    },
+                    open_timeout=6.0,
+                    close_timeout=3.0,
+                    max_size=4 * 1024 * 1024,
+                ) as ws:
+                    ws.send(MCPGPUExecutor._ws_pack_default(req_msg))
+                    while time.monotonic() < deadline:
+                        remaining = max(0.3, deadline - time.monotonic())
+                        raw = ws.recv(timeout=remaining)
+                        msg = MCPGPUExecutor._ws_unpack_default(raw)
+                        if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
+                            continue
+                        mtype = (msg.get("header") or {}).get("msg_type") or msg.get("msg_type")
+                        content = msg.get("content") or {}
+                        if mtype == "error":
+                            has_error = True
+                        elif mtype == "execute_reply":
+                            reply_seen = True
+                            if content.get("status") == "error":
+                                has_error = True
+                        elif mtype == "status" and content.get("execution_state") == "idle":
+                            idle_seen = True
+                        if reply_seen and idle_seen:
+                            break
+                kernel_exec_status = "ok" if (reply_seen and idle_seen and not has_error) else "incomplete"
+            except Exception as exc:
+                kernel_exec_status = f"err:{type(exc).__name__}"
+
+        tfe_ok = (tfe_status.startswith("ok:") or tfe_status == "read_timeout_ack") if is_cli else True
+        proxy_ok = proxy_status == "ok"
+        exec_ok = (not run_kernel_exec) or kernel_exec_status == "ok"
+        return {
+            "ok": bool(tfe_ok and proxy_ok and exec_ok),
+            "tfe": tfe_status,
+            "proxy": proxy_status,
+            "kernel_exec": kernel_exec_status,
+            "lease_patch": lease_patch,
+        }
 
     def delete(self, handle):
         lease = self._owned(handle)

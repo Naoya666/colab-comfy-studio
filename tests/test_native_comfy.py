@@ -222,7 +222,8 @@ def test_unknown_activity_never_releases(proxy, monkeypatch):
     assert proxy.state.repo.lease["native_last_busy"] == 10000
     monkeypatch.setattr(native, "busy", lambda: False)
     assert native.protect_lease(proxy.state.repo, proxy.state.repo.lease, clock=lambda: 10001)
-    assert not native.protect_lease(proxy.state.repo, proxy.state.repo.lease, clock=lambda: 12000)
+    assert native.protect_lease(proxy.state.repo, proxy.state.repo.lease, clock=lambda: 10000 + settings.native_comfy_idle_minutes * 60 - 1)
+    assert not native.protect_lease(proxy.state.repo, proxy.state.repo.lease, clock=lambda: 10000 + settings.native_comfy_idle_minutes * 60)
 
 
 def test_ready_requires_protected_tunnel_and_native_extension(proxy):
@@ -275,7 +276,7 @@ def test_native_admission_idempotent_across_restart_and_gpu_switch(proxy, monkey
     body = {"account_id": "account", "spec": {"key": {"variant": "VARIANT_GPU", "accelerator": "T4", "shape": "SHAPE_STANDARD"}}, **timeouts}
     job = native.admit(repo, "owner", body, "native-start")
     assert job["execution_policy"]["retain_idle_minutes"] == timeouts.get("retain_idle_minutes", settings.native_comfy_idle_minutes)
-    assert job["max_runtime_minutes"] == job["execution_policy"]["max_runtime_minutes"] == timeouts.get("max_runtime_minutes", 30)
+    assert job["max_runtime_minutes"] == job["execution_policy"]["max_runtime_minutes"] == timeouts.get("max_runtime_minutes", settings.native_comfy_max_runtime_minutes)
     assert job["estimated_units"] == job["max_runtime_minutes"] * 0.01
     assert 0 <= job["native_session_deadline_epoch"] - time.time() <= job["max_runtime_minutes"] * 60
     assert native.admit(Repository(store), "owner", body, "native-start")["id"] == job["id"]
@@ -334,13 +335,14 @@ def test_native_idle_timeout_survives_studio_handoff(proxy, monkeypatch):
 
 
 def test_native_status_exposes_timeout_defaults_and_limits(proxy, monkeypatch):
-    from app.gpu.compute import GpuConfig
     from app.native_routes import router
 
+    assert settings.native_comfy_idle_minutes == 120
+    assert settings.native_comfy_max_runtime_minutes == 720
     proxy.include_router(router)
     proxy.state.repo.lease["native_ready"] = False
     monkeypatch.setattr(settings, "native_comfy_idle_minutes", 8)
-    monkeypatch.setattr(native.GpuConfig, "from_env", lambda: GpuConfig(max_runtime_minutes=60))
+    monkeypatch.setattr(settings, "native_comfy_max_runtime_minutes", 60)
     with TestClient(proxy) as client:
         response = client.get("/api/gpu/native/status", headers={"Authorization": "Bearer api-test-token"})
     assert response.status_code == 200
@@ -1104,3 +1106,216 @@ def test_native_startup_still_fails_on_exit_or_deadline(monkeypatch, exit_code, 
     with pytest.raises(RuntimeError, match=error):
         runtime.wait_for_comfy(worker, SimpleNamespace(poll=lambda: exit_code), timeout)
     assert clock[0] == (0 if exit_code is not None else timeout)
+
+
+def test_colab_cli_dual_layer_keepalive_refreshes_proxy_recreates_kernel_and_executes_ws(monkeypatch):
+    import json
+
+    import httpx
+    from app.db import Store
+    from app.gpu.colab import GoogleColabProvider
+    from app.gpu.mcp import MCPGPUExecutor
+    from app.gpu.repository import Repository
+    from app.security import decrypt_secret, encrypt_secret
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setattr(settings, "encryption_key", Fernet.generate_key().decode())
+
+    store = Store("sqlite:///:memory:")
+    repo = Repository(store)
+    seen = []
+    ws_calls = []
+    state = {"tfe_timeout": False}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, str(request.url.host), request.url.path, dict(request.headers)))
+        if request.url.path == "/tun/m/m-s-test123/keep-alive/":
+            assert request.headers.get("X-Colab-Tunnel") == "Google"
+            assert request.headers.get("X-Colab-Client-Agent") == "colab-cli"
+            assert request.headers.get("Authorization") == "Bearer colab-token"
+            if state["tfe_timeout"]:
+                raise httpx.ReadTimeout("stream held open")
+            return httpx.Response(200, json={"ok": True})
+        if request.url.path == "/tun/m/assignments":
+            return httpx.Response(200, json={
+                "assignments": [{
+                    "endpoint": "m-s-test123",
+                    "runtimeProxyInfo": {
+                        "url": "https://8080-test.colab.dev/",
+                        "token": "fresh-proxy-token",
+                        "tokenExpiresInSeconds": 3600,
+                    },
+                }]
+            })
+        if request.url.host == "8080-test.colab.dev":
+            tok = request.headers.get("X-Colab-Runtime-Proxy-Token")
+            if tok != "fresh-proxy-token":
+                return httpx.Response(401, json={"error": "expired"})
+            if request.url.path == "/api/kernels/dead-kernel":
+                return httpx.Response(404, json={"message": "not found"})
+            if request.url.path == "/api/kernels" and request.method == "GET":
+                return httpx.Response(200, json=[])
+            if request.url.path == "/api/kernels" and request.method == "POST":
+                assert json.loads(request.content.decode()) == {"name": "python3"}
+                return httpx.Response(201, json={"id": "new-kernel-99"})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    class FakeWS:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.kwargs = kwargs
+            self.replies = []
+
+        def __enter__(self):
+            ws_calls.append((self.url, self.kwargs.get("additional_headers")))
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def send(self, frame):
+            msg = MCPGPUExecutor._ws_unpack_default(frame)
+            assert msg["content"]["code"] == "1 + 1"
+            assert msg["content"]["store_history"] is False
+            mid = msg["header"]["msg_id"]
+            self.replies = [
+                MCPGPUExecutor._ws_pack_default({
+                    "header": {"msg_type": "execute_reply"},
+                    "parent_header": {"msg_id": mid},
+                    "content": {"status": "ok"},
+                }),
+                MCPGPUExecutor._ws_pack_default({
+                    "header": {"msg_type": "status"},
+                    "parent_header": {"msg_id": mid},
+                    "content": {"execution_state": "idle"},
+                }),
+            ]
+
+        def recv(self, timeout=None):
+            return self.replies.pop(0)
+
+    class FakeGoogle:
+        def access_token(self, scope):
+            assert scope == "colab"
+            return "colab-token"
+
+    lease = {
+        "id": "lease-1",
+        "owner_id": "owner",
+        "tunnel_endpoint": "m-s-test123",
+        "proxy_url": "https://8080-test.colab.dev",
+        "encrypted_proxy_token": encrypt_secret("stale-proxy-token"),
+        "proxy_token_expires_at": time.time() + 1000,
+        "kernel_id": "dead-kernel",
+    }
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        provider = GoogleColabProvider(repo, "owner", account_id="acc", client=client, google=FakeGoogle())
+        res = provider.keep_alive(lease, run_kernel_exec=True, ws_connect_fn=FakeWS)
+        assert res["ok"] is True
+        assert res["tfe"] == "ok:200"
+        assert res["proxy"] == "ok"
+        assert res["kernel_exec"] == "ok"
+        assert res["lease_patch"]["kernel_id"] == "new-kernel-99"
+        assert decrypt_secret(res["lease_patch"]["encrypted_proxy_token"]) == "fresh-proxy-token"
+        assert len(ws_calls) == 1
+        assert "new-kernel-99" in ws_calls[0][0]
+        assert ws_calls[0][1]["X-Colab-Runtime-Proxy-Token"] == "fresh-proxy-token"
+
+        # ReadTimeout on TFE stream is also accepted as signal ack
+        state["tfe_timeout"] = True
+        lease_updated = {**lease, **res["lease_patch"]}
+        seen_known = []
+
+        def transport_steady(request: httpx.Request) -> httpx.Response:
+            seen_known.append(request.url.path)
+            if request.url.path == "/tun/m/m-s-test123/keep-alive/":
+                raise httpx.ReadTimeout("stream held open")
+            if request.url.path == "/api/kernels/new-kernel-99":
+                return httpx.Response(200, json={"id": "new-kernel-99"})
+            raise AssertionError(f"Unexpected: {request.url}")
+
+        with httpx.Client(transport=httpx.MockTransport(transport_steady)) as client2:
+            provider2 = GoogleColabProvider(repo, "owner", account_id="acc", client=client2, google=FakeGoogle())
+            res2 = provider2.keep_alive(lease_updated, run_kernel_exec=False, ws_connect_fn=FakeWS)
+            assert res2["ok"] is True
+            assert res2["tfe"] == "read_timeout_ack"
+            assert res2["proxy"] == "ok"
+            assert res2["kernel_exec"] == "skipped"
+
+
+def test_protect_lease_gates_and_throttles_keepalive(monkeypatch):
+    from app.db import Store
+    from app.gpu.compute import GpuConfig
+    from app.gpu.repository import Repository
+
+    store = Store("sqlite:///:memory:")
+    repo = Repository(store)
+    now = [1000.0]
+    repo.create("instances", "owner", {
+        "state": "retained_idle", "provider": "colab", "account_id": "acc", "lease_id": "lease-ka",
+        "manual_stop_requested": False,
+    }, record_id="inst-ka")
+    repo.create("jobs", "owner", {
+        "state": "completed", "provider": "colab", "snapshot": {"native_comfy": True},
+        "execution_policy": {"lifecycle": "retain", "retain_idle_minutes": 120, "max_runtime_minutes": 720},
+    }, record_id="job-ka")
+    repo.create("leases", "owner", {
+        "state": "idle", "provider": "colab", "owner_job_id": "job-ka", "account_id": "acc",
+        "instance_id": "inst-ka", "native_comfy": True, "native_ready": True,
+        "native_last_busy": 1000.0, "native_idle_minutes": 120, "deadline_epoch": 1000.0 + 720 * 60,
+        "runtime_id": "studio-ka", "request_id": "req-ka", "tunnel_endpoint": "m-s-ka",
+        "handle": {"runtime_name": "runtimes/studio-ka"},
+    }, record_id="lease-ka")
+
+    calls = []
+
+    class FakeProvider:
+        def keep_alive(self, lease, *, run_kernel_exec=False):
+            calls.append((now[0], run_kernel_exec))
+            return {
+                "ok": True,
+                "tfe": "ok:200",
+                "proxy": "ok",
+                "kernel_exec": "ok" if run_kernel_exec else "skipped",
+                "lease_patch": {"kernel_id": "k-1"},
+            }
+
+    monkeypatch.setattr(native, "busy", lambda: False)
+    monkeypatch.setattr(native.GpuConfig, "from_env", lambda: GpuConfig(real_enabled=False))
+
+    # t=1000: first check fires both HTTP keep-alive and WS kernel exec
+    assert native.protect_lease(repo, repo.get("leases", "lease-ka", "owner"), clock=lambda: now[0], provider_factory=lambda job: FakeProvider())
+    assert calls == [(1000.0, True)]
+    saved = repo.get("leases", "lease-ka", "owner")
+    assert saved["kernel_id"] == "k-1"
+    assert saved["native_last_keepalive_at"] == 1000.0
+    assert saved["native_last_kernel_exec_at"] == 1000.0
+
+    # t=1030 (<60s): throttled, no provider call
+    now[0] = 1030.0
+    assert native.protect_lease(repo, repo.get("leases", "lease-ka", "owner"), clock=lambda: now[0], provider_factory=lambda job: FakeProvider())
+    assert len(calls) == 1
+
+    # t=1065 (>=60s, <240s): HTTP keep-alive only, no WS kernel exec
+    now[0] = 1065.0
+    assert native.protect_lease(repo, repo.get("leases", "lease-ka", "owner"), clock=lambda: now[0], provider_factory=lambda job: FakeProvider())
+    assert calls[-1] == (1065.0, False)
+
+    # t=1245 (>=240s since last WS exec): both HTTP keep-alive and WS kernel exec
+    now[0] = 1245.0
+    assert native.protect_lease(repo, repo.get("leases", "lease-ka", "owner"), clock=lambda: now[0], provider_factory=lambda job: FakeProvider())
+    assert calls[-1] == (1245.0, True)
+
+    # Deadline reached even if upstream_busy=True: keep-alive stops immediately (no infinite CU burn)
+    monkeypatch.setattr(native, "busy", lambda: True)
+    monkeypatch.setattr(native, "_runtime_deleted", lambda r, lease: False)
+    now[0] = 1000.0 + 720 * 60
+    count_before = len(calls)
+    assert native.protect_lease(repo, repo.get("leases", "lease-ka", "owner"), clock=lambda: now[0], provider_factory=lambda job: FakeProvider())
+    assert len(calls) == count_before
+
+    # Manual stop: drains immediately and never sends keep-alive
+    repo.update("instances", "inst-ka", {"manual_stop_requested": True}, "owner")
+    now[0] = 1500.0
+    assert not native.protect_lease(repo, repo.get("leases", "lease-ka", "owner"), clock=lambda: now[0], provider_factory=lambda job: FakeProvider())
+    assert len(calls) == count_before

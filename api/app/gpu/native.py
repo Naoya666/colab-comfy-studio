@@ -21,10 +21,9 @@ TERMINAL = {"completed", "failed", "cancelled", "rejected"}
 
 
 def timeout_options():
-    max_runtime = GpuConfig.from_env().max_runtime_minutes
     return {
         "defaults": {"retain_idle_minutes": settings.native_comfy_idle_minutes,
-                     "max_runtime_minutes": max_runtime},
+                     "max_runtime_minutes": settings.native_comfy_max_runtime_minutes},
         "limits": {"retain_idle_minutes": None, "max_runtime_minutes": None},
     }
 
@@ -96,7 +95,7 @@ class _borrow:
 def admit(repo, owner, body, key):
     cfg = GpuConfig.from_env()
     timeouts = {"retain_idle_minutes": settings.native_comfy_idle_minutes,
-                "max_runtime_minutes": cfg.max_runtime_minutes}
+                "max_runtime_minutes": settings.native_comfy_max_runtime_minutes}
     for field in timeouts:
         value = body.get(field, timeouts[field])
         if type(value) is not int or value < 1:
@@ -141,7 +140,7 @@ def admit(repo, owner, body, key):
             policy = source.get("execution_policy") or {}
             if any(field in body and timeouts[field] != policy.get(field, default)
                    for field, default in (("retain_idle_minutes", settings.native_comfy_idle_minutes),
-                                          ("max_runtime_minutes", cfg.max_runtime_minutes))):
+                                          ("max_runtime_minutes", settings.native_comfy_max_runtime_minutes))):
                 raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止旧实例后重新启动以调整时间参数", 409)
             return source
         # Never create a second GPU while another live instance is already present.
@@ -234,7 +233,107 @@ def _lease_identity(lease):
     ))
 
 
-def protect_lease(repo, lease, clock=time.time, *, check_remote=True):
+def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None):
+    """Send bounded Colab TFE + proxy/kernel keep-alive only while retention gates hold."""
+    if (
+        not isinstance(lease, dict)
+        or lease.get("provider") != "colab"
+        or lease.get("state") != "idle"
+        or lease.get("current_job_id")
+        or lease.get("native_draining")
+        or not lease.get("account_id")
+    ):
+        return None
+    if provider_factory is None and not GpuConfig.from_env().real_enabled:
+        return None
+    if provider_factory is None and not (lease.get("tunnel_endpoint") or lease.get("proxy_url") or isinstance(lease.get("handle"), dict)):
+        return None
+    now = float(clock())
+    deadline = lease.get("deadline_epoch")
+    if deadline is not None and now >= float(deadline):
+        return None
+    from .colab import (
+        KEEPALIVE_INTERVAL_SECONDS,
+        KEEPALIVE_RETRY_SECONDS,
+        KERNEL_EXEC_INTERVAL_SECONDS,
+        GoogleColabProvider,
+    )
+
+    prev_status = lease.get("native_keepalive_status")
+    interval = (
+        KEEPALIVE_RETRY_SECONDS
+        if isinstance(prev_status, dict) and prev_status.get("ok") is False
+        else KEEPALIVE_INTERVAL_SECONDS
+    )
+    last_keepalive = float(lease.get("native_last_keepalive_at") or 0)
+    if last_keepalive > 0 and now - last_keepalive < interval:
+        return None
+    last_kernel_exec = float(lease.get("native_last_kernel_exec_at") or 0)
+    run_kernel_exec = last_kernel_exec <= 0 or (now - last_kernel_exec) >= KERNEL_EXEC_INTERVAL_SECONDS
+    identity = _lease_identity(lease)
+    job_stub = {
+        "id": lease.get("owner_job_id"),
+        "owner_id": lease["owner_id"],
+        "provider": "colab",
+        "account_id": lease["account_id"],
+    }
+    provider = None
+    owns_provider = False
+    try:
+        if provider_factory is not None:
+            provider = provider_factory(job_stub)
+            if not hasattr(provider, "keep_alive"):
+                return None
+        else:
+            provider = GoogleColabProvider(repo, lease["owner_id"], account_id=lease["account_id"])
+            owns_provider = True
+        result = provider.keep_alive(lease, run_kernel_exec=run_kernel_exec)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "tfe": f"err:{type(exc).__name__}",
+            "proxy": "skipped",
+            "kernel_exec": "skipped",
+            "lease_patch": {},
+        }
+    finally:
+        if owns_provider and provider is not None:
+            provider.close()
+
+    if not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
+        return result
+    commit_now = float(clock())
+    with repo.store.dispatch_lock() as acquired:
+        if not acquired:
+            return result
+        fresh = repo.get("leases", lease["id"], lease["owner_id"])
+        if (
+            not fresh
+            or fresh.get("state") != "idle"
+            or fresh.get("current_job_id")
+            or fresh.get("native_draining")
+            or _lease_identity(fresh) != identity
+        ):
+            return None
+        fresh_deadline = fresh.get("deadline_epoch")
+        if fresh_deadline is not None and commit_now >= float(fresh_deadline):
+            return None
+        patch = dict(result.get("lease_patch") or {})
+        patch["native_last_keepalive_at"] = commit_now
+        if result.get("kernel_exec") == "ok":
+            patch["native_last_kernel_exec_at"] = commit_now
+        patch["native_keepalive_status"] = {
+            "at": commit_now,
+            "ok": bool(result.get("ok")),
+            "tfe": result.get("tfe"),
+            "proxy": result.get("proxy"),
+            "kernel_exec": result.get("kernel_exec"),
+        }
+        repo.update("leases", fresh["id"], patch, fresh["owner_id"])
+    return result
+
+
+def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_factory=None):
     """Fence idle shutdown against new uploads/prompts under the existing dispatch lock."""
     if not lease.get("native_comfy"):
         return False
@@ -251,6 +350,7 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True):
     # An offline tunnel also reports "busy". It cannot veto reconciliation of
     # a VM already confirmed absent by Colab's independent control plane.
     remote_deleted = check_remote and upstream_busy and _runtime_deleted(repo, lease)
+    retained = False
     with repo.store.dispatch_lock() as acquired:
         if not acquired:
             return True
@@ -267,23 +367,27 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True):
         manual = bool(instance.get("manual_stop_requested"))
         if not manual:
             if upstream_busy:
-                repo.update("leases", lease["id"], {"native_last_busy": clock()}, lease["owner_id"])
-                return True
-            if clock() - float(lease.get("native_http_heartbeat") or 0) < 30:
-                return True
-            last = max(float(lease.get("native_last_busy") or 0), float(lease.get("native_last_write") or 0))
-            idle_minutes = lease.get("native_idle_minutes")
-            if idle_minutes is None:
-                job = repo.get("jobs", lease.get("owner_job_id"), lease["owner_id"]) if lease.get("owner_job_id") else None
-                idle_minutes = ((job or {}).get("execution_policy") or {}).get("retain_idle_minutes", settings.native_comfy_idle_minutes)
-            deadline = lease.get("deadline_epoch")
-            expired = deadline is not None and clock() >= float(deadline)
-            if not expired and clock() - last < idle_minutes * 60:
-                return True
-        repo.update("leases", lease["id"], {"native_draining": True}, lease["owner_id"])
-        if lease.get("instance_id") and instance:
-            repo.update("instances", lease["instance_id"], {"native_draining": True}, lease["owner_id"])
-        return False
+                lease = repo.update("leases", lease["id"], {"native_last_busy": clock()}, lease["owner_id"])
+                retained = True
+            elif clock() - float(lease.get("native_http_heartbeat") or 0) < 30:
+                retained = True
+            else:
+                last = max(float(lease.get("native_last_busy") or 0), float(lease.get("native_last_write") or 0))
+                idle_minutes = lease.get("native_idle_minutes")
+                if idle_minutes is None:
+                    job = repo.get("jobs", lease.get("owner_job_id"), lease["owner_id"]) if lease.get("owner_job_id") else None
+                    idle_minutes = ((job or {}).get("execution_policy") or {}).get("retain_idle_minutes", settings.native_comfy_idle_minutes)
+                deadline = lease.get("deadline_epoch")
+                expired = deadline is not None and clock() >= float(deadline)
+                if not expired and clock() - last < idle_minutes * 60:
+                    retained = True
+        if not retained:
+            repo.update("leases", lease["id"], {"native_draining": True}, lease["owner_id"])
+            if lease.get("instance_id") and instance:
+                repo.update("instances", lease["instance_id"], {"native_draining": True}, lease["owner_id"])
+            return False
+    keepalive_lease(repo, lease, clock=clock, provider_factory=provider_factory)
+    return True
 
 
 def begin_write(repo, lease, *, allow_stopping=False, timeout=2.0):

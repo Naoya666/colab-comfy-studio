@@ -2075,7 +2075,13 @@ class Scheduler:
             instance = self._get("instances", instance_id, lease["owner_id"]) if instance_id else None
             if lease.get("native_ready"):
                 from .native import protect_lease
-                if protect_lease(self.store, lease, self.clock, check_remote=observation is None):
+                if protect_lease(
+                    self.store,
+                    lease,
+                    self.clock,
+                    check_remote=observation is None,
+                    provider_factory=self.provider_factory,
+                ):
                     continue
             stopping = bool(instance and (instance.get("manual_stop_requested") or instance.get("state") in {"releasing", "cleanup_pending"}))
             if lease.get('state')=='idle' and not stopping and self.clock()<min(
