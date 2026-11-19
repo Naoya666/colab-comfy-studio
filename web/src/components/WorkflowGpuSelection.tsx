@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { apiFetch, getGpuComputeSpecs, getGpuSettings, type ComputeSpec, type GpuManifest } from '../lib/gpu-api';
 import { resolveGpuCheckRequest } from '../lib/colab-check';
 import type { GpuAccount } from './AccountDirectory';
@@ -7,10 +7,12 @@ export function computeLabel(key: Record<string, unknown> | null | undefined): s
   if (!key) return '工作流默认规格';
   return `${key.accelerator || '默认 GPU'} · ${String(key.shape || '').includes('HIGHMEM') ? '高系统内存' : '标准系统内存'}`;
 }
-export function WorkflowGpuSelection({ manifest, accountId, value, onChange }: {
+export function WorkflowGpuSelection({ manifest, accountId, value, onChange, label = '本次 GPU' }: {
   manifest: GpuManifest | null; accountId?: string | null; value: Record<string, unknown> | null;
   onChange: (key: Record<string, unknown> | null) => void;
+  label?: string;
 }) {
+  const selectId = useId();
   const [specs, setSpecs] = useState<ComputeSpec[]>([]);
   const [error, setError] = useState('');
   const [accountName, setAccountName] = useState('');
@@ -47,8 +49,8 @@ export function WorkflowGpuSelection({ manifest, accountId, value, onChange }: {
   const current = value ? token(value) : '';
   const present = specs.some(s => token(s.key as Record<string, unknown>) === current);
   return <div className="field">
-    <label htmlFor="workflow-gpu">本次 GPU</label>
-    <select id="workflow-gpu" value={current} onChange={e => onChange((specs.find(s => token(s.key as Record<string, unknown>) === e.target.value)?.key as Record<string, unknown>) || null)}>
+    <label htmlFor={selectId}>{label}</label>
+    <select id={selectId} value={current} onChange={e => onChange((specs.find(s => token(s.key as Record<string, unknown>) === e.target.value)?.key as Record<string, unknown>) || null)}>
       <option value="">默认 / 推荐 GPU · {computeLabel(manifest?.compute_spec as Record<string, unknown>)}</option>
       {value && !present && <option value={current}>{computeLabel(value)}（上次选择，提交时重新校验）</option>}
       {specs.map(s => <option key={token(s.key as Record<string, unknown>)} value={token(s.key as Record<string, unknown>)}>{computeLabel(s.key as Record<string, unknown>)} · {s.vram_gb ? `${s.vram_gb} GB 显存` : '显存以实际设备为准'} · {typeof s.consumptionRateHourly === 'number' ? `${s.consumptionRateHourly} CU/h` : 'CU 速率未提供'}</option>)}

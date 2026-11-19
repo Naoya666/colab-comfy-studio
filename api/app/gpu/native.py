@@ -103,7 +103,7 @@ class _borrow:
         pass
 
 
-def admit(repo, owner, body, key):
+def admit(repo, owner, body, key, *, api_key_id=None):
     cfg = GpuConfig.from_env()
     timeouts = {"retain_idle_minutes": settings.native_comfy_idle_minutes,
                 "max_runtime_minutes": settings.native_comfy_max_runtime_minutes}
@@ -141,6 +141,8 @@ def admit(repo, owner, body, key):
         live = active_lease(repo, owner)
         if running or live:
             source = running or repo.get("jobs", live["owner_job_id"], owner)
+            if api_key_id and source:
+                return source
             from .specs import spec_key
             try:
                 same_spec = source and spec_key(source.get("requested_spec")) == spec_key(body["spec"])
@@ -181,6 +183,7 @@ def admit(repo, owner, body, key):
                   **timeouts,
                   **({"instance_id": requested_instance, "allocation": "existing"} if requested_instance else {})}
         return repo.update("jobs", job["id"], {
+            **({"native_api_key_id": api_key_id} if api_key_id else {}),
             "native_request_hash": digest(body), "project_id": project, "provider": "colab",
             "account_id": account, "requested_account_id": account,
             "requested_instance_id": requested_instance, "requested_spec": body["spec"],

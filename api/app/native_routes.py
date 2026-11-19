@@ -5,13 +5,66 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import APIRouter, Depends, Request
 
-from .common import APIError, current_user, ok
+from . import native_api
+from .common import APIError, admin, current_user, ok
 from .config import settings
 from .gpu import native, native_restart
 from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
 from .security import sign_session
 
 router = APIRouter(prefix="/api/gpu/native")
+
+
+@router.get("/api-settings")
+def api_settings(request: Request, user=Depends(current_user)):
+    admin(user)
+    owner = user["id"]
+    repo = request.app.state.repo
+    keys = repo.store.list(native_api.KEYS, owner)
+    starts = [job for job in repo.list("jobs", owner) if job.get("native_api_key_id")]
+    return ok({
+        "policy": native_api.policy(repo.store, owner),
+        "url": settings.native_comfy_url.rstrip("/"),
+        "keys": [native_api.public_key(row) for row in keys],
+        "recent_starts": [{"job_id": job["id"], "key_id": job["native_api_key_id"],
+                           "state": job["state"], "created_at": job["created_at"]} for job in starts[:10]],
+    }, request)
+
+
+@router.put("/api-settings")
+def update_api_settings(body: dict, request: Request, user=Depends(current_user)):
+    admin(user)
+    return ok(native_api.save_policy(request.app.state.repo, user["id"], body), request)
+
+
+@router.post("/api-keys", status_code=201)
+def create_api_key(body: dict, request: Request, user=Depends(current_user)):
+    admin(user)
+    response = ok(native_api.create_key(request.app.state.repo.store, user["id"], body), request, 201)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.patch("/api-keys/{key_id}")
+def update_api_key(key_id: str, body: dict, request: Request, user=Depends(current_user)):
+    admin(user)
+    store, owner = request.app.state.repo.store, user["id"]
+    if set(body) != {"auto_start"} or type(body["auto_start"]) is not bool:
+        raise APIError("NATIVE_API_INPUT", "开机权限无效")
+    with store.admission_lock() as acquired:
+        if not acquired:
+            raise APIError("NATIVE_API_BUSY", "暂无法更新接入 Key，请重试", 503)
+        row = store.get(native_api.KEYS, key_id, owner)
+        if not row or row.get("revoked_at"):
+            raise APIError("NATIVE_API_NOT_FOUND", "有效接入 Key 不存在", 404)
+        row = store.update(native_api.KEYS, key_id, body, owner)
+    return ok(native_api.public_key(row), request)
+
+
+@router.delete("/api-keys/{key_id}")
+def revoke_api_key(key_id: str, request: Request, user=Depends(current_user)):
+    admin(user)
+    return ok(native_api.revoke_key(request.app.state.repo.store, user["id"], key_id), request)
 
 
 @router.get("/status")

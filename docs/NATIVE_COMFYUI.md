@@ -35,7 +35,7 @@
 
 ## 部署
 
-继续使用原有 api/worker/watchdog/model-worker 服务、同一个数据库与数据卷。无需迁移表。当前环境未连接用户的 Cloudflare 账号，以下域名、Access 策略和 tunnel 必须在部署环境配置。
+继续使用原有 api/worker/watchdog/model-worker 服务、同一个数据库与数据卷。升级已有部署时运行 `alembic upgrade head`，新增的表保存专用 API Key 和任务归属。以下域名、Access 策略和 tunnel 必须在部署环境配置。
 
 1. 为 VPS 配置 `studio.example.com` 和 `comfy.example.com`，都转发至本项目 API；必须保留原始 Host、编码 URL、查询参数、WebSocket Upgrade，并关闭代理缓冲。示例 [deploy/native-comfy.nginx.conf.example](deploy/native-comfy.nginx.conf.example)。不要把 `/api/*` 单独转到 Studio 路由；整个 Comfy 域名均经过同一网关。当前仅实现独立域名，不提供未经验证的 `/comfy/` 子路径。
 2. 在 Cloudflare 创建 **named tunnel**，另用内部域名，例如 `colab-backend.example.com`，origin 为 Colab 中的 `http://127.0.0.1:8188`。不能将其指向 VPS。此域名配置独立 Access Application，策略使用 **Service Auth**，只允许网关的 service token；不要配置公开 Bypass。启动时网关会验证无 service token 的健康检查不能返回 200。
@@ -120,9 +120,16 @@ AI-Studio/<owner>/
 
 核查了实际克隆的 [SillyTavern/src/endpoints/stable-diffusion.js](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/src/endpoints/stable-diffusion.js)，其中 ComfyUI 的 ping、object_info、prompt、history、view 等 fetch 多数不带 Authorization；仅部分取消请求带 auth。因此不能要求其现有 ComfyUI 页面完成本站网页登录，或声称在一个 auth 输入框里填 Bearer 就都能成功。
 
-可用兼容配置是 [deploy/sillytavern-comfy.nginx.conf.example](deploy/sillytavern-comfy.nginx.conf.example)：仅监听 SillyTavern 服务器的 `127.0.0.1:8189`，服务端注入本站 Token，再请求固定公网 Comfy 域名。Token 写在权限受限的 nginx include 文件中，不写进酒馆 URL、工作流或浏览器脚本。酒馆 ComfyUI 地址填写 `http://127.0.0.1:8189`（由酒馆后端发起）。如果酒馆运行于另一台机器，将此 loopback relay 部署在那里；容器场景需使用仅私网可达且访问受限的 relay。也可用 SSH 转发访问 VPS loopback。禁止把无鉴权 relay 直接公开到公网。
+在「原生 ComfyUI → API 设置」为自管的酒馆创建专用接入 Key，并按需启用开机权限。用 [同机中继配置](deploy/sillytavern-comfy.nginx.conf.example) 让中继监听 `127.0.0.1:8189` 并转发至本机 Studio API 端口。固定 `Host` 为原生 ComfyUI 域名，网关据此选择原生代理。把 Key 放到权限受限的 nginx include 文件，并在柏宝绘填写 `http://127.0.0.1:8189`。如果酒馆在另一台服务器，在那里运行中继并通过 HTTPS 请求原生域名。容器场景应使用仅酒馆容器可访问的私网中继。
 
-实际酒馆生成、轮询和取图仍需真实环境验证；已离线验证的只是网关对标准授权 API 请求的透明转发。
+实际酒馆生成、轮询和取图仍需真实环境验证。离线测试覆盖管理员透明转发、专用 Key 的任务和产物归属，以及 API 冷启动等待超时。
+
+## 专用 API 接入
+
+- 服务端客户端直接使用公网原生 HTTPS 域名，并在每个请求带上 `Authorization: Bearer <专用 Key>`。Key 仅在创建时显示，撤销后立即拒绝后续请求。
+- 专用 Key 可用 `GET /_studio/api/status` 检查网关及会话就绪状态，也可获取 `/system_stats`、`/object_info` 和模型列表。生成顺序为 `POST /prompt`、`GET /history/{prompt_id}`，再按历史返回的 `filename`、`subfolder`、`type` 请求 `GET /view`。状态和取图权限归属提交 Key 及原生会话。该模式的共享队列、取消、Manager 和 WebSocket 操作需要管理员原生会话。
+- 「限定已批准的工作流」要求节点图和固定输入与保存的模板一致。只在管理员已确认可变的输入位置放完整占位符。支持 `%prompt%`、`%negative_prompt%`、`%nl%`、`%seed%`、`%width%`、`%height%`。管理员应审核模板节点及固定输入，文本占位符适用于提示词输入。自管客户端可使用「信任客户端提交的工作流」权限。每把专用 Key 最多提交 20 次/分钟，最多同时有 4 个未完成任务。
+- 自动启动默认为关闭。开启后，获准开机的 Key 发送有效 `POST /prompt` 可按保存的账号、GPU 和回收参数启动。连接探测与轮询不会开机。启动请求共用现有调度和预算，已有实例沿用自己的配置。网关最多等待启动 25 秒。若返回 `503 NATIVE_STARTING`，说明工作流尚未提交，后台仍在启动。调用方可等待就绪后重发。未修改的柏宝绘需手动重试。初次配置柏宝绘时可先在原生页启动实例，再测试连接和加载模型。
 
 ## 自动测试与真实验收
 

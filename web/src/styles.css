@@ -219,6 +219,12 @@ input[type="number"] { -moz-appearance: textfield; }
   color: var(--text);
 }
 .nativeRestartDialog::backdrop { background: var(--overlay); }
+.nativeApiDialog { width: min(660px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; }
+.nativeApiHeading { justify-content: space-between; }
+.nativeApiDialog form, .nativeApiDialog section { margin-block: 16px; }
+.nativeApiDialog form > .button { margin-top: 12px; }
+.nativeApiKeys { padding-left: 20px; }
+.nativeApiKeys li { margin-block: 12px; overflow-wrap: anywhere; }
 .muted { color: var(--muted); }
 .small { font-size: 0.78rem; }
 

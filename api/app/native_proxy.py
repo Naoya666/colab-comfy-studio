@@ -6,18 +6,20 @@ no frontend rewriting, raw encoded paths, streamed bodies, binary WebSockets.
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import time
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake
 
+from . import native_api
 from .common import APIError
 from .config import settings
 from .gpu import native
@@ -100,7 +102,14 @@ class NativeHostMiddleware:
                 response.set_cookie("studio_native", token, max_age=43200, secure=True, httponly=True, samesite="strict")
                 response.headers["Cache-Control"] = "no-store"
                 return await response(scope, receive, send)
-            owner = identity(headers, request.cookies)
+            repo = self.studio_app.state.repo
+            auth = headers.get("authorization", "")
+            key = None
+            if auth.startswith("Bearer nca_") and not (
+                settings.studio_api_token and secrets.compare_digest(auth[7:], settings.studio_api_token)
+            ):
+                key = await asyncio.to_thread(native_api.authenticate, repo.store, auth[7:])
+            owner = key["owner_id"] if key else identity(headers, request.cookies)
             if not owner:
                 raise APIError("UNAUTHENTICATED", "请从 Studio 的原生 ComfyUI 入口登录，API 使用 Bearer Token", 401)
             internal_path = scope["path"].removeprefix("/api").rstrip("/")
@@ -108,16 +117,112 @@ class NativeHostMiddleware:
                 raise APIError("NOT_FOUND", "接口不存在", 404)
             if request.method not in {"GET", "HEAD", "OPTIONS"}:
                 check_origin(headers)
-            lease = await asyncio.to_thread(native.active_lease, self.studio_app.state.repo, owner)
+            path, file, payload = None, None, None
+            if key:
+                path = native_api.scope_path(scope["path"], request.method, scope["query_string"])
+                await asyncio.to_thread(native_api.touch, repo.store, key)
+            lease = await asyncio.to_thread(native.active_lease, repo, owner)
+            if (path or scope["path"]) == "/_studio/api/status":
+                return await JSONResponse(
+                    {"ready": bool(lease and lease.get("native_ready") and not native.restart_active(lease))},
+                    headers={"Cache-Control": "no-store"},
+                )(scope, receive, send)
+            submit = request.method == "POST" and scope["path"] in {"/prompt", "/api/prompt"}
+            if key and submit:
+                _, graph = await self.read_prompt(request)
+                payload = json.dumps(native_api.submission(key, graph), allow_nan=False).encode()
+            if lease and submit and not lease.get("native_ready"):
+                await self.check_stopping(repo, lease, owner)
             if not lease or not lease.get("native_ready"):
-                raise APIError("NATIVE_NOT_READY", "请在 Studio 启动原生 ComfyUI", 503)
+                if not submit or (not key and not (
+                    settings.studio_api_token and auth.startswith("Bearer ")
+                    and secrets.compare_digest(auth[7:], settings.studio_api_token)
+                )):
+                    raise APIError("NATIVE_NOT_READY", "请在 Studio 启动原生 ComfyUI", 503)
+                if not key:
+                    values = await asyncio.to_thread(native_api.policy, repo.store, owner)
+                    if not values["auto_start"]:
+                        raise APIError("NATIVE_NOT_READY", "请在 Studio 启动原生 ComfyUI", 503)
+                    payload, graph = await self.read_prompt(request)
+                    native_api.submission({"mode": "trusted"}, graph)
+                lease = await self.wait_for_start(request, repo, owner, key)
             if request.method not in {"GET", "HEAD", "OPTIONS"} and scope["path"] not in {"/interrupt", "/api/interrupt", "/queue", "/api/queue"}:
-                instance = await asyncio.to_thread(self.studio_app.state.repo.get, "instances", lease.get("instance_id"), owner)
-                if (instance or {}).get("manual_stop_requested") or time.time() >= float(lease.get("deadline_epoch") or float("inf")):
-                    raise APIError("NATIVE_DRAINING", "会话已到运行时限或正在停止；等待已有任务及同步结束后重启", 409)
-            return await self.http(request, lease, scope, receive, send)
+                await self.check_stopping(repo, lease, owner)
+            if key:
+                if path.startswith("/history/"):
+                    prompt_id = path.rsplit("/", 1)[1]
+                    record = await asyncio.to_thread(
+                        repo.store.get, native_api.PROMPTS, native_api.prompt_record_id(key, lease, prompt_id), owner,
+                    )
+                    if not record:
+                        raise APIError("NATIVE_API_NOT_FOUND", "任务不存在或已结束会话", 404)
+                if path == "/view":
+                    file = native_api.view_tuple(scope["query_string"].decode("ascii"))
+                    record = await asyncio.to_thread(
+                        repo.store.get, native_api.PROMPTS, native_api.view_id(key, lease, file), owner,
+                    )
+                    if not record:
+                        raise APIError("NATIVE_API_NOT_FOUND", "图片不存在或不属于当前接入 Key", 404)
+            return await self.http(request, lease, scope, receive, send, key=key, path=path, file=file, payload=payload)
         except APIError as exc:
-            return await JSONResponse({"error": exc.code, "message": exc.message}, status_code=exc.status)(scope, receive, send)
+            return await JSONResponse(
+                {"error": exc.code, "message": exc.message}, status_code=exc.status,
+                headers={"Cache-Control": "no-store", **({"Retry-After": "5"} if exc.code == "NATIVE_STARTING" else {})},
+            )(scope, receive, send)
+
+    @staticmethod
+    async def check_stopping(repo, lease, owner):
+        instance = await asyncio.to_thread(repo.get, "instances", lease.get("instance_id"), owner)
+        if (lease.get("native_draining") or (instance or {}).get("manual_stop_requested")
+                or time.time() >= float(lease.get("deadline_epoch") or float("inf"))):
+            raise APIError("NATIVE_DRAINING", "会话已到运行时限或正在停止；等待已有任务及同步结束后重启", 409)
+
+    @staticmethod
+    async def read_prompt(request):
+        body = bytearray()
+        try:
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > native_api.MAX_WORKFLOW_BYTES:
+                    raise APIError("PAYLOAD_TOO_LARGE", "工作流请求不能超过 1 MiB", 413)
+                body.extend(chunk)
+            data = json.loads(body)
+            json.dumps(data, allow_nan=False)
+        except ClientDisconnect as exc:
+            raise APIError("NATIVE_REQUEST_CLOSED", "连接已关闭，工作流未提交", 499) from exc
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            raise APIError("NATIVE_API_INPUT", "请求必须为有效的 JSON 工作流", 400) from exc
+        return bytes(body), data
+
+    async def wait_for_start(self, request, repo, owner, key):
+        deadline = time.monotonic() + native_api.START_WAIT_SECONDS
+        admission_deadline = min(deadline, time.monotonic() + 2)
+        while True:
+            try:
+                job = await asyncio.to_thread(native_api.request_start, repo, owner, key)
+                break
+            except APIError as exc:
+                if exc.code != "SCHEDULER_BUSY" or time.monotonic() >= admission_deadline:
+                    raise
+                await asyncio.sleep(0.1)
+        if not job:
+            raise APIError("NATIVE_NOT_READY", "请在 Studio 启动原生 ComfyUI", 503)
+        while True:
+            if await request.is_disconnected():
+                raise APIError("NATIVE_REQUEST_CLOSED", "连接已关闭，工作流未提交", 499)
+            current = await asyncio.to_thread(repo.get, "jobs", job["id"], owner) or job
+            if current.get("state") in native.TERMINAL - {"completed"}:
+                raise APIError("NATIVE_START_FAILED", "原生 ComfyUI 启动失败，请在 Studio 查看启动记录", 503)
+            lease = await asyncio.to_thread(native.active_lease, repo, owner)
+            if lease:
+                if lease.get("native_ready"):
+                    if key:
+                        await asyncio.to_thread(native_api.live_key, repo.store, key)
+                    return lease
+                await self.check_stopping(repo, lease, owner)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise APIError("NATIVE_STARTING", "原生 ComfyUI 正在启动，工作流尚未提交，请就绪后重试", 503)
+            await asyncio.sleep(min(remaining, 1))
 
     @staticmethod
     def target(scope):
@@ -126,17 +231,27 @@ class NativeHostMiddleware:
         query = scope.get("query_string", b"").decode("ascii")
         return base + raw + ("?" + query if query else ""), base, auth
 
-    async def http(self, request, lease, scope, receive, send):
+    async def http(self, request, lease, scope, receive, send, *, key=None, path=None, file=None, payload=None):
         url, base, auth = self.target(scope)
+        if key:
+            url = base + quote(path, safe="/")
+            if file:
+                url += "?" + urlencode(dict(zip(("filename", "subfolder", "type"), file)))
         headers = clean_headers(httpx.Headers(scope["headers"]), request=True)
         headers += list(auth.items()) + [("Origin", base)]
         # Do not forward a browser Referer containing the public host to Comfy's origin checker.
         headers = [(k, v) for k, v in headers if k.lower() != "referer"]
-        path = scope["path"].removeprefix("/api").rstrip("/")
+        path = path or scope["path"].removeprefix("/api").rstrip("/")
         mutating = request.method not in {"GET", "HEAD", "OPTIONS"} or (
             request.method == "GET" and path in {"/manager/reboot", "/v2/manager/reboot", "/manager/queue/start"}
         )
         repo = self.studio_app.state.repo
+        if payload is not None:
+            headers = [(k, v) for k, v in headers if k.lower() not in {"content-length", "content-type", "content-encoding"}]
+            headers.append(("Content-Type", "application/json"))
+        if key:
+            headers = [(k, v) for k, v in headers if k.lower() != "accept-encoding"]
+            headers.append(("Accept-Encoding", "identity"))
         stop_heartbeat = asyncio.Event()
         write_id = uuid.uuid4().hex if mutating else None
 
@@ -154,14 +269,18 @@ class NativeHostMiddleware:
             )
         heartbeat = asyncio.create_task(activity()) if mutating else None
         downstream_started = False
+        reservation = None
         try:
             client = self.http_client()
+            if key and mutating:
+                reservation = await self.reserve_prompt(client, base, auth, repo, key, lease)
             retryable = (not mutating and request.method in {"GET", "HEAD"}
                          and request.headers.get("content-length", "0") == "0"
                          and "transfer-encoding" not in request.headers)
             for attempt in range(3 if retryable else 1):
                 req = client.build_request(request.method, httpx.URL(url), headers=headers,
-                                           content=None if retryable else request.stream())
+                                           content=payload if payload is not None else None if retryable else request.stream(),
+                                           timeout=45 if key else httpx.USE_CLIENT_DEFAULT)
                 # The pool must never replay upstream cookies on another browser request.
                 req.headers.pop("cookie", None)
                 try:
@@ -177,6 +296,22 @@ class NativeHostMiddleware:
                     continue
                 break
             try:
+                if key and response.is_redirect:
+                    raise APIError("NATIVE_UPSTREAM_UNAVAILABLE", "原生 ComfyUI 返回了意外的重定向", 502)
+                if key and response.is_success and (reservation or path.startswith("/history/")):
+                    data = await self.read_upstream_json(response)
+                    if reservation:
+                        prompt_id = data.get("prompt_id")
+                        if not isinstance(prompt_id, str) or not native_api.PROMPT_ID.fullmatch(prompt_id):
+                            raise APIError("NATIVE_UPSTREAM_UNAVAILABLE", "ComfyUI 未返回有效任务 ID", 502)
+                        await asyncio.to_thread(native_api.finish_submission, repo.store, key, lease, reservation, prompt_id)
+                        reservation = None
+                    else:
+                        prompt_id = path.rsplit("/", 1)[1]
+                        item = data.get(prompt_id)
+                        await asyncio.to_thread(native_api.register_outputs, repo.store, key, lease, item)
+                        data = {prompt_id: item} if item is not None else {}
+                    return await JSONResponse(data, status_code=response.status_code, headers={"Cache-Control": "no-store"})(scope, receive, send)
                 response_headers = clean_headers(response.headers)
                 response_headers = [(k, v.replace(base, settings.native_comfy_url.rstrip("/")) if k.lower() == "location" else v)
                                     for k, v in response_headers]
@@ -198,6 +333,41 @@ class NativeHostMiddleware:
                     await heartbeat
                 finally:
                     await asyncio.to_thread(native.update_write, repo, lease, write_id, finished=True)
+            if reservation:
+                await asyncio.to_thread(native_api.finish_submission, repo.store, key, lease, reservation)
+
+    @staticmethod
+    async def read_upstream_json(response):
+        try:
+            data = json.loads(await response.aread())
+            if not isinstance(data, dict):
+                raise ValueError
+            return data
+        except (ValueError, RecursionError) as exc:
+            raise APIError("NATIVE_UPSTREAM_UNAVAILABLE", "原生 ComfyUI 返回了无效响应", 502) from exc
+
+    async def reserve_prompt(self, client, base, auth, repo, key, lease):
+        reservation = await asyncio.to_thread(native_api.reserve, repo.store, key, lease)
+        if reservation:
+            return reservation
+        current = await asyncio.to_thread(native_api.live_key, repo.store, key)
+        request = client.build_request("GET", base + "/queue", headers=auth, timeout=8)
+        request.headers.pop("cookie", None)
+        response = await client.send(request)
+        if not response.is_success:
+            raise APIError("NATIVE_UPSTREAM_UNAVAILABLE", "暂时无法检查 ComfyUI 队列", 502)
+        data = await self.read_upstream_json(response)
+        queues = [data.get(name) for name in ("queue_running", "queue_pending")]
+        if any(not isinstance(queue, list) for queue in queues):
+            raise APIError("NATIVE_UPSTREAM_UNAVAILABLE", "暂时无法检查 ComfyUI 队列", 502)
+        queued = {entry[1] for queue in queues for entry in queue
+                  if isinstance(entry, list) and len(entry) > 1 and isinstance(entry[1], str)}
+        observed = {ident: entry["prompt"] for ident, entry in current.get("active", {}).items()
+                    if entry.get("prompt") and entry["prompt"] not in queued}
+        reservation = await asyncio.to_thread(native_api.reserve, repo.store, key, lease, observed)
+        if not reservation:
+            raise APIError("NATIVE_API_CONCURRENCY", "已达到此 Key 的并行任务上限，请等待任务完成", 429)
+        return reservation
 
     async def websocket(self, scope, receive, send):
         ws = WebSocket(scope, receive, send)

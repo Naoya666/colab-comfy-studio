@@ -72,6 +72,8 @@ ProjectRow = _entity("ProjectRow", "projects")
 AssetRow = _entity("AssetRow", "assets")
 SettingRow = _entity("SettingRow", "settings")
 ProviderCredentialRow = _entity("ProviderCredentialRow", "provider_credentials")
+NativeApiKeyRow = _entity("NativeApiKeyRow", "native_api_keys")
+NativeApiPromptRow = _entity("NativeApiPromptRow", "native_api_prompts")
 MODELS.update(
     {
         "users": UserRow,
@@ -79,6 +81,8 @@ MODELS.update(
         "assets": AssetRow,
         "settings": SettingRow,
         "provider_credentials": ProviderCredentialRow,
+        "native_api_keys": NativeApiKeyRow,
+        "native_api_prompts": NativeApiPromptRow,
     }
 )
 

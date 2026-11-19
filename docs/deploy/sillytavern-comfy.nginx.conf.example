@@ -1,17 +1,14 @@
 # Optional relay on the SAME VPS as SillyTavern. Never bind this to 0.0.0.0.
-# Replace comfy.example.com and create the secret include before nginx -t.
+# Replace comfy.example.com and the Studio API port before nginx -t.
 server {
     listen 127.0.0.1:8189;
     server_name localhost;
-    client_max_body_size 0;
+    client_max_body_size 1m;
     location / {
-        proxy_pass https://comfy.example.com;
+        proxy_pass http://127.0.0.1:8788;
         proxy_set_header Host comfy.example.com;
-        proxy_ssl_server_name on;
-        proxy_ssl_name comfy.example.com;
-        proxy_ssl_verify on;
-        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
-        # File content: proxy_set_header Authorization "Bearer YOUR_STUDIO_API_TOKEN";
+        # For a separate Studio host, use its HTTPS Comfy origin and verify upstream TLS.
+        # File content: proxy_set_header Authorization "Bearer YOUR_NATIVE_API_KEY";
         include /etc/nginx/secrets/studio-comfy-auth.conf;
         proxy_http_version 1.1;
         proxy_buffering off;

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
+import { NativeApiSettings } from '../components/NativeApiSettings';
 import type { GpuAccount } from '../components/AccountDirectory';
 import { submitNativeHandoff } from '../lib/native-handoff';
 
@@ -102,7 +103,10 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
     finally { setStarting(false); }
   }
   return <section className="card">
-    <h1>原生 ComfyUI</h1>
+    <div className="actions nativeApiHeading">
+      <h1>原生 ComfyUI</h1>
+      <NativeApiSettings accounts={accounts} />
+    </div>
     <p>打开官方节点编辑器。可以直接导入工作流 JSON 或拖入带工作流的原图，使用原生保存、扩展和 Manager。</p>
     <p className="muted">与 Studio 共用 GPU。工作流、设置、素材、结果、节点源码和模型保存至 Google Drive。页面打开时仍会按任务活动判断空闲。</p>
     {(status?.ready || restartInProgress || (status?.instance_id && restart)) ? <div className="actions">
