@@ -78,10 +78,10 @@ export function ComputePage({
   const unresolved = (usage?.ccu?.anomalies || []).filter((item) => !item.resolved_at);
 
   return (
-    <div className={styles.stack}>
-      <div className={styles.pageHead}>
+    <div className={`${styles.stack} ${styles.workspaceGrid}`}>
+      <div className={`${styles.pageHead} ${styles.workspaceWide}`}>
         <h2><Cpu size={20} strokeWidth={1.6} aria-hidden />算力</h2>
-        <p className="muted small">任务在后台运行，关掉手机也不会中断，回来再看就行。</p>
+        <p className="muted small">任务在后台运行，关闭页面后仍可回来查看进度。</p>
       </div>
 
       <Card icon={<Monitor size={17} strokeWidth={1.6} aria-hidden />} title="当前环境" aside={<span className={`pill ${realEnabled ? 'solid' : ''}`}>{realEnabled ? '真实 GPU' : '模拟模式'}</span>}>
@@ -144,7 +144,9 @@ export function ComputePage({
         </div>
       </Card>
 
-      <InstanceCenter instances={instances} onContinue={onContinue} onOpenWorkbench={onOpenWorkbench} onRefresh={onRefreshInstances} />
+      <div className={styles.workspaceWide}>
+        <InstanceCenter instances={instances} onContinue={onContinue} onOpenWorkbench={onOpenWorkbench} onRefresh={onRefreshInstances} />
+      </div>
 
       <div className={styles.note}><Info size={16} strokeWidth={1.6} aria-hidden /><span>{realEnabled ? '用量数据来自站内记录，可能与 Google 账单略有出入。' : '模拟模式的数据仅供演示，不代表真实账单。'}</span></div>
 
@@ -157,7 +159,7 @@ export function ComputePage({
         </button>
       </div>
       {specsNote && <p className="muted small" role="status">{specsNote}</p>}
-      {specs.length > 0 && <ComputeSpecs specs={specs} />}
+      {specs.length > 0 && <div className={styles.workspaceWide}><ComputeSpecs specs={specs} /></div>}
       {error && <p className="status error" role="alert">{error}</p>}
     </div>
   );

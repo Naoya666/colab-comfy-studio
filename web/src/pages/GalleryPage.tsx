@@ -13,14 +13,16 @@ function dims(asset: GalleryAsset): string {
 }
 
 export function GalleryPanel({
-  gallery, onFavorite, onDelete, onOpen, onReuse, onGoCreate,
+  gallery, error, onFavorite, onDelete, onOpen, onReuse, onGoCreate, inspectedId,
 }: {
   gallery: GalleryAsset[];
+  error?: string;
   onFavorite: (asset: GalleryAsset) => void;
   onDelete: (asset: GalleryAsset) => void;
   onOpen: (asset: GalleryAsset) => void;
   onReuse?: (asset: GalleryAsset) => void;
   onGoCreate?: () => void;
+  inspectedId?: string;
 }) {
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
@@ -48,6 +50,7 @@ export function GalleryPanel({
       <div className={styles.pageTitle}>
         <h2><ImageIcon size={20} strokeWidth={1.6} aria-hidden />作品<span className="pill">{gallery.length} 件作品</span></h2>
       </div>
+      {error && <p className="status error" role="alert">{error}</p>}
 
       <label className={styles.searchBox}>
         <Search size={17} strokeWidth={1.6} aria-hidden />
@@ -66,13 +69,17 @@ export function GalleryPanel({
           {filtered.slice(0, limit).map((asset) => {
             const isVideo = asset.mime.startsWith('video/');
             const isJson = asset.mime.includes('json') || asset.filename?.toLowerCase().endsWith('.json');
-            const on = selectedId === asset.id;
+            const on = (inspectedId ?? selectedId) === asset.id;
             const size = dims(asset);
             return (
               <article className={styles.tile} key={asset.id} data-selected={on}>
                 <div className={styles.tileMedia}>
                   <button className={styles.tileCover} type="button" aria-label={`查看 ${asset.filename || '作品'}`}
-                    onClick={() => { setSelectedId(asset.id); setConfirmDelete(false); onOpen(asset); }}>
+                    aria-pressed={inspectedId === undefined ? undefined : on}
+                    onClick={() => {
+                      if (inspectedId === undefined) { setSelectedId(asset.id); setConfirmDelete(false); }
+                      onOpen(asset);
+                    }}>
                     {isVideo ? (
                       <video src={assetUrl(asset)} preload="metadata" muted playsInline aria-label={asset.filename || '视频'} />
                     ) : isJson ? (
@@ -82,10 +89,10 @@ export function GalleryPanel({
                     )}
                   </button>
                   <span className={styles.tileType}>{isVideo ? <Film size={12} strokeWidth={1.8} aria-hidden /> : <ImageIcon size={12} strokeWidth={1.8} aria-hidden />}{isVideo ? '视频' : '图片'}</span>
-                  <button type="button" className={styles.tileCheck} data-on={on} aria-label={on ? '取消选中' : '选中'} aria-pressed={on}
+                  {inspectedId === undefined && <button type="button" className={styles.tileCheck} data-on={on} aria-label={on ? '取消选中' : '选中'} aria-pressed={on}
                     onClick={() => { setSelectedId(on ? null : asset.id); setConfirmDelete(false); }}>
                     {on && <Check size={13} strokeWidth={2.6} aria-hidden />}
-                  </button>
+                  </button>}
                   {(size || isVideo) && <span className={styles.tileHud}>{isVideo && <Play size={10} strokeWidth={2} aria-hidden />}{size || '视频'}</span>}
                 </div>
                 <div className={styles.tileMeta}>
@@ -113,7 +120,7 @@ export function GalleryPanel({
         <button className="button secondary block" type="button" onClick={() => setLimit(limit + 24)}>加载更多作品</button>
       )}
 
-      {selected && (
+      {selected && inspectedId === undefined && (
         <div className={styles.floatBar} role="toolbar" aria-label="作品操作">
           <button type="button" onClick={() => onOpen(selected)}><Eye size={17} strokeWidth={1.6} aria-hidden />预览</button>
           <i />

@@ -69,8 +69,8 @@ export function SettingsPanel({
   }
 
   return (
-    <div className={styles.stack}>
-      <div className={styles.subHead}>
+    <div className={`${styles.stack} ${styles.workspaceGrid}`}>
+      <div className={`${styles.subHead} ${styles.workspaceWide}`}>
         <button type="button" className={styles.backBtn} onClick={onBack}><ChevronLeft size={18} strokeWidth={1.6} aria-hidden />返回</button>
         <h2><Settings size={20} strokeWidth={1.6} aria-hidden />设置</h2>
       </div>
@@ -90,7 +90,9 @@ export function SettingsPanel({
 
       <ModelStorageSettings />
       <ModelSourceSettings />
-      <InstanceCenter instances={instances} onRefresh={onRefreshInstances} />
+      <div className={styles.workspaceWide}>
+        <InstanceCenter instances={instances} onRefresh={onRefreshInstances} />
+      </div>
 
       <Card icon={<Plug size={17} strokeWidth={1.6} aria-hidden />} title="Google 账号" aside={settings?.offline_mode ? <span className="pill">离线模式</span> : undefined}>
         <AccountDirectory accounts={accounts} onAccountsChange={onAccountsChange} />

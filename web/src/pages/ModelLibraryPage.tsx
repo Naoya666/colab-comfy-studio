@@ -80,7 +80,7 @@ export function ModelLibraryPage() {
       <label>本地模型（直接分块上传到 Drive）<input disabled={busy} type="file" accept=".safetensors,.gguf,.onnx" onChange={e => {const f = e.target.files?.[0]; if(f) void action(async () => {const id = await uploadModel(f, n => setProgress(`上传 ${Math.round(n / f.size * 100)}%`)); await add({source:'upload', drive_file_id:id, filename:f.name, model_type:type, architecture, expected_sha256:expected || undefined});});}} /></label>
       <p className="muted small">Drive OAuth 的 drive.file 权限仅可读取应用可见文件。上传失败会在当前页面重试分块；刷新页面后需重新上传。</p>
     </div></details>
-    <div className={styles.grid2}>
+    <div className={`${styles.grid2} ${styles.modelFilters}`}>
       <label>搜索名称 / 文件名<input value={query} onChange={e => setQuery(e.target.value)} /></label>
       <label>类型<select value={category} onChange={e => setCategory(e.target.value)}><option value="">全部类型</option>{Object.keys(catalog?.types || {}).map(t => <option key={t}>{t}</option>)}</select></label>
       <label>状态<select value={state} onChange={e => setState(e.target.value)}><option value="">全部状态</option>{['pending','downloading','verifying','uploading','ready','failed','missing','unverified'].map(s => <option key={s} value={s}>{modelStatus[s]}</option>)}</select></label>
@@ -88,7 +88,8 @@ export function ModelLibraryPage() {
     </div>
     {error && <p className="status error" role="alert">{error}</p>}{progress && <p role="status">{progress}</p>}
     {!items.length && <p className="muted">暂无符合条件的模型。添加来源链接、上传文件或从工作流迁移旧缓存。</p>}
-    {items.map(m => { const task = tasks.find(t => t.model_id === m.id); return <article className={styles.card} key={m.id}>
+    {!!items.length && <div className={`${styles.stack} ${styles.workspaceGrid}`}>
+    {items.map(m => { const task = tasks.find(t => t.model_id === m.id); return <article className={`${styles.card} ${detailId === m.id ? styles.workspaceWide : ''}`} key={m.id}>
       <h3>{m.display_name}</h3><p>{m.relative_path || m.filename} · {m.model_type} · {m.architecture}</p><p>{modelStatus[m.state] || m.state} · {bytesLabel(m.size)} · {m.external_source ? (m.external_source.status === 'verified' ? '外部来源已验证' : '外部来源待验证') : '无外部来源'}</p>
       {task && ['pending','downloading','verifying','uploading'].includes(task.state) && <div>
         <progress aria-label="模型准备进度" max={task.total || 1} value={task.total ? task.bytes : undefined} />
@@ -111,6 +112,7 @@ export function ModelLibraryPage() {
       {detailId === m.id && <ModelDetail modelId={m.id} panelId={detailPanelId} refresh={refresh}
         onClose={() => setDetailId(current => current === m.id ? null : current)} onProgress={setProgress} />}
     </article>;})}
+    </div>}
   </div>;
 }
 

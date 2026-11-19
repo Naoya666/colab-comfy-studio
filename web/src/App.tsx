@@ -6,9 +6,10 @@ import { GalleryPanel } from './pages/GalleryPage';
 import { TasksPanel } from './pages/JobsPage';
 import { WorkflowGpuSelection, computeLabel } from './components/WorkflowGpuSelection';
 import { CreatePanel } from './pages/CreatePage';
+import { CreateResults } from './components/CreateResults';
 import { ComputePage, ThemePicker } from './pages/ComputePage';
 import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { Sparkles, Zap, Image as ImageIcon, Cpu, Settings as SettingsIcon, Folder, ChevronDown, X, Plus, Check, Maximize2, Star, Download, Trash2, RotateCcw, Triangle } from 'lucide-react';
+import { Sparkles, Zap, Image as ImageIcon, Cpu, Settings as SettingsIcon, Folder, ChevronDown, X, Plus, Check, Maximize2, Star, Download, Trash2, RotateCcw, Triangle, Boxes, Workflow } from 'lucide-react';
 import {
   apiMessage, assetUrl, cancelGpuJob, createGpuJob, createGpuBatch, createProject, deleteAsset, disconnectGoogle,
   apiFetch,
@@ -32,10 +33,14 @@ import { projectOptionLabel } from './lib/project-label';
 import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
 import { formatInstanceTime } from './lib/instance-time';
 import { JobHistoryDetails } from './components/JobHistoryDetails';
+import { useDesktopLayout } from './lib/desktop-layout';
+import { readableState } from './lib/ui-helpers';
 import styles from './gpu.module.css';
 
 const tabs = ['创作', '任务', '作品', '算力', '模型库', '原生 ComfyUI'] as const;
 type Tab = typeof tabs[number] | '设置';
+const desktopTabs: Tab[] = ['创作', '任务', '作品', '原生 ComfyUI', '模型库', '算力', '设置'];
+const tabIcons = { 创作: Sparkles, 任务: Zap, 作品: ImageIcon, 算力: Cpu, 模型库: Boxes, '原生 ComfyUI': Workflow, 设置: SettingsIcon };
 const terminalStates = new Set(['completed', 'succeeded', 'failed', 'failed_final', 'cancelled', 'cancelled_local', 'blocked']);
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -218,6 +223,7 @@ function NewProjectDialog({
 }
 
 export default function App() {
+  const desktop = useDesktopLayout();
   const [loggedIn, setLoggedIn] = useState(isLoggedIn());
   const [tab, setTab] = useState<Tab>('创作');
   const [projects, setProjects] = useState<Project[]>([]);
@@ -242,6 +248,7 @@ export default function App() {
   const [manifest, setManifest] = useState<GpuManifest | null>(null);
   const [params, setParams] = useState<Record<string, unknown>>({});
   const [gallery, setGallery] = useState<GalleryAsset[]>([]);
+  const [galleryError, setGalleryError] = useState('');
   const [referenceImages, setReferenceImages] = useState<GalleryAsset[]>([]);
   const [jobs, setJobs] = useState<GpuJob[]>([]);
   const [selectedAssets, setSelectedAssets] = useState<string[]>([]);
@@ -265,7 +272,13 @@ export default function App() {
   const [uploadProgress, setUploadProgress] = useState<Record<string, number>>({});
   const [confirm, setConfirm] = useState<'submit' | 'stop' | null>(null);
   const [detail, setDetail] = useState<GpuJob | null>(null);
-  const [viewer, setViewer] = useState<GalleryAsset | null>(null);
+  const [detailId, setDetailId] = useState('');
+  const [detailError, setDetailError] = useState('');
+  const [detailRefresh, setDetailRefresh] = useState(0);
+  const [viewerSelection, setViewer] = useState<GalleryAsset | null>(null);
+  const [viewerJob, setViewerJob] = useState<GpuJob | null>(null);
+  const [viewerJobError, setViewerJobError] = useState('');
+  const [submission, setSubmission] = useState<{ projectId: string; ids: string[] } | null>(null);
   const [againJob, setAgainJob] = useState<GpuJob | null>(null);
   const [loginRefresh, setLoginRefresh] = useState(0);
   const [refreshingJobs, setRefreshingJobs] = useState(false);
@@ -283,10 +296,33 @@ export default function App() {
 
   const activeProject = projects.find((p) => p.id === projectId);
   const activeWorkflow = workflows.find((item) => item.id === workflowId);
+  const workflowParamsReady = Boolean(projectId && workflowId && draftReady.current === `${projectId}:${workflowId}`);
+  const projectJobs = useMemo(() => jobs.filter(job => job.project_id === projectId), [jobs, projectId]);
+  const projectGallery = useMemo(() => gallery.filter(asset => asset.project_id === projectId), [gallery, projectId]);
+  const latestJob = projectJobs.find(job => !job.prep);
+  const currentSubmission = submission?.projectId === projectId ? submission : null;
+  const previewJobs = currentSubmission
+    ? projectJobs.filter(job => currentSubmission.ids.includes(job.id))
+    : latestJob?.batch_id
+      ? projectJobs.filter(job => job.batch_id === latestJob.batch_id)
+      : latestJob ? [latestJob] : [];
+  const galleryOutputs = desktop && (tab === '创作' || tab === '作品')
+    ? projectJobs.flatMap(job => job.output_asset_ids || []).join(',')
+    : '';
+  const activeInstance = instances.find(instance => instance.provider === 'colab' && !instance.runtime_deleted
+    && instanceIdOf(instance) === runtimeChoice.instanceId)
+    || instances.find(instance => instance.provider === 'colab' && !instance.runtime_deleted
+      && ['ready', 'busy', 'retained_idle', 'allocating', 'preparing'].includes(instance.state || ''));
+  const viewer = viewerSelection?.project_id === projectId
+    ? projectGallery.find(asset => asset.id === viewerSelection.id) ?? viewerSelection
+    : null;
+  const viewerJobId = viewer?.source_job_id || viewer?.gpu_job_id;
+  const inlineViewer = desktop && tab === '作品';
+  const detailRevision = projectJobs.find(job => job.id === detailId)?.updated_at;
 
   const activeJobsCount = useMemo(() => {
-    return jobs.filter((j) => !terminalStates.has(String(j.state || '').toLowerCase())).length;
-  }, [jobs]);
+    return projectJobs.filter((j) => !terminalStates.has(String(j.state || '').toLowerCase())).length;
+  }, [projectJobs]);
 
   useEffect(() => {
     const expire = () => setLoggedIn(false);
@@ -457,9 +493,39 @@ export default function App() {
   useEffect(() => {
     if (!projectId || !loggedIn) return;
     let alive = true;
-    getGpuGallery(projectId).then((next) => alive && setGallery(next)).catch((cause) => alive && setError(`作品：${apiMessage(cause)}`));
+    setGalleryError('');
+    getGpuGallery(projectId).then(next => {
+      if (alive) setGallery(next.map(asset => asset.project_id ? asset : { ...asset, project_id: projectId }));
+    }).catch(cause => {
+      if (alive) setGalleryError(apiMessage(cause));
+    });
     return () => { alive = false; };
-  }, [projectId, loggedIn, tab]);
+  }, [projectId, loggedIn, tab, galleryOutputs]);
+
+  useEffect(() => {
+    if (tab !== '任务' || !detailId || !projectId || !loggedIn) return;
+    let alive = true;
+    getGpuJob(detailId).then(job => {
+      if (!alive || job.project_id !== projectId) return;
+      setDetail(job);
+      setDetailError('');
+    }).catch(cause => {
+      if (alive) setDetailError(apiMessage(cause));
+    });
+    return () => { alive = false; };
+  }, [tab, detailId, detailRevision, detailRefresh, projectId, loggedIn]);
+
+  useEffect(() => {
+    if (!inlineViewer || !viewerJobId || !projectId || !loggedIn) return;
+    let alive = true;
+    setViewerJobError('');
+    getGpuJob(viewerJobId).then(job => {
+      if (alive && job.project_id === projectId) setViewerJob(job);
+    }).catch(cause => {
+      if (alive) setViewerJobError(apiMessage(cause));
+    });
+    return () => { alive = false; };
+  }, [inlineViewer, viewerJobId, projectId, loggedIn]);
 
   useEffect(() => {
     if (againJob && (againJob.resolved_params || againJob.params)) {
@@ -475,6 +541,11 @@ export default function App() {
   }, [againJob, workflows]);
 
   function chooseProject(id: string) {
+    if (id !== projectId) {
+      setDetailId('');
+      setDetail(null);
+      setViewer(null);
+    }
     setProjectId(id);
     saveProjectId(id);
   }
@@ -493,14 +564,18 @@ export default function App() {
 
   async function refreshJobs() {
     if (!projectId) return;
+    const seq = ++jobSequence.current;
+    const current = () => currentProjectId.current === projectId && seq === jobSequence.current;
     setRefreshingJobs(true);
     try {
-      setJobs((await getGpuJobs(projectId)).filter((j) => j.project_id === projectId));
+      const next = await getGpuJobs(projectId);
+      if (!current()) return;
+      setJobs(next.filter((j) => j.project_id === projectId));
       setJobError('');
     } catch (cause) {
-      setJobError(apiMessage(cause));
+      if (current()) setJobError(apiMessage(cause));
     } finally {
-      setRefreshingJobs(false);
+      if (current()) setRefreshingJobs(false);
     }
   }
 
@@ -527,7 +602,7 @@ export default function App() {
   }
 
   async function submitJob() {
-    if (submitting.current || !projectId || !modelId || !workflowId || !activeWorkflow) return;
+    if (submitting.current || !workflowParamsReady || !modelId || !activeWorkflow) return;
     submitting.current = true;
     if (!idempotencyKey.current) idempotencyKey.current = keyId();
     setLoading('submit');
@@ -561,16 +636,21 @@ export default function App() {
           retain_idle_minutes: runtimeChoice.retainIdleMinutes,
         },
       };
+      let ids: string[];
       if (runtime === 'mock' || batchCount > 1) {
         // 批次沿用用户选定的账号、实例与生命周期，不再静默改成 batch。
-        await createGpuBatch(Array.from({length:batchCount},(_,index)=>({...body,
+        const batch = await createGpuBatch(Array.from({length:batchCount},(_,index)=>({...body,
           params:{...body.params,...(typeof body.params.seed === 'number' && body.params.seed >= 0 ? {seed:body.params.seed+index} : {})}})),
           runtimeChoice.lifecycle, runtimeChoice.retainIdleMinutes * 60, idempotencyKey.current);
+        ids = batch.job_ids || [];
       } else {
-        await createGpuJob(body, idempotencyKey.current);
+        ids = [(await createGpuJob(body, idempotencyKey.current)).id];
       }
       setConfirm(null);
-      setTab('任务');
+      if (currentProjectId.current === projectId) {
+        setSubmission(ids.length ? { projectId, ids } : null);
+        if (!desktop) setTab('任务');
+      }
       idempotencyKey.current = '';
       await refreshJobs();
     } catch (cause) {
@@ -622,32 +702,39 @@ export default function App() {
   async function reuseAsset(asset: GalleryAsset) {
     const sourceJobId = asset.source_job_id || asset.gpu_job_id;
     if (!sourceJobId) {
-      setError('该素材没有来源任务记录。');
+      setGalleryError('该素材没有来源任务记录。');
       return;
     }
+    setGalleryError('');
     try {
-      setAgainJob(await getGpuJob(sourceJobId));
+      const job = await getGpuJob(sourceJobId);
+      if (currentProjectId.current !== asset.project_id) return;
+      setAgainJob(job);
+      setViewer(current => current?.id === asset.id ? null : current);
     } catch (cause) {
-      setError(`再次生成：${apiMessage(cause)}`);
+      if (currentProjectId.current === asset.project_id) setGalleryError(`再次生成：${apiMessage(cause)}`);
     }
   }
 
   async function favorite(asset: GalleryAsset) {
+    setGalleryError('');
     try {
       const next = await updateAsset(asset.id, !asset.favorite);
       setGallery((curr) => curr.map((i) => i.id === next.id ? next : i));
+      setViewer(current => current?.id === next.id ? next : current);
     } catch (cause) {
-      setError(apiMessage(cause));
+      if (currentProjectId.current === asset.project_id) setGalleryError(apiMessage(cause));
     }
   }
 
   async function remove(asset: GalleryAsset) {
+    setGalleryError('');
     try {
       await deleteAsset(asset.id);
       setGallery((curr) => curr.filter((i) => i.id !== asset.id));
-      setViewer(null);
+      setViewer(current => current?.id === asset.id ? null : current);
     } catch (cause) {
-      setError(`删除失败：${apiMessage(cause)}`);
+      if (currentProjectId.current === asset.project_id) setGalleryError(`删除失败：${apiMessage(cause)}`);
     }
   }
 
@@ -758,19 +845,131 @@ export default function App() {
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') {
-        if (viewer) setViewer(null);
-        else if (detail) setDetail(null);
-        else if (confirm) setConfirm(null);
+        if (confirm) setConfirm(null);
         else if (showNewProject) setShowNewProject(false);
         else if (showProjectSheet) setShowProjectSheet(false);
+        else if (viewer) setViewer(null);
+        else if (detailId && tab === '任务') setDetailId('');
       }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [viewer, detail, confirm, showProjectSheet, showNewProject]);
+  }, [viewer, detailId, tab, confirm, showProjectSheet, showNewProject]);
 
   if (!loggedIn) {
     return <Login onLoggedIn={() => { setLoggedIn(true); setLoginRefresh((c) => c + 1); }} />;
+  }
+
+  const inspectedJob = detail?.id === detailId && detail.project_id === projectId ? detail : null;
+  const jobDetailContent = <>
+    <div className={styles.cardHead}>
+      <h2>任务详情{detailId && ` · ${detailId.slice(0, 8)}`}</h2>
+      {detailId && <button className={styles.iconGhost} type="button" aria-label="关闭任务详情" onClick={() => setDetailId('')}><X size={18} aria-hidden /></button>}
+    </div>
+    {detailId && detailError && <p className="status error" role="alert">{detailError}</p>}
+    {inspectedJob ? (
+      <>
+        <dl className={styles.kv}>
+          <dt>状态</dt><dd>{jobStateLabel(inspectedJob.state)}</dd>
+          <dt>运行方式</dt><dd>{inspectedJob.provider === 'mock' ? '离线模拟' : inspectedJob.provider === 'colab' ? 'Colab GPU' : shown(inspectedJob.provider)}</dd>
+          <dt>创建时间</dt><dd>{formatInstanceTime(inspectedJob.created_at)}</dd>
+        </dl>
+        <p className="muted small">{taskStatusNote(inspectedJob)}</p>
+        {Array.isArray(inspectedJob.attempts) && <details className="foldable" open>
+          <summary>执行记录</summary>
+          <div className="foldContent">
+            {inspectedJob.attempts.length ? inspectedJob.attempts.map((attempt: Record<string, unknown>) => <p key={String(attempt.id)}>
+              第 {String(attempt.attempt)} 次 · {jobStateLabel(String(attempt.state))}
+              {attempt.error_code ? ` · ${String(attempt.error_code)}` : ''}
+            </p>) : <p className="muted">还没有开始执行</p>}
+          </div>
+        </details>}
+        {(inspectedJob.timings || inspectedJob.timing_details || inspectedJob.logs || inspectedJob.events) ? <JobHistoryDetails job={inspectedJob} /> : null}
+        {stageSecondsTotal(jobDetailTimings(inspectedJob)) ? <p className="muted small">各阶段相加约 {stageSecondsTotal(jobDetailTimings(inspectedJob))}。阶段按秒独立计时，可能重叠，不是工作流发布又额外等了这么久。</p> : null}
+        {inspectedJob.resolved_params ? (
+          <details className="foldable">
+            <summary>本次使用的参数</summary>
+            <div className="foldContent">
+              <dl className={styles.kv}>
+                {paramRows(inspectedJob.resolved_params).map((row) => <Fragment key={row.key}><dt>{row.label}</dt><dd>{row.value}</dd></Fragment>)}
+              </dl>
+            </div>
+          </details>
+        ) : null}
+      </>
+    ) : <p className="muted small">{detailId ? detailError ? '可重新选择任务以加载详情。' : '正在读取任务详情…' : '选择任务查看执行阶段、日志和生成参数。'}</p>}
+  </>;
+  const viewerContent = viewer && <>
+    <div className={`${styles.cardHead} ${styles.viewerHead}`}>
+      <h2>{viewer.filename || viewer.id}</h2>
+      <div className={styles.viewerHeadActions}>
+        <button className="button secondary small" type="button" onClick={async (event) => {
+          const panel = event.currentTarget.closest('section');
+          try {
+            if (document.fullscreenElement) await document.exitFullscreen();
+            else if (panel?.requestFullscreen) await panel.requestFullscreen();
+            else throw new Error('当前浏览器不支持全屏');
+          } catch (error) { setGalleryError(apiMessage(error)); }
+        }}><Maximize2 size={14} strokeWidth={1.6} aria-hidden />全屏查看</button>
+        <button className="button secondary small" type="button" onClick={() => {
+          if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+          setViewer(null);
+        }}>关闭</button>
+      </div>
+    </div>
+    {viewer.mime.startsWith('video/') ? (
+      <video className={styles.viewerVideo} src={assetUrl(viewer)} controls autoPlay playsInline />
+    ) : viewer.mime.startsWith('image/') ? (
+      <img className={styles.viewerImage} src={assetUrl(viewer)} alt="" />
+    ) : (
+      <p className="muted">这是诊断文件，不能直接预览，请下载查看。</p>
+    )}
+    {inlineViewer && viewerJobId && (
+      viewerJob?.id === viewerJobId ? (
+        <details className="foldable" open>
+          <summary>生成参数</summary>
+          <div className="foldContent">
+            <dl className={styles.kv}>
+              {paramRows(viewerJob.resolved_params || viewerJob.params || {}).map(row => (
+                <Fragment key={row.key}><dt>{row.label}</dt><dd>{row.value}</dd></Fragment>
+              ))}
+            </dl>
+          </div>
+        </details>
+      ) : <p className="muted small">{viewerJobError || '正在读取生成参数…'}</p>
+    )}
+    <div className={styles.viewerActions}>
+      <button className="button secondary small" type="button" onClick={() => void favorite(viewer)}>
+        <Star size={14} strokeWidth={1.6} aria-hidden />{viewer.favorite ? '取消收藏' : '收藏'}
+      </button>
+      <button className="button secondary small" type="button" disabled={!viewerJobId} onClick={() => void reuseAsset(viewer)}>
+        <RotateCcw size={14} strokeWidth={1.6} aria-hidden />用同样参数再来一次
+      </button>
+      <a className="button secondary small" href={assetUrl(viewer)} download={viewer.filename || viewer.id} target="_blank" rel="noreferrer">
+        <Download size={14} strokeWidth={1.6} aria-hidden />下载
+      </a>
+      <button className="button danger small" type="button" onClick={() => void remove(viewer)}>
+        <Trash2 size={14} strokeWidth={1.6} aria-hidden />删除
+      </button>
+    </div>
+    {galleryError && <p className="status error" role="alert">{galleryError}</p>}
+  </>;
+
+  function inspectJob(id: string) {
+    setDetailError('');
+    if (id === detailId && tab === '任务') {
+      // Selecting the same task also lets the user retry a failed detail request.
+      setDetailRefresh(value => value + 1);
+    }
+    setDetailId(id);
+  }
+
+  function navigate(next: Tab) {
+    if (next === tab) return;
+    setViewer(null);
+    setDetailId('');
+    setTab(next);
+    window.scrollTo(0, 0);
   }
 
   return (
@@ -792,18 +991,26 @@ export default function App() {
           <button className="iconButton" type="button" aria-label="新建项目" title="新建项目" onClick={() => setShowNewProject(true)}>
             <Plus size={18} strokeWidth={1.6} aria-hidden />
           </button>
-          <button className="iconButton" aria-label="打开设置" onClick={() => setTab('设置')}>
+          <button className="iconButton mobileSettings" aria-label="打开设置" onClick={() => navigate('设置')}>
             <SettingsIcon size={18} strokeWidth={1.6} aria-hidden />
+          </button>
+          <button className="desktopGpu projectChip" type="button" onClick={() => navigate('算力')}
+            title="查看算力" data-online={Boolean(activeInstance && ['ready', 'busy', 'retained_idle'].includes(activeInstance.state || ''))}>
+            <Cpu size={15} strokeWidth={1.6} aria-hidden />
+            <span>{settings?.offline_mode ? '离线演示' : activeInstance
+              ? `${activeInstance.gpu_reported || 'Colab GPU'} · ${readableState(activeInstance.state)}`
+              : '无活动 GPU'}</span>
           </button>
         </div>
       </header>
 
       <nav className="bottomNav" aria-label="工作区导航">
-        {tabs.map((item) => {
-          const Icon = item === '创作' ? Sparkles : item === '任务' ? Zap : item === '作品' ? ImageIcon : Cpu;
+        {(desktop ? desktopTabs : tabs).map((item) => {
+          const Icon = tabIcons[item];
           return (
-            <button key={item} type="button" aria-current={tab === item ? 'page' : undefined} onClick={() => setTab(item)}>
-              <Icon size={21} strokeWidth={1.5} aria-hidden />
+            <button key={item} type="button" data-tab={item} title={item} aria-label={item === '设置' ? '打开设置' : undefined}
+              aria-current={tab === item ? 'page' : undefined} onClick={() => navigate(item)}>
+              <Icon size={20} strokeWidth={1.6} aria-hidden />
               <span>{item}</span>
               {item === '任务' && activeJobsCount > 0 && <span className="tabBadge">{activeJobsCount}</span>}
             </button>
@@ -824,79 +1031,98 @@ export default function App() {
       {/* 主工作区 */}
       <main className={styles.page}>
         {tab === '创作' && (
-          <>
-          <CreatePanel
-            gpuSelection={runtime === 'colab' ? <WorkflowGpuSelection manifest={manifest} accountId={runtimeChoice.accountId} value={selectedCompute} onChange={chooseGpu} /> : null}
-            projectId={projectId}
-            models={models}
-            workflows={workflows}
-            presets={presets}
-            settings={settings}
-            manifest={manifest}
-            params={params}
-            setParams={setParams}
-            gallery={referenceImages}
-            selectedAssets={selectedAssets}
-            setSelectedAssets={setSelectedAssets}
-            uploadProgress={uploadProgress}
-            onUpload={handleUpload}
-            modelId={modelId}
-            setModelId={setModelId}
-            workflowId={workflowId}
-            setWorkflowId={setWorkflowId}
-            runtime={runtime}
-            setRuntime={setRuntime}
-            maxRuntime={maxRuntime}
-            setMaxRuntime={setMaxRuntime}
-            batchCount={batchCount}
-            setBatchCount={setBatchCount}
-            batchMode={batchMode}
-            setBatchMode={setBatchMode}
-            runtimeChoice={runtimeChoice}
-            accounts={accounts}
-            instances={instances}
-            onRuntimeChoiceChange={changeRuntimeChoice}
-            loading={loading}
-            error={error}
-            onSubmit={() => setConfirm('submit')}
-            onApplyPreset={applyPreset}
-            onSavePreset={(name) => void savePreset(name)}
-          />
-          {workflowId && <ModelRunOverrides workflowId={workflowId} value={modelOverrides[workflowId] || []} onChange={value => setModelOverrides(current => ({...current, [workflowId]:value}))} />}
-          </>
+          <section className={styles.createWorkspace} aria-label="创作工作区">
+            <h1 className={styles.desktopTitle}>创作</h1>
+            <div className={styles.createColumns}>
+              <CreatePanel
+                desktop={desktop}
+                draftReady={workflowParamsReady}
+                gpuSelection={runtime === 'colab' ? <WorkflowGpuSelection manifest={manifest} accountId={runtimeChoice.accountId} value={selectedCompute} onChange={chooseGpu} /> : null}
+                projectId={projectId}
+                models={models}
+                workflows={workflows}
+                presets={presets}
+                settings={settings}
+                manifest={workflowParamsReady ? manifest : null}
+                params={workflowParamsReady ? params : {}}
+                setParams={setParams}
+                gallery={referenceImages}
+                selectedAssets={selectedAssets}
+                setSelectedAssets={setSelectedAssets}
+                uploadProgress={uploadProgress}
+                onUpload={handleUpload}
+                modelId={modelId}
+                setModelId={setModelId}
+                workflowId={workflowId}
+                setWorkflowId={setWorkflowId}
+                runtime={runtime}
+                setRuntime={setRuntime}
+                maxRuntime={maxRuntime}
+                setMaxRuntime={setMaxRuntime}
+                batchCount={batchCount}
+                setBatchCount={setBatchCount}
+                batchMode={batchMode}
+                setBatchMode={setBatchMode}
+                runtimeChoice={runtimeChoice}
+                accounts={accounts}
+                instances={instances}
+                onRuntimeChoiceChange={changeRuntimeChoice}
+                loading={loading}
+                error={error}
+                onSubmit={() => setConfirm('submit')}
+                onApplyPreset={applyPreset}
+                onSavePreset={(name) => void savePreset(name)}
+              >
+                {workflowId && <ModelRunOverrides workflowId={workflowId} value={modelOverrides[workflowId] || []} onChange={value => setModelOverrides(current => ({...current, [workflowId]:value}))} />}
+              </CreatePanel>
+              {desktop && projectId && <CreateResults key={projectId} jobs={previewJobs} count={currentSubmission?.ids.length || previewJobs.length}
+                gallery={projectGallery} error={galleryError} onOpen={setViewer} onJobs={() => navigate('任务')} />}
+            </div>
+          </section>
         )}
 
         {tab === '任务' && (
-          <TasksPanel
-            jobs={jobs}
-            error={jobError}
-            refreshing={refreshingJobs}
-            onRefresh={() => void refreshJobs()}
-            onCancel={(id) => void action('cancel', async () => { await cancelGpuJob(id); await refreshJobs(); })}
-            onRetry={(id) => void action('retry', async () => {
-              const job = jobs.find((item) => item.id === id);
-              const key = retryKeys.current[id] || `attempt:${id}:${keyId()}`;
-              retryKeys.current[id] = key;
-              if (job?.provider === 'mock') await retryGpuAttempt(id, key);
-              else await retryGpuJob(id, key);
-              delete retryKeys.current[id];
-              await refreshJobs();
-            })}
-            onDetail={(job) => void action('inspect', async () => setDetail(await getGpuJob(job.id)))}
-            onRetain={(job) => void retainJob(job)}
-            onInstance={(job) => { const instance = instances.find((item) => instanceIdOf(item) === String(job.instance_id || '')); if (instance) { const id = instanceIdOf(instance); setRuntimeChoice({ accountId: instance.account_id || null, instanceId: id, lifecycle: runtimeChoice.lifecycle, retainIdleMinutes: runtimeChoice.retainIdleMinutes }); setTab('算力'); } }}
-          />
+          <div className={styles.detailWorkspace}>
+            <TasksPanel
+              jobs={projectJobs}
+              error={jobError}
+              refreshing={refreshingJobs}
+              onRefresh={() => void refreshJobs()}
+              onCancel={(id) => void action('cancel', async () => { await cancelGpuJob(id); await refreshJobs(); })}
+              onRetry={(id) => void action('retry', async () => {
+                const job = projectJobs.find((item) => item.id === id);
+                const key = retryKeys.current[id] || `attempt:${id}:${keyId()}`;
+                retryKeys.current[id] = key;
+                if (job?.provider === 'mock') await retryGpuAttempt(id, key);
+                else await retryGpuJob(id, key);
+                delete retryKeys.current[id];
+                await refreshJobs();
+              })}
+              onDetail={(job) => inspectJob(job.id)}
+              selectedId={detailId}
+              onRetain={(job) => void retainJob(job)}
+              onInstance={(job) => { const instance = instances.find((item) => instanceIdOf(item) === String(job.instance_id || '')); if (instance) { const id = instanceIdOf(instance); setRuntimeChoice({ accountId: instance.account_id || null, instanceId: id, lifecycle: runtimeChoice.lifecycle, retainIdleMinutes: runtimeChoice.retainIdleMinutes }); setTab('算力'); } }}
+            />
+            {desktop && <section className={`${styles.card} ${styles.inspector}`} aria-label="任务详情">{jobDetailContent}</section>}
+          </div>
         )}
 
         {tab === '作品' && (
-          <GalleryPanel
-            gallery={gallery}
-            onFavorite={(asset) => void favorite(asset)}
-            onDelete={(asset) => void remove(asset)}
-            onOpen={setViewer}
-            onReuse={(asset) => void reuseAsset(asset)}
-            onGoCreate={() => setTab('创作')}
-          />
+          <div className={styles.detailWorkspace} data-gallery>
+            <GalleryPanel
+              gallery={projectGallery}
+              error={viewer ? '' : galleryError}
+              inspectedId={desktop ? viewer?.id || '' : undefined}
+              onFavorite={(asset) => void favorite(asset)}
+              onDelete={(asset) => void remove(asset)}
+              onOpen={setViewer}
+              onReuse={(asset) => void reuseAsset(asset)}
+              onGoCreate={() => navigate('创作')}
+            />
+            {desktop && <section className={`${styles.card} ${styles.inspector} ${styles.assetInspector}`} aria-label="作品详情">
+              {viewerContent || <><h2>作品详情</h2><p className="muted small">选择作品查看原图、视频和生成参数。</p></>}
+            </section>}
+          </div>
         )}
 
         {tab === '算力' && (
@@ -917,7 +1143,7 @@ export default function App() {
           />
         )}
         {tab === '模型库' && <ModelLibraryPage />}
-        {tab === '原生 ComfyUI' && <NativeComfyPage accounts={accounts} />}
+        {tab === '原生 ComfyUI' && <NativeComfyPage accounts={accounts} instances={instances} desktop={desktop} />}
         {tab === '设置' && (
           <SettingsPanel
             accounts={accounts}
@@ -963,7 +1189,7 @@ export default function App() {
             onOpenJob={(jobId, jobProjectId) => {
               if (jobProjectId) chooseProject(jobProjectId);
               setTab('任务');
-              void getGpuJob(jobId).then(setDetail).catch((cause) => setError(apiMessage(cause)));
+              inspectJob(jobId);
             }}
             onUseProject={(id) => { chooseProject(id); setTab('任务'); }}
             onActivated={() => { void getGpuWorkflows().then(setWorkflows); void getGpuModels().then(setModels).catch(() => undefined); }}
@@ -1026,87 +1252,18 @@ export default function App() {
         </div>
       )}
 
-      {/* 任务详情 */}
-      {detail && (
-        <div className={styles.dialogBackdrop} role="presentation" onClick={() => setDetail(null)}>
-          <section className={styles.dialog} role="dialog" aria-modal="true" aria-label="任务详情" onClick={(e) => e.stopPropagation()}>
-            <div className={styles.cardHead}>
-              <h2>任务详情 · {detail.id.slice(0, 8)}</h2>
-              <button className={styles.iconGhost} type="button" aria-label="关闭" onClick={() => setDetail(null)}><X size={18} strokeWidth={1.6} aria-hidden /></button>
-            </div>
-            <dl className={styles.kv}>
-              <dt>状态</dt><dd>{jobStateLabel(detail.state)}</dd>
-              <dt>运行方式</dt><dd>{detail.provider === 'mock' ? '离线模拟' : detail.provider === 'colab' ? 'Colab GPU' : shown(detail.provider)}</dd>
-              <dt>创建时间</dt><dd>{formatInstanceTime(detail.created_at)}</dd>
-            </dl>
-            <p className="muted small">{taskStatusNote(detail)}</p>
-            {Array.isArray(detail.attempts) && <details className="foldable" open>
-              <summary>执行记录</summary>
-              <div className="foldContent">
-                {detail.attempts.length ? detail.attempts.map((attempt: Record<string, unknown>) => <p key={String(attempt.id)}>
-                  第 {String(attempt.attempt)} 次 · {jobStateLabel(String(attempt.state))}
-                  {attempt.error_code ? ` · ${String(attempt.error_code)}` : ''}
-                </p>) : <p className="muted">还没有开始执行</p>}
-              </div>
-            </details>}
-            {(detail.timings || detail.timing_details || detail.logs || detail.events) ? <JobHistoryDetails job={detail} /> : null}
-            {stageSecondsTotal(jobDetailTimings(detail)) ? <p className="muted small">各阶段相加约 {stageSecondsTotal(jobDetailTimings(detail))}。阶段按秒独立计时，可能重叠，不是工作流发布又额外等了这么久。</p> : null}
-            {detail.resolved_params ? (
-              <details className="foldable">
-                <summary>本次使用的参数</summary>
-                <div className="foldContent">
-                  <dl className={styles.kv}>
-                    {paramRows(detail.resolved_params).map((row) => <Fragment key={row.key}><dt>{row.label}</dt><dd>{row.value}</dd></Fragment>)}
-                  </dl>
-                </div>
-              </details>
-            ) : null}
+      {detailId && tab === '任务' && !desktop && (
+        <div className={styles.dialogBackdrop} role="presentation" onClick={() => setDetailId('')}>
+          <section className={styles.dialog} role="dialog" aria-modal="true" aria-label="任务详情" onClick={event => event.stopPropagation()}>
+            {jobDetailContent}
           </section>
         </div>
       )}
 
-      {/* 作品查看 */}
-      {viewer && (
+      {viewer && !inlineViewer && (
         <div className={styles.dialogBackdrop} role="presentation" onClick={() => setViewer(null)}>
-          <section className={styles.dialog} role="dialog" aria-modal="true" aria-label="查看作品" onClick={(e) => e.stopPropagation()}>
-            <div className={`${styles.cardHead} ${styles.viewerHead}`}>
-              <h2>{viewer.filename || viewer.id}</h2>
-              <div className={styles.viewerHeadActions}>
-                <button className="button secondary small" type="button" onClick={async (event) => {
-                  const panel = event.currentTarget.closest('section');
-                  try {
-                    if (document.fullscreenElement) await document.exitFullscreen();
-                    else if (panel?.requestFullscreen) await panel.requestFullscreen();
-                    else throw new Error('当前浏览器不支持全屏');
-                  } catch (error) { setError(apiMessage(error)); }
-                }}><Maximize2 size={14} strokeWidth={1.6} aria-hidden />全屏查看</button>
-                <button className="button secondary small" type="button" onClick={async () => {
-                  if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
-                  setViewer(null);
-                }}>关闭</button>
-              </div>
-            </div>
-            {viewer.mime.startsWith('video/') ? (
-              <video className={styles.viewerVideo} src={assetUrl(viewer)} controls autoPlay playsInline />
-            ) : viewer.mime.startsWith('image/') ? (
-              <img className={styles.viewerImage} src={assetUrl(viewer)} alt="" />
-            ) : (
-              <p className="muted">这是诊断文件，不能直接预览，请下载查看。</p>
-            )}
-            <div className={styles.viewerActions}>
-              <button className="button secondary small" type="button" onClick={() => void favorite(viewer)}>
-                <Star size={14} strokeWidth={1.6} aria-hidden />{viewer.favorite ? '取消收藏' : '收藏'}
-              </button>
-              <button className="button secondary small" type="button" onClick={() => void reuseAsset(viewer)}>
-                <RotateCcw size={14} strokeWidth={1.6} aria-hidden />用同样参数再来一次
-              </button>
-              <a className="button secondary small" href={assetUrl(viewer)} download={viewer.filename || viewer.id} target="_blank" rel="noreferrer">
-                <Download size={14} strokeWidth={1.6} aria-hidden />下载
-              </a>
-              <button className="button danger small" type="button" onClick={() => void remove(viewer)}>
-                <Trash2 size={14} strokeWidth={1.6} aria-hidden />删除
-              </button>
-            </div>
+          <section className={styles.dialog} role="dialog" aria-modal="true" aria-label="查看作品" onClick={event => event.stopPropagation()}>
+            {viewerContent}
           </section>
         </div>
       )}

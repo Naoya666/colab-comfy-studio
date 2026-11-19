@@ -1,5 +1,5 @@
 /* Colab GPU Studio — 黑白极简主题
-   纯黑底 / 深灰卡片 / 白色主按钮 / 发丝边框。移动优先，桌面端为居中窄栏。 */
+   纯黑底 / 深灰卡片 / 白色主按钮 / 发丝边框。 */
 
 :root {
   --bg: #000000;
@@ -162,6 +162,7 @@ svg { flex: none; }
   background: transparent; color: var(--muted); font-size: 0.72rem;
 }
 .bottomNav button[aria-current="page"] { color: var(--text); background: var(--card-2); }
+.desktopGpu.projectChip { display: none; }
 .tabBadge {
   position: absolute; top: 2px; right: calc(50% - 22px);
   min-width: 16px; height: 16px; padding: 0 4px; border-radius: var(--r-full);
@@ -277,6 +278,82 @@ details.foldable[open] > summary::after { transform: rotate(-135deg) translateY(
 
 @media (min-width: 700px) {
   .app { border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+}
+@media (min-width: 800px) {
+  .app {
+    --desktop-header-height: calc(64px + var(--safe-t));
+    --desktop-sidebar-width: 76px;
+    --workspace-accent: light-dark(#1b634c, #83cdb4);
+    display: grid;
+    grid-template-columns: var(--desktop-sidebar-width) minmax(0, 1fr);
+    grid-template-rows: var(--desktop-header-height) 1fr;
+    max-width: none;
+    border: 0;
+    padding-bottom: 0;
+  }
+  .topbar { grid-column: 1 / -1; padding-inline: 24px; }
+  .brand { flex: none; }
+  .brandMark { width: 36px; height: 36px; color: var(--workspace-accent); }
+  .brandText strong { font-size: 0.96rem; }
+  .topbarActions { gap: 8px; }
+  .projectChip { max-width: 230px; }
+  .mobileSettings.iconButton { display: none; }
+  .desktopGpu.projectChip { display: inline-flex; margin-left: 10px; border-color: var(--line); background: var(--card); }
+  .desktopGpu[data-online="true"] svg { color: var(--workspace-accent); }
+  .desktopGpu:hover { border-color: var(--line-strong); }
+  .bottomNav {
+    grid-column: 1;
+    grid-row: 2;
+    align-self: start;
+    position: sticky;
+    top: var(--desktop-header-height);
+    left: auto;
+    bottom: auto;
+    transform: none;
+    z-index: 20;
+    min-height: calc(100dvh - var(--desktop-header-height));
+    max-height: calc(100dvh - var(--desktop-header-height));
+    overflow-y: auto;
+    padding: 16px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border-top: 0;
+    border-right: 1px solid var(--line);
+    background: var(--card);
+  }
+  .bottomNav button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 42px;
+    gap: 9px;
+    flex: none;
+    text-align: left;
+    color: var(--text-2);
+  }
+  .bottomNav button[data-tab="原生 ComfyUI"] { margin-top: 16px; }
+  .bottomNav button[data-tab="设置"] { margin-top: auto; }
+  .bottomNav button:hover { background: var(--card-2); }
+  .bottomNav button[aria-current="page"] { color: var(--workspace-accent); }
+  .bottomNav button:focus-visible { outline-offset: -2px; }
+  .bottomNav .tabBadge { right: 4px; top: 4px; }
+}
+@media (800px <= width < 1100px) {
+  .bottomNav button > span:not(.tabBadge) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+@media (min-width: 1100px) {
+  .app { --desktop-sidebar-width: 206px; }
+  .bottomNav { padding: 18px 12px; }
+  .bottomNav button { justify-content: flex-start; padding-inline: 12px; font-size: 0.9rem; }
+  .bottomNav .tabBadge { position: static; margin-inline-start: auto; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }

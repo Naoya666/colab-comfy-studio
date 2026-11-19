@@ -284,3 +284,147 @@
 .notice { padding: 10px 12px; border: 1px solid var(--line); }
 .errorText { font-size: 13px; color: #a63b32; }
 .checkline { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+
+/* 桌面工作区 */
+.desktopTitle { display: none; }
+.nativeWorkspace, .nativeColumns, .nativeControls, .nativeActivity, .nativeFieldPair { display: grid; gap: 12px; min-width: 0; align-content: start; }
+.nativeControls > button { justify-self: start; }
+.nativeActivity ol { margin: 0; padding-inline-start: 20px; }
+.nativeActivity li + li { margin-top: 6px; }
+
+@media (min-width: 1100px) {
+  .workspaceGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .workspaceWide { grid-column: 1 / -1; min-width: 0; }
+  .modelFilters { grid-template-columns: minmax(0, 2fr) repeat(3, minmax(0, 1fr)); }
+}
+@media (min-width: 800px) {
+  .page {
+    grid-row: 2;
+    grid-column: 2;
+    min-width: 0;
+    max-width: 1720px;
+    padding: 24px clamp(18px, 2.1vw, 36px) 40px;
+    justify-self: center;
+  }
+  .desktopTitle { display: block; margin-bottom: 16px; font-size: 1.5rem; }
+  .pageTitle h2, .pageHead h2 { font-size: 1.35rem; }
+  .createColumns { display: grid; align-items: start; gap: 20px; min-width: 0; }
+  .createForm { display: grid; gap: 12px; min-width: 0; }
+  .createSubmit {
+    display: grid;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-md);
+    background: var(--card);
+  }
+  .submitRow { display: flex; align-items: center; justify-content: space-between; gap: 6px 12px; flex-wrap: wrap; }
+  .submitRow > span { color: var(--text-2); font-size: .82rem; }
+  .createResults { gap: 12px; padding: 16px; align-content: start; grid-auto-rows: max-content; }
+  .createResults .cardHead h2 { font-size: 1rem; }
+  .resultStatus {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px 10px;
+    min-width: 0;
+    color: var(--text-2);
+    font-size: .82rem;
+  }
+  .resultCanvas {
+    display: grid;
+    grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+    place-items: center;
+    min-width: 0;
+    height: clamp(250px, 54dvh, 640px);
+    background-color: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    overflow: hidden;
+  }
+  .resultCanvas:has(.resultEmpty) {
+    background-image: radial-gradient(var(--line) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+  .resultCanvas > button {
+    display: block;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+  .resultCanvas > button:focus-visible, .tileCover:focus-visible { outline-offset: -3px; }
+  .resultCanvas img, .resultCanvas video { display: block; width: 100%; height: 100%; object-fit: contain; }
+  .resultEmpty {
+    display: grid;
+    justify-items: center;
+    gap: 8px;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    color: var(--text-2);
+    background: var(--card);
+    text-align: center;
+  }
+  .resultStrip { display: flex; gap: 8px; overflow-x: auto; padding: 3px; }
+  .resultStrip button {
+    display: grid;
+    place-items: center;
+    flex: 0 0 60px;
+    height: 50px;
+    padding: 2px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    background: var(--bg);
+  }
+  .resultStrip button[aria-pressed="true"] { border-color: var(--workspace-accent); }
+  .resultStrip img { width: 100%; height: 44px; object-fit: cover; display: block; border-radius: 4px; }
+  .detailWorkspace { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(260px, .85fr); align-items: start; gap: 20px; }
+  .detailWorkspace[data-gallery] { grid-template-columns: minmax(0, 1fr) minmax(260px, 34%); }
+  .inspector {
+    position: sticky;
+    top: calc(var(--desktop-header-height) + 24px);
+    max-height: calc(100dvh - var(--desktop-header-height) - 48px);
+    overflow: auto;
+    align-content: start;
+    grid-auto-rows: max-content;
+    padding: 16px;
+  }
+  .inspector > h2, .inspector .cardHead h2, .nativeWorkspace h2 { font-size: 1rem; }
+  .assetInspector { scrollbar-gutter: stable; }
+  .assetInspector:fullscreen { width: 100%; max-height: none; background: var(--bg); }
+  .assetInspector:fullscreen .viewerImage, .assetInspector:fullscreen .viewerVideo { max-height: 78dvh; }
+  .jobCard[data-inspected="true"] { border-color: var(--workspace-accent); }
+  .galleryGrid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 145px), 1fr)); gap: 12px; }
+  .nativeWorkspace { gap: 16px; }
+  .nativeWorkspace h1 { font-size: 1.5rem; }
+  .nativeColumns { grid-template-columns: minmax(0, 1.18fr) minmax(250px, .82fr); align-items: start; gap: 20px; }
+  .nativeControls, .nativeActivity { padding: 16px; background: var(--card); border: 1px solid var(--line); border-radius: var(--r-lg); }
+  .nativeActivity { position: sticky; top: calc(var(--desktop-header-height) + 24px); }
+  .nativeActivity ol { max-height: 42dvh; overflow: auto; }
+  .nativeControls .nativeFieldPair { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .dialog:has(.viewerImage), .dialog:has(.viewerVideo) { max-width: min(960px, calc(100vw - 48px)); }
+  .dialog:fullscreen { max-width: 100vw; }
+}
+@media (min-width: 960px) and (min-height: 500px) {
+  .createColumns { grid-template-columns: minmax(340px, min(41%, 450px)) minmax(0, 1fr); }
+  .createForm {
+    grid-template-rows: minmax(0, 1fr) auto;
+    max-height: calc(100dvh - var(--desktop-header-height) - 96px);
+  }
+  .createFields { grid-auto-rows: max-content; overflow: auto; scrollbar-gutter: stable; padding: 2px; }
+  .createResults {
+    position: sticky;
+    top: calc(var(--desktop-header-height) + 24px);
+    max-height: calc(100dvh - var(--desktop-header-height) - 48px);
+    overflow: auto;
+  }
+}
+@media (min-width: 960px) and (max-height: 499px) {
+  .createColumns { grid-template-columns: minmax(340px, min(41%, 450px)) minmax(0, 1fr); }
+  .inspector { position: static; max-height: none; }
+}

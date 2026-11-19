@@ -15,7 +15,7 @@ const FAILED = ['failed', 'failed_final', 'cancelled', 'cancelled_local', 'block
 type Filter = 'all' | 'running' | 'completed' | string;
 
 export function TasksPanel({
-  jobs, error, refreshing, onRefresh, onCancel, onRetry, onDetail, onRetain, onInstance,
+  jobs, error, refreshing, onRefresh, onCancel, onRetry, onDetail, onRetain, onInstance, selectedId,
 }: {
   jobs: GpuJob[];
   error: string;
@@ -24,6 +24,7 @@ export function TasksPanel({
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
   onDetail: (job: GpuJob) => void;
+  selectedId?: string;
   onRetain?: (job: GpuJob) => void;
   onInstance?: (job: GpuJob) => void;
 }) {
@@ -123,7 +124,7 @@ export function TasksPanel({
             const retained = liveInstance && Boolean(job.retained_until || job.instance_state === 'retained_idle');
 
             return (
-              <article className={styles.jobCard} key={jobKey}>
+              <article className={styles.jobCard} key={jobKey} data-inspected={selectedId === job.id}>
                 <div className={styles.jobTop}>
                   <div className={styles.jobThumb}>
                     {thumb ? <img src={thumb} alt="" loading="lazy" /> : video ? <Film size={22} strokeWidth={1.4} aria-hidden /> : <ImageIcon size={22} strokeWidth={1.4} aria-hidden />}
@@ -154,7 +155,7 @@ export function TasksPanel({
                 {err && <p className="status error" role="alert">{err}</p>}
 
                 <div className={styles.cardActions}>
-                  <button className="button small" style={{ flex: 1 }} type="button" onClick={() => onDetail(job)}>查看详情</button>
+                  <button className="button small" style={{ flex: 1 }} type="button" aria-pressed={selectedId === job.id} onClick={() => onDetail(job)}>查看详情</button>
                   {liveInstance && !retained && onRetain && <button className="button secondary small" type="button" onClick={() => onRetain(job)}>保留这台机器</button>}
                   {retained && <span className="pill">已保留{job.retained_until ? `至 ${formatDateTime(String(job.retained_until))}` : ''}</span>}
                   {!terminalStates.has(s) ? (

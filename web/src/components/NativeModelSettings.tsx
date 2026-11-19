@@ -1,3 +1,5 @@
+import styles from '../gpu.module.css';
+
 export type ModelStorage = {
   model_storage_mode: 'drive_mount' | 'local';
   cache_gb: number;
@@ -16,7 +18,7 @@ export function NativeModelSettings({ value, onChange }: {
         <option value="local">本地模式（按需完整下载）</option>
       </select>
     </label>
-    {value.model_storage_mode === 'drive_mount' && <>
+    {value.model_storage_mode === 'drive_mount' && <div className={styles.nativeFieldPair}>
       <label className="field">挂载缓存容量（GB）
         <input type="number" min={1} max={2147483647} required value={value.cache_gb || ''}
           onChange={e => onChange({ ...value, cache_gb: Number(e.target.value) })} />
@@ -26,6 +28,6 @@ export function NativeModelSettings({ value, onChange }: {
           onChange={e => onChange({ ...value, cache_max_age_minutes: Number(e.target.value) })} />
         <span className="muted small">rclone 根据上次访问时间回收 VFS 缓存。实例空闲回收和会话上限另行设置。</span>
       </label>
-    </>}
+    </div>}
   </>;
 }

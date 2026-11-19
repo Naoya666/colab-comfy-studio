@@ -48,6 +48,7 @@ export interface GpuJobRequest extends GpuJobRequestV020 { }
 export interface GpuJob {
   id: string;
   job_id?: string;
+  batch_id?: string;
   project_id: string;
   model_id?: string;
   workflow_key?: string;
@@ -350,7 +351,7 @@ export const saveGoogleClientConfig = (body: {account_id?: string; client_id?: s
 export const getReferenceAssets = (projectId: string) => apiFetch<GalleryAsset[]>(`/api/assets?project_id=${encodeURIComponent(projectId)}`);
 
 export function createGpuBatch(jobs: GpuJobRequest[], mode: 'save'|'smart'|'batch'|'retain', idleSeconds: number, idempotencyKey: string) {
-  return apiFetch<{id:string}>('/api/gpu/batches', {method:'POST',headers:{'Idempotency-Key':idempotencyKey},body:JSON.stringify({jobs,mode,idle_seconds:Math.min(300, Math.max(0, idleSeconds))})});
+  return apiFetch<{ id: string; job_ids: string[] }>('/api/gpu/batches', {method:'POST',headers:{'Idempotency-Key':idempotencyKey},body:JSON.stringify({jobs,mode,idle_seconds:Math.min(300, Math.max(0, idleSeconds))})});
 }
 
 export const retryGpuAttempt = (id: string, key: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/attempts`, { method: "POST", headers: { "Idempotency-Key": key }, body: JSON.stringify({}) });

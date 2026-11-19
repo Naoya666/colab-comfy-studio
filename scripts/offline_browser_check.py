@@ -44,7 +44,7 @@ with sync_playwright() as p:
     if isinstance(existing,dict): existing=existing.get('items',existing.get('jobs',[]))
     baseline_ids={job['id'] for job in existing}
     page.get_by_label("生成数量", exact=True).fill("3")
-    page.get_by_label("运行策略", exact=True).select_option("batch")
+    page.get_by_label("任务完成后的策略").select_option("batch")
     page.get_by_role("button", name="立即生成").click()
     with page.expect_response(lambda response: response.request.method=='POST' and response.url.endswith('/api/gpu/batches')) as submitted:
         page.get_by_role("dialog", name="确认提交任务").get_by_role("button", name="确认启动").evaluate("button=>{button.click();button.click()}")

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Sparkles, Image as ImageIcon, Film, Layers, Pencil, SlidersHorizontal, Play, Monitor, Cloud,
   ChevronRight, Minus, Plus, X, Check,
@@ -54,9 +54,12 @@ export function CreatePanel({
   selectedAssets, setSelectedAssets, uploadProgress, onUpload, setModelId, workflowId, setWorkflowId,
   runtime, setRuntime, maxRuntime, setMaxRuntime, batchCount, setBatchCount, batchMode,
   runtimeChoice, accounts, instances, onRuntimeChoiceChange,
-  gpuSelection, loading, error, onSubmit, onApplyPreset, onSavePreset,
+  gpuSelection, loading, error, onSubmit, onApplyPreset, onSavePreset, children, desktop, draftReady,
 }: {
-  gpuSelection?: import('react').ReactNode;
+  gpuSelection?: ReactNode;
+  children?: ReactNode;
+  desktop: boolean;
+  draftReady: boolean;
   projectId: string;
   models: GpuModel[];
   workflows: GpuWorkflow[];
@@ -170,201 +173,217 @@ export function CreatePanel({
     );
   }
 
+  const submitButton = (
+    <button className={desktop ? 'button' : 'button big'} disabled={!draftReady || loading === 'submit'} type="button" onClick={onSubmit}>
+      <Sparkles size={18} strokeWidth={1.8} aria-hidden />{loading === 'submit' ? '提交中…' : '立即生成'}
+    </button>
+  );
+  const submitError = error && <p className="status error" role="alert">{error}</p>;
+
   return (
-    <div className={styles.stack}>
-      {/* 1 创作类型 */}
-      <Card icon={<Sparkles size={17} strokeWidth={1.6} aria-hidden />} title="创作类型">
-        <Segmented<Category>
-          ariaLabel="创作类型"
-          value={category}
-          onChange={switchCategory}
-          options={[
-            { value: 'image', label: '图片生成', icon: <ImageIcon size={17} strokeWidth={1.6} aria-hidden />, disabled: !families.some((f) => f.category === 'image') },
-            { value: 'video', label: '视频生成', icon: <Film size={17} strokeWidth={1.6} aria-hidden />, disabled: !families.some((f) => f.category === 'video') },
-          ]}
-        />
-      </Card>
+    <div className={styles.createForm}>
+      <section className={`${styles.stack} ${styles.createFields}`} aria-label={desktop ? '创作参数' : undefined}>
+        {/* 1 创作类型 */}
+        <Card icon={<Sparkles size={17} strokeWidth={1.6} aria-hidden />} title="创作类型">
+          <Segmented<Category>
+            ariaLabel="创作类型"
+            value={category}
+            onChange={switchCategory}
+            options={[
+              { value: 'image', label: '图片生成', icon: <ImageIcon size={17} strokeWidth={1.6} aria-hidden />, disabled: !families.some((f) => f.category === 'image') },
+              { value: 'video', label: '视频生成', icon: <Film size={17} strokeWidth={1.6} aria-hidden />, disabled: !families.some((f) => f.category === 'video') },
+            ]}
+          />
+        </Card>
 
-      {/* 2 工作流 */}
-      <Card
-        icon={<Layers size={17} strokeWidth={1.6} aria-hidden />}
-        title="工作流"
-        aside={<button type="button" className={styles.linkButton} onClick={() => setPickerOpen(true)}>切换<ChevronRight size={15} strokeWidth={1.6} aria-hidden /></button>}
-      >
-        {activeWorkflow ? (
-          <button type="button" className={styles.wfCard} onClick={() => setPickerOpen(true)} aria-label="切换工作流">
-            <span className={styles.wfThumb}><Layers size={20} strokeWidth={1.4} aria-hidden /></span>
-            <span className={styles.wfBody}>
-              <span className={styles.wfName}>
-                <strong>{workflowTitle(activeWorkflow)}</strong>
-                <span className="pill">v{activeWorkflow.workflow_version}</span>
-              </span>
-              <small className="muted">{activeWorkflow.workflow_key}{subtitle ? ` · ${subtitle}` : ''}</small>
-            </span>
-          </button>
-        ) : <p className="muted small">还没有可用的工作流，请先到「设置 › 工作流与模型」发布一个。</p>}
-        <details className={`foldable ${styles.presetBox}`}>
-          <summary>参数预设{presets.filter((p) => p.workflow_version_id === workflowId).length ? `（${presets.filter((p) => p.workflow_version_id === workflowId).length}）` : ''}</summary>
-          <div className="foldContent">
-            <div className="field">
-              <label htmlFor="preset-select">套用已存的参数</label>
-              <select id="preset-select" defaultValue="" onChange={(e) => {
-                const preset = presets.find((p) => p.id === e.target.value);
-                if (preset) onApplyPreset(preset);
-              }}>
-                <option value="">选择预设…</option>
-                {presets.filter((p) => p.workflow_version_id === workflowId).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </select>
-            </div>
-            <div className={styles.inlineForm}>
-              <input aria-label="新预设名称" placeholder="给当前参数起个名字" value={presetName} onChange={(e) => setPresetName(e.target.value)} />
-              <button className="button secondary" type="button" disabled={!presetName.trim() || !workflowId} onClick={() => { onSavePreset(presetName.trim()); setPresetName(''); }}>保存</button>
-            </div>
-          </div>
-        </details>
-      </Card>
-
-      {/* 3 提示词 */}
-      <Card icon={<Pencil size={17} strokeWidth={1.6} aria-hidden />} title="提示词">
-        <textarea
-          aria-label="提示词"
-          value={promptValue}
-          placeholder="描述想要的画面：主体、风格、光线、细节……"
-          rows={3}
-          onChange={(e) => setParams({ ...params, [promptKey]: e.target.value })}
-        />
-      </Card>
-
-      {/* 4 画面尺寸 —— 全页只有这一套尺寸选择 */}
-      {hasSize && (
+        {/* 2 工作流 */}
         <Card
-          icon={<SlidersHorizontal size={17} strokeWidth={1.6} aria-hidden />}
-          title="画面尺寸"
-          aside={<span className={styles.sizeBadge}>{curW || '—'} × {curH || '—'}</span>}
+          icon={<Layers size={17} strokeWidth={1.6} aria-hidden />}
+          title="工作流"
+          aside={<button type="button" className={styles.linkButton} onClick={() => setPickerOpen(true)}>切换<ChevronRight size={15} strokeWidth={1.6} aria-hidden /></button>}
         >
-          <div className={styles.ratioGrid} role="group" aria-label="画幅比例">
-            {sizes.map((s) => {
-              const on = !showCustom && matched?.label === s.label;
-              const box = 22;
-              const bw = s.rw >= s.rh ? box : Math.round(box * s.rw / s.rh);
-              const bh = s.rh >= s.rw ? box : Math.round(box * s.rh / s.rw);
-              return (
-                <button key={s.label} type="button" className={styles.ratioChip} data-active={on} aria-pressed={on}
-                  onClick={() => { setCustomSize(false); patch({ width: s.w, height: s.h }); }}>
-                  <span className={styles.ratioShape} aria-hidden><i style={{ width: bw, height: bh }} /></span>
-                  <strong>{s.label}</strong>
-                  <small>{s.w}×{s.h}</small>
-                </button>
-              );
-            })}
-            <button type="button" className={styles.ratioChip} data-active={showCustom} aria-pressed={showCustom} onClick={() => setCustomSize(true)}>
-              <span className={styles.ratioShape} aria-hidden><i className={styles.ratioDashed} style={{ width: 22, height: 16 }} /></span>
-              <strong>自定义</strong>
-              <small>手动输入</small>
+          {activeWorkflow ? (
+            <button type="button" className={styles.wfCard} onClick={() => setPickerOpen(true)} aria-label="切换工作流">
+              <span className={styles.wfThumb}><Layers size={20} strokeWidth={1.4} aria-hidden /></span>
+              <span className={styles.wfBody}>
+                <span className={styles.wfName}>
+                  <strong>{workflowTitle(activeWorkflow)}</strong>
+                  <span className="pill">v{activeWorkflow.workflow_version}</span>
+                </span>
+                <small className="muted">{activeWorkflow.workflow_key}{subtitle ? ` · ${subtitle}` : ''}</small>
+              </span>
             </button>
+          ) : <p className="muted small">还没有可用的工作流，请先到「设置 › 工作流与模型」发布一个。</p>}
+          <details className={`foldable ${styles.presetBox}`}>
+            <summary>参数预设{presets.filter((p) => p.workflow_version_id === workflowId).length ? `（${presets.filter((p) => p.workflow_version_id === workflowId).length}）` : ''}</summary>
+            <div className="foldContent">
+              <div className="field">
+                <label htmlFor="preset-select">套用已存的参数</label>
+                <select id="preset-select" defaultValue="" disabled={!draftReady} onChange={(e) => {
+                  const preset = presets.find((p) => p.id === e.target.value);
+                  if (preset) onApplyPreset(preset);
+                }}>
+                  <option value="">选择预设…</option>
+                  {presets.filter((p) => p.workflow_version_id === workflowId).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+              </div>
+              <div className={styles.inlineForm}>
+                <input aria-label="新预设名称" placeholder="给当前参数起个名字" value={presetName} onChange={(e) => setPresetName(e.target.value)} />
+                <button className="button secondary" type="button" disabled={!presetName.trim() || !draftReady} onClick={() => { onSavePreset(presetName.trim()); setPresetName(''); }}>保存</button>
+              </div>
+            </div>
+          </details>
+        </Card>
+
+        {/* 3 提示词 */}
+        <Card icon={<Pencil size={17} strokeWidth={1.6} aria-hidden />} title="提示词">
+          <textarea
+            aria-label="提示词"
+            value={promptValue}
+            disabled={!draftReady}
+            placeholder={loading === 'schema' ? '正在加载工作流参数…' : '描述想要的画面：主体、风格、光线、细节……'}
+            rows={3}
+            onChange={(e) => setParams({ ...params, [promptKey]: e.target.value })}
+          />
+        </Card>
+
+        {/* 4 画面尺寸 —— 全页只有这一套尺寸选择 */}
+        {hasSize && (
+          <Card
+            icon={<SlidersHorizontal size={17} strokeWidth={1.6} aria-hidden />}
+            title="画面尺寸"
+            aside={<span className={styles.sizeBadge}>{curW || '—'} × {curH || '—'}</span>}
+          >
+            <div className={styles.ratioGrid} role="group" aria-label="画幅比例">
+              {sizes.map((s) => {
+                const on = !showCustom && matched?.label === s.label;
+                const box = 22;
+                const bw = s.rw >= s.rh ? box : Math.round(box * s.rw / s.rh);
+                const bh = s.rh >= s.rw ? box : Math.round(box * s.rh / s.rw);
+                return (
+                  <button key={s.label} type="button" className={styles.ratioChip} data-active={on} aria-pressed={on}
+                    onClick={() => { setCustomSize(false); patch({ width: s.w, height: s.h }); }}>
+                    <span className={styles.ratioShape} aria-hidden><i style={{ width: bw, height: bh }} /></span>
+                    <strong>{s.label}</strong>
+                    <small>{s.w}×{s.h}</small>
+                  </button>
+                );
+              })}
+              <button type="button" className={styles.ratioChip} data-active={showCustom} aria-pressed={showCustom} onClick={() => setCustomSize(true)}>
+                <span className={styles.ratioShape} aria-hidden><i className={styles.ratioDashed} style={{ width: 22, height: 16 }} /></span>
+                <strong>自定义</strong>
+                <small>手动输入</small>
+              </button>
+            </div>
+            {showCustom && (
+              <div className={styles.customSize}>
+                <label className={styles.sizeInput}>
+                  <span>宽</span>
+                  <input type="number" inputMode="numeric" min={minSide} max={maxSide} step={step} value={String(params.width ?? '')}
+                    onChange={(e) => patch({ width: Number(e.target.value) || 0 })} />
+                  <em>px</em>
+                </label>
+                <span className="muted">×</span>
+                <label className={styles.sizeInput}>
+                  <span>高</span>
+                  <input type="number" inputMode="numeric" min={minSide} max={maxSide} step={step} value={String(params.height ?? '')}
+                    onChange={(e) => patch({ height: Number(e.target.value) || 0 })} />
+                  <em>px</em>
+                </label>
+              </div>
+            )}
+            {showCustom && <p className="muted small">建议取 {step} 的倍数，范围 {minSide}–{maxSide}。尺寸越大越慢、越费 CU。</p>}
+          </Card>
+        )}
+
+        {/* 5 常用选项（时长 / 模式）直接展示 */}
+        {split.options.length > 0 && (
+          <Card icon={<SlidersHorizontal size={17} strokeWidth={1.6} aria-hidden />} title="生成选项">
+            <GpuParamForm section="options" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
+              onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
+          </Card>
+        )}
+
+        {/* 6 素材 */}
+        {manifest && (split.assets.length > 0 || supportsReferences(manifest)) && (
+          <Card icon={<ImageIcon size={17} strokeWidth={1.6} aria-hidden />} title="参考素材">
+            <GpuParamForm section="assets" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
+              onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
+            <ReferencePicker manifest={manifest} assets={gallery} selected={selectedAssets} onChange={setSelectedAssets} onUpload={onUpload} />
+          </Card>
+        )}
+
+        {/* 7 数量 */}
+        <Card>
+          <div className={styles.countRow}>
+            <div>
+              <strong>生成数量</strong>
+              <p className="muted small">一次提交几张/几段，多个会按顺序排队。</p>
+            </div>
+            <div className={styles.stepper}>
+              <button type="button" aria-label="减少数量" disabled={batchCount <= 1} onClick={() => setBatchCount(Math.max(1, batchCount - 1))}><Minus size={16} strokeWidth={1.8} aria-hidden /></button>
+              <input aria-label="生成数量" type="number" inputMode="numeric" min={1} max={100} value={batchCount}
+                onChange={(e) => setBatchCount(Math.max(1, Math.min(100, Number(e.target.value) || 1)))} />
+              <button type="button" aria-label="增加数量" disabled={batchCount >= 100} onClick={() => setBatchCount(Math.min(100, batchCount + 1))}><Plus size={16} strokeWidth={1.8} aria-hidden /></button>
+            </div>
           </div>
-          {showCustom && (
-            <div className={styles.customSize}>
-              <label className={styles.sizeInput}>
-                <span>宽</span>
-                <input type="number" inputMode="numeric" min={minSide} max={maxSide} step={step} value={String(params.width ?? '')}
-                  onChange={(e) => patch({ width: Number(e.target.value) || 0 })} />
-                <em>px</em>
-              </label>
-              <span className="muted">×</span>
-              <label className={styles.sizeInput}>
-                <span>高</span>
-                <input type="number" inputMode="numeric" min={minSide} max={maxSide} step={step} value={String(params.height ?? '')}
-                  onChange={(e) => patch({ height: Number(e.target.value) || 0 })} />
-                <em>px</em>
-              </label>
+        </Card>
+
+        {/* 8 高级参数：默认折叠 */}
+        {split.advanced.length > 0 && (
+          <details className={`foldable ${styles.advanced}`}>
+            <summary>
+              <span className={styles.advTitle}><SlidersHorizontal size={17} strokeWidth={1.6} aria-hidden />高级参数<span className="pill">{split.advanced.length} 项</span></span>
+            </summary>
+            <div className="foldContent">
+              <p className="muted small">一般不用改。不确定时保持默认即可。</p>
+              <GpuParamForm section="advanced" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
+                onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
+            </div>
+          </details>
+        )}
+
+        {/* 9 运行设置 */}
+        <Card
+          icon={<Play size={17} strokeWidth={1.6} aria-hidden />}
+          title="运行设置"
+          aside={<InfoTip label="运行方式说明" text={<><span className={styles.tipLine}><b>离线模拟</b>：{RUNTIME_HELP.mock}</span><span className={styles.tipLine}><b>Colab GPU</b>：{RUNTIME_HELP.colab}</span></>} />}
+        >
+          <Segmented<Provider>
+            ariaLabel="运行方式"
+            value={runtime}
+            onChange={setRuntime}
+            options={[
+              { value: 'mock', label: '离线模拟', sub: '不扣 CU', icon: <Monitor size={17} strokeWidth={1.6} aria-hidden /> },
+              { value: 'colab', label: 'Colab GPU', sub: settings?.real_enabled ? '真实出图' : '未启用', disabled: !settings?.real_enabled, icon: <Cloud size={17} strokeWidth={1.6} aria-hidden /> },
+            ]}
+          />
+          <RuntimeSelection value={runtimeChoice} accounts={accounts} instances={instances} provider={runtime}
+            onChange={onRuntimeChoiceChange} />
+          {gpuSelection}
+          {batchMode === 'retain' && <p className="muted small">保留机器会继续产生 CU；本站只承诺保留到设定截止，Google 仍可能提前回收。</p>}
+          {runtime === 'colab' && (
+            <div className="field">
+              <label htmlFor="max-runtime">单个任务最长运行（分钟）</label>
+              <input id="max-runtime" type="number" inputMode="numeric" min={5} max={maxMinutesCap} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
+              <span className={styles.hint}>超时会被强制关机，已花的 CU 不退。</span>
             </div>
           )}
-          {showCustom && <p className="muted small">建议取 {step} 的倍数，范围 {minSide}–{maxSide}。尺寸越大越慢、越费 CU。</p>}
+          <p className="muted small">
+            {runtime === 'mock' ? RUNTIME_HELP.mock : `${RUNTIME_HELP.colab}今日限额 ${shown(settings?.budget?.daily_units)} CU。`}
+          </p>
+          {!desktop && <>{submitButton}{submitError}</>}
         </Card>
-      )}
 
-      {/* 5 常用选项（时长 / 模式）直接展示 */}
-      {split.options.length > 0 && (
-        <Card icon={<SlidersHorizontal size={17} strokeWidth={1.6} aria-hidden />} title="生成选项">
-          <GpuParamForm section="options" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
-            onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
-        </Card>
-      )}
-
-      {/* 6 素材 */}
-      {manifest && (split.assets.length > 0 || supportsReferences(manifest)) && (
-        <Card icon={<ImageIcon size={17} strokeWidth={1.6} aria-hidden />} title="参考素材">
-          <GpuParamForm section="assets" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
-            onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
-          <ReferencePicker manifest={manifest} assets={gallery} selected={selectedAssets} onChange={setSelectedAssets} onUpload={onUpload} />
-        </Card>
-      )}
-
-      {/* 7 数量 */}
-      <Card>
-        <div className={styles.countRow}>
-          <div>
-            <strong>生成数量</strong>
-            <p className="muted small">一次提交几张/几段，多个会按顺序排队。</p>
-          </div>
-          <div className={styles.stepper}>
-            <button type="button" aria-label="减少数量" disabled={batchCount <= 1} onClick={() => setBatchCount(Math.max(1, batchCount - 1))}><Minus size={16} strokeWidth={1.8} aria-hidden /></button>
-            <input aria-label="生成数量" type="number" inputMode="numeric" min={1} max={100} value={batchCount}
-              onChange={(e) => setBatchCount(Math.max(1, Math.min(100, Number(e.target.value) || 1)))} />
-            <button type="button" aria-label="增加数量" disabled={batchCount >= 100} onClick={() => setBatchCount(Math.min(100, batchCount + 1))}><Plus size={16} strokeWidth={1.8} aria-hidden /></button>
-          </div>
+        {children}
+      </section>
+      {desktop && <div className={styles.createSubmit}>
+        {submitError}
+        <div className={styles.submitRow}>
+          <span>{runtime === 'mock' ? '离线模拟' : 'Colab GPU'} · {batchCount} 个任务</span>
+          {submitButton}
         </div>
-      </Card>
-
-      {/* 8 高级参数：默认折叠 */}
-      {split.advanced.length > 0 && (
-        <details className={`foldable ${styles.advanced}`}>
-          <summary>
-            <span className={styles.advTitle}><SlidersHorizontal size={17} strokeWidth={1.6} aria-hidden />高级参数<span className="pill">{split.advanced.length} 项</span></span>
-          </summary>
-          <div className="foldContent">
-            <p className="muted small">一般不用改。不确定时保持默认即可。</p>
-            <GpuParamForm section="advanced" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
-              onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
-          </div>
-        </details>
-      )}
-
-      {/* 9 运行设置 */}
-      <Card
-        icon={<Play size={17} strokeWidth={1.6} aria-hidden />}
-        title="运行设置"
-        aside={<InfoTip label="运行方式说明" text={<><span className={styles.tipLine}><b>离线模拟</b>：{RUNTIME_HELP.mock}</span><span className={styles.tipLine}><b>Colab GPU</b>：{RUNTIME_HELP.colab}</span></>} />}
-      >
-        <Segmented<Provider>
-          ariaLabel="运行方式"
-          value={runtime}
-          onChange={setRuntime}
-          options={[
-            { value: 'mock', label: '离线模拟', sub: '不扣 CU', icon: <Monitor size={17} strokeWidth={1.6} aria-hidden /> },
-            { value: 'colab', label: 'Colab GPU', sub: settings?.real_enabled ? '真实出图' : '未启用', disabled: !settings?.real_enabled, icon: <Cloud size={17} strokeWidth={1.6} aria-hidden /> },
-          ]}
-        />
-        <RuntimeSelection value={runtimeChoice} accounts={accounts} instances={instances} provider={runtime}
-          onChange={onRuntimeChoiceChange} />
-        {gpuSelection}
-        {batchMode === 'retain' && <p className="muted small">保留机器会继续产生 CU；本站只承诺保留到设定截止，Google 仍可能提前回收。</p>}
-        {runtime === 'colab' && (
-          <div className="field">
-            <label htmlFor="max-runtime">单个任务最长运行（分钟）</label>
-            <input id="max-runtime" type="number" inputMode="numeric" min={5} max={maxMinutesCap} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
-            <span className={styles.hint}>超时会被强制关机，已花的 CU 不退。</span>
-          </div>
-        )}
-        <p className="muted small">
-          {runtime === 'mock' ? RUNTIME_HELP.mock : `${RUNTIME_HELP.colab}今日限额 ${shown(settings?.budget?.daily_units)} CU。`}
-        </p>
-        <button className="button big" disabled={!workflowId || loading === 'submit'} type="button" onClick={onSubmit}>
-          <Sparkles size={18} strokeWidth={1.8} aria-hidden />{loading === 'submit' ? '提交中…' : '立即生成'}
-        </button>
-        {error && <p className="status error" role="alert">{error}</p>}
-      </Card>
+      </div>}
 
       {/* 工作流选择面板 */}
       {pickerOpen && (
