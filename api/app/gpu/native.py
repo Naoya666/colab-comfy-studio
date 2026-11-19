@@ -1,6 +1,8 @@
 """Native ComfyUI admission and conservative activity checks on existing leases."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -26,6 +28,31 @@ def timeout_options():
                      "max_runtime_minutes": settings.native_comfy_max_runtime_minutes},
         "limits": {"retain_idle_minutes": None, "max_runtime_minutes": None},
     }
+
+
+def model_storage(values=None, *, validate=False):
+    defaults = {"model_storage_mode": "drive_mount", "cache_gb": settings.native_comfy_cache_gb,
+                "cache_max_age_minutes": settings.native_comfy_cache_max_age_minutes}
+    result = {field: (values or {}).get(field, value) for field, value in defaults.items()}
+    if validate:
+        if result["model_storage_mode"] not in ("drive_mount", "local"):
+            raise APIError("NATIVE_INPUT", "模型存储模式无效", 422)
+        for field, limit in (("cache_gb", 2**31 - 1), ("cache_max_age_minutes", 153722867)):
+            if type(result[field]) is not int or not 1 <= result[field] <= limit:
+                raise APIError("NATIVE_INPUT", f"{field} 必须为正整数，且不超过 {limit}", 422)
+    return result
+
+
+def lease_storage(repo, lease):
+    if lease.get("native_model_storage"):
+        return model_storage(lease["native_model_storage"])
+    job = repo.get("jobs", lease.get("native_bootstrap_job_id") or lease.get("owner_job_id"), lease["owner_id"])
+    return model_storage((job or {}).get("execution_policy"))
+
+
+def model_channel(lease_id, tunnel_token=None):
+    token = tunnel_token or secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
+    return hmac.new(token.encode(), ("native-models:" + lease_id).encode(), hashlib.sha256).hexdigest()
 
 
 def secret_file(name):
@@ -112,6 +139,7 @@ def admit(repo, owner, body, key, *, api_key_id=None):
         if type(value) is not int or value < 1:
             raise APIError("NATIVE_INPUT", f"{field} 必须为正整数（分钟）", 422)
         timeouts[field] = value
+    storage = model_storage(body, validate=True)
     if not settings.native_comfy_url or not cfg.real_enabled:
         raise APIError("NATIVE_DISABLED", "请先配置原生 ComfyUI 域名并启用真实 GPU", 503)
     backend()
@@ -140,7 +168,7 @@ def admit(repo, owner, body, key, *, api_key_id=None):
                         if (j.get("snapshot") or {}).get("native_comfy") and j["state"] not in TERMINAL), None)
         live = active_lease(repo, owner)
         if running or live:
-            source = running or repo.get("jobs", live["owner_job_id"], owner)
+            source = running or repo.get("jobs", live.get("native_bootstrap_job_id") or live.get("owner_job_id"), owner)
             if api_key_id and source:
                 return source
             from .specs import spec_key
@@ -155,6 +183,8 @@ def admit(repo, owner, body, key, *, api_key_id=None):
                    for field, default in (("retain_idle_minutes", settings.native_comfy_idle_minutes),
                                           ("max_runtime_minutes", settings.native_comfy_max_runtime_minutes))):
                 raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止旧实例后重新启动以调整时间参数", 409)
+            if any(field in body and storage[field] != model_storage(policy)[field] for field in storage):
+                raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止实例并重新启动以修改模型存储配置", 409)
             return source
         # Never create a second GPU while another live instance is already present.
         instances = [i for i in repo.list("instances", owner) if i.get("state") not in {"deleted"} and i.get("provider") == "colab"]
@@ -180,7 +210,7 @@ def admit(repo, owner, body, key, *, api_key_id=None):
         raw = {"kind": "native-comfy", **body}
         job, _ = repo.create_job(owner, raw, key)
         policy = {"provider": "colab", "lifecycle": "retain", "account_id": account,
-                  **timeouts,
+                  **timeouts, **storage,
                   **({"instance_id": requested_instance, "allocation": "existing"} if requested_instance else {})}
         return repo.update("jobs", job["id"], {
             **({"native_api_key_id": api_key_id} if api_key_id else {}),
@@ -199,7 +229,9 @@ def admit(repo, owner, body, key, *, api_key_id=None):
 
 def runtime_secrets(repo, job):
     """Only sent over the trusted Colab execution channel; never saved in a DB row."""
+    from .accounts import AccountService
     from .drive import DriveStorage
+
     drive = DriveStorage(job, repo)
     try:
         cache = drive.model_cache()
@@ -210,16 +242,53 @@ def runtime_secrets(repo, job):
             client_secret = decrypt_secret(cred["encrypted_client_secret"])
         else:
             client_id, client_secret, _ = google._config()
+        storage = model_storage(job.get("execution_policy"))
+        tunnel = secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
+        local = storage["model_storage_mode"] == "local"
+        default = AccountService.default_account_id(job["owner_id"])
+        drive_account = drive.account_id or default
+        refresh_token = decrypt_secret(cred["encrypted_refresh_token"])
+        extra = {}
+        if local:
+            from app.native_model_api import runtime_context
+
+            from . import model_dependencies
+
+            context = runtime_context(repo, {"owner_id": job["owner_id"], "native_drive_account_id": drive_account})
+            context["drive_auth"][drive_account] = {"client_id": client_id, "client_secret": client_secret,
+                                                    "refresh_token": refresh_token}
+            extra = {"model_channel": model_channel(job["lease_id"], tunnel), "drive_account": drive_account,
+                     "source_tokens": context["tokens"], "drive_auth": context["drive_auth"],
+                     "catalog": context["catalog"], "directories": model_dependencies.directories(),
+                     "rules": model_dependencies.rules()}
         return {"owner_folder_id": drive._owner_folder_id, "models_folder_id": cache["folder_id"],
                 "lease_id": job.get("lease_id"),
                 "client_id": client_id, "client_secret": client_secret,
-                "refresh_token": decrypt_secret(cred["encrypted_refresh_token"]),
+                "refresh_token": refresh_token,
                 "access_token": cache["access_token"],
-                "tunnel_token": secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE"),
-                "cache_gb": settings.native_comfy_cache_gb, "max_upload_mb": settings.native_comfy_max_upload_mb,
-                "models": ready_models(repo, job["owner_id"], drive.account_id)}
+                "tunnel_token": tunnel, **storage, **extra, "max_upload_mb": settings.native_comfy_max_upload_mb,
+                "models": [] if local else ready_models(repo, job["owner_id"], drive.account_id)}
     finally:
         drive.close()
+
+
+def local_catalog(repo, owner):
+    from .accounts import AccountService
+    from .model_library import external_source
+
+    default = AccountService.default_account_id(owner)
+    result = []
+    for row in repo.list("model_library", owner):
+        binding = external_source(row)
+        if row.get("state") != "ready" and not binding:
+            continue
+        result.append({"model_type": row["model_type"], "filename": row["filename"],
+                       "relative_path": row.get("relative_path"), "legacy_target": row.get("legacy_target"),
+                       "sha256": row.get("sha256") or row.get("expected_sha256"),
+                       "size": row.get("size") or row.get("expected_size"), "md5": row.get("drive_md5"),
+                       "drive_file_id": row.get("drive_file_id") if row.get("state") == "ready" else None,
+                       "account": row.get("drive_account_id") or default, "source": binding})
+    return result
 
 
 def ready_models(repo, owner, account):

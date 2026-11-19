@@ -1,0 +1,361 @@
+"""Exercise local preparation with in-process Comfy routes and simulated model sources."""
+import asyncio
+import fcntl
+import hashlib
+import io
+import json
+import os
+import shutil
+import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from app.config import settings
+from app.gpu import model_sources, native, native_models
+from app.gpu.native_runtime import EXTENSION
+
+DATA = b"model bytes for integrity tests"
+SHA = hashlib.sha256(DATA).hexdigest()
+PATH = "subdir/base.safetensors"
+EXTERNAL = "https://huggingface.co/owner/repo/resolve/commit/base.safetensors"
+
+
+def graph(name=PATH):
+    return {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": name}},
+            "2": {"class_type": "PreviewImage", "inputs": {"images": ["1", 0]}}}
+
+
+def row(**patch):
+    return {"model_type": "checkpoints", "filename": "base.safetensors", "relative_path": PATH,
+            "sha256": SHA, "size": len(DATA), "drive_file_id": "known-file-id", "account": "drive-account",
+            "source": {"download_url": EXTERNAL, "status": "verified"}, **patch}
+
+
+class Stream(httpx.SyncByteStream):
+    def __init__(self, body):
+        self.body = body
+
+    def __iter__(self):
+        yield self.body
+
+
+def media(body=DATA):
+    return httpx.Response(200, headers={"content-length": str(len(body)), "etag": '"fixed"'}, stream=Stream(body))
+
+
+@pytest.fixture
+def local(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_sources, "public_addresses", lambda host: ["8.8.8.8"])
+    # SourceHTTP captures its default resolver at import.
+    original = native_models.SourceHTTP
+    monkeypatch.setattr(native_models, "SourceHTTP",
+                        lambda *args, **kw: original(*args, **kw, resolver=model_sources.public_addresses))
+    monkeypatch.setattr(native_models, "RESERVE", 1)
+    monkeypatch.setattr(native_models.time, "sleep", lambda _: None)
+    instances = []
+
+    def create(handler, catalog=(), **config):
+        models = native_models.LocalModels(
+            tmp_path, tmp_path / "models", {"catalog": list(catalog), "channel": "internal-channel", **config},
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        instances.append(models)
+        return models
+
+    yield create
+    for instance in instances:
+        instance.executor.shutdown()
+        instance.client.close()
+
+
+@pytest.mark.asyncio
+async def test_local_hit_uses_registered_hash_and_skips_both_remotes(local, tmp_path):
+    model = local(lambda _: pytest.fail("local hit contacted a remote source"), [row()], models_folder="folder")
+    target = tmp_path / "models/checkpoints" / PATH
+    target.parent.mkdir(parents=True)
+    target.write_bytes(DATA)
+    for _ in range(2):
+        result = await model.submit({"prompt": graph()})[1]
+        assert result[0]["source"] == "local" and result[0]["cache_hit"] is True
+    target.write_bytes(b"wrong")
+    result = await model.submit({"prompt": graph()})[1]
+    assert result[0]["state"] == "failed" and "身份" in result[0]["error"]
+    assert target.read_bytes() == b"wrong"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("external_ok", [True, False])
+async def test_external_priority_and_hash_checked_drive_fallback(local, tmp_path, external_ok):
+    calls = []
+
+    def handler(req):
+        host = req.headers["host"]
+        calls.append(host)
+        if host == "huggingface.co":
+            assert req.headers["authorization"] == "Bearer model-token"
+            return media() if external_ok else httpx.Response(403)
+        if host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "drive-token", "expires_in": 3600})
+        assert host == "www.googleapis.com"
+        assert req.headers["authorization"] == "Bearer drive-token"
+        assert req.url.path.endswith("/known-file-id")
+        return media()
+
+    model = local(handler, [row()], drive_auth={"drive-account": {}}, tokens={"huggingface": "model-token"})
+    result = (await model.submit({"prompt": graph()})[1])[0]
+    assert result["state"] == "ready"
+    if external_ok:
+        assert calls == ["huggingface.co"] and result["source"] == "external"
+    else:
+        assert calls[-2:] == ["oauth2.googleapis.com", "www.googleapis.com"]
+        assert result["source"] == "drive" and "403" in result["fallback"]
+    assert "model-token" not in repr(result) and "drive-token" not in repr(result)
+    assert (tmp_path / "models/checkpoints" / PATH).read_bytes() == DATA
+
+
+@pytest.mark.asyncio
+async def test_missing_ambiguous_and_distinct_subdirectory(local):
+    models = local(lambda _: pytest.fail("an ambiguous or missing model triggered a download"), [
+        row(), row(sha256="a" * 64, drive_file_id="another-id"),
+        row(relative_path="different/base.safetensors", sha256="b" * 64),
+        row(model_type="loras", sha256="c" * 64),
+    ])
+    problem = (await models.submit({"prompt": graph()})[1])[0]
+    assert problem["state"] == "failed" and "多个版本" in problem["error"]
+    problem = (await models.submit({"prompt": graph("base.safetensors")})[1])[0]
+    assert problem["state"] == "failed" and "找不到明确来源" in problem["error"]
+
+
+@pytest.mark.asyncio
+async def test_verified_binding_resolves_workflow_link_conflict(local):
+    hosts = []
+
+    def handler(req):
+        hosts.append(req.headers["Host"])
+        return media()
+
+    models = local(handler, [row()])
+    body = {"prompt": graph(), "extra_data": {"extra_pnginfo": {"workflow": {
+        "models": [{"name": PATH, "directory": "checkpoints", "url": "https://other.example/m",
+                    "hash_type": "SHA256", "hash": SHA}]
+    }}}}
+    assert (await models.submit(body)[1])[0]["state"] == "ready"
+    assert hosts == ["huggingface.co"]
+
+
+@pytest.mark.asyncio
+async def test_download_dedup_stays_responsive_and_fences_idle_probe(local, tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def handler(req):
+        calls.append(req.url)
+        entered.set()
+        assert release.wait(5)
+        return media()
+
+    models = local(handler, [row()])
+    first_id, first = models.submit({"prompt": graph()})
+    second_id, second = models.submit({"prompt": graph()})
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert models.status(first_id)["state"] == models.status(second_id)["state"] == "preparing"
+        assert not (tmp_path / "models/checkpoints" / PATH).exists()
+        probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("def index_status(")]
+        namespace = {"Path": Path, "Request": lambda url, **kw: url,
+                     "urlopen": lambda _, **kw: io.BytesIO(b'{"is_processing":false}'), "json": json, "os": os}
+        exec(probe.replace("/content/ai-studio/native", str(tmp_path)), namespace)
+        assert namespace["probe"]()["busy_reason"] == "model_preparation"
+        with (tmp_path / "models-active.lock").open("rb") as handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        release.set()
+    assert (await first)[0]["state"] == (await second)[0]["state"] == "ready"
+    assert len(calls) == 1
+    assert namespace["probe"]()["busy"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("space_ok", [True, False])
+async def test_hash_failure_and_insufficient_disk_never_publish(local, monkeypatch, tmp_path, space_ok):
+    called = []
+    models = local(lambda _: called.append(True) or media(b"x" * len(DATA)), [row(drive_file_id=None)])
+    if not space_ok:
+        monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=1))
+    outcome = (await models.submit({"prompt": graph()})[1])[0]
+    assert outcome["state"] == "failed"
+    assert ("SHA-256" if space_ok else "磁盘空间不足") in outcome["error"]
+    assert bool(called) == space_ok
+    assert not (tmp_path / "models/checkpoints" / PATH).exists()
+    assert not list((tmp_path / "model-transfers").glob("*.partial"))
+
+
+@pytest.mark.asyncio
+async def test_range_resume_requires_same_external_identity(local, monkeypatch, tmp_path):
+    monkeypatch.setattr(native_models, "CHUNK", 4)
+    calls = []
+
+    class Interrupted(httpx.SyncByteStream):
+        def __iter__(self):
+            yield DATA[:8]
+            raise httpx.ReadError("simulated interruption")
+
+    def handler(req):
+        calls.append(dict(req.headers))
+        if len(calls) == 1:
+            return httpx.Response(200, headers={"content-length": str(len(DATA)), "etag": '"e"'}, stream=Interrupted())
+        return httpx.Response(206, headers={"content-range": f"bytes 8-{len(DATA)-1}/{len(DATA)}", "etag": '"e"'},
+                              stream=Stream(DATA[8:]))
+
+    model = local(handler, [row(drive_file_id=None)])
+    assert (await model.submit({"prompt": graph()})[1])[0]["state"] == "ready"
+    assert calls[1]["range"] == "bytes=8-" and calls[1]["if-range"] == '"e"'
+    assert (tmp_path / "models/checkpoints" / PATH).read_bytes() == DATA
+
+
+def test_native_old_model_storage_defaults_validate_independently(monkeypatch):
+    monkeypatch.setattr(settings, "native_comfy_cache_gb", 23)
+    assert native.model_storage({"max_runtime_minutes": 8}) == {
+        "model_storage_mode": "drive_mount", "cache_gb": 23, "cache_max_age_minutes": 60,
+    }
+    for payload in ({"cache_gb": True}, {"cache_max_age_minutes": 0}, {"model_storage_mode": "remote"}):
+        with pytest.raises(Exception, match="无效|正整数"):
+            native.model_storage(payload, validate=True)
+
+
+def test_scan_uses_reachable_node_types_and_native_model_metadata():
+    body = {"prompt": {
+        **graph(), "3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "unused.safetensors"}},
+        "4": {"class_type": "Remote", "inputs": {"model_name": "gpt-image.safetensors"}},
+    }, "partial_execution_targets": ["2"], "extra_data": {"extra_pnginfo": {"workflow": {
+        "models": [{"name": PATH, "url": EXTERNAL, "hash": SHA, "hash_type": "SHA-256", "directory": "checkpoints"}],
+    }}}}
+    types = {"CheckpointLoaderSimple": object, "PreviewImage": SimpleNamespace(OUTPUT_NODE=True),
+             "Remote": SimpleNamespace(OUTPUT_NODE=True, API_NODE=True)}
+    assert [(d["name"], d["url"], d["sha256"]) for d in native_models.dependencies(body, [], node_types=types)] == [
+        (PATH, EXTERNAL, SHA)
+    ]
+    assert list(native_models.dependencies({"prompt": {
+        "1": {"class_type": "VAELoader", "inputs": {"vae_name": "pixel_space"}},
+        "2": {"class_type": "RemoteApiModelLoader", "inputs": {"model": "remote-id.safetensors"}},
+    }}, [])) == []
+
+
+class Routes(dict):
+    def method(self, verb, path):
+        def register(handler):
+            self[verb, path] = handler
+            return handler
+        return register
+
+    def get(self, path):
+        return self.method("GET", path)
+
+    def post(self, path):
+        return self.method("POST", path)
+
+
+@pytest.mark.asyncio
+async def test_runtime_lists_registered_names_without_files_and_prepares_before_validator(local, monkeypatch, tmp_path):
+    async def mounted_request(method, path, data=None, headers=None):
+        async def json_body():
+            return data
+
+        return SimpleNamespace(method=method, path=path, json=json_body, headers=httpx.Headers(headers),
+                               match_info={"ident": path.split("/")[-1]})
+
+    def response(data, status=200):
+        return SimpleNamespace(body=json.dumps(data).encode(), status=status, content_type="application/json")
+
+    web = SimpleNamespace(middleware=lambda f: f, json_response=response)
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(web=web))
+    engine = SimpleNamespace(routes=Routes(), app=SimpleNamespace(middlewares=[]))
+    models = local(lambda _: media(), [row()])
+    monkeypatch.setattr(native_models, "LocalModels", lambda *args, **kwargs: models)
+    (tmp_path / "local-model-config.json").write_text("{}")
+    filename_cache = {"checkpoints": []}
+    folder_paths = SimpleNamespace(models_dir=str(tmp_path / "models"), folder_names_and_paths={},
+                                   filename_list_cache=filename_cache)
+    native_models.install(engine, tmp_path, folder_paths, {})
+    middleware = engine.app.middlewares[0]
+    target = tmp_path / "models/checkpoints" / PATH
+    definition = {"CheckpointLoaderSimple": {"input": {"required": {"ckpt_name": [[]]}}}}
+
+    async def initial_info(_request):
+        return response(definition)
+
+    result = await middleware(await mounted_request("GET", "/api/object_info"), initial_info)
+    assert PATH in json.loads(result.body)["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
+    assert not target.exists()
+    signed = {"X-Studio-Model-Channel": "internal-channel"}
+    prompt = {"prompt": graph(), "client_id": "websocket-client"}
+    start = engine.routes["POST", "/studio_native/models/prepare"]
+    submitted = await start(await mounted_request("POST", "/studio_native/models/prepare", {"workflow": prompt}, signed))
+    ident = json.loads(submitted.body)["id"]
+    await models.jobs[ident][0]
+
+    async def upstream_validator(request):
+        assert not filename_cache and target.read_bytes() == DATA
+        assert (await request.json())["client_id"] == "websocket-client"
+        return response({"prompt_id": "real-id", "number": 0, "node_errors": {}})
+
+    result = await middleware(await mounted_request("POST", "/api/prompt", prompt, {
+        **signed, "X-Studio-Model-Prepared": ident,
+    }), upstream_validator)
+    assert json.loads(result.body) == {"prompt_id": "real-id", "number": 0, "node_errors": {}}
+
+
+@pytest.mark.asyncio
+async def test_drive_only_fallback_adds_identity_for_older_model_rows(local, tmp_path):
+    calls = []
+
+    def handler(req):
+        calls.append(req)
+        if req.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "drive-token", "expires_in": 3600})
+        assert req.headers["authorization"] == "Bearer drive-token"
+        if "alt" not in req.url.params:
+            return httpx.Response(200, json={"id": "known-file-id", "size": str(len(DATA)),
+                                              "mimeType": "application/octet-stream",
+                                              "md5Checksum": hashlib.md5(DATA, usedforsecurity=False).hexdigest()})
+        return media()
+
+    model = local(handler, [row(source=None, sha256=None)], drive_auth={"drive-account": {}})
+    result = (await model.submit({"prompt": graph()})[1])[0]
+    assert result["state"] == "ready" and result["source"] == "drive" and result["integrity"] == "drive_md5"
+    assert (tmp_path / "models/checkpoints" / PATH).read_bytes() == DATA
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_local_legacy_directory_alias_is_reused(local, tmp_path):
+    model = local(lambda _: pytest.fail("existing legacy local path must not query Drive"), [
+        row(model_type="unet"),
+    ], models_folder="drive-models")
+    target = tmp_path / "models/unet" / PATH
+    target.parent.mkdir(parents=True)
+    target.write_bytes(DATA)
+    body = {"prompt": {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": PATH}}}}
+    result = (await model.submit(body)[1])[0]
+    assert result["state"] == "ready" and result["cache_hit"]
+    assert not (tmp_path / "models/diffusion_models" / PATH).exists()
+
+
+@pytest.mark.asyncio
+async def test_url_only_verified_file_survives_comfy_process_restart(local, tmp_path):
+    header = b'{"w":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}'
+    data = len(header).to_bytes(8, "little") + header + b"data"
+    model = local(lambda _: media(data))
+    body = {"prompt": graph(), "extra_data": {"extra_pnginfo": {"workflow": {
+        "models": [{"name": PATH, "directory": "checkpoints", "url": EXTERNAL}]
+    }}}}
+    assert (await model.submit(body)[1])[0]["integrity"] == "transport"
+    restarted = local(lambda _: pytest.fail("complete local file must be reused after process restart"))
+    result = (await restarted.submit(body)[1])[0]
+    assert result["state"] == "ready" and result["cache_hit"]
+    provenance = next((tmp_path / "model-transfers").glob("*.json"))
+    assert EXTERNAL not in provenance.read_text()

@@ -31,7 +31,7 @@ NUMBER_MARKERS = {"%seed%": (0, 2**53 - 1), "%width%": (64, 2048), "%height%": (
 def policy(store, owner):
     row = store.get("settings", f"native-api:{owner}", owner) or {}
     return {"auto_start": False, "account_id": None, "gpu": None,
-            **native.timeout_options()["defaults"], **row.get("policy", {})}
+            **native.timeout_options()["defaults"], **native.model_storage(), **row.get("policy", {})}
 
 
 def save_policy(repo, owner, body):
@@ -60,7 +60,7 @@ def save_policy(repo, owner, body):
     else:
         account, gpu = previous["account_id"], previous["gpu"]
     values = {"auto_start": body["auto_start"], "account_id": account or None,
-              "gpu": gpu or None, **timeouts}
+              "gpu": gpu or None, **timeouts, **native.model_storage({**previous, **body}, validate=True)}
     store = repo.store
     record_id = f"native-api:{owner}"
     with store.admission_lock() as acquired:
@@ -307,6 +307,6 @@ def request_start(repo, owner, key):
     if not values["auto_start"]:
         return None
     body = {"account_id": values["account_id"], "spec": {"key": values["gpu"]},
-            "retain_idle_minutes": values["retain_idle_minutes"], "max_runtime_minutes": values["max_runtime_minutes"]}
+            "retain_idle_minutes": values["retain_idle_minutes"], "max_runtime_minutes": values["max_runtime_minutes"], **native.model_storage(values)}
     return native.admit(repo, owner, body, f"native-api-start:{uuid.uuid4().hex}",
                         api_key_id=key["id"] if key else "admin")

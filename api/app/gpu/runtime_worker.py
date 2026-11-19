@@ -1189,9 +1189,10 @@ def _restore_weights(
             return list(pool.map(lambda item: restore(item, Path(scratch)), checked))
 
 
-def _http_json(url: str, method: str = "GET", body: dict | None = None, timeout: float = 30) -> dict:
+def _http_json(url: str, method: str = "GET", body: dict | None = None, timeout: float = 30,
+               *, extra_headers=None) -> dict:
     request = Request(
-        url, method=method, headers={"Accept": "application/json", "Content-Type": "application/json"}
+        url, method=method, headers={"Accept": "application/json", "Content-Type": "application/json", **(extra_headers or {})}
     )
     data = json.dumps(body).encode() if body is not None else None
     try:
@@ -1248,6 +1249,46 @@ def _stream_output(response, target: Path, limit: int) -> int:
         partial.unlink(missing_ok=True)
 
 
+def _prepare_native_weights(api, native_dir, graph, weights, loras, deadline):
+    config = json.loads((native_dir / "local-model-config.json").read_text())
+    headers = {"X-Studio-Model-Channel": config["channel"]}
+    declared = []
+    for weight in weights:
+        category, _, name = weight["target"].partition("/")
+        item = {"category": category, "name": name, "sha256": weight["sha256"], "size": weight["size"]}
+        if weight.get("source") == "drive":
+            item["drive_file_id"] = weight["drive_file_id"]
+        else:
+            item["url"] = (f"https://huggingface.co/{weight['repo_id']}/resolve/{weight['revision']}/"
+                           + quote(weight["filename"], safe="/"))
+        declared.append(item)
+    for lora in loras:
+        declared.append({"category": "loras", "name": lora["target"], "drive_file_id": lora["id"],
+                         "size": lora["size"], "md5": lora.get("md5Checksum")})
+    endpoint = api + "/studio_native/models/prepare"
+    started = _http_json(endpoint, "POST", {"workflow": {"prompt": graph}, "dependencies": declared, "reviewed": True},
+                         extra_headers=headers)
+    ident = started.get("id")
+    if not isinstance(ident, str) or not re.fullmatch(r"[0-9a-f]{32}", ident):
+        raise WorkerError("Native model preparation did not return a valid ID")
+    while time.time() < deadline:
+        result = _http_json(endpoint + "/" + ident, extra_headers=headers)
+        if result.get("state") == "ready":
+            timings = []
+            hashes = {(item["category"], item["name"]): item.get("sha256") for item in declared}
+            for model in result["models"]:
+                category, name = model["category"], model["name"]
+                timings.append({"target": f"{category}/{name}", "source": model.get("source"),
+                                "seconds": model.get("seconds"), "sha256": hashes.get((category, name))})
+            return timings, {**headers, "X-Studio-Model-Prepared": ident}
+        if result.get("state") == "failed":
+            errors = "; ".join(f"{item['category']}/{item['name']}: {item['error']}"
+                               for item in result["models"] if item["state"] == "failed")
+            raise WorkerError((result.get("message") or errors or "Native model preparation failed")[:1400])
+        time.sleep(1)
+    raise WorkerError("Native model preparation exceeded this Studio job's runtime limit")
+
+
 def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _Stages) -> list[dict]:
     commit = manifest.get("comfy_commit", manifest.get("comfy_version"))
     if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
@@ -1261,6 +1302,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
     native_marker = NATIVE_SERVICE_MARKER
     native_state = json.loads(native_marker.read_text()) if native_marker.is_file() else None
     shared_native = native_state is not None
+    shared_local = shared_native and native_state.get("model_storage_mode") == "local"
     if shared_native and native_state.get("commit") != commit:
         raise WorkerError("Studio workflow uses a different ComfyUI version; stop native session before switching versions")
     comfy = Path(native_state["comfy"]) if shared_native else root / "ComfyUI"
@@ -1279,7 +1321,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
             if actual != node["commit"]:
                 raise WorkerError("Native service custom node version differs from reviewed Studio workflow")
         env = {"source": "native_shared"}
-        weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False)
+        weights = [] if shared_local else _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False)
     elif _warm_take(root, fingerprint, nodes, checked):
         # Same runtime, same environment: the previous job left it restored. Nothing to download.
         stages.start("warm_reuse")
@@ -1293,7 +1335,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
         weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False)
     try:
         user_loras = (payload.get("snapshot") or {}).get("lora_files") or []
-        if user_loras:
+        if user_loras and not shared_local:
             stages.start("restore_loras")
             _restore_user_loras(comfy, user_loras, _drive_cache(payload))
         _write_input_files(comfy, payload.get("snapshot") or {})
@@ -1322,8 +1364,13 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                     time.sleep(1)
             else:
                 raise WorkerError("Comfy worker startup timed out")
+            submit_args = {}
+            if shared_local:
+                stages.start("restore_weights")
+                weights, headers = _prepare_native_weights(api, native_marker.parent, graph, checked, user_loras, deadline)
+                submit_args["extra_headers"] = headers
             stages.start("sampling")
-            queued = _http_json(api + "/prompt", "POST", {"prompt": graph}, timeout=30)
+            queued = _http_json(api + "/prompt", "POST", {"prompt": graph}, timeout=30, **submit_args)
             prompt_id = queued.get("prompt_id")
             if not isinstance(prompt_id, str) or not prompt_id:
                 raise WorkerError("Comfy queue did not return a prompt id")

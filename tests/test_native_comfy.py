@@ -277,6 +277,9 @@ def test_native_admission_idempotent_across_restart_and_gpu_switch(proxy, monkey
     job = native.admit(repo, "owner", body, "native-start")
     assert job["execution_policy"]["retain_idle_minutes"] == timeouts.get("retain_idle_minutes", settings.native_comfy_idle_minutes)
     assert job["max_runtime_minutes"] == job["execution_policy"]["max_runtime_minutes"] == timeouts.get("max_runtime_minutes", settings.native_comfy_max_runtime_minutes)
+    assert native.model_storage(job["execution_policy"]) == native.model_storage(body)
+    with pytest.raises(APIError, match="停止实例"):
+        native.admit(repo, "owner", {**body, "model_storage_mode": "local"}, "change-model-storage")
     assert job["estimated_units"] == job["max_runtime_minutes"] * 0.01
     assert 0 <= job["native_session_deadline_epoch"] - time.time() <= job["max_runtime_minutes"] * 60
     assert native.admit(Repository(store), "owner", body, "native-start")["id"] == job["id"]
@@ -590,6 +593,15 @@ def test_drive_mount_uses_one_rc_process_and_waits_for_actual_fuse_mount(monkeyp
     runtime, secret, process, seen = _mount_fixture(monkeypatch, tmp_path, mounted=True)
     assert runtime.mount_drive(tmp_path, secret) == tmp_path / 'drive'
     assert len(seen) == 1 and not process.stopped
+    assert seen[0][seen[0].index('--vfs-cache-max-size') + 1] == '20G'
+    assert seen[0][seen[0].index('--vfs-cache-max-age') + 1] == '60m'
+
+
+def test_rclone_receives_explicit_cache_settings(monkeypatch, tmp_path):
+    runtime, secret, _, seen = _mount_fixture(monkeypatch, tmp_path, mounted=True)
+    runtime.mount_drive(tmp_path, {**secret, 'cache_gb': 37, 'cache_max_age_minutes': 185})
+    assert seen[0][seen[0].index('--vfs-cache-max-size') + 1] == '37G'
+    assert seen[0][seen[0].index('--vfs-cache-max-age') + 1] == '185m'
 
 
 def test_drive_mount_early_exit_reports_sanitized_child_error(monkeypatch, tmp_path):
@@ -755,8 +767,8 @@ def test_ready_rejects_manager_access_bypass(proxy):
         assert not native.ready(client)
 
 
-@pytest.mark.parametrize('failure', [None, 'requirements', 'log', 'api', 'stale-log', 'node-import'])
-def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_path, failure):
+@pytest.mark.parametrize('failure,local', [(None, False), (None, True)] + [(f, False) for f in ('requirements', 'log', 'api', 'stale-log', 'node-import')])
+def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_path, failure, local):
     import json
     import sys
     from types import SimpleNamespace
@@ -815,6 +827,10 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
     stages = SimpleNamespace(start=lambda name: None, end=lambda: None, timings={})
     payload = {'snapshot': {'manifest': {'comfy_commit': 'a' * 40}},
                'native_secrets': {'max_upload_mb': 2048, 'tunnel_token': 'fake-token'}}
+    if local:
+        payload['native_secrets'].update(model_storage_mode='local', catalog=[], drive_auth={}, drive_account='acct',
+                                         models_folder_id='models', model_channel='test-channel', directories={}, rules={})
+        monkeypatch.setattr(runtime, '_index_models', lambda *args: pytest.fail("local mode created a Drive index"))
     if failure:
         with pytest.raises(RuntimeError, match='Manager|Custom node load failed'):
             runtime.run(job, payload, stages)
@@ -830,10 +846,16 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
                             str(comfy / 'manager_requirements.txt')]]
     args, kwargs = launches[0]
     data = drive / 'native-comfy'
+    model_args = [] if local else ['--extra-model-paths-config', str(service / 'extra_model_paths.yaml')]
+    if local:
+        assert not (comfy / 'models').is_symlink()
+        assert (comfy / 'models' / 'checkpoints').is_dir()
+        assert not (drive / 'models').exists()
+        assert (service / 'local-model-config.json').stat().st_mode & 0o777 == 0o600
     assert args == [sys.executable, 'main.py', '--listen', '127.0.0.1', '--port', '8188', '--enable-manager',
                     '--user-directory', str(data / 'user'), '--input-directory', str(data / 'input'),
                     '--output-directory', str(data / 'output'), '--temp-directory', str(service / 'temp'),
-                    '--max-upload-size', '2048', '--extra-model-paths-config', str(service / 'extra_model_paths.yaml'),
+                    '--max-upload-size', '2048', *model_args,
                     '--preview-method', 'auto', '--disable-auto-launch']
     assert kwargs['cwd'] == comfy
     marker = json.loads((service / 'state.json').read_text())
@@ -1320,3 +1342,37 @@ def test_protect_lease_gates_and_throttles_keepalive(monkeypatch):
     now[0] = 1500.0
     assert not native.protect_lease(repo, repo.get("leases", "lease-ka", "owner"), clock=lambda: now[0], provider_factory=lambda job: FakeProvider())
     assert len(calls) == count_before
+
+
+@pytest.mark.asyncio
+async def test_disconnected_client_does_not_submit_after_model_preparation(proxy, monkeypatch):
+    repo = proxy.state.repo
+    repo.lease["native_model_storage"] = {"model_storage_mode": "local"}
+    monkeypatch.setattr(native, "model_channel", lambda lease_id: "trusted-runtime")
+    seen = []
+
+    async def handler(req):
+        seen.append(req.url.path)
+        assert req.url.path == "/studio_native/models/prepare"
+        return httpx.Response(202, json={"id": "test"})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    events = iter([{"type": "http.request", "body": b'{"prompt": {}}'}, {"type": "http.disconnect"}])
+
+    async def receive():
+        return next(events)
+
+    async def send(message):
+        pytest.fail("client disconnected before enqueue")
+
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "method": "POST", "scheme": "https",
+             "path": "/prompt", "raw_path": b"/prompt", "query_string": b"",
+             "headers": [(b"host", b"comfy.example.test"), (b"authorization", b"Bearer api-test-token")]}
+    middleware = NativeHostMiddleware(proxy, proxy)
+    try:
+        await middleware(scope, receive, send)
+    finally:
+        if middleware._http_client:
+            await middleware._http_client.aclose()
+    assert seen == ["/studio_native/models/prepare"] and not repo.lease["native_writes"]

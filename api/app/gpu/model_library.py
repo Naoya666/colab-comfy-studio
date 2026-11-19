@@ -13,7 +13,7 @@ import re
 import shutil
 import time
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlsplit
 
 from app.config import settings
@@ -29,6 +29,16 @@ BUFFER = 1024 ** 2
 CHECKPOINT_BYTES = 32 * BUFFER
 UPLOAD_CHUNK = 8 * BUFFER
 FIELDS = "id,name,size,mimeType,trashed,md5Checksum,sha256Checksum,appProperties"
+
+
+def external_source(row):
+    if "external_source" in row:
+        return row["external_source"]
+    if row.get("download_url"):
+        return {"url": row.get("original_source_url") or row.get("source_url") or row["download_url"],
+                "download_url": row["download_url"],
+                "status": row.get("source_verification") or "unverified"}
+    return None
 
 
 class ModelLibrary:
@@ -85,6 +95,14 @@ class ModelLibrary:
             return self.repo.update("files", ident, data, self.owner)
         return self.repo.create("files", self.owner, data, record_id=ident)
 
+    def storage_account(self):
+        from .accounts import AccountService
+
+        accounts = AccountService(self.repo, self.owner)
+        account = (getattr(self._drive, "account_id", None) if self._drive
+                   else accounts.resolve_drive_account_id(self.storage_settings().get("account_id")))
+        return account or accounts.default_account_id(self.owner)
+
     def tokens(self):
         result = {}
         for row in self.repo.list("credentials", self.owner):
@@ -113,10 +131,36 @@ class ModelLibrary:
         return self.token_status()
 
     def resolve(self, body):
-        return Sources(self.http).resolve(body)
+        files = Sources(self.http).resolve(body)
+        if body.get("url") and not body.get("sha256") and not body.get("repo_id"):
+            return [{**item, "original_source_url": https_url(body["url"])} for item in files]
+        return files
+
+    def bind_external_source(self, row, url):
+        if url is None or url == "":
+            return None
+        original = https_url(url)
+        choices = self.resolve({"url": original, "filename": row["filename"]})
+        known_hash = row.get("sha256") or row.get("expected_sha256")
+        known_size = row.get("size") or row.get("expected_size")
+        compatible = [
+            item for item in choices
+            if (not known_hash or item.get("expected_sha256") in {None, known_hash})
+            and (not known_size or item.get("expected_size") in {None, known_size})
+        ]
+        exact = [item for item in compatible if known_hash and item.get("expected_sha256") == known_hash]
+        selected = exact or [item for item in compatible if item["filename"] == row["filename"]]
+        if len(selected) != 1:
+            raise ModelError("来源文件不匹配或版本有歧义，请提供具体文件链接并核对 SHA-256 和大小")
+        return {"url": original, "download_url": selected[0]["download_url"],
+                "status": "verified" if exact and row.get("state") == "ready" and row.get("sha256") else "unverified"}
 
     def add(self, data):
         name = filename(data.get("filename"))
+        legacy_target = relative_path(data["legacy_target"]) if data.get("legacy_target") else None
+        model_path = relative_path(data.get("relative_path") or (legacy_target.split("/", 1)[-1] if legacy_target else name))
+        if PurePosixPath(model_path).name != name:
+            raise ModelError("模型相对路径必须以所登记的文件名结尾")
         category = data.get("model_type")
         if category not in deps.directories():
             raise ModelError("请选择模型类型（可通过 MODEL_LIBRARY_DIRECTORIES 扩展）")
@@ -129,18 +173,20 @@ class ModelLibrary:
         source = data.get("source") or "https"
         if source not in {"https", "huggingface", "civitai", "drive", "upload", "legacy_cache"}:
             raise ModelError("不支持的模型来源")
+        account = self.storage_account()
         # All source fields are selected explicitly: never persist arbitrary client metadata/tokens.
         row = {"display_name": str(data.get("display_name") or name)[:300], "filename": name,
-               "model_type": category, "architecture": str(data.get("architecture") or "unknown")[:120],
+               "model_type": category, "relative_path": model_path, "drive_account_id": account, "architecture": str(data.get("architecture") or "unknown")[:120],
                "expected_sha256": expected.lower() if expected else None, "sha256": None,
                "expected_size": size, "size": None, "source": source,
                "source_url": https_url(data["source_url"]) if data.get("source_url") else None,
+               "original_source_url": https_url(data["original_source_url"]) if data.get("original_source_url") else None,
                "download_url": https_url(data["download_url"]) if data.get("download_url") else None,
                "source_identity": {}, "state": "pending", "error": None,
                "version_name": str(data.get("version_name") or "")[:200],
                "trigger_words": [str(x)[:200] for x in (data.get("trigger_words") or [])[:100]],
                "tags": [], "last_used_at": None, "managed_file": False,
-               "legacy_target": relative_path(data["legacy_target"]) if data.get("legacy_target") else None}
+               "legacy_target": legacy_target}
         identity = data.get("source_identity") or {}
         if not isinstance(identity, dict):
             raise ModelError("来源身份格式无效")
@@ -156,14 +202,27 @@ class ModelLibrary:
             raise ModelError("缺少下载来源，请先解析并选择文件")
         identity_key = None
         if expected:
-            for existing in self.models():
-                if existing["model_type"] == category and expected.lower() in {existing.get("expected_sha256"), existing.get("sha256")}:
-                    return existing
             identity_key = f"sha256:{expected.lower()}"
         elif row["source_identity"] and source in {"huggingface", "civitai"}:
             from .manifest import digest
             identity_key = source + ":" + digest(row["source_identity"])
-        record_id = hashlib.sha256(f"library:{self.owner}:{category}:{identity_key}".encode()).hexdigest() if identity_key else None
+        elif row.get("drive_file_id"):
+            identity_key = "drive:" + row["drive_file_id"]
+        row_origin = row.get("original_source_url") or row.get("source_url") or row.get("download_url")
+        record_id = hashlib.sha256(
+            json.dumps([self.owner, account, category, model_path, identity_key, row_origin, row.get("drive_file_id")]).encode()
+        ).hexdigest() if identity_key else None
+        if expected:
+            from .accounts import AccountService
+
+            legacy_account = AccountService.default_account_id(self.owner)
+            for existing in self.models():
+                if (existing["model_type"] == category and (existing.get("relative_path") or existing["filename"]) == model_path
+                        and (existing.get("drive_account_id") or legacy_account) == account
+                        and (existing.get("original_source_url") or existing.get("source_url") or existing.get("download_url")) == row_origin
+                        and expected.lower() in {existing.get("expected_sha256"), existing.get("sha256")}
+                        and (not row.get("drive_file_id") or row["drive_file_id"] == existing.get("drive_file_id"))):
+                    return existing
         try:
             return self.repo.create("model_library", self.owner, row, record_id=record_id)
         except ValueError:
@@ -178,7 +237,7 @@ class ModelLibrary:
                 if any(d.get("model_id") == ident for d in row["dependencies"])]
 
     def enqueue(self, ident, action="prepare"):
-        self.get(ident)
+        model = self.get(ident)
         if action not in {"prepare", "verify"}:
             raise ModelError("未知模型任务操作")
         with self.repo.store.admission_lock() as acquired:
@@ -197,6 +256,7 @@ class ModelLibrary:
                 return task
             task = self.repo.create("model_downloads", self.owner,
                                     {"model_id": ident, "action": action, "state": "pending", "bytes": 0,
+                                     "original_source_url": model.get("original_source_url") or model.get("source_url") or model.get("download_url"),
                                      "total": None, "speed": None, "error": None, "attempt": 0, "cancel_requested": False})
             self.update(ident, state="pending", error=None)
             return task
@@ -807,8 +867,13 @@ class ModelTransfer:
             # Reuse verified catalog content before any download. Check actual Drive metadata first.
             expected = self.model.get("expected_sha256") or self.model.get("sha256")
             if expected and self.task.get("action") != "verify":
+                from .accounts import AccountService
+
+                account = self.lib.storage_account()
+                legacy_account = AccountService.default_account_id(self.lib.owner)
                 for other in self.lib.models():
-                    if other["id"] != self.model["id"] and other.get("sha256") == expected and other.get("state") == "ready":
+                    if (other["id"] != self.model["id"] and other.get("sha256") == expected
+                            and other.get("state") == "ready" and (other.get("drive_account_id") or legacy_account) == account):
                         other = self.lib.check_remote(other["id"])
                         if other["state"] == "ready":
                             self.finish(other["drive_file_id"], expected, other["size"], other.get("drive_md5"), other.get("managed_file", False))
@@ -852,7 +917,8 @@ class ModelTransfer:
             remote = self.lib.metadata(meta["id"])
             if not self.matches(remote, sha, md5, size):
                 raise ModelError("Drive 最终完整性检查失败，未提交 ready")
-            self.finish(meta["id"], sha, size, md5, self.model.get("managed_file", False) if imported else True)
+            self.finish(meta["id"], sha, size, md5, self.model.get("managed_file", False) if imported else True,
+                        source_verified=not imported)
         except TransferPaused:
             return
         except Exception as exc:
@@ -868,7 +934,7 @@ class ModelTransfer:
             if current.get("state") in {"ready", "cancelled"} or not path.exists():
                 shutil.rmtree(directory, ignore_errors=True)
 
-    def finish(self, file_id, sha, size, md5, managed):
+    def finish(self, file_id, sha, size, md5, managed, *, source_verified=False):
         from .accounts import AccountService
 
         current = self.lib.repo.get("model_downloads", self.task["id"], self.lib.owner)
@@ -877,8 +943,9 @@ class ModelTransfer:
         storage_account = getattr(self.lib.drive, "account_id", None) or AccountService.default_account_id(self.lib.owner)
         self.lib.update(self.model["id"], drive_account_id=storage_account, state="ready", drive_file_id=file_id, sha256=sha, size=size,
                         drive_md5=md5, managed_file=managed, error=None,
+                        **({"source_verification": "verified"} if source_verified else {}),
                         integrity="expected_hash_verified" if self.model.get("expected_sha256") else "computed_hash_only")
-        self.lib.repo.update("model_downloads", self.task["id"], {"state": "ready", "bytes": size, "total": size,
+        self.lib.repo.update("model_downloads", self.task["id"], {"state": "ready", "bytes": size, "total": size, "drive_file_id": file_id,
                              "error": None, "encrypted_upload_session": None, "upload_identity": None,
                              "upload_file_id": None}, self.lib.owner)
 

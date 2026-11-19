@@ -1,11 +1,14 @@
 """Studio control plane for native ComfyUI. Data plane lives on its own host."""
+import asyncio
+import re
 import time
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, Request
 
-from . import native_api
+from . import native_api, native_model_api
 from .common import APIError, admin, current_user, ok
 from .config import settings
 from .gpu import native, native_restart
@@ -83,18 +86,28 @@ async def status(request: Request, user=Depends(current_user)):
     reclaimed = bool(instance and instance.get("state") == "deleted"
                      and instance.get("remote_delete_source") == RUNTIME_MISSING)
     ready = False
+    disk = {}
     if lease and lease.get("native_ready") and not native.restart_active(lease):
         try:
             url, headers = native.backend()
             async with httpx.AsyncClient(timeout=8) as client:
                 response = await client.get(url + "/system_stats", headers=headers)
                 ready = response.status_code == 200 and isinstance(response.json().get("system"), dict)
+                if ready and lease.get("native_model_storage"):
+                    metrics = await client.get(url + "/studio_native/state", headers=headers)
+                    if metrics.is_success:
+                        state = metrics.json()
+                        disk = {k: state[k] for k in ("disk_free_bytes", "vfs_cache_bytes") if type(state.get(k)) is int}
         except (httpx.HTTPError, ValueError, AttributeError, APIError):
             pass
     events = repo.list("events", user["id"]) if job else []
     can_restart = ready and native_restart.can_restart(repo, lease)
     return ok({"configured": bool(settings.native_comfy_url), "url": settings.native_comfy_url,
-               "timeouts": native.timeout_options(),
+               "timeouts": native.timeout_options(), "model_storage_defaults": native.model_storage(),
+               "model_storage_known": not lease or bool(lease.get("native_model_storage")),
+               "model_storage": native.lease_storage(repo, lease) if lease else (
+                   native.model_storage(job.get("execution_policy")) if job and job["state"] not in native.TERMINAL else None
+               ), "disk": disk,
                "ready": ready, "instance_id": lease.get("instance_id") if lease else None,
                "job_id": job["id"] if job else None, "state": job["state"] if job else "stopped",
                "restart": restart, "can_restart": can_restart,
@@ -116,11 +129,53 @@ def restart(body: dict, request: Request, user=Depends(current_user)):
 @router.post("/start", status_code=202)
 def start(body: dict, request: Request, user=Depends(current_user)):
     unknown = set(body) - {"account_id", "spec", "instance_id", "plugin_generation",
-                           "retain_idle_minutes", "max_runtime_minutes"}
+                           "retain_idle_minutes", "max_runtime_minutes", *native.model_storage()}
     if unknown:
         raise APIError("NATIVE_INPUT", "不支持的启动参数", 422)
     job = native.admit(request.app.state.repo, user["id"], body, request.headers.get("Idempotency-Key"))
     return ok({"job_id": job["id"], "state": job["state"]}, request, 202)
+
+
+def _local_lease(request, owner):
+    repo = request.app.state.repo
+    lease = native.active_lease(repo, owner)
+    if not lease or not lease.get("native_ready") or native.lease_storage(repo, lease)["model_storage_mode"] != "local":
+        raise APIError("NATIVE_NOT_LOCAL", "请先启动本地模型模式的原生 ComfyUI", 409)
+    return repo, lease
+
+
+@router.post("/model-preparation", status_code=202)
+async def prepare_models(body: dict, request: Request, user=Depends(current_user)):
+    repo, lease = await asyncio.to_thread(_local_lease, request, user["id"])
+    if set(body) - {"workflow", "dependencies"} or not isinstance(body.get("workflow"), dict):
+        raise APIError("NATIVE_MODEL_INPUT", "请提供工作流 JSON 和可选的显式模型依赖", 422)
+    workflow = body["workflow"]
+    if "prompt" not in workflow and "workflow" not in workflow:
+        workflow = {"workflow": workflow} if "nodes" in workflow else {"prompt": workflow}
+    write_id = uuid4().hex
+    await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
+    try:
+        base, auth = native.backend()
+        async with httpx.AsyncClient() as client:
+            result = await native_model_api.start(
+                client, base, native_model_api.headers(base, auth, lease), repo, lease,
+                workflow, body.get("dependencies", []), visual=True,
+            )
+        return ok(result, request, 202)
+    finally:
+        await asyncio.to_thread(native.update_write, repo, lease, write_id, finished=True)
+
+
+@router.get("/model-preparation/{ident}")
+async def model_preparation(ident: str, request: Request, user=Depends(current_user)):
+    _, lease = await asyncio.to_thread(_local_lease, request, user["id"])
+    if ident != "latest" and not re.fullmatch(r"[0-9a-f]{32}", ident):
+        raise APIError("NATIVE_MODEL_PREPARATION_MISSING", "准备记录不存在", 404)
+    base, auth = native.backend()
+    async with httpx.AsyncClient() as client:
+        result = await native_model_api.rpc(client, "GET", base, native_model_api.headers(base, auth, lease),
+                                            "/prepare/" + ident)
+    return ok(result, request)
 
 
 @router.post("/ticket")

@@ -52,6 +52,7 @@
 | `NATIVE_COMFY_IDLE_MINUTES` | `120`，正整数分钟，无最大值限制，原生队列/写入活动结束后才开始计时 |
 | `NATIVE_COMFY_MAX_RUNTIME_MINUTES` | `720`，正整数分钟，无最大值限制，原生会话默认上限时长 |
 | `NATIVE_COMFY_CACHE_GB` | `20`，按需 VFS 缓存回收目标；活动文件可能暂时超过该值；另外保留 5GiB 本地可用空间 |
+| `NATIVE_COMFY_CACHE_MAX_AGE_MINUTES` | `60`，VFS 缓存自上次访问起的保留分钟数 |
 | `NATIVE_COMFY_MAX_UPLOAD_MB` | `2048`，传给 ComfyUI `--max-upload-size`；Cloudflare 套餐仍可能限制单次请求大小 |
 | `STUDIO_API_TOKEN` | 标准 API 客户端使用的现有 Bearer Token |
 | `GPU_MAX_RUNTIME_MINUTES` | 复用原有会话期限；期限后拒绝新的原生写入，已入队任务和 Drive 同步完成后才释放 |
@@ -112,7 +113,7 @@ AI-Studio/<owner>/
 
 本地 `/content/ai-studio/native/drive` 为 rclone 挂载，模型按实际读取下载到有上限的本地 VFS 缓存；模型文件在执行时真实可读，不做仅名称占位。不预复制整个 Drive，不强行加载显存。`extra_model_paths.yaml` 保留 `unet/diffusion_models`、`clip/text_encoders` 等别名。
 
-用户目录、输入输出、Manager 下载的模型沿用 Drive VFS。自定义节点从本地 SSD 执行，稳定后以压缩对象直接写入 Drive，重启加载验证后更新 VPS 清单；正常释放会等待候选同步完成。依赖通过同一 Python 环境下的官方 Manager restore-dependencies 恢复，同一 VM 指纹不变时复用安装结果，不共享不同 GPU 的整个 site-packages。完整协议、回滚接口和八项验收见 [Custom Nodes 持久化](CUSTOM_NODES_PERSISTENCE.md)。
+用户目录、输入输出沿用 Drive VFS。Drive 挂载模式下，Manager 下载的模型也保存在挂载目录。自定义节点从本地 SSD 执行，稳定后以压缩对象直接写入 Drive，重启加载验证后更新 VPS 清单；正常释放会等待候选同步完成。依赖通过同一 Python 环境下的官方 Manager restore-dependencies 恢复，同一 VM 指纹不变时复用安装结果，不共享不同 GPU 的整个 site-packages。完整协议、回滚接口和八项验收见 [Custom Nodes 持久化](CUSTOM_NODES_PERSISTENCE.md)。
 
 临时预览/中间文件在本地 `native/temp`，VFS 缓存和未完成下载也属于临时数据。突然被 Colab 强制回收、断电或手工外部删除 VM 时，尚未上传完成的数据仍可能丢失；代码不能保证未落盘数据在基础设施强制终止后恢复。已确认写入 Drive 的工作流、模型与结果保留。不要把配置了挂载等同于已经验证了真实持久化恢复。
 
@@ -175,3 +176,36 @@ AI-Studio/<owner>/
 | `git diff --check` | 通过 |
 
 上述测试由仓库的离线网络拦截器禁止真实 Google/Colab 请求；未申请 GPU，未消费 CU。未构建或发布 Docker 镜像，未配置外部 DNS、TLS 或 Cloudflare 账号。真实 UI、FUSE、模型读取/生成、Manager 安装、Drive 恢复和酒馆端到端状态均仍为上表的待验收项。
+
+## 模型存储模式
+
+在「原生 ComfyUI」启动页选择模式。「API 设置」也可以为 API 自动开机保存独立的启动配置。现有实例继续使用启动时的参数。切换模式或修改挂载缓存参数需停止实例并重新启动。同实例的「重启原生 ComfyUI」只重启 ComfyUI 进程。
+
+| 模式 | 运行方式 |
+| --- | --- |
+| Drive 挂载模式（默认） | 模型沿用 Drive FUSE 路径和 rclone VFS 按需缓存。模型库已有 Drive 快捷方式继续可用。 |
+| 本地模式 | 权重保存在 Colab 的 `/content/ai-studio/native/ComfyUI/models`。完整下载并校验后才出现在实际文件列表。模型目录和本项目的模型路径配置均使用本地磁盘。工作流、设置、输入输出和自定义节点持久化继续使用现有 Drive 机制。 |
+
+启动 API 可传 `model_storage_mode`（`drive_mount` 或 `local`）、`cache_gb`、`cache_max_age_minutes`。省略时使用挂载模式、`NATIVE_COMFY_CACHE_GB`（默认 20）与 `NATIVE_COMFY_CACHE_MAX_AGE_MINUTES`（默认 60）。容量按 rclone 的二进制 GB 计，属于缓存清理目标。保留时间从 VFS 文件上次访问起算，另受容量和磁盘空间回收影响。原生页面在运行时可获取指标时展示 VFS 占用与本地磁盘剩余。升级前启动的旧会话继续沿用其挂载，重新启动后可查看保存的实际配置。空闲回收和会话上限由各自的原生会话参数控制。
+
+本地模式先检查同类别、相对路径与可用内容校验信息是否匹配。命中时无需查询 Drive。缺失时 Colab 优先从绑定的外部来源或工作流的明确模型下载元数据读取，接着尝试已登记的 Drive 文件。对于旧的 Drive 模型目录，还会按准确类别及相对路径查询。外链失败时，只有存在符合所需 SHA-256 的 Drive 副本才尝试回退。多个版本或不确定来源会列出具体路径和原因。对于已经存在的本地同路径文件，版本冲突时应给所需版本选用不同路径。实例内的完整文件可重复使用，新 Colab 实例按需重新下载。
+
+每个实例合并同一路径和身份的并发下载，在模型目录外写临时文件并原子发布，为运行预留 5 GiB，并阻止空闲回收中断正在准备的模型。支持强 ETag 的来源可在短暂连接中断后续传。模型字节由 Colab 直接读取。运行日志与准备状态记录所用来源类别、域名、进度、耗时、回退和失败原因。可用现有模型库凭据设置配置 Hugging Face Token 或 Civitai Key。临时签名重定向由下载器处理，凭据仅发送给相应服务的首跳主机。
+
+### 在模型库登记外部来源
+
+导入外链时先解析并选择具体文件。准备任务从创建起保存输入的原始链接，成功后将其关联至最终 Drive 文件 ID、文件大小和 SHA-256。模型库可填写类别下的相对路径，包含文件名，例如 `styles/pencil.safetensors`。相同文件内容可以共享 Drive 副本，并保有各自的类别和路径记录。
+
+对已有的 Drive 模型，打开「详情与引用 → 外部来源链接」新增或修改链接。清空并保存可移除绑定，Drive 文件继续可用。可取得完整来源 SHA-256 时与已登记身份比较，同时检查可用的精确大小。通用直链或缺少可比对的哈希时显示「外部来源待验证」，执行下载仍检查记录中的哈希或大小。链接须为无凭据的 HTTPS 链接。
+
+### 在酒馆首次调用前准备
+
+1. 启动本地模式的原生 ComfyUI。在 Studio 原生页打开「检查并下载此工作流所需模型」。
+2. 上传或粘贴 ComfyUI 的普通工作流 JSON 或 API 工作流 JSON。对于动态或自定义加载器，按需填写显式依赖，例如 `[{"category":"loras","name":"styles/pencil.safetensors"}]`。可以通过模型库绑定准确路径，也可为显式依赖补上 `url`、`sha256` 和字节数 `size`。
+3. 查看缺失项、下载进度和失败信息。准备完成后，酒馆按原方式提交工作流。
+
+Studio 预准备接口为 `POST /api/gpu/native/model-preparation`，请求字段为 `workflow` 和可选的 `dependencies`；随后 `GET /api/gpu/native/model-preparation/{id}` 获取状态。可用 `GET /api/gpu/native/model-preparation/latest` 查看最近一次准备，包括自动提交的来源和回退原因。预准备不把任务放入 ComfyUI 队列。历史状态保存在当前 ComfyUI 进程。再次浏览 `/object_info` 或模型列表时可看到模型库中可用的登记名称，加载时仍使用经过校验的实际文件。
+
+网页、专用 API Key、管理员 API 和共享该实例的 Studio 工作流都经过 Colab 的准备逻辑。投递前刷新 ComfyUI 文件列表，再由原生处理器校验、入队并返回真实 `prompt_id`。后续队列、WebSocket、history、取图保持原协议。客户端首个冷请求仍可能因客户端、中继或网关的等待限制而断开。准备阶段断开时不会代为入队，已经开始的共享下载可继续，后续提交可复用文件。一旦请求交给 ComfyUI，则沿用其取消和队列语义。重复请求共享权重下载；相互独立且成功送达的提交仍按 ComfyUI 原规则分别入队。
+
+自动识别使用已有加载器字段规则和目录别名，覆盖 checkpoint、LoRA、VAE、diffusion model、text encoder 等。原生工作流顶层 `models` 与节点 `properties.models` 中类别和文件名匹配的条目可以提供下载身份。自动准备不会把远端 API 节点的模型选项、普通字符串或提示词当成权重。自定义动态节点、视觉 JSON 的自定义小部件和运行期生成的依赖可用显式声明；管理员还可配置 `MODEL_DEPENDENCY_RULES` 与 `MODEL_LIBRARY_DIRECTORIES`。自动下载沿用模型库安全扩展名，未提供哈希的来源需要可校验的文件大小和支持的格式。只使用工作流 JSON 所能静态识别的依赖，并保留 ComfyUI 自身对节点、模型与图的正式校验。

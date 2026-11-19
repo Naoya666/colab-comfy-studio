@@ -82,8 +82,20 @@ def manager_busy():
 
 def probe():
     try:
+        import fcntl
+        import shutil
+
+        root = Path("/content/ai-studio/native")
+        metrics = {"disk_free_bytes": shutil.disk_usage(root).free} if root.is_dir() else {}
+        active = root / "models-active.lock"
+        if active.is_file():
+            with active.open("rb") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return {**metrics, "busy": True, "busy_reason": "model_preparation"}
         if manager_busy():
-            return {"busy": True, "busy_reason": "manager"}
+            return {**metrics, "busy": True, "busy_reason": "manager"}
         config = Path("/content/ai-studio/native/plugins-config.json")
         if config.exists():
             import sys
@@ -94,7 +106,7 @@ def probe():
             status = read(root / "plugins-status.json", {})
             nodes = Path(read(config)["comfy"]) / "custom_nodes"
             if status.get("error") or pending.get("source") != digest(inventory(nodes)):
-                return {"busy": True, "busy_reason": "plugins"}
+                return {**metrics, "busy": True, "busy_reason": "plugins"}
         def rpc(path):
             with urlopen(Request("http://127.0.0.1:5572/" + path, data=b"{}", headers={"Content-Type":"application/json"}), timeout=5) as r:
                 return json.load(r)
@@ -105,7 +117,7 @@ def probe():
         # temporary files. Current VFS errors and pending writes still fence shutdown.
         busy = bool(open_writes() or d.get("uploadsQueued", 0) or d.get("uploadsInProgress", 0)
                     or d.get("erroredFiles", 0) or d.get("outOfSpace", False) or io.get("transferring"))
-        return {"busy": busy, "busy_reason": "drive" if busy else None}
+        return {**metrics, "vfs_cache_bytes": d.get("bytesUsed"), "busy": busy, "busy_reason": "drive" if busy else None}
     except Exception:
         return {"busy": True, "busy_reason": "unknown"}
 
@@ -143,6 +155,8 @@ async def state(request):
     Path("/content/ai-studio/native/heartbeat").write_text(str(time.time()))
     result = await asyncio.to_thread(probe)
     status_file = Path("/content/ai-studio/native/plugins-status.json")
+    if LOCAL_MODELS and LOCAL_MODELS.handoffs:
+        result.update(busy=True, busy_reason="model_preparation")
     if status_file.exists():
         result["plugins"] = await asyncio.to_thread(PERSISTENCE.status)
         if not result["busy"] and (not result["plugins"].get("durable") or result["plugins"].get("error")):
@@ -194,6 +208,12 @@ import sys
 sys.path.insert(0, "/content/ai-studio/native")
 from node_persistence import install
 PERSISTENCE = install(PromptServer.instance, Path("/content/ai-studio/native"), manager_busy)
+LOCAL_MODELS = None
+if (ROOT / "local-model-config.json").exists():
+    import folder_paths
+    from nodes import NODE_CLASS_MAPPINGS
+    from native_models import install as install_models
+    LOCAL_MODELS = install_models(PromptServer.instance, ROOT, folder_paths, NODE_CLASS_MAPPINGS)
 NODE_CLASS_MAPPINGS = {}
 '''
 
@@ -313,7 +333,11 @@ def _mount_error(log, secret):
 def mount_drive(root, secret):
     mount = root / "drive"
     mount.mkdir(exist_ok=True)
+    cache = [int(secret.get("cache_gb", 20)), int(secret.get("cache_max_age_minutes", 60))]
+    applied = root / "mount-cache.json"
     if os.path.ismount(mount):
+        if applied.is_file() and json.loads(applied.read_text()) != cache:
+            raise RuntimeError("已挂载的 Drive 使用其他 VFS 配置，请停止并重新分配实例")
         return mount
     config = root / "rclone.conf"
     token = json.dumps({"access_token": secret["access_token"], "refresh_token": secret["refresh_token"],
@@ -324,7 +348,8 @@ def mount_drive(root, secret):
                   f"root_folder_id = {secret['owner_folder_id']}\ntoken = {token}\n")
     args = [str(root / "rclone"), "mount", "studio:", str(mount), "--config", str(config),
          "--vfs-cache-mode", "full", "--vfs-write-back", "5s",
-         "--vfs-cache-max-size", f"{int(secret['cache_gb'])}G", "--vfs-cache-min-free-space", "5G",
+         "--vfs-cache-max-size", f"{cache[0]}G", "--vfs-cache-min-free-space", "5G",
+         "--vfs-cache-max-age", f"{cache[1]}m",
          "--cache-dir", str(root / "vfs-cache"), "--dir-cache-time", "30s", "--poll-interval", "15s",
          "--rc", "--rc-addr", "127.0.0.1:5572", "--rc-no-auth", "--log-level", "ERROR"]
     # rclone 1.70.3 starts RC in both the --daemon parent and child. The parent
@@ -341,6 +366,7 @@ def mount_drive(root, secret):
             if process.poll() is not None:
                 raise RuntimeError("Google Drive 挂载进程退出：" + _mount_error(log, secret))
             if os.path.ismount(mount):
+                applied.write_text(json.dumps(cache))
                 return mount
             if time.monotonic() >= deadline:
                 raise RuntimeError("Google Drive 挂载就绪超时：" + _mount_error(log, secret))
@@ -356,14 +382,28 @@ def mount_drive(root, secret):
         raise
 
 
-def prepare_paths(comfy, mount):
+def prepare_paths(comfy, mount, *, local=False):
     data = mount / "native-comfy"
     for name in ("user", "input", "output", "custom_nodes"):
         (data / name).mkdir(parents=True, exist_ok=True)
-    # Keep Manager-created models under the existing persistent models directory.
+    models = comfy / "models"
+    if local and models.is_symlink():
+        if models.resolve() != (mount / "models").resolve():
+            raise RuntimeError("Unexpected native models symlink")
+        models.unlink()
+        backup = comfy / "models.checkout"
+        if backup.is_dir() and not backup.is_symlink():
+            backup.rename(models)
+    model_root = models if local else mount / "models"
     for category in CATEGORIES:
-        (mount / "models" / category).mkdir(parents=True, exist_ok=True)
-    for name, target in (("models", mount / "models"), ("input", data / "input")):
+        path = model_root / category
+        if local and (path.resolve() != path or any(p.is_symlink() for p in path.rglob("*"))):
+            raise RuntimeError("Local model directories must not contain symlinks")
+        path.mkdir(parents=True, exist_ok=True)
+    links = [("input", data / "input")]
+    if not local:
+        links.append(("models", model_root))
+    for name, target in links:
         link = comfy / name
         if link.is_symlink():
             if link.resolve() != target.resolve():
@@ -468,10 +508,14 @@ def run(root, payload, stages):
     secret = payload["native_secrets"]
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     with worker._file_lock(ROOT / ".bootstrap.lock"):
+        mode = secret.get("model_storage_mode", "drive_mount")
+        local = mode == "local"
         commit = payload["snapshot"]["manifest"]["comfy_commit"]
         marker = ROOT / "state.json"
         if marker.exists():
             state = json.loads(marker.read_text())
+            if state.get("model_storage_mode", "drive_mount") != mode:
+                raise RuntimeError("Native model storage differs; stop the old instance first")
             if state.get("commit") != commit:
                 raise RuntimeError("Native ComfyUI version differs; stop the old session first")
             worker._http_json("http://127.0.0.1:8188/system_stats", timeout=5)
@@ -489,7 +533,8 @@ def run(root, payload, stages):
                     worker._stream_output(response, binary, 100 * 1024**2)
                 binary.chmod(0o700)
             stages.start("native_drive")
-            _index_models(secret, worker)
+            if not local:
+                _index_models(secret, worker)
             mount = mount_drive(ROOT, secret)
             stages.start("native_models")
             comfy = ROOT / "ComfyUI"
@@ -497,9 +542,24 @@ def run(root, payload, stages):
                 comfy.mkdir()
                 worker._checkout_comfy(comfy, commit, 180)
             worker._verify_checkout(comfy, commit)
-            data = prepare_paths(comfy, mount)
+            data = prepare_paths(comfy, mount, local=True) if local else prepare_paths(comfy, mount)
             extra = ROOT / "extra_model_paths.yaml"
-            extra.write_text(json.dumps(model_paths(mount)))
+            local_config = ROOT / "local-model-config.json"
+            if local:
+                extra.unlink(missing_ok=True)
+                # Comfy auto-loads the checkout-local file independently of CLI flags.
+                if (comfy / "extra_model_paths.yaml").exists() or (comfy / "extra_model_paths.yaml").is_symlink():
+                    raise RuntimeError("Remove the ComfyUI checkout extra_model_paths.yaml before starting local mode")
+                for module in ("native_models.py", "model_dependencies.py", "model_sources.py"):
+                    shutil.copyfile(Path(__file__).with_name(module), ROOT / module)
+                _write_secret(local_config, json.dumps({"catalog": secret["catalog"], "channel": secret["model_channel"],
+                                                        "drive_auth": secret["drive_auth"], "tokens": secret.get("source_tokens", {}),
+                                                        "drive_account": secret["drive_account"],
+                                                        "models_folder": secret["models_folder_id"],
+                                                        "directories": secret["directories"], "rules": secret["rules"]}))
+            else:
+                local_config.unlink(missing_ok=True)
+                extra.write_text(json.dumps(model_paths(mount)))
             stages.start("native_environment")
             try:
                 from node_persistence import protect_environment
@@ -510,6 +570,8 @@ def run(root, payload, stages):
             # base environment before the strict plugin compatibility check.
             worker._run([sys.executable, "-m", "pip", "install", "-q", "jedi>=0.16,<0.20"], timeout=180)
             worker._run([sys.executable, "-m", "pip", "install", "-q", "-r", str(comfy / "requirements.txt")], timeout=600)
+            if local:
+                worker._run([sys.executable, "-m", "pip", "install", "-q", "httpx>=0.27,<1"], timeout=180)
             manager = comfy / "manager_requirements.txt"
             if not manager.is_file():
                 raise RuntimeError("Pinned ComfyUI must support the official Manager (--enable-manager)")
@@ -542,6 +604,8 @@ def run(root, payload, stages):
                     "--output-directory", str(data / "output"), "--temp-directory", str(ROOT / "temp"),
                     "--max-upload-size", str(secret["max_upload_mb"]),
                     "--extra-model-paths-config", str(extra), "--preview-method", "auto", "--disable-auto-launch"]
+            if local:
+                del args[args.index("--extra-model-paths-config"):args.index("--extra-model-paths-config") + 2]
             comfy_log = root / "comfy.log"
             with comfy_log.open("ab") as log:
                 log_offset = log.tell()
@@ -579,7 +643,7 @@ def run(root, payload, stages):
                 subprocess.Popen([sys.executable, str(ROOT / "watchdog.py")], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             worker._atomic_json(marker, {"commit": commit, "pid": process.pid, "tunnel_pid": tunnel.pid,
                                          "tunnel_start_id": worker._process_metadata(tunnel.pid)["start_id"], "tunnel_binary": binary,
-                                         "comfy": str(comfy), "comfy_log": str(comfy_log),
+                                         "comfy": str(comfy), "comfy_log": str(comfy_log), "model_storage_mode": mode,
                                          "comfy_log_offset": log_offset, "started": time.time()})
         stages.end()
         report = root / "outputs" / "native-ready.json"

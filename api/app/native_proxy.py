@@ -19,7 +19,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake
 
-from . import native_api
+from . import native_api, native_model_api
 from .common import APIError
 from .config import settings
 from .gpu import native
@@ -34,7 +34,7 @@ def clean_headers(headers, *, request=False):
     connection = set(headers.get("connection", "").lower().replace(" ", "").split(","))
     return [(k, v) for k, v in headers.multi_items()
             if k.lower() not in HOP | connection
-            and not (request and (k.lower() in PRIVATE or k.lower().startswith(("cf-", "sec-websocket", "x-studio-restart-"))))
+            and not (request and (k.lower() in PRIVATE or k.lower().startswith(("cf-", "sec-websocket", "x-studio-restart-", "x-studio-model-"))))
             and not (not request and k.lower() == "set-cookie")]
 
 
@@ -113,7 +113,7 @@ class NativeHostMiddleware:
             if not owner:
                 raise APIError("UNAUTHENTICATED", "请从 Studio 的原生 ComfyUI 入口登录，API 使用 Bearer Token", 401)
             internal_path = scope["path"].removeprefix("/api").rstrip("/")
-            if internal_path == "/studio_native/index":
+            if internal_path == "/studio_native/index" or internal_path.startswith("/studio_native/models"):
                 raise APIError("NOT_FOUND", "接口不存在", 404)
             if request.method not in {"GET", "HEAD", "OPTIONS"}:
                 check_origin(headers)
@@ -163,7 +163,15 @@ class NativeHostMiddleware:
                     )
                     if not record:
                         raise APIError("NATIVE_API_NOT_FOUND", "图片不存在或不属于当前接入 Key", 404)
-            return await self.http(request, lease, scope, receive, send, key=key, path=path, file=file, payload=payload)
+            local = False
+            model_listing = internal_path == "/object_info" or internal_path.startswith(("/models/", "/object_info/"))
+            if submit or (request.method == "GET" and model_listing):
+                storage = await asyncio.to_thread(native.lease_storage, repo, lease)
+                local = storage["model_storage_mode"] == "local"
+            if local and submit and payload is None:
+                payload, _ = await self.read_prompt(request, limit=16 * 1024**2)
+            return await self.http(request, lease, scope, receive, send, key=key, path=path, file=file,
+                                   payload=payload, local=local)
         except APIError as exc:
             return await JSONResponse(
                 {"error": exc.code, "message": exc.message}, status_code=exc.status,
@@ -178,12 +186,12 @@ class NativeHostMiddleware:
             raise APIError("NATIVE_DRAINING", "会话已到运行时限或正在停止；等待已有任务及同步结束后重启", 409)
 
     @staticmethod
-    async def read_prompt(request):
+    async def read_prompt(request, limit=native_api.MAX_WORKFLOW_BYTES):
         body = bytearray()
         try:
             async for chunk in request.stream():
-                if len(body) + len(chunk) > native_api.MAX_WORKFLOW_BYTES:
-                    raise APIError("PAYLOAD_TOO_LARGE", "工作流请求不能超过 1 MiB", 413)
+                if len(body) + len(chunk) > limit:
+                    raise APIError("PAYLOAD_TOO_LARGE", f"工作流请求不能超过 {limit // 1024**2} MiB", 413)
                 body.extend(chunk)
             data = json.loads(body)
             json.dumps(data, allow_nan=False)
@@ -231,7 +239,7 @@ class NativeHostMiddleware:
         query = scope.get("query_string", b"").decode("ascii")
         return base + raw + ("?" + query if query else ""), base, auth
 
-    async def http(self, request, lease, scope, receive, send, *, key=None, path=None, file=None, payload=None):
+    async def http(self, request, lease, scope, receive, send, *, key=None, path=None, file=None, payload=None, local=False):
         url, base, auth = self.target(scope)
         if key:
             url = base + quote(path, safe="/")
@@ -274,6 +282,41 @@ class NativeHostMiddleware:
             client = self.http_client()
             if key and mutating:
                 reservation = await self.reserve_prompt(client, base, auth, repo, key, lease)
+            if local:
+                channel = native_model_api.headers(base, auth, lease)
+                if request.method == "POST":
+                    task = await native_model_api.start(client, base, channel, repo, lease, json.loads(payload), [], visual=False)
+                    while True:
+                        if await request.is_disconnected():
+                            # The shared download can still be used by other requests. This prompt has never been sent.
+                            return
+                        state = await native_model_api.rpc(client, "GET", base, channel, "/prepare/" + task["id"])
+                        if state["state"] != "preparing":
+                            break
+                        await asyncio.sleep(1)
+                    if state["state"] != "ready":
+                        from .gpu.native_models import model_problem
+
+                        failures = [r for r in state["models"] if r["state"] == "failed"]
+                        message = state.get("message") or "、".join(
+                            f"{r['category']}/{r['name']} · {r['error']}" for r in failures
+                        )[:3000]
+                        problem = {**model_problem(message), "models": state["models"]}
+                        return await JSONResponse(problem, status_code=422)(scope, receive, send)
+                    if await request.is_disconnected():
+                        return
+                    fresh = await asyncio.to_thread(native.active_lease, repo, lease["owner_id"])
+                    if (not fresh or fresh["id"] != lease["id"] or not fresh.get("native_ready")
+                            or native.restart_active(fresh)):
+                        raise APIError("NATIVE_SESSION_CHANGED", "模型准备期间原生会话已改变，请重新提交", 409)
+                    await self.check_stopping(repo, fresh, lease["owner_id"])
+                    if key:
+                        await asyncio.to_thread(native_api.live_key, repo.store, key)
+                    headers.extend([("X-Studio-Model-Channel", channel["X-Studio-Model-Channel"]),
+                                    ("X-Studio-Model-Prepared", task["id"])])
+                else:
+                    context = await asyncio.to_thread(native_model_api.runtime_context, repo, lease, credentials=False)
+                    await native_model_api.rpc(client, "POST", base, channel, "/catalog", body=context)
             retryable = (not mutating and request.method in {"GET", "HEAD"}
                          and request.headers.get("content-length", "0") == "0"
                          and "transfer-encoding" not in request.headers)

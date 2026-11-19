@@ -1,9 +1,10 @@
 import { useRef, useState, type FormEvent } from 'react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
 import type { GpuAccount } from './AccountDirectory';
+import { NativeModelSettings, type ModelStorage } from './NativeModelSettings';
 import { WorkflowGpuSelection } from './WorkflowGpuSelection';
 
-type Policy = {
+type Policy = ModelStorage & {
   auto_start: boolean;
   account_id: string | null;
   gpu: Record<string, unknown> | null;
@@ -157,6 +158,7 @@ export function NativeApiSettings({ accounts }: { accounts: GpuAccount[] }) {
             {policy.account_id && <WorkflowGpuSelection manifest={null} accountId={policy.account_id} value={policy.gpu}
               label="API 默认 GPU" onChange={gpu => changePolicy({ gpu })} />}
           </>}
+          <NativeModelSettings value={policy} onChange={changePolicy} />
           <label className="field">空闲回收时间（分钟）
             <input type="number" min={1} max={2147483647} required value={policy.retain_idle_minutes || ''}
               onChange={event => changePolicy({ retain_idle_minutes: Number(event.target.value) })} />

@@ -85,6 +85,10 @@ def build_bootstrap_code(execution_id: str, payload: dict, worker_source: str | 
         raise MCPError("trusted worker source is unavailable")
     plugins_b64 = base64.b64encode(Path(__file__).with_name("node_persistence.py").read_bytes()).decode("ascii")
     native_b64 = base64.b64encode(Path(__file__).with_name("native_runtime.py").read_bytes()).decode("ascii")
+    local_modules = {}
+    if (payload.get("native_secrets") or {}).get("model_storage_mode") == "local":
+        local_modules = {name: base64.b64encode(Path(__file__).with_name(name).read_bytes()).decode("ascii")
+                         for name in ("native_models.py", "model_dependencies.py", "model_sources.py")}
     source_b64 = base64.b64encode(worker_source.encode("utf-8")).decode("ascii")
     payload_b64 = _b64_json(payload)
     execution_literal = repr(execution_id)
@@ -120,6 +124,8 @@ else:
     else:
         (_dir / "node_persistence.py").write_bytes(_base64.b64decode({plugins_b64!r}))
         (_dir / "native_runtime.py").write_bytes(_base64.b64decode({native_b64!r}))
+        for _filename, _content in {local_modules!r}.items():
+            (_dir / _filename).write_bytes(_base64.b64decode(_content))
         _worker.write_bytes(_base64.b64decode({source_b64!r}))
         _payload.touch(mode=0o600)
         _payload.chmod(0o600)

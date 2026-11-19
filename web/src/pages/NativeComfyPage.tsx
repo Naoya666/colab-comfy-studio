@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
+import { NativeModelSettings, type ModelStorage } from '../components/NativeModelSettings';
+import { NativeModelPreparation } from '../components/NativeModelPreparation';
 import { NativeApiSettings } from '../components/NativeApiSettings';
 import type { GpuAccount } from '../components/AccountDirectory';
 import { submitNativeHandoff } from '../lib/native-handoff';
@@ -8,7 +10,7 @@ import { submitNativeHandoff } from '../lib/native-handoff';
 type Timeouts = { retain_idle_minutes: number; max_runtime_minutes: number };
 type RestartPhase = 'checking' | 'syncing' | 'rebooting' | 'recovering' | 'succeeded' | 'failed';
 type NativeRestart = { restart_id: string; instance_id: string; phase: RestartPhase; failed_phase?: RestartPhase; error?: string };
-type NativeStatus = { configured: boolean; ready: boolean; can_restart: boolean; restart?: NativeRestart; state: string; url: string; instance_id?: string; error?: string; timeouts: { defaults: Timeouts }; events: { state?: string; message?: string }[] };
+type NativeStatus = { configured: boolean; ready: boolean; can_restart: boolean; restart?: NativeRestart; state: string; url: string; instance_id?: string; error?: string; timeouts: { defaults: Timeouts }; model_storage_defaults: ModelStorage; model_storage?: ModelStorage; model_storage_known?: boolean; disk?: { disk_free_bytes?: number; vfs_cache_bytes?: number }; events: { state?: string; message?: string }[] };
 const restartMessages: Record<RestartPhase, string> = {
   checking: '检查生成、安装和 Drive 同步状态',
   syncing: '同步模型索引',
@@ -28,6 +30,7 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
   const [submittingRestart, setSubmittingRestart] = useState(false);
   const [pendingRestart, setPendingRestart] = useState<{ id: string; previous?: string }>();
   const [autoOpen, setAutoOpen] = useState(false);
+  const [storage, setStorage] = useState<ModelStorage>();
   const [idleMinutes, setIdleMinutes] = useState('');
   const [runtimeMinutes, setRuntimeMinutes] = useState('');
   const timeoutsInitialized = useRef(false);
@@ -56,6 +59,7 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
           return pending && data.instance_id && observed !== pending.id && observed === pending.previous ? pending : undefined;
         });
         if (!timeoutsInitialized.current) {
+          setStorage(data.model_storage_defaults);
           setIdleMinutes(String(data.timeouts.defaults.retain_idle_minutes));
           setRuntimeMinutes(String(data.timeouts.defaults.max_runtime_minutes));
           timeoutsInitialized.current = true;
@@ -68,6 +72,10 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
     return () => { live = false; clearTimeout(timer); };
   }, [autoOpen]);
   const validTimeouts = [idleMinutes, runtimeMinutes].every(value => Number.isInteger(Number(value)) && Number(value) >= 1);
+  const validStorage = storage && Number.isInteger(storage.cache_gb) && storage.cache_gb >= 1
+    && storage.cache_gb <= 2147483647 && Number.isInteger(storage.cache_max_age_minutes)
+    && storage.cache_max_age_minutes >= 1 && storage.cache_max_age_minutes <= 153722867;
+  const effective = status?.model_storage;
   const restart = status?.restart;
   const restartInProgress = submittingRestart || Boolean(pendingRestart)
     || restart?.phase === 'checking' || restart?.phase === 'syncing'
@@ -96,7 +104,7 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
     if (!validTimeouts) { setError('请填写正整数分钟数。'); return; }
     setStarting(true); setError('');
     try {
-      await apiFetch('/api/gpu/native/start', { method: 'POST', headers: { 'Idempotency-Key': key.current }, body: JSON.stringify({ account_id: account, spec: { key: spec }, retain_idle_minutes: Number(idleMinutes), max_runtime_minutes: Number(runtimeMinutes) }) });
+      await apiFetch('/api/gpu/native/start', { method: 'POST', headers: { 'Idempotency-Key': key.current }, body: JSON.stringify({ account_id: account, spec: { key: spec }, retain_idle_minutes: Number(idleMinutes), max_runtime_minutes: Number(runtimeMinutes), ...storage }) });
       key.current = crypto.randomUUID();
       setAutoOpen(true);
     } catch (cause) { setError(apiMessage(cause)); }
@@ -108,7 +116,18 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
       <NativeApiSettings accounts={accounts} />
     </div>
     <p>打开官方节点编辑器。可以直接导入工作流 JSON 或拖入带工作流的原图，使用原生保存、扩展和 Manager。</p>
-    <p className="muted">与 Studio 共用 GPU。工作流、设置、素材、结果、节点源码和模型保存至 Google Drive。页面打开时仍会按任务活动判断空闲。</p>
+    <p className="muted">与 Studio 共用 GPU。工作流、设置、素材、结果和节点持久化沿用 Google Drive。页面打开时仍会按任务活动判断空闲。</p>
+    {effective && <div className="status">
+      <p>{status?.ready ? '当前模型存储' : '本次启动配置'} · {effective.model_storage_mode === 'local' ? '本地模式' : 'Drive 挂载模式'}</p>
+      {effective.model_storage_mode === 'drive_mount' && status?.model_storage_known === false &&
+        <p>旧会话未记录实际 VFS 参数。重新启动后可查看。</p>}
+      {effective.model_storage_mode === 'drive_mount' && status?.model_storage_known !== false &&
+        <p>VFS 缓存 {effective.cache_gb} GB · 未访问后保留 {effective.cache_max_age_minutes} 分钟
+          {status?.disk?.vfs_cache_bytes !== undefined && ` · 已占用 ${(status.disk.vfs_cache_bytes / 1024 ** 3).toFixed(2)} GiB`}</p>}
+      {status?.disk?.disk_free_bytes !== undefined && <p>本地磁盘剩余 {(status.disk.disk_free_bytes / 1024 ** 3).toFixed(2)} GiB</p>}
+      <p className="muted small">修改模型存储模式和缓存参数需停止当前实例后重新启动。</p>
+    </div>}
+    {status?.ready && effective?.model_storage_mode === 'local' && <NativeModelPreparation />}
     {(status?.ready || restartInProgress || (status?.instance_id && restart)) ? <div className="actions">
       <button className="button" disabled={!status?.ready || restartInProgress} onClick={() => void enter()}>进入原生 ComfyUI</button>
       <button className="button secondary" disabled={!status?.can_restart || restartInProgress}
@@ -119,6 +138,7 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
         {accounts.filter(a => a.enabled !== false && a.allow_allocation !== false).map(a => <option key={a.account_id} value={a.account_id}>{a.alias || a.account_id}</option>)}
       </select></label>
       <WorkflowGpuSelection manifest={null} accountId={account} value={spec} onChange={value => { setSpec(value); key.current = crypto.randomUUID(); }} />
+      {storage && <NativeModelSettings value={storage} onChange={value => { setStorage(value); key.current = crypto.randomUUID(); }} />}
       <label className="field">空闲回收时间（分钟）
         <input type="number" min={1} step={1} required value={idleMinutes} onChange={e => { setIdleMinutes(e.target.value); key.current = crypto.randomUUID(); }} />
         <span className="muted small">填写正整数分钟数，无最大值限制；生成、安装和同步等活动结束后开始计时。</span>
@@ -128,12 +148,14 @@ export function NativeComfyPage({ accounts }: { accounts: GpuAccount[] }) {
         <span className="muted small">填写正整数分钟数，无最大值限制，从提交启动时计时；复用 GPU 时仍受原实例截止时间限制。</span>
       </label>
       <p className="muted small">参数在本次启动时生效。到期后停止接收新任务，等待生成和同步完成后释放 GPU。调整已有原生会话的参数需先停止旧实例。</p>
-      <button className="button" disabled={starting || !account || !spec || !status?.configured || !validTimeouts} onClick={() => void start()}>{starting ? '正在提交…' : '启动 / 复用 GPU 并进入'}</button>
+      <button className="button" disabled={starting || !account || !spec || !status?.configured || !validTimeouts || !validStorage} onClick={() => void start()}>{starting ? '正在提交…' : '启动 / 复用 GPU 并进入'}</button>
       {status && !status.configured && <p className="status">请按部署文档配置原生 ComfyUI 域名和隧道。</p>}
     </>}
     <dialog className="nativeRestartDialog" ref={restartDialog} aria-labelledby="native-restart-title" aria-describedby="native-restart-description">
       <h2 id="native-restart-title">重启原生 ComfyUI</h2>
-      <p id="native-restart-description">将重启当前 GPU 实例上的 ComfyUI，并同步已就绪的模型。页面会短暂断开，请先保存工作流。</p>
+      <p id="native-restart-description">{effective?.model_storage_mode === 'local'
+        ? '将重启当前 GPU 实例上的 ComfyUI，本地模型文件继续保留。页面会短暂断开，请先保存工作流。'
+        : '将重启当前 GPU 实例上的 ComfyUI，并同步已就绪的模型。页面会短暂断开，请先保存工作流。'}</p>
       <div className="actions">
         <button type="button" className="button secondary" autoFocus onClick={() => restartDialog.current?.close()}>取消</button>
         <button type="button" className="button" onClick={() => void restartNative()}>重启</button>

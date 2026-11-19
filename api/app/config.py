@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     native_comfy_backend_url: str = ""
     native_comfy_idle_minutes: int = Field(default=120, ge=1)
     native_comfy_max_runtime_minutes: int = Field(default=720, ge=1)
-    native_comfy_cache_gb: int = Field(default=20, ge=1)
+    native_comfy_cache_max_age_minutes: int = Field(default=60, ge=1, le=153722867)
+    native_comfy_cache_gb: int = Field(default=20, ge=1, le=2**31 - 1)
     native_comfy_max_upload_mb: int = Field(default=2048, ge=1)
 
 

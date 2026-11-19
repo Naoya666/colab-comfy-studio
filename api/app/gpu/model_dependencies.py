@@ -8,7 +8,10 @@ import os
 import re
 from pathlib import PurePosixPath
 
-from .model_sources import SHA, ModelError, https_url, relative_path
+try:
+    from .model_sources import SHA, ModelError, https_url, relative_path
+except ImportError:  # Standalone Colab bootstrap.
+    from model_sources import SHA, ModelError, https_url, relative_path
 
 # field -> model category; widget positions are explicit, never guessed from a suffix.
 RULES = {
@@ -21,8 +24,10 @@ RULES = {
     "CLIPLoader": {"clip_name": "text_encoders"},
     "DualCLIPLoader": {"clip_name1": "text_encoders", "clip_name2": "text_encoders"},
     "TripleCLIPLoader": {"clip_name1": "text_encoders", "clip_name2": "text_encoders", "clip_name3": "text_encoders"},
+    "QuadrupleCLIPLoader": {f"clip_name{i}": "text_encoders" for i in range(1, 5)},
     "CLIPVisionLoader": {"clip_name": "clip_vision"},
     "ControlNetLoader": {"control_net_name": "controlnet"},
+    "DiffControlNetLoader": {"control_net_name": "controlnet"},
     "UpscaleModelLoader": {"model_name": "upscale_models"},
 }
 # Only schemas with known stable widget order are decoded without object_info.
@@ -34,7 +39,7 @@ WIDGETS = {"CheckpointLoaderSimple": ["ckpt_name"], "LoraLoader": ["lora_name", 
            "CLIPVisionLoader": ["clip_name"], "ControlNetLoader": ["control_net_name"],
            "UpscaleModelLoader": ["model_name"]}
 DIRECTORIES = {x: x for x in ("checkpoints", "loras", "vae", "diffusion_models", "text_encoders",
-                              "clip_vision", "controlnet", "upscale_models", "embeddings")}
+                              "clip_vision", "controlnet", "upscale_models", "embeddings", "latent_upscale_models")}
 DIRECTORIES.update(unet="diffusion_models", clip="text_encoders")
 
 
@@ -101,27 +106,54 @@ def scan(workflow):
         # Unknown loaders remain visible without treating arbitrary strings as filenames.
         if not rule and node_type and re.search(r"(load|lora)", node_type, re.I) and node_type not in {"LoadImage", "LoadVideo"}:
             append(node_id, node_type, "?", "需补充节点识别规则", "unknown", not bypassed, status="manual_review")
-    # Modern ComfyUI workflow metadata may carry explicit per-node source hints.
+    # ComfyUI publishes top-level model metadata and node templates can provide it per node.
     visual_nodes = {str(n.get("id")): n for n in visual.get("nodes", []) if isinstance(n, dict)} if isinstance(visual, dict) else {}
+    global_hints = visual.get("models", []) if isinstance(visual, dict) else []
+    directory_map = directories()
     for dep in dependencies:
         node = visual_nodes.get(dep["node_id"], {})
-        hints = (node.get("properties") or {}).get("models") or []
-        if not isinstance(hints, list):
-            continue
-        candidates = [m for m in hints if isinstance(m, dict) and m.get("name") == dep["reference"]
-                      and m.get("directory") in {None, dep["model_type"], directories().get(dep["model_type"])}]
-        if len(candidates) == 1:
-            hint = candidates[0]
+        local_hints = (node.get("properties") or {}).get("models") or []
+        hints = [
+            (hint, scoped)
+            for candidates, scoped in ((local_hints, True), (global_hints, False)) if isinstance(candidates, list)
+            for hint in candidates
+        ]
+        candidates = []
+        for hint, scoped in hints:
+            if not isinstance(hint, dict) or hint.get("name") != dep["reference"]:
+                continue
+            directory = hint.get("directory")
+            if not (directory is None and scoped) and (
+                not isinstance(directory, str)
+                or directory_map.get(directory.removeprefix("models/"), directory.removeprefix("models/"))
+                != directory_map.get(dep["model_type"])
+            ):
+                continue
+            candidates.append(hint)
+        urls, digests, sizes = set(), set(), set()
+        for hint in candidates:
             if isinstance(hint.get("url"), str):
                 try:
-                    dep["source_hint"] = https_url(hint["url"])
+                    urls.add(https_url(hint["url"]))
                 except ModelError:
                     dep["source_error"] = "节点来源链接无效，需手动补充"
             digest = hint.get("sha256")
+            if not digest and str(hint.get("hash_type", "")).lower().replace("-", "") == "sha256":
+                digest = hint.get("hash")
             if isinstance(digest, str) and SHA.fullmatch(digest):
-                dep["expected_sha256"] = digest.lower()
+                digests.add(digest.lower())
+            if type(hint.get("size")) is int and hint["size"] > 0:
+                sizes.add(hint["size"])
             if isinstance(hint.get("architecture"), str):
                 dep["architecture"] = hint["architecture"]
+        if len(urls) > 1 or len(digests) > 1 or len(sizes) > 1:
+            dep["source_conflict"] = True
+        if len(urls) == 1:
+            dep["source_hint"] = next(iter(urls))
+        if len(digests) == 1:
+            dep["expected_sha256"] = next(iter(digests))
+        if len(sizes) == 1:
+            dep["expected_size"] = next(iter(sizes))
     # Reviewed legacy manifests supply exact source identity; no filename-only source inference.
     for dep in dependencies:
         if dep["status"] == "manual_review":

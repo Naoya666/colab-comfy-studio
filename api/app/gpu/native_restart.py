@@ -187,6 +187,8 @@ def submit(repo, owner, instance_id, key):
 
 
 def _sync_models(repo, lease):
+    if native.lease_storage(repo, lease)["model_storage_mode"] == "local":
+        return []
     owner = lease["owner_id"]
     job = repo.get("jobs", lease.get("native_bootstrap_job_id") or lease["owner_job_id"], owner)
     if not job:

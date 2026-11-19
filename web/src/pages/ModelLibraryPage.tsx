@@ -36,6 +36,8 @@ export function ModelLibraryPage() {
   const [state, setState] = useState('');
   const [url, setUrl] = useState('');
   const [name, setName] = useState('');
+  const [relativePath, setRelativePath] = useState('');
+  const [externalSource, setExternalSource] = useState('');
   const [type, setType] = useState('checkpoints');
   const [architecture, setArchitecture] = useState('unknown');
   const [expected, setExpected] = useState('');
@@ -52,7 +54,7 @@ export function ModelLibraryPage() {
   useEffect(() => {void refresh().catch(e => setError(apiMessage(e))); const id = window.setInterval(() => {void refresh().catch(() => {});}, 3000); return () => clearInterval(id);}, [refresh]);
   async function action(fn: () => Promise<unknown>) {setBusy(true); setError(''); try {await fn(); await refresh();} catch(e) {setError(apiMessage(e));} finally {setBusy(false);}}
   async function add(data: Record<string, unknown>) {
-    const model = await libraryApi<LibraryModel>('', {...data, model_type: data.model_type === 'unknown' || !data.model_type ? type : data.model_type, architecture: data.architecture === 'unknown' || !data.architecture ? architecture : data.architecture});
+    const model = await libraryApi<LibraryModel>('', {...data, relative_path: relativePath.trim() || undefined, model_type: data.model_type === 'unknown' || !data.model_type ? type : data.model_type, architecture: data.architecture === 'unknown' || !data.architecture ? architecture : data.architecture});
     await libraryApi(`/${model.id}/prepare`, {});
     setChoices([]); setProgress('模型已入库并加入准备队列');
   }
@@ -69,6 +71,7 @@ export function ModelLibraryPage() {
         <label>文件名（通用链接 / Drive）<input value={name} onChange={e => setName(e.target.value)} placeholder="model.safetensors" /></label>
         <label>预期 SHA-256（可选）<input value={expected} onChange={e => setExpected(e.target.value)} /></label>
       </div>
+      <label>工作流引用的相对路径（可选）<input value={relativePath} onChange={e => setRelativePath(e.target.value)} placeholder="子目录/model.safetensors" /></label>
       <label>模型页面或 HTTPS 下载链接<input value={url} onChange={e => setUrl(e.target.value)} /></label>
       <button disabled={busy || !url} className="button secondary" onClick={() => void action(async () => {const resolved = await libraryApi<{files:Record<string, unknown>[]}>('/resolve', {url, filename:name || undefined, model_type:type, architecture, expected_sha256:expected || undefined}); setChoices(resolved.files); if (!resolved.files.length) setProgress('该来源未返回受支持的模型文件');})}>解析来源并选择文件</button>
       {choices.map((c, i) => <div key={i} className={styles.card}><strong>{String(c.filename)}</strong><p>{String(c.version_name || '')} · {String(c.architecture)} · {bytesLabel(Number(c.expected_size || c.reported_size))}</p><button disabled={busy} className="button small" onClick={() => void action(() => add(c))}>选择此文件并准备</button></div>)}
@@ -86,7 +89,7 @@ export function ModelLibraryPage() {
     {error && <p className="status error" role="alert">{error}</p>}{progress && <p role="status">{progress}</p>}
     {!items.length && <p className="muted">暂无符合条件的模型。添加来源链接、上传文件或从工作流迁移旧缓存。</p>}
     {items.map(m => { const task = tasks.find(t => t.model_id === m.id); return <article className={styles.card} key={m.id}>
-      <h3>{m.display_name}</h3><p>{m.filename} · {m.model_type} · {m.architecture}</p><p>{modelStatus[m.state] || m.state} · {bytesLabel(m.size)}</p>
+      <h3>{m.display_name}</h3><p>{m.relative_path || m.filename} · {m.model_type} · {m.architecture}</p><p>{modelStatus[m.state] || m.state} · {bytesLabel(m.size)} · {m.external_source ? (m.external_source.status === 'verified' ? '外部来源已验证' : '外部来源待验证') : '无外部来源'}</p>
       {task && ['pending','downloading','verifying','uploading'].includes(task.state) && <div>
         <progress aria-label="模型准备进度" max={task.total || 1} value={task.total ? task.bytes : undefined} />
         <p>{modelStatus[task.state]} · {task.bytes ? bytesLabel(task.bytes) : '0 B'} / {bytesLabel(task.total)} · {task.speed ? `${(task.speed / 1024**2).toFixed(1)} MB/s` : '等待进度'}</p>
@@ -98,13 +101,22 @@ export function ModelLibraryPage() {
         <button className="button secondary small" onClick={() => void action(() => libraryApi(`/tasks/${task.id}/cancel`, {}))}>取消准备</button>
       </div>}
       {m.error && <p className="status error">{m.error}</p>}
-      <div className="actions"><button className="button secondary small" onClick={() => void action(async () => setDetail(await libraryApi('/' + m.id)))}>详情与引用</button>
+      <div className="actions"><button className="button secondary small" onClick={() => void action(async () => {
+        const model = await libraryApi<LibraryModel & { references?: { workflow_id: string }[] }>('/' + m.id);
+        setDetail(model); setExternalSource(model.external_source?.url || '');
+      })}>详情与引用</button>
         <button disabled={busy} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/prepare`, {action:'prepare'}))}>准备 / 重试</button>
         <button disabled={busy || !m.drive_file_id} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/prepare`, {action:'verify'}))}>重新校验</button>
         <button disabled={busy || !m.drive_file_id} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/check`, {}))}>检查 Drive 文件</button>
       </div>
     </article>;})}
     {detail && <section className={styles.card} aria-label="模型详情"><h3>{detail.display_name}</h3><p>SHA-256：{detail.sha256 || '未计算'}</p><p>来源：{detail.source} · 版本：{detail.version_name || '未知'}</p><p>预期 SHA-256：{detail.expected_sha256 || '未提供；计算 Hash 不代表来源可信'}</p><p>触发词：{detail.trigger_words?.join(', ') || '无'}</p><p>引用工作流：{detail.references?.length || 0}</p>{detail.references?.map(r => <p key={r.workflow_id}>{r.workflow_id}</p>)}
+      <label>外部来源链接<input type="url" value={externalSource} onChange={e => setExternalSource(e.target.value)} /></label>
+      <p className="muted small">可填写无凭据的 HTTPS 来源链接，凭据在「模型下载源凭据」中配置。留空并保存可移除绑定。</p>
+      <button className="button secondary small" disabled={busy} onClick={() => void action(async () => {
+        const updated = await libraryApi<LibraryModel>('/' + detail.id, { external_source_url: externalSource.trim() || null }, 'PATCH');
+        setDetail({ ...detail, external_source: updated.external_source }); setExternalSource(updated.external_source?.url || '');
+      })}>保存外部来源</button>
       <label>显示名称<input value={detail.display_name} onChange={e => setDetail({...detail, display_name:e.target.value})} /></label>
       <label>架构<input value={detail.architecture} onChange={e => setDetail({...detail, architecture:e.target.value})} /></label>
       <label>标签（逗号分隔）<input value={detail.tags?.join(', ') || ''} onChange={e => setDetail({...detail, tags:e.target.value.split(',').map(s => s.trim())})} /></label>

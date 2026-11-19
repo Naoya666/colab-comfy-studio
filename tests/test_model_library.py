@@ -47,7 +47,7 @@ def test_file_safety(path):
         filename(path)
 
 
-@pytest.mark.parametrize("url", ["http://example.com/a", "file:///etc/passwd", "https://u:p@example.com/a", "https://example.com:8443/a", "https://example.com/a?token=private", "https://example.com/a?X-Amz-Credential=private"])
+@pytest.mark.parametrize("url", ["http://example.com/a", "file:///etc/passwd", "https://u:p@example.com/a", "https://example.com:8443/a", "https://example.com/a?token=private", "https://example.com/a?X-Amz-Credential=private", "https://example.com/a?sig=private"])
 def test_url_safety(url):
     with pytest.raises(ModelError):
         https_url(url)
@@ -60,20 +60,23 @@ def test_internal_dns_refused(monkeypatch, address):
         public_addresses("unsafe.example")
 
 
-def test_redirect_pins_dns_and_does_not_leak_authorization():
+def test_redirect_pins_dns_and_does_not_leak_authorization(caplog):
     calls = []
     def handler(request):
         calls.append(request)
         if len(calls) == 1:
-            return httpx.Response(302, headers={"location": "https://cdn.example/model"})
+            return httpx.Response(302, headers={"location": "https://cdn.example/model?signature=private-signature",
+                                               "set-cookie": "private=secret; Path=/"})
         return httpx.Response(200, content=DATA)
     http = source_http(handler, {"civitai": "secret"})
-    with http.stream("https://civitai.com/api/download/models/1") as response:
-        assert response.read() == DATA
+    with caplog.at_level("DEBUG"):
+        with http.stream("https://civitai.com/api/download/models/1") as response:
+            assert response.read() == DATA
     assert calls[0].url.host == "8.8.8.8" and calls[0].headers["host"] == "civitai.com"
     assert calls[0].extensions["sni_hostname"] == b"civitai.com"
     assert calls[0].headers["authorization"] == "Bearer secret"
-    assert "authorization" not in calls[1].headers
+    assert "authorization" not in calls[1].headers and "cookie" not in calls[1].headers
+    assert "private-signature" not in caplog.text
 
 
 def test_redirect_to_internal_network_rejected():
@@ -370,12 +373,16 @@ def test_storage_account_is_owned_and_cannot_move_existing_catalog(repo):
         ModelLibrary(repo,"other").save_storage(account["id"])
 
 
-def test_same_expected_hash_shares_index_and_download_queue(repo):
+def test_same_hash_with_distinct_references_keeps_both_catalog_paths(repo):
     lib=ModelLibrary(repo,"owner")
     a=model(lib,expected_sha256=HASH)
     b=model(lib,filename="alias.safetensors",expected_sha256=HASH)
-    assert a["id"] == b["id"]
-    assert lib.enqueue(a["id"])["id"] == lib.enqueue(b["id"])["id"]
+    c=model(lib, relative_path="nested/base.safetensors", expected_sha256=HASH)
+    assert len({a["id"], b["id"], c["id"]}) == 3
+    assert model(lib, expected_sha256=HASH)["id"] == a["id"]
+    first = lib.enqueue(a["id"])
+    assert lib.enqueue(a["id"])["id"] == first["id"]
+    assert lib.enqueue(b["id"])["id"] != first["id"]
 
 
 def test_optional_lora_is_not_restored_when_disabled():
@@ -582,3 +589,64 @@ def test_drive_resumes_confirmed_offset_and_dedupes_final_response(repo, monkeyp
     if mode == "resume":
         assert repo.get("model_downloads", task["id"], "owner")["resume_offset"] == 8
         assert drive.ranges[1] == f"bytes 8-15/{len(DATA)}"
+
+
+def test_import_records_original_url_before_transfer_and_final_drive_id(repo):
+    from app.gpu.model_library import external_source
+
+    entered = "https://example.com/original"
+    signed = "https://cdn.example.com/content?signature=redirect-secret"
+
+    def handler(request):
+        if request.headers["host"] == "example.com":
+            return httpx.Response(302, headers={"Location": signed})
+        return httpx.Response(200, content=DATA)
+
+    lib = ModelLibrary(repo, "owner", drive=FakeDrive(), http=source_http(handler))
+    [candidate] = lib.resolve({"url": entered, "filename": "base.safetensors", "model_type": "checkpoints"})
+    model_row = lib.add(candidate)
+    task = lib.enqueue(model_row["id"])
+    assert task["original_source_url"] == entered
+    ModelTransfer(lib, task).run()
+    saved = lib.get(model_row["id"])
+    assert external_source(saved) == {"url": entered, "download_url": entered, "status": "verified"}
+    persisted_task = repo.get("model_downloads", task["id"], "owner")
+    assert persisted_task["drive_file_id"] == saved["drive_file_id"] == "remote"
+    assert persisted_task["original_source_url"] == entered
+    assert "redirect-secret" not in repr((saved, persisted_task))
+    assert not repo.list("model_library", "other")
+
+
+def test_manual_binding_checks_metadata_and_removes_source_without_upload(repo):
+    from app.gpu.model_library import external_source
+
+    url = "https://huggingface.co/org/repo/blob/main/base.safetensors"
+    drive = FakeDrive()
+    meta_hash = HASH
+    meta_size = len(DATA)
+
+    def handler(request):
+        return httpx.Response(200, json={"sha": "a" * 40, "siblings": [
+            {"rfilename": "base.safetensors", "lfs": {"sha256": meta_hash, "size": meta_size}},
+        ]})
+
+    lib = ModelLibrary(repo, "owner", drive=drive, http=source_http(handler))
+    record = lib.add({"source": "drive", "drive_file_id": "drive-copy", "filename": "base.safetensors",
+                      "model_type": "checkpoints", "relative_path": "nested/base.safetensors"})
+    record = lib.update(record["id"], state="ready", sha256=HASH, size=len(DATA))
+    binding = lib.bind_external_source(record, url)
+    assert binding["status"] == "verified" and binding["url"] == url
+    assert "/resolve/" + "a" * 40 + "/" in binding["download_url"]
+    after = lib.update(record["id"], external_source=binding)
+    assert after["drive_file_id"] == "drive-copy" and after["relative_path"] == "nested/base.safetensors"
+    generic = lib.bind_external_source(after, "https://example.com/file")
+    assert generic["status"] == "unverified"
+    meta_hash = "0" * 64
+    with pytest.raises(ModelError, match="不匹配"):
+        lib.bind_external_source(after, url)
+    meta_hash = HASH
+    meta_size += 1
+    with pytest.raises(ModelError, match="不匹配"):
+        lib.bind_external_source(after, url)
+    assert external_source(lib.update(record["id"], external_source=lib.bind_external_source(after, None))) is None
+    assert drive.uploads == 0

@@ -8,9 +8,11 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 import socket
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit
 
@@ -18,6 +20,19 @@ import httpx
 
 SHA = re.compile(r"^[a-fA-F0-9]{64}$")
 SAFE_EXTENSIONS = {".safetensors", ".gguf", ".onnx"}
+
+
+_SOURCE_REQUEST = ContextVar("model_source_request", default=False)
+
+
+def _omit_source_request(record):
+    return not _SOURCE_REQUEST.get()
+
+
+# HTTP client request logs can contain signed redirect URLs. Keep other
+# clients' request logging and suppress transport tracing only for this stream.
+for _logger_name in ("httpx", "httpcore.connection", "httpcore.http11", "httpcore.http2", "httpcore.proxy"):
+    logging.getLogger(_logger_name).addFilter(_omit_source_request)
 
 
 class ModelError(ValueError):
@@ -47,8 +62,10 @@ def https_url(value: str, *, persisted=True) -> str:
         if (len(value) > 4096 or p.scheme != "https" or not p.hostname or p.username or p.password
                 or p.port not in {None, 443} or p.fragment or any(ord(c) < 33 for c in value)):
             raise ValueError
-        if persisted and any(any(s in k.lower() for s in ("token", "key", "auth", "signature", "credential"))
-                             for k in parse_qs(p.query)):
+        if persisted and any(
+            k.lower() == "sig" or any(s in k.lower() for s in ("token", "key", "auth", "signature", "credential", "password", "secret"))
+            for k in parse_qs(p.query)
+        ):
             raise ModelError("链接含凭据或签名，请使用无密钥来源链接并在设置中配置 Token")
     except (ValueError, TypeError) as exc:
         raise ModelError("只允许无凭据的 HTTPS 公网链接") from exc
@@ -72,7 +89,16 @@ class SourceHTTP:
         self.resolver = resolver
 
     @contextmanager
-    def stream(self, url, *, offset=0, validator=None):
+    def stream(self, url, *, offset=0, validator=None, drive_token=None):
+        token = _SOURCE_REQUEST.set(True)
+        try:
+            with self._stream(url, offset, validator, drive_token) as response:
+                yield response
+        finally:
+            _SOURCE_REQUEST.reset(token)
+
+    @contextmanager
+    def _stream(self, url, offset, validator, drive_token):
         initial_host = urlsplit(https_url(url, persisted=False)).hostname
         for _ in range(6):
             parsed = urlsplit(https_url(url, persisted=False))
@@ -80,7 +106,7 @@ class SourceHTTP:
             address = self.resolver(host)[0]
             original = httpx.URL(url)
             pinned = original.copy_with(host=address)
-            headers = {"Host": host, "Accept-Encoding": "identity"}
+            headers = {"Host": host, "Accept-Encoding": "identity", "Connection": "close"}
             if offset:
                 headers["Range"] = f"bytes={offset}-"
                 if validator:
@@ -88,9 +114,13 @@ class SourceHTTP:
             source = {"huggingface.co": "huggingface", "civitai.com": "civitai"}.get(host)
             if host == initial_host and source and self.tokens.get(source):
                 headers["Authorization"] = "Bearer " + self.tokens[source]
+            if host == initial_host == "www.googleapis.com" and drive_token:
+                headers["Authorization"] = "Bearer " + drive_token
             try:
-                with self.client.stream("GET", pinned, headers=headers,
-                                        extensions={"sni_hostname": host.encode()}) as response:
+                request = self.client.build_request("GET", pinned, headers=headers,
+                                                    extensions={"sni_hostname": host.encode()})
+                request.headers.pop("Cookie", None)
+                with closing(self.client.send(request, stream=True)) as response:
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location")
                         if not location:

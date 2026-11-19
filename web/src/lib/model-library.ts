@@ -1,6 +1,7 @@
 import { apiFetch } from './gpu-api';
 export interface LibraryModel {
   id: string; display_name: string; filename: string; model_type: string; architecture: string;
+  relative_path?: string; external_source?: { url: string; status: "verified" | "unverified" } | null;
   state: string; size?: number; sha256?: string; expected_sha256?: string; error?: string;
   tags?: string[]; trigger_words?: string[]; drive_file_id?: string; source?: string; version_name?: string;
 }

@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from .common import APIError, admin, current_user, get_store, ok
 from .config import settings
 from .gpu.model_dependencies import directories
-from .gpu.model_library import ModelLibrary
+from .gpu.model_library import ModelLibrary, external_source
 from .gpu.model_sources import ModelError, Sources
 from .gpu.repository import Repository
 
@@ -36,7 +36,7 @@ def list_models(q: str = "", model_type: str = "", architecture: str = "", state
                    and (not model_type or m["model_type"] == model_type)
                    and (not architecture or m["architecture"] == architecture) and (not state or m["state"] == state)]
         physical = {m["drive_file_id"]: m.get("size") or 0 for m in models if m.get("drive_file_id")}
-        return ok({"items": visible, "types": directories(), "statistics": {"count": len(models), "bytes": sum(physical.values()),
+        return ok({"items": [{**m, "external_source": external_source(m)} for m in visible], "types": directories(), "statistics": {"count": len(models), "bytes": sum(physical.values()),
                    "by_type": {t: {"count": sum(m["model_type"] == t for m in models),
                                   "bytes": sum({m["drive_file_id"]: m.get("size") or 0 for m in models if m["model_type"] == t and m.get("drive_file_id")}.values())}
                                for t in directories()}}})
@@ -101,11 +101,11 @@ def add(body: dict, user=Depends(current_user), st=Depends(get_store)):
     with library(st, user) as lib:
         # Source adapters are re-run server-side to avoid trusting user-supplied platform identities.
         if body.get("source") in {"huggingface", "civitai"}:
-            options = lib.resolve({"url": body.get("source_url")})
+            options = lib.resolve({"url": body.get("original_source_url") or body.get("source_url")})
             selected = [f for f in options if f.get("source_identity") == body.get("source_identity")]
             if len(selected) != 1:
                 raise ModelError("所选来源文件身份已变化，请重新解析")
-            body = {**selected[0], **{k: body[k] for k in ("model_type", "architecture", "display_name") if k in body}}
+            body = {**selected[0], **{k: body[k] for k in ("model_type", "architecture", "display_name", "relative_path") if k in body}}
         return ok(lib.add(body), status=201)
 
 
@@ -119,18 +119,21 @@ def register_workflow_model(model_id: str, body: dict, user=Depends(current_user
 @router.get("/model-library/{model_id}")
 def detail(model_id: str, user=Depends(current_user), st=Depends(get_store)):
     with library(st, user) as lib:
-        return ok({**lib.get(model_id), "references": lib.references(model_id)})
+        row = lib.get(model_id)
+        return ok({**row, "external_source": external_source(row), "references": lib.references(model_id)})
 
 
 @router.patch("/model-library/{model_id}")
 def update(model_id: str, body: dict, user=Depends(current_user), st=Depends(get_store)):
     with library(st, user) as lib:
-        lib.get(model_id)
+        model = lib.get(model_id)
         patch = {k: str(body[k])[:300] for k in ("display_name", "architecture") if k in body}
         if "tags" in body:
             if not isinstance(body["tags"], list):
                 raise ModelError("标签需为数组")
             patch["tags"] = [str(t)[:100] for t in body["tags"][:100]]
+        if "external_source_url" in body:
+            patch["external_source"] = lib.bind_external_source(model, body["external_source_url"])
         return ok(lib.update(model_id, **patch))
 
 

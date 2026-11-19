@@ -1073,7 +1073,7 @@ class Scheduler:
             if (job.get("snapshot") or {}).get("native_comfy"):
                 from app.config import settings
 
-                from .native import ready
+                from .native import model_storage, ready
                 if not ready():
                     if job.get("stage") != "native_tunnel":
                         self._event(job, "running", "等待代理健康检查及内部隧道鉴权验证", None)
@@ -1084,6 +1084,7 @@ class Scheduler:
                 lease = self._update("leases", lease["id"], {
                     "native_ready": True, "native_last_busy": self.clock(),
                     "native_bootstrap_job_id": job["id"],
+                    "native_model_storage": model_storage(job.get("execution_policy")),
                     "deadline_epoch": deadline,
                     "native_idle_minutes": (job.get("execution_policy") or {}).get(
                         "retain_idle_minutes", settings.native_comfy_idle_minutes),
