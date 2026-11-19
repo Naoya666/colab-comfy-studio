@@ -643,11 +643,19 @@ class MCPGPUExecutor:
         }
         cache = job.get("drive_cache")
         if isinstance(cache, dict):
+            if job.get("use_drive_cache") is False:
+                payload["use_drive_cache"] = False
             payload["drive_cache"] = {
                 "folder_id": cache.get("folder_id"),
                 "runtime_folder_id": cache.get("runtime_folder_id"),
                 "access_token": cache.get("access_token"),
             }
+        if "lora_drive_cache" in job:
+            loras = job["lora_drive_cache"]
+            payload["lora_drive_cache"] = (
+                {"folder_id": loras.get("folder_id"), "access_token": loras.get("access_token")}
+                if isinstance(loras, dict) else None
+            )
         return payload
 
     def _exec_code_on_handle(self, handle: dict, session: str, execution_id: str, code: str) -> Any:

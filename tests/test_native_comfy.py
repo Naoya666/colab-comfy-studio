@@ -355,7 +355,8 @@ def test_native_status_exposes_timeout_defaults_and_limits(proxy, monkeypatch):
     }
 
 
-def test_native_shared_studio_does_not_spawn_or_kill_comfy(monkeypatch, tmp_path):
+@pytest.mark.parametrize("storage", ["local", "drive_mount", None])
+def test_native_shared_studio_does_not_spawn_or_kill_comfy(monkeypatch, tmp_path, storage):
     import json
 
     from app.gpu import runtime_worker as worker
@@ -365,24 +366,42 @@ def test_native_shared_studio_does_not_spawn_or_kill_comfy(monkeypatch, tmp_path
     comfy = tmp_path / "native" / "ComfyUI"
     comfy.mkdir(parents=True)
     marker = tmp_path / "native" / "state.json"
-    marker.write_text(json.dumps({"commit": "a" * 40, "comfy": str(comfy)}))
+    state = {"commit": "a" * 40, "comfy": str(comfy)}
+    if storage is not None:
+        state["model_storage_mode"] = storage
+    marker.write_text(json.dumps(state))
+    (marker.parent / "local-model-config.json").write_text(json.dumps({"channel": "native-channel"}))
     monkeypatch.setattr(worker, "NATIVE_SERVICE_MARKER", marker)
     monkeypatch.setattr(worker, "_verify_checkout", lambda *args: None)
-    monkeypatch.setattr(worker, "_restore_weights", lambda *args, **kwargs: [])
     monkeypatch.setattr(worker, "_warm_put", lambda *args: pytest.fail("native process must remain in its own directory"))
     monkeypatch.setattr(worker.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must use the resident ComfyUI process"))
     calls = []
 
-    def api(url, method="GET", body=None, timeout=30):
+    prepare_id = "0" * 32
+
+    def api(url, method="GET", body=None, timeout=30, *, extra_headers=None):
         calls.append((url, method))
+        if url.endswith("/prepare-studio"):
+            assert body["weights"][0]["sha256"] == "c" * 64
+            assert extra_headers == {"X-Studio-Model-Channel": "native-channel"}
+            return {"id": prepare_id}
+        if url.endswith("/prepare/" + prepare_id):
+            return {"state": "ready", "models": []}
         if url.endswith("/prompt"):
+            assert extra_headers["X-Studio-Model-Prepared"] == prepare_id
             return {"prompt_id": "native-and-studio"}
         if "/history/" in url:
             return {"native-and-studio": {"status": {"completed": True}, "outputs": {}}}
         return {"system": {}}
     monkeypatch.setattr(worker, "_http_json", api)
     manifest = {"comfy_commit": "a" * 40, "node_allowlist": ["TestNode"], "weight_files": [{"repo_id": "test/model", "filename": "model.safetensors", "target": "checkpoints/model.safetensors", "revision": "b" * 40, "sha256": "c" * 64}]}
-    assert worker._run_comfy(root, {"snapshot": {}}, manifest, {"1": {"class_type": "TestNode", "inputs": {}}}, worker._Stages(root)) == []
+    graph = {"1": {"class_type": "TestNode", "inputs": {}}}
+    if storage != "local":
+        with pytest.raises(worker.WorkerError, match="Drive 挂载"):
+            worker._run_comfy(root, {"snapshot": {}}, manifest, graph, worker._Stages(root))
+        assert not calls
+        return
+    assert worker._run_comfy(root, {"snapshot": {}}, manifest, graph, worker._Stages(root)) == []
     assert any(url.endswith("/prompt") for url, method in calls)
     assert marker.exists()
 

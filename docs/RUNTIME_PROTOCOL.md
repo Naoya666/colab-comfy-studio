@@ -94,6 +94,18 @@ All worker status is written atomically to `status.json`; `meta.json` records
 only output metadata and relative paths. Logs are kept in the execution
 folder and do not include OAuth or model credentials.
 
+## 创作模式的本地模型恢复
+
+网页「创作」页由 `web/src/App.tsx` 的 `submitJob` 发起 `POST /api/gpu/jobs`，批量提交走 GPU 批次接口。API 绑定工作流版本、参数、模型替换和用户 LoRA，生成不可变任务快照。调度器通过 MCP 将快照和短期 Drive 授权交给 Colab，真实生成进入 `runtime_worker._run_comfy`。原生 ComfyUI 启动任务带有 `snapshot.native_comfy`，由 `native_runtime.run` 处理。
+
+创作作业先检查同一实例的本地模型。清单权重按 SHA-256 和已登记大小校验，用户 LoRA 按 Drive MD5 和大小校验。保留实例仍可复用上个任务的 ComfyUI 目录，工作流变更后也可复用该目录中匹配的权重。热复用时只保留新任务获准使用的用户 LoRA。
+
+已固定 Hugging Face 仓库、提交和文件名的模型，优先查询 SHA-256 和大小匹配的 Drive 缓存，未命中时从锁定的 Hugging Face 来源下载。Drive 专属模型和用户 LoRA 用各自授权对应的 Drive 文件 ID 下载。模型字节由 Colab 直接下载。权重沿用最多四路并行恢复，先写入本地临时目录，校验完成后原子发布。下载、校验或空间检查失败会中止任务。磁盘检查为已知大小的待下载模型预留总量，并保留 256 MiB 空间。
+
+独立创作作业使用该 ComfyUI checkout 的本地 `models/`，检查模型树内软链接、挂载点和 checkout 自动加载的 `extra_model_paths.yaml`。复用原生会话时，调度器跳过已知的 Drive 挂载实例。兼容的原生本地会话通过内部准备接口执行相同的权重恢复，并在下载及排队前核对运行中的模型路径，确认每个绑定文件优先解析到 Colab 本地。ComfyUI 自带的输出目录候选路径保留在所需本地模型之后。模型路径无从确认、原生会话版本不兼容，或本地同路径已被另一模型占用时，任务会报告原因。活动锁覆盖准备到入队，原生回收探测继续生效。
+
+升级前已运行的原生本地会话需要停止并重新启动，才能提供新的创作模型准备接口。原生页面、工作流、插件、用户设置和输入输出继续使用原有持久化机制。[原生 ComfyUI 模型存储](NATIVE_COMFYUI.md#模型存储模式)
+
 ## CUDA system smoke
 
 A system smoke is a separate trusted path. It runs only when

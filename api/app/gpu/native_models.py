@@ -22,9 +22,11 @@ import httpx
 
 try:
     from . import model_dependencies as deps
+    from . import runtime_worker as studio_worker
     from .model_sources import SHA, ModelError, SourceHTTP, filename, https_url, relative_path
 except ImportError:  # The bootstrap ships standalone modules to Colab.
     import model_dependencies as deps
+    import runtime_worker as studio_worker
     from model_sources import SHA, ModelError, SourceHTTP, filename, https_url, relative_path
 
 RESERVE = 5 * 1024**3
@@ -620,7 +622,51 @@ class LocalModels:
                   for _, status, shared in tasks}
         return [copied.get(id(status), dict(status)) for status in rows.values()]
 
-    def submit(self, body, explicit=None, *, visual=False, trusted=False):
+    async def prepare_studio(self, weights, loras, cache_payload, verify_paths, paths, timeout):
+        # Keep the existing native activity fence and serialize with native prepares.
+        with (self.root / "models-active.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            rows = {}
+            for target in [*(item["target"] for item in weights), *("loras/" + item["target"] for item in loras)]:
+                category, _, name = target.partition("/")
+                rows[(category, name)] = {"category": category, "name": name, "state": "preparing"}
+            task = asyncio.current_task()
+            self.current_rows[task] = rows, []
+
+            def restore():
+                try:
+                    paths.update(verify_paths(rows, require_files=False))
+                    cache = studio_worker._drive_cache(cache_payload)
+                    models = studio_worker._restore_weights(
+                        self.model_dir.parent, {"weight_files": weights}, timeout, cache, prep=False,
+                        preserve_existing=True, use_drive_cache=cache_payload["use_drive_cache"], paths=paths,
+                    )
+                    models.extend(studio_worker._restore_user_loras(
+                        self.model_dir.parent, loras, studio_worker._lora_drive_cache(cache_payload),
+                        preserve_existing=True, paths=paths,
+                    ))
+                    if verify_paths(rows, require_files=True) != paths:
+                        raise ModelError("原生 ComfyUI 的模型搜索路径在准备期间发生变化")
+                except studio_worker.WorkerError as exc:
+                    raise ModelError(str(exc)) from exc
+                for record in models:
+                    category, _, name = record["target"].partition("/")
+                    status = {**record, "category": category, "name": name, "state": "ready"}
+                    rows[(category, name)] = status
+                    LOG.info("Studio model preparation %s", json.dumps(status, ensure_ascii=False))
+                return list(rows.values())
+
+            try:
+                future = asyncio.get_running_loop().run_in_executor(self.executor, restore)
+                try:
+                    return await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    await asyncio.shield(future)
+                    raise
+            finally:
+                self.current_rows.pop(task, None)
+
+    def submit(self, body, explicit=None, *, visual=False, trusted=False, studio=None):
         expiry = time.monotonic() - 3600
         self.jobs = {k: v for k, v in self.jobs.items() if not v[0].done() or v[1] > expiry}
         if len(self.jobs) >= 256:
@@ -630,7 +676,9 @@ class LocalModels:
         if sum(not task.done() for task, _ in self.jobs.values()) >= 16:
             raise ModelError("模型准备请求过多，请等待当前下载完成")
         ident = uuid.uuid4().hex
-        task = asyncio.create_task(self.prepare(body, [] if explicit is None else explicit, self.catalog, visual=visual, trusted=trusted))
+        work = (self.prepare_studio(*studio) if studio is not None else
+                self.prepare(body, [] if explicit is None else explicit, self.catalog, visual=visual, trusted=trusted))
+        task = asyncio.create_task(work)
         # Retrieve exceptions even if the client disappears.
         task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         self.jobs[ident] = task, time.monotonic()
@@ -683,6 +731,45 @@ def install(server, root, folder_paths, node_types):
             folder_paths.add_model_folder_path(category, str(path), is_default=True)
     completed = {}
 
+    def verify_studio_paths(references, *, require_files):
+        models = studio_worker._local_models(local.model_dir.parent)
+        if models != local.model_dir:
+            raise ModelError("原生 ComfyUI 的模型根目录与创作模式不兼容")
+        # ComfyUI adds these output paths for its model-saving nodes. Preserve
+        # native I/O and allow them only behind every Studio model's local path.
+        output = Path(folder_paths.get_output_directory())
+        output_folders = {"checkpoints": "checkpoints", "text_encoders": "clip", "vae": "vae",
+                          "diffusion_models": "diffusion_models", "loras": "loras"}
+        for category, (paths, _) in folder_paths.folder_names_and_paths.items():
+            if category in {"custom_nodes", "datasets"}:
+                continue
+            for folder in map(Path, paths):
+                if category in output_folders and folder == output / output_folders[category]:
+                    continue
+                if not folder.is_relative_to(models) or folder.resolve() != folder:
+                    raise ModelError(f"原生 ComfyUI 的 {category} 搜索路径不在 Colab 本地模型目录内")
+        selected = {}
+        for category, name in references:
+            mapped = category_for(category)
+            mapped = getattr(folder_paths, "map_legacy", category_for)(mapped)
+            directory = models / category
+            target = directory / name
+            paths = folder_paths.folder_names_and_paths.get(mapped, ([], set()))[0]
+            if str(directory) not in paths or not name or target.resolve() != target or not target.is_relative_to(directory):
+                raise ModelError(f"原生 ComfyUI 的搜索路径与创作模型位置不兼容：{category}/{name}")
+            for folder in map(Path, paths[:paths.index(str(directory))]):
+                if not folder.is_relative_to(models):
+                    raise ModelError(f"原生 ComfyUI 有优先于创作本地模型的挂载搜索路径：{category}/{name}")
+                if (folder / name).is_file():
+                    target = folder / name
+                    break
+            if require_files and (not target.is_file() or folder_paths.get_full_path(mapped, name) != str(target)):
+                raise ModelError(f"原生 ComfyUI 未解析到创作模式的本地文件：{category}/{name}")
+            selected[f"{category}/{name}"] = target
+        if len(set(selected.values())) != len(selected):
+            raise ModelError("多个创作模型绑定到了原生 ComfyUI 的同一文件")
+        return selected
+
     def refresh():
         folder_paths.filename_list_cache.clear()
         helper = getattr(folder_paths, "cache_helper", None)
@@ -725,11 +812,35 @@ def install(server, root, folder_paths, node_types):
                                     trusted=data.get("reviewed") is True)
             await asyncio.sleep(0)  # Acquire the download fence before acknowledging the gateway.
             if not data.get("visual"):
-                completed[ident] = graph_key(body)
+                completed[ident] = (graph_key(body), None)
             # Bound the handoff map with the same lifetime and count as progress records.
             for old in completed.keys() - local.jobs.keys():
                 del completed[old]
         except ModelError as exc:
+            return web.json_response(model_problem(str(exc)), status=422)
+        return web.json_response({"id": ident}, status=202)
+
+    @server.routes.post("/studio_native/models/prepare-studio")
+    async def start_studio(request):
+        if not local.signed(request):
+            raise web.HTTPNotFound()
+        try:
+            data = await json_body(request)
+            body, loras = data["workflow"], data["loras"]
+            weights = studio_worker._validate_weights({"weight_files": data["weights"]})
+            references = [tuple(relative_path(item["target"]).split("/", 1)) for item in weights]
+            references.extend(("loras", relative_path(item["target"])) for item in loras)
+            if any(len(reference) != 2 for reference in references):
+                raise ModelError("创作模型需要明确的类别和文件路径")
+            cache_payload = {"drive_cache": data.get("drive_cache"), "lora_drive_cache": data.get("lora_drive_cache"),
+                             "use_drive_cache": data.get("use_drive_cache", True)}
+            paths = {}
+            ident, _ = local.submit(body, studio=(weights, loras, cache_payload, verify_studio_paths, paths, data["timeout"]))
+            await asyncio.sleep(0)
+            completed[ident] = (graph_key(body), (references, paths))
+            for old in completed.keys() - local.jobs.keys():
+                del completed[old]
+        except (ModelError, studio_worker.WorkerError, KeyError, TypeError) as exc:
             return web.json_response(model_problem(str(exc)), status=422)
         return web.json_response({"id": ident}, status=202)
 
@@ -760,10 +871,19 @@ def install(server, root, folder_paths, node_types):
                 return web.json_response(model_problem("原生会话已切换，请重新准备模型"), status=409)
             ident = request.headers.get("X-Studio-Model-Prepared", "") if signed else ""
             if ident:
-                if completed.get(ident) != graph_key(body) or (local.status(ident) or {}).get("state") != "ready":
+                key, studio = completed.get(ident, (None, None))
+                if key != graph_key(body) or (local.status(ident) or {}).get("state") != "ready":
                     return web.json_response(model_problem("模型准备记录已过期或与当前工作流不符，请重新提交"), status=409)
                 # One handoff authorizes one validation of the exact prepared prompt.
                 del completed[ident]
+                if studio is not None:
+                    references, paths = studio
+                    try:
+                        resolved = await asyncio.to_thread(verify_studio_paths, references, require_files=True)
+                        if resolved != paths:
+                            raise ModelError("原生 ComfyUI 的模型搜索路径在排队前发生变化")
+                    except (ModelError, studio_worker.WorkerError) as exc:
+                        return web.json_response(model_problem(str(exc)), status=422)
             else:
                 try:
                     _, task = local.submit(body, body.get("studio_model_dependencies", []) if signed else [])

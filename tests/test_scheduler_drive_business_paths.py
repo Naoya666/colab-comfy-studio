@@ -36,3 +36,30 @@ def test_scheduler_outputs_use_valid_drive_business_keys(monkeypatch, tmp_path):
     assert len(result["output_asset_ids"]) == 1
     assert len(result["persisted_outputs"]) == 2
     assert all(k.startswith("outputs/") for k in seen)
+
+
+def test_user_lora_authorization_uses_the_owner_upload_account(monkeypatch):
+    seen = []
+
+    class Storage:
+        def __init__(self, job, repo):
+            seen.append(job)
+            self.google = self
+
+        def access_token(self, purpose):
+            assert purpose == "drive"
+            return "lora-token"
+
+        def lora_folder(self):
+            return "owner-loras"
+
+        def close(self):
+            seen.append("closed")
+
+    monkeypatch.setattr("app.gpu.drive.DriveStorage", Storage)
+    scheduler = Scheduler(MemoryStore())
+    cache = {"folder_id": "other-models", "access_token": "other-token"}
+    job = {"owner_id": "owner", "drive_account_id": "other-account"}
+    assert scheduler._lora_cache(job, cache) == {"folder_id": "owner-loras", "access_token": "lora-token"}
+    assert seen == [{"owner_id": "owner"}, "closed"]
+    assert scheduler._lora_cache({"owner_id": "owner"}, cache) is cache

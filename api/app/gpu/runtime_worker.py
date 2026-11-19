@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import csv
+import errno
 import hashlib
 import importlib.metadata
 import io
@@ -18,6 +19,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import sysconfig
@@ -149,7 +151,7 @@ def _comfy_service_dir(instance_id: str) -> Path:
 
 
 @contextlib.contextmanager
-def _file_lock(path: Path):
+def _file_lock(path: Path, *, shared: bool = False):
     """Serialize worker-local service management without trusting a PID lock."""
     # Service management runs in the Linux runtime; coordinators also import
     # this module for the fixed worker protocol on Windows.
@@ -157,7 +159,7 @@ def _file_lock(path: Path):
 
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.open("a+") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         try:
             yield stream
         finally:
@@ -542,6 +544,67 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _check_local_tree(models: Path) -> None:
+    if models.resolve() != models.absolute():
+        raise WorkerError("创作模式的 ComfyUI 模型目录必须位于 Colab 本地且不能经过软链接")
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        info, fs = line.split(" - ", 1)
+        mount = Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), info.split()[4]))
+        kind = fs.split()[0]
+        if (mount.is_relative_to(models) or
+                (models.is_relative_to(mount) and (kind.startswith("fuse") or kind in {
+                    "nfs", "nfs4", "cifs", "smb3", "9p", "autofs", "davfs",
+                }))):
+            raise WorkerError("创作模式的模型目录不能位于挂载目录或包含其他挂载点")
+    if not models.exists():
+        return
+    if not models.is_dir():
+        raise WorkerError("创作模式的本地模型路径不是目录")
+
+    def inspection_failed(exc: OSError) -> None:
+        raise WorkerError("无法检查创作模式的本地模型路径") from exc
+
+    for parent, dirs, files in os.walk(models, onerror=inspection_failed):
+        if any((Path(parent) / name).is_symlink() for name in (*dirs, *files)):
+            raise WorkerError("创作模式的模型目录不能包含软链接")
+
+
+def _local_models(comfy: Path) -> Path:
+    """Validate the model tree independently of Drive-backed input/output directories."""
+    extra = comfy / "extra_model_paths.yaml"
+    if extra.exists() or extra.is_symlink():
+        raise WorkerError("创作模式需要默认本地模型目录，请检查 extra_model_paths.yaml")
+    models = comfy / "models"
+    _check_local_tree(models)
+    return models
+
+
+def _local_model_hit(path: Path, size: int | None, digest: str, *, md5: bool = False) -> bool:
+    if not path.is_file():
+        return False
+    before = path.stat()
+    if before.st_size <= 0 or (size is not None and before.st_size != size):
+        return False
+    actual = _hash_file(path)[1] if md5 else _sha256(path)
+    after = path.stat()
+    return actual == digest and (before.st_ino, before.st_ctime_ns) == (after.st_ino, after.st_ctime_ns)
+
+
+def _check_model_space(directory: Path, needed: int) -> None:
+    free = shutil.disk_usage(directory).free
+    if free < needed + 256 * 1024**2:
+        raise WorkerError(f"Colab 本地磁盘空间不足，模型下载需要 {needed} 字节及 256 MiB 预留，当前剩余 {free} 字节")
+
+
+def _model_download_error(exc: BaseException) -> str:
+    cause = exc
+    while cause is not None:
+        if isinstance(cause, OSError) and cause.errno == errno.ENOSPC:
+            return "Colab 本地磁盘空间不足"
+        cause = cause.__cause__
+    return _safe_error(exc)[:200]
+
+
 def run_cuda_smoke(root: Path) -> dict:
     """Run only real CUDA probes; a missing GPU is a hard failure."""
     try:
@@ -734,7 +797,8 @@ def _warm_fingerprint(commit: str, custom_nodes: list[dict], weights: list[dict]
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
-def _warm_take(root: Path, fingerprint: str, custom_nodes: list[dict], weights: list[dict]) -> bool:
+def _warm_take(root: Path, fingerprint: str, custom_nodes: list[dict], weights: list[dict],
+               *, user_loras: list[dict] | tuple = ()) -> bool:
     """Move the previous job's restored ComfyUI tree into this job's root when it is the same environment.
 
     The marker is dropped while the tree is in use, so a job that dies mid-run can never leave a
@@ -749,10 +813,9 @@ def _warm_take(root: Path, fingerprint: str, custom_nodes: list[dict], weights: 
     tree = warm / "ComfyUI"
     if not isinstance(state, dict) or state.get("fingerprint") != fingerprint or not tree.is_dir():
         return False
-    models = tree / "models"
+    models = _local_models(tree)
     for item in weights:
-        path = models / item["target"]
-        if not path.is_file() or (item.get("size") and path.stat().st_size != item["size"]):
+        if not _local_model_hit(models / item["target"], item.get("size"), item["sha256"]):
             return False
     for node in custom_nodes:
         if not (tree / "custom_nodes" / node["dir"]).is_dir():
@@ -760,8 +823,14 @@ def _warm_take(root: Path, fingerprint: str, custom_nodes: list[dict], weights: 
     marker.unlink(missing_ok=True)
     shutil.rmtree(root / "ComfyUI", ignore_errors=True)
     tree.rename(root / "ComfyUI")
-    # Per-job leftovers: reference images, previous outputs and the owner's own LoRAs.
-    for leftover in ("input", "output", "temp", "models/loras/user"):
+    # Only the LoRAs admitted for the new job may remain. Their bytes are checked on restore.
+    selected = {Path(item["target"]).name for item in user_loras}
+    loras = root / "ComfyUI" / "models" / "loras" / "user"
+    if loras.is_dir():
+        for file in loras.iterdir():
+            if file.name not in selected:
+                _remove(file)
+    for leftover in ("input", "output", "temp"):
         shutil.rmtree(root / "ComfyUI" / leftover, ignore_errors=True)
     return True
 
@@ -954,19 +1023,27 @@ class DriveCache:
 
     def fetch(self, entry: dict, destination: Path) -> None:
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name + ".part")
         digest = hashlib.md5(usedforsecurity=False)
+        size = int(entry["size"])
         written = 0
         url = f"{DRIVE_API}/files/{quote(entry['id'])}?alt=media"
-        with self._open("GET", url, timeout=300) as response, temporary.open("wb") as out:
-            for block in iter(lambda: response.read(8 * 1024 * 1024), b""):
-                out.write(block)
-                digest.update(block)
-                written += len(block)
-        if written != int(entry["size"]) or digest.hexdigest() != entry.get("md5Checksum"):
-            temporary.unlink(missing_ok=True)
-            raise WorkerError("drive cached file failed size/md5 check")
-        os.replace(temporary, destination)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".part", delete=False) as out:
+                temporary = Path(out.name)
+                with self._open("GET", url, timeout=300) as response:
+                    for block in iter(lambda: response.read(8 * 1024 * 1024), b""):
+                        written += len(block)
+                        if written > size:
+                            raise WorkerError("drive cached file exceeds expected size")
+                        out.write(block)
+                        digest.update(block)
+            if written != size or digest.hexdigest() != entry.get("md5Checksum"):
+                raise WorkerError("drive cached file failed size/md5 check")
+            os.replace(temporary, destination)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def store(self, target: str, source: Path, sha256: str, md5: str, size: int) -> None:
         parent, name = self._parent(target, create=True)
@@ -1036,9 +1113,16 @@ def _drive_cache(payload: dict, folder_key: str = "folder_id") -> DriveCache | N
     return DriveCache(config.get("access_token"), config.get(folder_key))
 
 
+def _lora_drive_cache(payload: dict) -> DriveCache | None:
+    return _drive_cache({"drive_cache": payload.get("lora_drive_cache", payload.get("drive_cache"))})
+
+
 def _check_loras(graph: dict, manifest: dict, user_files: list[dict]) -> None:
     """Fail before any download if every referenced LoRA is not in this job."""
-    have = {w.get("target", "").removeprefix("loras/") for w in manifest.get("weight_files") or []}
+    weights = manifest.get("weight_files", manifest.get("weights")) or []
+    have = {w["target"].removeprefix("loras/") for w in weights if str(w.get("target", "")).startswith("loras/")}
+    if {Path(f["target"]) for f in user_files} & {Path(target) for target in have}:
+        raise WorkerError("用户 LoRA 与工作流模型绑定在同一本地路径")
     have |= {f.get("target") for f in user_files}
     for node in graph.values():
         if isinstance(node, dict) and node.get("class_type") == "LoraLoaderModelOnly":
@@ -1047,37 +1131,93 @@ def _check_loras(graph: dict, manifest: dict, user_files: list[dict]) -> None:
                 raise WorkerError(f"LoRA 文件没有随任务下发：{name}")
 
 
-def _restore_user_loras(comfy: Path, files: list[dict], cache: DriveCache | None) -> None:
-    """The owner's own LoRAs from Drive (``loras/h3``) into models/loras/user/."""
-    if cache is None:
-        raise WorkerError("自定义 LoRA 需要 Drive 存储")
-    loras = (comfy / "models" / "loras").resolve()
+def _publish_model(source: Path, target: Path, *, preserve_existing: bool) -> None:
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if preserve_existing:
+        # A native session must keep its own existing weights, including concurrent imports.
+        try:
+            os.link(source, target)
+        except FileExistsError as exc:
+            raise WorkerError(f"原生 ComfyUI 本地模型路径已被占用：{target.name}") from exc
+    else:
+        os.replace(source, target)
+
+
+def _restore_user_loras(comfy: Path, files: list[dict], cache: DriveCache | None,
+                        *, preserve_existing: bool = False, paths: dict[str, Path] | None = None) -> list[dict]:
+    """Verify the job's Drive LoRAs before exposing them to ComfyUI."""
+    if not files:
+        return []
+    models = _local_models(comfy)
+    pending = {}
+    records = []
     for item in files:
-        target = (loras / item["target"]).resolve()
-        if loras not in target.parents or not target.name.endswith(".safetensors"):
-            raise WorkerError("LoRA target is invalid")
-        cache.fetch({"id": item["id"], "size": item["size"], "md5Checksum": item.get("md5Checksum")}, target)
+        relative = Path(item["target"])
+        md5 = item.get("md5Checksum")
+        size = item.get("size")
+        if (len(relative.parts) != 2 or relative.parts[0] != "user" or relative.suffix.lower() != ".safetensors"
+                or not DRIVE_ID.fullmatch(str(item.get("id", "")))
+                or type(size) is not int or size <= 0
+                or not isinstance(md5, str) or not re.fullmatch(r"[0-9a-f]{32}", md5)):
+            raise WorkerError("用户 LoRA 的路径或 Drive 文件身份无效")
+        model_name = "loras/" + item["target"]
+        target = paths[model_name] if paths is not None else models / model_name
+        if not target.is_relative_to(models):
+            raise WorkerError("用户 LoRA 路径不在本地模型目录")
+        if _local_model_hit(target, size, md5, md5=True):
+            records.append({"target": "loras/" + item["target"], "source": "local"})
+            continue
+        if preserve_existing and target.exists():
+            raise WorkerError(f"原生 ComfyUI 本地 LoRA 身份不匹配：{relative.name}")
+        if target in pending and pending[target] != item:
+            raise WorkerError("同一路径绑定了不同的用户 LoRA")
+        pending[target] = item
+    if not pending:
+        return records
+    if cache is None:
+        raise WorkerError("自定义 LoRA 需要 Drive 存储授权")
+    _check_model_space(comfy, sum(item["size"] for item in pending.values()))
+    with tempfile.TemporaryDirectory(prefix=".studio-loras-", dir=comfy) as scratch:
+        for target, item in pending.items():
+            started = time.time()
+            try:
+                source = Path(scratch) / target.name
+                cache.fetch(item, source)
+                _publish_model(source, target, preserve_existing=preserve_existing)
+                records.append({"target": "loras/" + item["target"], "source": "drive",
+                                "seconds": round(time.time() - started, 1)})
+            except Exception as exc:
+                raise WorkerError(f"用户 LoRA 恢复失败：{_model_download_error(exc)}") from exc
+    return records
 
 
 def _restore_weights(
-    comfy: Path, manifest: dict, timeout: float, cache: DriveCache | None, prep: bool
+    comfy: Path, manifest: dict, timeout: float, cache: DriveCache | None, prep: bool,
+    *, preserve_existing: bool = False, warm_models: Path | None = None, use_drive_cache: bool = True,
+    paths: dict[str, Path] | None = None,
 ) -> list[dict]:
-    """Bring every reviewed weight file in, four at a time."""
+    """Bring every reviewed weight file in, four at a time, on the destination filesystem."""
     checked = _validate_weights(manifest)
-    models = (comfy / "models").resolve()
+    models = _local_models(comfy)
+    destinations = {item["target"]: paths[item["target"]] if paths is not None else models / item["target"]
+                    for item in checked}
+    by_target = {}
+    for item in checked:
+        key = destinations[item["target"]]
+        if key == models or not key.is_relative_to(models) or (key in by_target and by_target[key] != item):
+            raise WorkerError("同一本地路径绑定了不同的模型，或模型路径无效")
+        by_target[key] = item
     models.mkdir(mode=0o700, parents=True, exist_ok=True)
     if prep and cache is not None:
-        for item in checked:
-            cache._parent(item["target"], create=True)  # noqa: SLF001
+        for item in by_target.values():
+            if item.get("source") != "drive":
+                cache._parent(item["target"], create=True)  # noqa: SLF001
 
     def drive_entry(item: dict) -> dict:
         if cache is None:
-            raise WorkerError("Drive weight import is unavailable: Drive cache is not configured")
-        try:
-            fields = urlencode({"fields": "id,size,md5Checksum,mimeType,trashed"})
-            entry = cache._json("GET", f"{DRIVE_API}/files/{quote(item['drive_file_id'])}?{fields}")  # noqa: SLF001
-        except Exception as exc:  # noqa: BLE001 - make Drive failures explicit and safe
-            raise WorkerError(f"Drive weight metadata unavailable: {_safe_error(exc)[:200]}") from exc
+            raise WorkerError("Drive 模型需要 Drive 存储授权")
+        fields = urlencode({"fields": "id,size,md5Checksum,mimeType,trashed"})
+        entry = cache._json("GET", f"{DRIVE_API}/files/{quote(item['drive_file_id'])}?{fields}")  # noqa: SLF001
         if (
             entry.get("id") != item["drive_file_id"]
             or entry.get("trashed") is not False
@@ -1089,104 +1229,96 @@ def _restore_weights(
             raise WorkerError("Drive weight metadata failed id/trashed/type/size/md5 checks")
         return entry
 
-    def verify_file(path: Path, item: dict) -> tuple[str, str, int]:
-        if not path.is_file():
-            raise WorkerError("Drive weight download produced no file")
-        sha256, md5 = _hash_file(path)
-        size = path.stat().st_size
-        if sha256 != item["sha256"] or size != item["size"]:
-            path.unlink(missing_ok=True)
-            raise WorkerError("Drive weight sha256 or size mismatch")
-        return sha256, md5, size
-
-    def restore(item: dict, scratch: Path) -> dict:
+    def local(item: dict) -> dict:
         started = time.time()
-        target = (models / item["target"]).resolve()
-        if models not in target.parents:
-            raise WorkerError("model target escaped Comfy models directory")
-        is_drive = item.get("source") == "drive"
+        target = destinations[item["target"]]
         record = {"target": item["target"], "sha256": item["sha256"]}
-        if is_drive:
-            record.update(source="drive", drive_file_id=item["drive_file_id"])
-        if not prep and target.is_file():
-            # Retained runtimes reuse only bytes matching the reviewed identity.
-            if (item.get("size") is None or target.stat().st_size == item["size"]) and _sha256(target) == item["sha256"]:
+        if item.get("source") == "drive":
+            record["drive_file_id"] = item["drive_file_id"]
+        if not prep:
+            if _local_model_hit(target, item["size"], item["sha256"]):
                 return {**record, "source": "local", "seconds": round(time.time() - started, 1)}
-            target.unlink(missing_ok=True)
-        required_space = item.get("size") or 0
-        if required_space and shutil.disk_usage(models).free < required_space + 256 * 1024 * 1024:
-            raise WorkerError("Colab 本地磁盘空间不足，无法恢复当前任务模型")
-        if cache is not None and not is_drive:
-            try:
-                entry = cache.lookup(item["target"], item["sha256"], item["size"])
-                if entry and not is_drive:
-                    if prep:
-                        return {**record, "source": "drive", "seconds": round(time.time() - started, 1)}
-                    cache.fetch(entry, target)
-                    return {**record, "source": "drive", "seconds": round(time.time() - started, 1)}
-                if entry and is_drive:
-                    cache.fetch(entry, target)
-                    verify_file(target, item)
-                    if prep:
-                        target.unlink(missing_ok=True)
-                    return {**record, "seconds": round(time.time() - started, 1)}
-            except Exception as exc:  # noqa: BLE001 - Drive sources never fall back to Hugging Face
-                if is_drive:
-                    raise WorkerError(f"Drive weight import failed: {_safe_error(exc)[:200]}") from exc
-                record["cache_error"] = _safe_error(exc)[:200]
-                target.unlink(missing_ok=True)
-        if is_drive:
-            entry = drive_entry(item)
-            try:
-                cache.fetch(entry, target)  # type: ignore[union-attr]
-                sha256, md5, size = verify_file(target, item)
+            if target.exists():
+                if preserve_existing or not target.is_file():
+                    raise WorkerError(f"本地模型路径已被占用或文件身份不匹配：{item['target']}")
+                target.unlink()
+            if warm_models is not None:
+                candidate = warm_models / item["target"]
+                if _local_model_hit(candidate, item["size"], item["sha256"]):
+                    _publish_model(candidate, target, preserve_existing=True)
+                    return {**record, "source": "local", "seconds": round(time.time() - started, 1)}
+        return record
+
+    def restore(item: dict, record: dict, scratch: Path) -> dict:
+        if record.get("source") == "local":
+            return record
+        started = time.time()
+        target = destinations[item["target"]]
+        scratch.mkdir()
+
+        def fetch(entry: dict, source: Path) -> None:
+            _check_model_space(scratch, int(entry["size"]))
+            cache.fetch(entry, source)
+            if not _local_model_hit(source, item["size"], item["sha256"]):
+                raise WorkerError("Drive weight sha256 or size mismatch")
+            if not prep:
+                _publish_model(source, target, preserve_existing=preserve_existing)
+
+        try:
+            if item.get("source") == "drive":
+                fetch(drive_entry(item), scratch / "drive")
+                record.update(source="drive")
                 if prep:
-                    # The library file already lives in Drive; never create a second cache copy.
-                    target.unlink(missing_ok=True)
-                    record["cache_stored"] = True
-                record["seconds"] = round(time.time() - started, 1)
-                return record
-            except WorkerError:
-                target.unlink(missing_ok=True)
-                raise
-            except Exception as exc:  # noqa: BLE001 - preserve explicit Drive failure
-                target.unlink(missing_ok=True)
-                raise WorkerError(f"Drive weight import failed: {_safe_error(exc)[:200]}") from exc
-        try:
-            from huggingface_hub import hf_hub_download
+                    record["cache_stored"] = True  # The library file is already in Drive.
+            else:
+                entry = None
+                if cache is not None and use_drive_cache:
+                    try:
+                        entry = cache.lookup(item["target"], item["sha256"], item["size"])
+                    except Exception as exc:  # Cache lookup is optional for pinned Hugging Face models.
+                        record["cache_error"] = _model_download_error(exc)
+                if entry:
+                    if not prep:
+                        fetch(entry, scratch / "drive")
+                    record.update(source="drive")
+                else:
+                    _check_model_space(scratch, item["size"] or 0)
+                    from huggingface_hub import hf_hub_download
+
+                    source = Path(hf_hub_download(
+                        item["repo_id"], item["filename"], revision=item["revision"], local_dir=str(scratch)
+                    ))
+                    if not source.is_file():
+                        raise WorkerError("reviewed model download produced no file")
+                    sha256, md5 = _hash_file(source)
+                    size = source.stat().st_size
+                    if not size or sha256 != item["sha256"] or (item["size"] is not None and size != item["size"]):
+                        raise WorkerError("downloaded model sha256 or size mismatch")
+                    record.update(source="huggingface")
+                    if prep and cache is not None:
+                        try:
+                            cache.store(item["target"], source, sha256, md5, size)
+                            record["cache_stored"] = True
+                        except Exception as exc:  # The prep report records an incomplete cache fill.
+                            record.update(cache_stored=False, cache_error=_model_download_error(exc))
+                    elif not prep:
+                        _publish_model(source, target, preserve_existing=preserve_existing)
         except Exception as exc:
-            raise WorkerError("Hugging Face client is unavailable") from exc
-        try:
-            source = Path(
-                hf_hub_download(
-                    item["repo_id"], item["filename"], revision=item["revision"], local_dir=str(scratch)
-                )
-            )
-        except Exception as exc:
-            raise WorkerError(f"reviewed model download failed: {_safe_error(exc)[:200]}") from exc
-        if not source.is_file():
-            raise WorkerError("reviewed model download produced no file")
-        sha256, md5 = _hash_file(source)
-        if sha256 != item["sha256"] or (item["size"] is not None and source.stat().st_size != item["size"]):
-            raise WorkerError("downloaded model sha256 mismatch")
-        record.update(source="huggingface")
-        if prep:
-            if cache is not None:
-                try:
-                    cache.store(item["target"], source, sha256, md5, source.stat().st_size)
-                    record["cache_stored"] = True
-                except Exception as exc:  # noqa: BLE001 - reported; the prep job is marked incomplete below
-                    record.update(cache_stored=False, cache_error=_safe_error(exc)[:200])
-            source.unlink(missing_ok=True)
-        else:
-            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            shutil.move(str(source), str(target))
+            raise WorkerError(f"模型 {item['target']} 恢复失败：{_model_download_error(exc)}") from exc
         record["seconds"] = round(time.time() - started, 1)
         return record
 
-    with tempfile.TemporaryDirectory(prefix="ai-studio-weight-") as scratch:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            return list(pool.map(lambda item: restore(item, Path(scratch)), checked))
+    items = list(by_target.values())
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        records = list(pool.map(local, items))
+        if not prep and any(not record.get("source") for record in records):
+            _check_model_space(models, sum(item["size"] or 0 for item, record in zip(items, records, strict=True)
+                                           if not record.get("source")))
+        with tempfile.TemporaryDirectory(prefix=".studio-weights-", dir=comfy) as scratch:
+            return list(pool.map(
+                lambda args: restore(args[1], args[2], Path(scratch) / str(args[0])),
+                ((index, item, record) for index, (item, record) in enumerate(zip(items, records, strict=True))),
+            ))
 
 
 def _http_json(url: str, method: str = "GET", body: dict | None = None, timeout: float = 30,
@@ -1249,42 +1381,28 @@ def _stream_output(response, target: Path, limit: int) -> int:
         partial.unlink(missing_ok=True)
 
 
-def _prepare_native_weights(api, native_dir, graph, weights, loras, deadline):
-    config = json.loads((native_dir / "local-model-config.json").read_text())
-    headers = {"X-Studio-Model-Channel": config["channel"]}
-    declared = []
-    for weight in weights:
-        category, _, name = weight["target"].partition("/")
-        item = {"category": category, "name": name, "sha256": weight["sha256"], "size": weight["size"]}
-        if weight.get("source") == "drive":
-            item["drive_file_id"] = weight["drive_file_id"]
-        else:
-            item["url"] = (f"https://huggingface.co/{weight['repo_id']}/resolve/{weight['revision']}/"
-                           + quote(weight["filename"], safe="/"))
-        declared.append(item)
-    for lora in loras:
-        declared.append({"category": "loras", "name": lora["target"], "drive_file_id": lora["id"],
-                         "size": lora["size"], "md5": lora.get("md5Checksum")})
-    endpoint = api + "/studio_native/models/prepare"
-    started = _http_json(endpoint, "POST", {"workflow": {"prompt": graph}, "dependencies": declared, "reviewed": True},
-                         extra_headers=headers)
+def _prepare_native_weights(api, native_dir, graph, weights, loras, payload, deadline, timeout):
+    try:
+        config = json.loads((native_dir / "local-model-config.json").read_text())
+        headers = {"X-Studio-Model-Channel": config["channel"]}
+        started = _http_json(api + "/studio_native/models/prepare-studio", "POST", {
+            "workflow": {"prompt": graph}, "weights": weights, "loras": loras,
+            "drive_cache": payload.get("drive_cache"),
+            "lora_drive_cache": payload.get("lora_drive_cache", payload.get("drive_cache")),
+            "use_drive_cache": payload.get("use_drive_cache", True),
+            "timeout": timeout,
+        }, extra_headers=headers)
+    except (OSError, ValueError, KeyError, WorkerError) as exc:
+        raise WorkerError("原生 ComfyUI 无法确认创作模式的本地模型准备能力，请重启原生本地会话或改用创作实例") from exc
     ident = started.get("id")
     if not isinstance(ident, str) or not re.fullmatch(r"[0-9a-f]{32}", ident):
         raise WorkerError("Native model preparation did not return a valid ID")
     while time.time() < deadline:
-        result = _http_json(endpoint + "/" + ident, extra_headers=headers)
+        result = _http_json(api + "/studio_native/models/prepare/" + ident, extra_headers=headers)
         if result.get("state") == "ready":
-            timings = []
-            hashes = {(item["category"], item["name"]): item.get("sha256") for item in declared}
-            for model in result["models"]:
-                category, name = model["category"], model["name"]
-                timings.append({"target": f"{category}/{name}", "source": model.get("source"),
-                                "seconds": model.get("seconds"), "sha256": hashes.get((category, name))})
-            return timings, {**headers, "X-Studio-Model-Prepared": ident}
+            return result["models"], {**headers, "X-Studio-Model-Prepared": ident}
         if result.get("state") == "failed":
-            errors = "; ".join(f"{item['category']}/{item['name']}: {item['error']}"
-                               for item in result["models"] if item["state"] == "failed")
-            raise WorkerError((result.get("message") or errors or "Native model preparation failed")[:1400])
+            raise WorkerError((result.get("message") or "Native Studio model preparation failed")[:1400])
         time.sleep(1)
     raise WorkerError("Native model preparation exceeded this Studio job's runtime limit")
 
@@ -1302,18 +1420,20 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
     native_marker = NATIVE_SERVICE_MARKER
     native_state = json.loads(native_marker.read_text()) if native_marker.is_file() else None
     shared_native = native_state is not None
-    shared_local = shared_native and native_state.get("model_storage_mode") == "local"
+    if shared_native and native_state.get("model_storage_mode") != "local":
+        raise WorkerError("创作模式需要 Colab 本地模型。当前原生 ComfyUI 使用 Drive 挂载，请改用兼容实例或停止原生会话后重试")
     if shared_native and native_state.get("commit") != commit:
         raise WorkerError("Studio workflow uses a different ComfyUI version; stop native session before switching versions")
     comfy = Path(native_state["comfy"]) if shared_native else root / "ComfyUI"
-    _check_loras(graph, manifest, (payload.get("snapshot") or {}).get("lora_files") or [])
+    user_loras = (payload.get("snapshot") or {}).get("lora_files") or []
+    _check_loras(graph, manifest, user_loras)
     timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
     nodes = _reviewed_custom_nodes(manifest.get("custom_nodes"))
     checked = _validate_weights(manifest)
     fingerprint = _warm_fingerprint(commit, nodes, checked)
     if shared_native:
+        _local_models(comfy)
         _verify_checkout(comfy, commit)
-        stages.start("restore_weights")
         # The shared process already loaded its nodes. Never install packages or restart it under queued native work.
         for node in nodes:
             folder = comfy / "custom_nodes" / node["dir"]
@@ -1321,31 +1441,40 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
             if actual != node["commit"]:
                 raise WorkerError("Native service custom node version differs from reviewed Studio workflow")
         env = {"source": "native_shared"}
-        weights = [] if shared_local else _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False)
-    elif _warm_take(root, fingerprint, nodes, checked):
+    elif _warm_take(root, fingerprint, nodes, checked, user_loras=user_loras):
         # Same runtime, same environment: the previous job left it restored. Nothing to download.
         stages.start("warm_reuse")
         env = {"source": "warm"}
         weights = [{"target": w["target"], "sha256": w["sha256"], "source": "warm", "seconds": 0.0} for w in checked]
     else:
         stages.start("restore_env")
-        env = _restore_env(root, commit, timeout, _drive_cache(payload, "runtime_folder_id"), build=False,
-                           custom_nodes=nodes)
+        env_cache = _drive_cache(payload, "runtime_folder_id") if payload.get("use_drive_cache", True) else None
+        env = _restore_env(root, commit, timeout, env_cache, build=False, custom_nodes=nodes)
         stages.start("restore_weights")
-        weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False)
+        parked = root.parent / ".warm" / "ComfyUI"
+        warm_models = _local_models(parked) if parked.is_dir() else None
+        weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False,
+                                   warm_models=warm_models, use_drive_cache=payload.get("use_drive_cache", True))
     try:
-        user_loras = (payload.get("snapshot") or {}).get("lora_files") or []
-        if user_loras and not shared_local:
+        if user_loras and not shared_native:
             stages.start("restore_loras")
-            _restore_user_loras(comfy, user_loras, _drive_cache(payload))
-        _write_input_files(comfy, payload.get("snapshot") or {})
+            _restore_user_loras(comfy, user_loras, _lora_drive_cache(payload))
+        if not shared_native:
+            _local_models(comfy)
+            _check_local_tree(comfy / "output")  # ComfyUI also registers model folders under its output directory.
+            _write_input_files(comfy, payload.get("snapshot") or {})
         stages.start("comfy_start")
         log_path = root / "comfy.log"
         log = log_path.open("ab", buffering=0)
         process = None
         try:
+            port = COMFY_SERVICE_PORT
+            if not shared_native:
+                with socket.socket() as listener:
+                    listener.bind((COMFY_SERVICE_HOST, 0))
+                    port = listener.getsockname()[1]
             process = None if shared_native else subprocess.Popen(
-                [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188"],
+                [sys.executable, "main.py", "--listen", COMFY_SERVICE_HOST, "--port", str(port)],
                 cwd=comfy,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -1353,7 +1482,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                 start_new_session=True,
             )
             deadline = time.time() + min(float(payload.get("max_runtime_minutes", 10)) * 60, 600 * 60)
-            api = "http://127.0.0.1:8188"
+            api = f"http://{COMFY_SERVICE_HOST}:{port}"
             while time.time() < deadline:
                 try:
                     _http_json(api + "/system_stats", timeout=5)
@@ -1364,13 +1493,25 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                     time.sleep(1)
             else:
                 raise WorkerError("Comfy worker startup timed out")
-            submit_args = {}
-            if shared_local:
-                stages.start("restore_weights")
-                weights, headers = _prepare_native_weights(api, native_marker.parent, graph, checked, user_loras, deadline)
-                submit_args["extra_headers"] = headers
-            stages.start("sampling")
-            queued = _http_json(api + "/prompt", "POST", {"prompt": graph}, timeout=30, **submit_args)
+            fence = (_file_lock(native_marker.parent / "models-active.lock", shared=True)
+                     if shared_native else contextlib.nullcontext())
+            with fence:
+                submit_args = {}
+                if shared_native:
+                    stages.start("restore_weights")
+                    weights, headers = _prepare_native_weights(
+                        api, native_marker.parent, graph, checked, user_loras, payload, deadline, timeout)
+                    submit_args["extra_headers"] = headers
+                    _write_input_files(comfy, payload.get("snapshot") or {})
+                if process is not None and process.poll() is not None:
+                    raise WorkerError("Comfy worker exited before queue submission")
+                stages.start("sampling")
+                try:
+                    queued = _http_json(api + "/prompt", "POST", {"prompt": graph}, timeout=30, **submit_args)
+                except WorkerError as exc:
+                    if shared_native:
+                        raise WorkerError("原生 ComfyUI 拒绝创作任务入队，请检查当前模型路径和工作流") from exc
+                    raise
             prompt_id = queued.get("prompt_id")
             if not isinstance(prompt_id, str) or not prompt_id:
                 raise WorkerError("Comfy queue did not return a prompt id")
@@ -1564,9 +1705,10 @@ def main(argv: list[str] | None = None) -> int:
             raise WorkerError("payload must be an object")
         root = Path(payload["execution_dir"]).resolve()
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if "drive_cache" in payload or "native_secrets" in payload:  # keep the Drive token out of files that outlive the worker's read
+        secret_fields = {"drive_cache", "lora_drive_cache", "native_secrets"}
+        if secret_fields & payload.keys():  # keep credentials out of files that outlive the worker's read
             payload_path.chmod(0o600)
-            _atomic_json(payload_path, {k: v for k, v in payload.items() if k not in {"drive_cache", "native_secrets"}})
+            _atomic_json(payload_path, {k: v for k, v in payload.items() if k not in secret_fields})
             payload_path.chmod(0o600)
         artifacts = _MCPManifestStore(root) if payload.get('output_transport') == 'mcp-chunks-v1' else None
         run_job(payload, root, artifact_store=artifacts)

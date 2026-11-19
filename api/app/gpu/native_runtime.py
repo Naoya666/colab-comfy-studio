@@ -552,6 +552,7 @@ def run(root, payload, stages):
                     raise RuntimeError("Remove the ComfyUI checkout extra_model_paths.yaml before starting local mode")
                 for module in ("native_models.py", "model_dependencies.py", "model_sources.py"):
                     shutil.copyfile(Path(__file__).with_name(module), ROOT / module)
+                shutil.copyfile(Path(__file__).with_name("runtime_worker.py"), ROOT / "runtime_worker.py")
                 _write_secret(local_config, json.dumps({"catalog": secret["catalog"], "channel": secret["model_channel"],
                                                         "drive_auth": secret["drive_auth"], "tokens": secret.get("source_tokens", {}),
                                                         "drive_account": secret["drive_account"],

@@ -396,3 +396,22 @@ def test_retained_instance_refreshes_idle_deadline_on_subsequent_job_completion(
     assert second_done["state"] == "retained_idle"
     assert second_done["idle_deadline_at"] == 2000.0 + 30 * 60
 
+
+
+def test_creation_prefers_compatible_instance_when_native_uses_drive_mount(repo):
+    account(repo, provider="colab", budget={"daily": 20.0, "monthly": 50.0})
+    repo.create("leases", "owner-1", {"native_model_storage": {"model_storage_mode": "drive_mount"}},
+                record_id="native-lease")
+    common = {"account_id": "acct-1", "provider": "colab", "state": "retained_idle",
+              "compatibility_signature": "compat-v1"}
+    repo.create("instances", "owner-1", common, record_id="studio-idle")
+    repo.create("instances", "owner-1", {**common, "native_comfy": True, "lease_id": "native-lease"},
+                record_id="native-idle")
+    service = InstanceService(repo, clock=lambda: 100.0,
+                              config={"unit_rate": 0.1, "daily_units": 20.0, "monthly_units": 50.0})
+    snapshot = {"manifest": {"weight_files": [{"target": "checkpoints/model.safetensors"}]}}
+    explicit = job(provider="colab", snapshot=snapshot, execution_policy={"provider": "colab", "instance_id": "native-idle"})
+    with pytest.raises(InstanceConflict, match="Drive 挂载"):
+        service.allocate(explicit)
+    chosen = service.allocate(job(provider="colab", snapshot=snapshot))
+    assert chosen["id"] == "studio-idle"

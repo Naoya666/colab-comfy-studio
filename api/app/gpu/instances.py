@@ -37,6 +37,10 @@ class InstanceConflict(InstanceServiceError):
     """The resource changed state or is owned by another active operation."""
 
 
+class StudioModelStorageConflict(InstanceConflict):
+    """A native Drive mount cannot supply locally loaded Studio weights."""
+
+
 class BudgetError(InstanceServiceError):
     """Allocation or retention has no safe, configured budget."""
 
@@ -363,6 +367,15 @@ class InstanceService:
         self._set(cursor, data, state="active", session=session)
         return selected
 
+    @staticmethod
+    def _studio_native_storage_conflict(job, lease):
+        snapshot = job.get("snapshot") or {}
+        manifest = snapshot.get("manifest") or {}
+        storage = lease.get("native_model_storage") or {}
+        return (not snapshot.get("native_comfy") and not snapshot.get("prep")
+                and bool(manifest.get("weight_files", manifest.get("weights")))
+                and storage.get("model_storage_mode") == "drive_mount")
+
     def _compatible(self, session, instance, job, account_id):
         data = self._data(instance)
         if self._value(data, "account_id") != account_id:
@@ -373,8 +386,10 @@ class InstanceService:
             from .native import restart_active
 
             lease = self._find(session, "leases", data["lease_id"], instance.owner_id)
-            if lease is not None and restart_active(self._data(lease)):
-                return False
+            if lease is not None:
+                lease_data = self._data(lease)
+                if restart_active(lease_data) or self._studio_native_storage_conflict(job, lease_data):
+                    return False
         if data.get("native_comfy") and data.get("hard_deadline_at") is not None and self.clock() >= float(data["hard_deadline_at"]):
             return False
         if data.get("current_job_id") is not None:
@@ -493,6 +508,10 @@ class InstanceService:
                     raise AllocationError("指定实例当前不可用")
                 if requested_account and data.get("account_id") != account_id:
                     raise AllocationError("指定实例与账号冲突")
+                if data.get("native_comfy") and data.get("lease_id"):
+                    lease = self._find(session, "leases", data["lease_id"], owner_id)
+                    if lease is not None and self._studio_native_storage_conflict(job, self._data(lease)):
+                        raise StudioModelStorageConflict("创作模式需要本地模型，指定原生实例使用 Drive 挂载，请改用兼容实例")
                 account = next((a for a in accounts if self._account_id(a) == data.get("account_id")), None)
                 if account is None or not self._compatible(session, instance, job, self._account_id(account)):
                     raise InstanceConflict("指定实例不兼容或已被占用")
@@ -516,8 +535,15 @@ class InstanceService:
                 units = self._reserve_budget(session, job, account, provider)
                 return self._claim_existing(session, instance, job, account, key, stable_id, "reuse_idle", units)
 
-            if provider == "colab" and any(self._data(r).get("native_comfy") and r.state != "deleted" for r in idle):
-                raise InstanceConflict("原生 ComfyUI 会话仍占用 GPU，请复用同一规格或先停止旧实例")
+            if provider == "colab":
+                for instance in idle:
+                    data = self._data(instance)
+                    if not data.get("native_comfy") or instance.state == "deleted":
+                        continue
+                    lease = self._find(session, "leases", data["lease_id"], owner_id) if data.get("lease_id") else None
+                    if lease is not None and self._studio_native_storage_conflict(job, self._data(lease)):
+                        raise StudioModelStorageConflict("创作模式需要本地模型，当前原生实例使用 Drive 挂载，请改用兼容实例")
+                    raise InstanceConflict("原生 ComfyUI 会话仍占用 GPU，请复用同一规格或先停止旧实例")
             account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
             units = self._reserve_budget(session, job, account, provider)
             return self._create_instance(session, job, account, key, stable_id, units, "requested_account" if requested_account else "round_robin")

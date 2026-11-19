@@ -359,3 +359,80 @@ async def test_url_only_verified_file_survives_comfy_process_restart(local, tmp_
     assert result["state"] == "ready" and result["cache_hit"]
     provenance = next((tmp_path / "model-transfers").glob("*.json"))
     assert EXTERNAL not in provenance.read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layout", ["local_alias", "mounted_extra", "mount_first", "changed_before_queue"])
+async def test_studio_prepare_checks_actual_native_loader_paths(local, monkeypatch, tmp_path, layout):
+    def response(data, status=200):
+        return SimpleNamespace(body=json.dumps(data).encode(), status=status, content_type="application/json")
+
+    def request(path, body, **headers):
+        async def read():
+            return body
+
+        return SimpleNamespace(method="POST", path=path, json=read,
+                               headers={"X-Studio-Model-Channel": "internal-channel", **headers})
+
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(web=SimpleNamespace(
+        middleware=lambda fn: fn, json_response=response,
+    )))
+    engine = SimpleNamespace(routes=Routes(), app=SimpleNamespace(middlewares=[]))
+    models = local(lambda _: pytest.fail("Studio local reuse must not access native sources"))
+    monkeypatch.setattr(native_models, "LocalModels", lambda *args, **kwargs: models)
+    (tmp_path / "local-model-config.json").write_text("{}")
+    model_dir = tmp_path / "models"
+    output = tmp_path / "drive" / "output"
+    alias = model_dir / "unet"
+    target = alias / PATH
+    target.parent.mkdir(parents=True)
+    target.write_bytes(DATA)
+    output_target = output / "diffusion_models" / PATH
+    output_target.parent.mkdir(parents=True)
+    output_target.write_bytes(b"mounted file")
+    paths = [str(alias), str(model_dir / "diffusion_models"), str(output_target.parents[1])]
+    if layout == "mounted_extra":
+        paths.append(str(tmp_path / "drive" / "extra"))
+    if layout == "mount_first":
+        paths.insert(0, paths.pop())
+    resolved = []
+
+    def get_full_path(category, name):
+        found = next((Path(root) / name for root in paths if (Path(root) / name).is_file()), None)
+        resolved.append(found)
+        return str(found) if found else None
+
+    folder_paths = SimpleNamespace(
+        models_dir=str(model_dir), folder_names_and_paths={"diffusion_models": (paths, {".safetensors"})},
+        filename_list_cache={}, add_model_folder_path=lambda *args, **kwargs: None,
+        get_output_directory=lambda: str(output), get_full_path=get_full_path,
+    )
+    native_models.install(engine, tmp_path, folder_paths, {})
+    prompt = {"prompt": {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": PATH}}}}
+    path = "/studio_native/models/prepare-studio"
+    weight = {"repo_id": "test/model", "filename": "base.safetensors", "revision": "a" * 40,
+              "sha256": SHA, "size": len(DATA), "target": "diffusion_models/" + PATH}
+    ready = await engine.routes["POST", path](request(path, {
+        "workflow": prompt, "weights": [weight], "loras": [], "timeout": 60,
+    }))
+    ident = json.loads(ready.body)["id"]
+    task, _ = models.jobs[ident]
+    if layout in {"mount_first", "mounted_extra"}:
+        with pytest.raises(model_sources.ModelError, match="搜索路径"):
+            await task
+        assert models.status(ident)["state"] == "failed" and not resolved
+        return
+    await task
+    assert models.status(ident)["models"][0]["source"] == "local"
+    assert not (model_dir / "diffusion_models" / PATH).exists()
+
+    async def queue(_):
+        assert layout == "local_alias"
+        return response({"prompt_id": "simulated"})
+
+    if layout == "changed_before_queue":
+        paths.insert(0, paths.pop())
+    middleware = engine.app.middlewares[0]
+    result = await middleware(request("/prompt", prompt, **{"X-Studio-Model-Prepared": ident}), queue)
+    assert result.status == (422 if layout == "changed_before_queue" else 200)
+    assert resolved and all(path == target for path in resolved)

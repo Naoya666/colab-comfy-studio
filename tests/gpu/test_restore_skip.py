@@ -3,6 +3,7 @@
 Bug: after a batch lease handoff the second job re-ran restore_env + restore_weights (~2 min on L4)
 because every job got a fresh /content/ai-studio/<execution> tree.
 """
+import hashlib
 import json
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from app.gpu.scheduler import Scheduler
 from tests.gpu.test_lease_handle_ownership import StrictMock
 
 COMMIT = "a" * 40
-SHA = "b" * 64
+SHA = hashlib.sha256(b"xxxx").hexdigest()
 
 
 def weights(size=4, sha=SHA, target="checkpoints/m.safetensors"):
@@ -26,7 +27,7 @@ def make_tree(root: Path, items):
     for item in items:
         path = root / "ComfyUI" / "models" / item["target"]
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"x" * item["size"])
+        path.write_bytes((b"x" if item["sha256"] == SHA else b"y") * item["size"])
 
 
 def test_fingerprint_changes_with_commit_nodes_and_weights():
@@ -47,13 +48,21 @@ def test_warm_roundtrip_reuses_same_fingerprint(tmp_path):
     make_tree(first, items)
     (first / "ComfyUI" / "input").mkdir()
     (first / "ComfyUI" / "input" / "ref.png").write_bytes(b"old")
+    loras = first / "ComfyUI/models/loras/user"
+    loras.mkdir(parents=True)
+    (loras / "selected.safetensors").write_bytes(b"user-lora")
+    (loras / "unselected.safetensors").write_bytes(b"unused")
+    selected = {"target": "user/selected.safetensors", "size": len(b"user-lora"), "id": "l" * 32,
+                "md5Checksum": hashlib.md5(b"user-lora", usedforsecurity=False).hexdigest()}
     fp = worker._warm_fingerprint(COMMIT, [], items)
     assert not worker._warm_take(second, fp, [], items)  # nothing parked yet
     worker._warm_put(first, fp)
     assert not (first / "ComfyUI").exists()
-    assert worker._warm_take(second, fp, [], items)
+    assert worker._warm_take(second, fp, [], items, user_loras=[selected])
     assert (second / "ComfyUI" / "models" / items[0]["target"]).is_file()
     assert not (second / "ComfyUI" / "input").exists()  # previous job's reference images are gone
+    assert worker._restore_user_loras(second / "ComfyUI", [selected], None)[0]["source"] == "local"
+    assert not (second / "ComfyUI/models/loras/user/unselected.safetensors").exists()
     # while a job holds the tree, the marker is gone: a third job restores normally
     third = tmp_path / "job3"
     third.mkdir()
@@ -69,8 +78,8 @@ def test_warm_not_reused_when_fingerprint_or_files_differ(tmp_path):
     worker._warm_put(one, fp)
     other = weights(sha="d" * 64)
     assert not worker._warm_take(two, worker._warm_fingerprint(COMMIT, [], other), [], other)
-    # a weight file that shrank or vanished is not trusted either
-    (tmp_path / ".warm" / "ComfyUI" / "models" / items[0]["target"]).write_bytes(b"x")
+    # Same filename and size still require the reviewed identity.
+    (tmp_path / ".warm" / "ComfyUI" / "models" / items[0]["target"]).write_bytes(b"yyyy")
     assert not worker._warm_take(two, fp, [], items)
 
 
@@ -125,10 +134,11 @@ def test_run_comfy_second_job_skips_restore_and_changed_workflow_restores(tmp_pa
     t2 = run("e2", items)  # same workflow on the same runtime
     assert "warm_reuse" in t2 and "restore_weights" not in t2 and "restore_env" not in t2
     assert calls == {"env": 1, "weights": 1}
-    t3 = run("e3", weights(sha="d" * 64))  # different weights
+    changed = weights(sha=hashlib.sha256(b"yyyy").hexdigest())
+    t3 = run("e3", changed)
     assert "restore_weights" in t3 and "warm_reuse" not in t3
     assert calls == {"env": 2, "weights": 2}
-    t4 = run("e4", weights(sha="d" * 64))
+    t4 = run("e4", changed)
     assert "warm_reuse" in t4
 
 

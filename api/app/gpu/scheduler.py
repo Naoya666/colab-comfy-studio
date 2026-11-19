@@ -22,6 +22,7 @@ from .compute import (
     default_provider_factory,
 )
 from .google import GoogleError
+from .instances import StudioModelStorageConflict
 from .manifest import digest
 from .mcp import MCPError
 from .newgpu.executor_plugins import TrustedExecutorAdapter
@@ -214,6 +215,8 @@ class Scheduler:
             return job
         try:
             instance = self._instance_call("allocate", self._instance_job(job))
+        except StudioModelStorageConflict as exc:
+            return self._begin_failure(job, "gpu_instance_allocation_failed", str(exc))
         except Exception as exc:
             return self._begin_failure(job, "gpu_instance_allocation_failed", self._safe_error(exc))
         if instance is None:
@@ -997,13 +1000,17 @@ class Scheduler:
             lease = self._update("leases", lease["id"], {"native_comfy": True}, job["owner_id"])
         try:
             # The Drive token is attached to an in-memory copy only; it is never persisted.
+            cache = self._model_cache(job)
             executor_job = {
                 **job,
-                "drive_cache": self._model_cache(job),
+                "drive_cache": cache,
+                "use_drive_cache": os.getenv("GPU_MODEL_CACHE", "drive").strip().lower() == "drive",
                 "deadline_epoch": job.get("deadline_epoch")
                 if job.get("deadline_epoch") is not None
                 else lease.get("deadline_epoch"),
             }
+            if self._provider_name(job) == "colab" and (job.get("snapshot") or {}).get("lora_files"):
+                executor_job["lora_drive_cache"] = self._lora_cache(job, cache)
             result = self._executor(job).start(
                 self._lease_handle(lease), executor_job, execution_id
             )
@@ -1024,12 +1031,15 @@ class Scheduler:
 
     def _model_cache(self, job: dict) -> dict | None:
         """Drive cache for reviewed model weights; None means download from Hugging Face."""
-        if os.getenv("GPU_MODEL_CACHE", "drive").strip().lower() != "drive":
-            return None
         if self._provider_name(job) != "colab":
             return None
-        manifest = (job.get("snapshot") or {}).get("manifest") or {}
-        if not manifest.get("weight_files"):
+        snapshot = job.get("snapshot") or {}
+        manifest = snapshot.get("manifest") or {}
+        weights = manifest.get("weight_files", manifest.get("weights")) or []
+        if not weights:
+            return None
+        if (os.getenv("GPU_MODEL_CACHE", "drive").strip().lower() != "drive"
+                and (snapshot.get("prep") or not any(item.get("source") == "drive" for item in weights))):
             return None
         try:
             from .drive import DriveStorage
@@ -1038,6 +1048,25 @@ class Scheduler:
         except Exception as exc:  # noqa: BLE001 - the cache is an optimisation, not a requirement
             logging.getLogger(__name__).warning("model cache unavailable: %s", self._safe_error(exc))
             return None
+
+    def _lora_cache(self, job: dict, model_cache: dict | None) -> dict | None:
+        """Use the same owner-scoped Drive identity used to admit uploaded LoRAs."""
+        from .accounts import AccountService
+        from .drive import DriveStorage
+
+        owner = job["owner_id"]
+        accounts = AccountService(self.store, owner)
+        model_account = accounts.resolve_drive_account_id(job.get("drive_account_id") or job.get("account_id"))
+        if model_cache is not None and model_account in {None, accounts.default_account_id(owner)}:
+            return model_cache
+        storage = DriveStorage({"owner_id": owner}, self.store)
+        try:
+            return {"folder_id": storage.lora_folder(), "access_token": storage.google.access_token("drive")}
+        except Exception as exc:
+            logging.getLogger(__name__).warning("LoRA Drive authorization unavailable: %s", self._safe_error(exc))
+            return None
+        finally:
+            storage.close()
 
     def _run(self, job: dict) -> dict:
         if float(job.get('poll_retry_at') or 0) > self.clock():
