@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -50,12 +51,15 @@ def _number(payload: Any, keys: tuple[str, ...], depth: int = 0) -> float | None
         if isinstance(value, bool):
             continue
         if isinstance(value, (int, float)):
-            return float(value)
+            if math.isfinite(value):
+                return float(value)
         if isinstance(value, str):
             try:
-                return float(value)
+                number = float(value)
             except ValueError:
                 continue
+            if math.isfinite(number):
+                return number
     for value in payload.values():
         if isinstance(value, dict):
             found = _number(value, keys, depth + 1)
@@ -219,17 +223,14 @@ def _detect(snapshots: dict[str, dict], previous: list[dict], now: float) -> lis
     return anomalies[:MAX_ANOMALIES]
 
 
-def tick_ccu(repo, owner_id: str, *, sampler=None, now: float | None = None) -> dict[str, Any]:
-    """Refresh per-account balance snapshots and idle-runtime anomalies."""
+def balance_snapshots(repo, owner_id: str, *, sampler=None) -> dict[str, dict]:
+    """Query enabled Colab accounts for this owner without writing worker state."""
     sample = sampler or maybe_sample_balance
-    moment = time.time() if now is None else now
-    state = read_state()
-    previous = state.get("anomalies") or []
     snapshots: dict[str, dict] = {}
 
     for account in repo.list("accounts", owner_id):
-        account_id = account.get("account_id")
-        if not account_id or account.get("enabled") is False:
+        account_id = account.get("account_id") or account.get("id")
+        if not account_id or account.get("enabled") is False or account.get("disabled") is True:
             continue
         if account.get("provider", "colab") != "colab":
             continue
@@ -240,12 +241,21 @@ def tick_ccu(repo, owner_id: str, *, sampler=None, now: float | None = None) -> 
             "rate": (sample_value or {}).get("rate"),
             "assignments": (sample_value or {}).get("assignments"),
             "sampled_at": (sample_value or {}).get("at"),
-            "active_jobs": active_job_count(repo, owner_id, account_id),
-            "active_leases": active_lease_count(repo, owner_id, account_id),
         }
         if sample_value is None:
             snapshot["error"] = "sample_failed"
         snapshots[account_id] = snapshot
+    return snapshots
+
+
+def tick_ccu(repo, owner_id: str, *, sampler=None, now: float | None = None) -> dict[str, Any]:
+    """Refresh per-account balance snapshots and idle-runtime anomalies."""
+    moment = time.time() if now is None else now
+    previous = read_state().get("anomalies") or []
+    snapshots = balance_snapshots(repo, owner_id, sampler=sampler)
+    for account_id, snapshot in snapshots.items():
+        snapshot["active_jobs"] = active_job_count(repo, owner_id, account_id)
+        snapshot["active_leases"] = active_lease_count(repo, owner_id, account_id)
 
     anomalies = _detect(snapshots, previous, moment)
     new_state = {"snapshots": snapshots, "anomalies": anomalies, "updated_at": moment}

@@ -81,6 +81,26 @@ def test_discovery_read_only_calls():
     assert paths == [("GET", "/v1beta/runtimespecs"), ("GET", "/v1beta/subscription")]
 
 
+def test_tunnel_subscription_distinguishes_zero_from_missing_balance(monkeypatch):
+    responses = iter([
+        httpx.Response(200, json={"currentBalance": 0}),
+        httpx.Response(200, json={}),
+        httpx.Response(404),
+    ])
+
+    def handler(request):
+        assert request.method == "GET"
+        assert request.url.path == "/tun/m/ccu-info"
+        return next(responses)
+
+    provider = make(handler)
+    monkeypatch.setattr(provider, "_is_cli_tunnel", lambda: True)
+    assert provider.subscription()["paidComputeUnitsBalance"] == 0
+    assert provider.subscription()["paidComputeUnitsBalance"] is None
+    with pytest.raises(ColabError):
+        provider.subscription()
+
+
 def test_create_matches_discovery_and_persists_operation():
     def handler(request):
         assert request.method == "POST" and request.url.path == "/v1beta/runtimes"

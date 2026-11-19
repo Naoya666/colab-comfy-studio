@@ -235,3 +235,44 @@ def test_usage_reports_measured_versus_estimated(tmp_path, monkeypatch):
     assert reconciliation["variance_units"] == pytest.approx(0.175 - 0.26)
     assert result["actual_units"] == pytest.approx(0.175)
     assert "ccu" in result and result["ccu"]["sampled_at"] == 5.0
+
+
+def test_manual_balance_queries_owner_accounts_and_preserves_zero(tmp_path, monkeypatch):
+    from app.common import current_user, get_store
+    from app.main import app
+    from fastapi.testclient import TestClient
+
+    repo = make_repo(tmp_path)
+    for account_id, owner_id, fields in [
+        ("zero", OWNER, {"allow_allocation": False}),
+        ("paid", OWNER, {}),
+        ("unavailable", OWNER, {}),
+        ("disabled", OWNER, {"enabled": False}),
+        ("mock", OWNER, {"provider": "mock"}),
+        ("other-owner", "other", {}),
+    ]:
+        repo.create("accounts", owner_id, {"account_id": account_id, **fields}, record_id=account_id)
+
+    monkeypatch.setattr(ccu, "sampling_enabled", lambda: True)
+
+    def sample(_repo, owner_id, account_id):
+        assert owner_id == OWNER
+        return {
+            "zero": {"balance": 0, "at": 10},
+            "paid": {"balance": 13.25, "at": 11},
+            "unavailable": None,
+        }[account_id]
+
+    monkeypatch.setattr(ccu, "sample_account_balance", sample)
+    monkeypatch.setitem(app.dependency_overrides, current_user, lambda: {"id": OWNER})
+    monkeypatch.setitem(app.dependency_overrides, get_store, lambda: repo.store)
+
+    response = TestClient(app).get("/api/gpu/compute/cu-balance")
+    assert response.status_code == 200
+    balances = response.json()["data"]
+    assert balances["total_balance"] == 13.25
+    assert set(balances["snapshots"]) == {"zero", "paid", "unavailable"}
+    assert balances["snapshots"]["zero"]["balance"] == 0
+    assert balances["snapshots"]["unavailable"]["balance"] is None
+    assert balances["snapshots"]["unavailable"]["error"] == "sample_failed"
+    assert not ccu._state_path().exists()

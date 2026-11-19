@@ -1,15 +1,55 @@
 import { useState } from 'react';
 import { Cpu, Layers, Monitor, Cloud, HardDrive, Leaf, Boxes, Sparkles, ChevronDown, Info, Square, Search } from 'lucide-react';
-import type { ComputeSpec, GpuSettings, GpuUsage } from '../lib/gpu-api';
+import { apiMessage, queryCcuBalance, type CcuBalance, type ComputeSpec, type GpuSettings, type GpuUsage } from '../lib/gpu-api';
 import { ComputeSpecs } from '../components/ComputeSpecs';
 import { InstanceCenter } from '../components/InstanceCenter';
 import type { GpuInstance } from '../components/AccountDirectory';
 import { Card } from '../components/ui';
 import { STRATEGIES } from '../lib/labels';
 import styles from '../gpu.module.css';
-import { cuNumber, shown } from '../lib/ui-helpers';
+import { cuNumber, formatDateTime, shown } from '../lib/ui-helpers';
 
 const STRATEGY_ICON = { save: Leaf, batch: Boxes, smart: Sparkles } as const;
+
+function CcuBalanceQuery() {
+  const [result, setResult] = useState<CcuBalance | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const accounts = Object.entries(result?.snapshots || {});
+  const partial = accounts.some(([, snapshot]) => snapshot.balance == null);
+
+  async function query() {
+    setLoading(true);
+    setResult(null);
+    setError('');
+    try {
+      setResult(await queryCcuBalance());
+    } catch (e) {
+      setError(apiMessage(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return <div className={styles.inlinePanel}>
+    <div className="actions">
+      <button type="button" className="button secondary small" disabled={loading} onClick={() => void query()}>
+        <Search size={15} strokeWidth={1.8} aria-hidden />{loading ? '查询中…' : '查询剩余 CU'}
+      </button>
+    </div>
+    {error && <p className="status error" role="alert">{error}</p>}
+    {result && <div className={styles.stack} role="status">
+      {!accounts.length && <p className="muted small">暂无启用的 Colab 账号。可在设置中添加并授权。</p>}
+      {result.total_balance != null && <p>
+        {partial ? '已查到的余额合计' : 'Colab 剩余 CU 合计'} <strong>{cuNumber(result.total_balance)} CU</strong>
+      </p>}
+      {accounts.map(([id, snapshot]) => <p key={id} className="small">
+        <strong>{snapshot.alias || id}</strong> · {snapshot.balance == null ? '暂时无法读取余额' : `${cuNumber(snapshot.balance)} CU`}
+        {snapshot.sampled_at != null && <span className="muted"> · {formatDateTime(snapshot.sampled_at * 1000)}</span>}
+      </p>)}
+    </div>}
+  </div>;
+}
 
 export function ComputePage({
   settings, usage, instances = [], onStop, onCheck, onContinue, onOpenWorkbench, onRefreshInstances, loadingStop, loadingCheck, specs = [], specsNote = '', error = '',
@@ -60,7 +100,7 @@ export function ComputePage({
           <div className={styles.statBox}><small className="muted">每日上限</small><strong>{shown(limit)}<em> CU</em></strong></div>
           <div className={styles.statBox}><small className="muted">在线机器</small><strong>{activeCount}</strong></div>
         </div>
-        <p className="muted small">这里的数字是站内按用时估算的，不是 Google 账单。实际余额以 Colab 官网为准。</p>
+        <CcuBalanceQuery />
       </Card>
 
       <Card icon={<HardDrive size={17} strokeWidth={1.6} aria-hidden />} title="扣费对账（Google 实测）">

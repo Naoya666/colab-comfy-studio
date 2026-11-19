@@ -215,11 +215,14 @@ class GoogleColabProvider:
 
     def subscription(self):
         if self._is_cli_tunnel():
-            info = self._tunnel_json(self._tunnel_request("GET", "/tun/m/ccu-info"))
+            response = self._tunnel_request("GET", "/tun/m/ccu-info")
+            if response.status_code != 200:
+                raise ColabError("Colab 隧道余额查询不可用")
+            info = self._tunnel_json(response)
             return {
                 "name": "subscription",
                 "tier": "SUBSCRIPTION_TIER_PRO" if float(info.get("currentBalance") or 0) > 0 else "SUBSCRIPTION_TIER_NONE",
-                "paidComputeUnitsBalance": info.get("currentBalance", 0),
+                "paidComputeUnitsBalance": info.get("currentBalance"),
                 "consumptionRateHourly": info.get("consumptionRateHourly", 0),
                 "assignmentsCount": info.get("assignmentsCount", 0),
                 "eligibleGpus": info.get("eligibleGpus", []),

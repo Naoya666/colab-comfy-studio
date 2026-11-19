@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, Request
 
 from .common import APIError, admin, current_user, get_store, ok
+from .gpu import ccu
 from .gpu.colab import GoogleColabProvider
 from .gpu.compute import GpuConfig
 from .gpu.google import GoogleService
@@ -10,6 +11,14 @@ from .gpu.manifest import digest
 from .gpu.repository import Repository
 
 router = APIRouter(prefix="/api/gpu")
+
+
+@router.get("/compute/cu-balance")
+def cu_balance(request: Request, user=Depends(current_user), st=Depends(get_store)):
+    if not ccu.sampling_enabled():
+        raise APIError("CCU_SAMPLING_DISABLED", "当前环境未启用 Colab CU 余额查询", 409)
+    snapshots = ccu.balance_snapshots(Repository(st), user["id"])
+    return ok({**ccu.summarize(snapshots), "snapshots": snapshots}, request)
 
 
 def _require_account(repo, owner_id: str, account_id: str | None, *, require_allocation: bool = True) -> dict | None:

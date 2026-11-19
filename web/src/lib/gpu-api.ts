@@ -86,6 +86,10 @@ export interface GpuJob {
 export interface GpuEvent { id?: string; state?: string; event_type?: string; message?: string; progress?: number; created_at?: string; payload?: Record<string, unknown>; [key: string]: unknown; }
 export interface GalleryAsset { id: string; project_id: string; mime: string; filename?: string; thumbnail_url?: string; download_url?: string; favorite?: boolean; gpu_job_id?: string; source_job_id?: string; mock?: boolean; metadata?: Record<string, unknown>; [key: string]: unknown; }
 export interface CcuSnapshot { alias?: string | null; balance?: number | null; rate?: number | null; assignments?: number | null; active_jobs?: number | null; active_leases?: number | null; sampled_at?: number | null; error?: string; }
+export interface CcuBalance {
+  total_balance: number | null;
+  snapshots: Record<string, CcuSnapshot>;
+}
 export interface CcuAnomaly { account_id: string; alias?: string | null; assignments?: number | null; first_seen?: number | null; last_seen?: number | null; resolved_at?: number | null; }
 export interface UsageReconciliationRow { job_id?: string; state?: string | null; estimated_units?: number | null; actual_units?: number | null; ccu_attribution?: string | null; ccu_source?: string | null; }
 export interface GpuUsage {
@@ -252,6 +256,7 @@ export const cancelGpuJob = (id: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${en
 export const retryGpuJob = (id: string, idempotencyKey: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify({}) });
 export const getGpuGallery = (projectId: string) => apiFetch<GalleryAsset[]>(`/api/gpu/gallery?project_id=${encodeURIComponent(projectId)}`);
 export const getGpuUsage = () => apiFetch<GpuUsage>('/api/gpu/usage');
+export const queryCcuBalance = () => apiFetch<CcuBalance>('/api/gpu/compute/cu-balance', { cache: 'no-store' }, 60000);
 export const getGpuSettings = () => apiFetch<GpuSettings>('/api/gpu/settings');
 export const getGpuComputeSpecs = (provider: Provider, accountId?: string | null) => {
   const query = `provider=${encodeURIComponent(provider)}`;

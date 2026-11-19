@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useId, useState } from 'react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
 import { bytesLabel, libraryApi, modelStatus, uploadModel, type Catalog, type LibraryModel, type ModelTask } from '../lib/model-library';
 import styles from '../gpu.module.css';
@@ -37,13 +37,13 @@ export function ModelLibraryPage() {
   const [url, setUrl] = useState('');
   const [name, setName] = useState('');
   const [relativePath, setRelativePath] = useState('');
-  const [externalSource, setExternalSource] = useState('');
   const [type, setType] = useState('checkpoints');
   const [architecture, setArchitecture] = useState('unknown');
   const [expected, setExpected] = useState('');
   const [driveId, setDriveId] = useState('');
   const [choices, setChoices] = useState<Record<string, unknown>[]>([]);
-  const [detail, setDetail] = useState<(LibraryModel & {references?: {workflow_id:string}[]}) | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const detailPanelId = useId();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState('');
@@ -101,16 +101,60 @@ export function ModelLibraryPage() {
         <button className="button secondary small" onClick={() => void action(() => libraryApi(`/tasks/${task.id}/cancel`, {}))}>取消准备</button>
       </div>}
       {m.error && <p className="status error">{m.error}</p>}
-      <div className="actions"><button className="button secondary small" onClick={() => void action(async () => {
-        const model = await libraryApi<LibraryModel & { references?: { workflow_id: string }[] }>('/' + m.id);
-        setDetail(model); setExternalSource(model.external_source?.url || '');
-      })}>详情与引用</button>
+      <div className="actions"><button className="button secondary small" aria-expanded={detailId === m.id}
+        aria-controls={detailId === m.id ? detailPanelId : undefined}
+        onClick={() => setDetailId(detailId === m.id ? null : m.id)}>详情与引用</button>
         <button disabled={busy} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/prepare`, {action:'prepare'}))}>准备 / 重试</button>
         <button disabled={busy || !m.drive_file_id} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/prepare`, {action:'verify'}))}>重新校验</button>
         <button disabled={busy || !m.drive_file_id} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/check`, {}))}>检查 Drive 文件</button>
       </div>
+      {detailId === m.id && <ModelDetail modelId={m.id} panelId={detailPanelId} refresh={refresh}
+        onClose={() => setDetailId(current => current === m.id ? null : current)} onProgress={setProgress} />}
     </article>;})}
-    {detail && <section className={styles.card} aria-label="模型详情"><h3>{detail.display_name}</h3><p>SHA-256：{detail.sha256 || '未计算'}</p><p>来源：{detail.source} · 版本：{detail.version_name || '未知'}</p><p>预期 SHA-256：{detail.expected_sha256 || '未提供；计算 Hash 不代表来源可信'}</p><p>触发词：{detail.trigger_words?.join(', ') || '无'}</p><p>引用工作流：{detail.references?.length || 0}</p>{detail.references?.map(r => <p key={r.workflow_id}>{r.workflow_id}</p>)}
+  </div>;
+}
+
+type LibraryModelDetail = LibraryModel & {references?: {workflow_id: string}[]};
+
+function ModelDetail({modelId, panelId, refresh, onClose, onProgress}: {
+  modelId: string;
+  panelId: string;
+  refresh: () => Promise<void>;
+  onClose: () => void;
+  onProgress: (message: string) => void;
+}) {
+  const [detail, setDetail] = useState<LibraryModelDetail | null>(null);
+  const [externalSource, setExternalSource] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void libraryApi<LibraryModelDetail>('/' + modelId).then(model => {
+      if (!active) return;
+      setDetail(model);
+      setExternalSource(model.external_source?.url || '');
+    }).catch(e => { if (active) setError(apiMessage(e)); });
+    return () => { active = false; };
+  }, [modelId]);
+
+  async function action(fn: () => Promise<unknown>) {
+    setBusy(true);
+    setError('');
+    try {
+      await fn();
+      await refresh();
+    } catch (e) {
+      setError(apiMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <section id={panelId} className={styles.inlinePanel} aria-label="模型详情">
+    {error && <p className="status error" role="alert">{error}</p>}
+    {!detail && !error && <p role="status">正在加载模型详情…</p>}
+    {detail && <><h3>{detail.display_name}</h3><p>SHA-256：{detail.sha256 || '未计算'}</p><p>来源：{detail.source} · 版本：{detail.version_name || '未知'}</p><p>预期 SHA-256：{detail.expected_sha256 || '未提供；计算 Hash 不代表来源可信'}</p><p>触发词：{detail.trigger_words?.join(', ') || '无'}</p><p>引用工作流：{detail.references?.length || 0}</p>{detail.references?.map(r => <p key={r.workflow_id}>{r.workflow_id}</p>)}
       <label>外部来源链接<input type="url" value={externalSource} onChange={e => setExternalSource(e.target.value)} /></label>
       <p className="muted small">可填写无凭据的 HTTPS 来源链接，凭据在「模型下载源凭据」中配置。留空并保存可移除绑定。</p>
       <button className="button secondary small" disabled={busy} onClick={() => void action(async () => {
@@ -120,16 +164,17 @@ export function ModelLibraryPage() {
       <label>显示名称<input value={detail.display_name} onChange={e => setDetail({...detail, display_name:e.target.value})} /></label>
       <label>架构<input value={detail.architecture} onChange={e => setDetail({...detail, architecture:e.target.value})} /></label>
       <label>标签（逗号分隔）<input value={detail.tags?.join(', ') || ''} onChange={e => setDetail({...detail, tags:e.target.value.split(',').map(s => s.trim())})} /></label>
-      <div className="actions"><button className="button small" onClick={() => void action(() => libraryApi('/' + detail.id, {display_name:detail.display_name, architecture:detail.architecture, tags:detail.tags}, 'PATCH'))}>保存信息</button>
-      <button className="button danger small" onClick={() => {if(window.confirm(`移除模型索引？引用工作流 ${detail.references?.length || 0} 个，相关依赖将失效。`)) void action(async () => {await libraryApi(`/${detail.id}?confirm_references=true`, undefined, 'DELETE'); setDetail(null);});}}>移除索引</button>
-      <button className="button danger small" onClick={() => {if(window.confirm(`将 Drive 物理文件移至回收站并移除索引？引用工作流 ${detail.references?.length || 0} 个。`)) void action(async () => {await libraryApi(`/${detail.id}?confirm_references=true&delete_file=true`, undefined, 'DELETE'); setDetail(null);});}}>删除 Drive 文件</button>
-      <button className="button secondary small" disabled={detail.state !== 'ready'} onClick={() => {
+      <div className="actions"><button className="button small" disabled={busy} onClick={() => void action(() => libraryApi('/' + detail.id, {display_name:detail.display_name, architecture:detail.architecture, tags:detail.tags}, 'PATCH'))}>保存信息</button>
+      <button className="button danger small" disabled={busy} onClick={() => {if(window.confirm(`移除模型索引？引用工作流 ${detail.references?.length || 0} 个，相关依赖将失效。`)) void action(async () => {await libraryApi(`/${detail.id}?confirm_references=true`, undefined, 'DELETE'); onClose();});}}>移除索引</button>
+      <button className="button danger small" disabled={busy} onClick={() => {if(window.confirm(`将 Drive 物理文件移至回收站并移除索引？引用工作流 ${detail.references?.length || 0} 个。`)) void action(async () => {await libraryApi(`/${detail.id}?confirm_references=true&delete_file=true`, undefined, 'DELETE'); onClose();});}}>删除 Drive 文件</button>
+      <button className="button secondary small" disabled={busy || detail.state !== 'ready'} onClick={() => {
         const key=window.prompt('登记到工作流审核流程：请输入唯一模型标识（字母、数字、短横线）'); if(!key) return;
         const license=window.prompt('请输入模型的实际许可证名称；登记后仍需人工接受许可和真实运行验证'); if(!license) return;
         const vram=window.prompt('请输入该模型实际需要的显存 GB（用于人工审核，不自动推断）'); if(!vram || !Number.isFinite(Number(vram)) || Number(vram) <= 0) return;
-        void action(async () => {await libraryApi(`/${detail.id}/workflow-model`, {model_key:key, license, resource_profile:{vram_gb:Number(vram)}}); setProgress('已登记为未启用模型，请在工作流配置中关联该标识并完成审核与真实 GPU 验证');});
+        void action(async () => {await libraryApi(`/${detail.id}/workflow-model`, {model_key:key, license, resource_profile:{vram_gb:Number(vram)}}); onProgress('已登记为未启用模型，请在工作流配置中关联该标识并完成审核与真实 GPU 验证');});
       }}>登记为工作流模型</button>
-      <button className="button secondary small" onClick={() => setDetail(null)}>关闭详情</button></div>
-    </section>}
-  </div>;
+      </div>
+    </>}
+    <div className="actions"><button className="button secondary small" disabled={busy} onClick={onClose}>关闭详情</button></div>
+  </section>;
 }
