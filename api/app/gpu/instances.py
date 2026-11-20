@@ -392,6 +392,10 @@ class InstanceService:
                     return False
         if data.get("native_comfy") and data.get("hard_deadline_at") is not None and self.clock() >= float(data["hard_deadline_at"]):
             return False
+        if not data.get("native_comfy") and instance.state == "retained_idle":
+            deadlines = [data[key] for key in ("idle_deadline_at", "hard_deadline_at") if data.get(key) is not None]
+            if deadlines and self.clock() >= min(map(float, deadlines)):
+                return False
         if data.get("current_job_id") is not None:
             return False
         if instance.state not in self._IDLE_STATES:
@@ -590,14 +594,16 @@ class InstanceService:
             if data.get("current_job_id") not in {None, job.get("id")}:
                 raise InstanceConflict("instance is owned by another job")
             policy = self._job_policy(job)
-            # The instance override is authoritative: a later job payload must
-            # not turn an explicitly retained instance back into a release.
-            mode = data.get("retention_mode") or job.get("lifecycle") or policy.get("lifecycle") or "save"
-            if data.get("native_comfy") and not data.get("manual_stop_requested"):
+            mode = policy.get("lifecycle") or job.get("lifecycle") or data.get("retention_mode") or "save"
+            if data.get("manual_stop_requested"):
+                mode = "save"
+            elif data.get("native_comfy"):
                 mode = "retain"
             hard = data.get("hard_deadline_at")
             retain = (success or data.get("native_comfy")) and mode in {"retain", "smart"} and not data.get("manual_stop_requested") and (hard is None or self.clock() < float(hard))
             data.update(current_job_id=None, last_seen_at=self.clock(), retention_mode=mode)
+            if not data.get("native_comfy"):
+                data.update(idle_deadline_at=None, retention_reserved=0.0)
             state = "retained_idle" if retain else "releasing"
             if retain:
                 minutes = (
@@ -719,10 +725,15 @@ class InstanceService:
                 deadline = self.clock() + minutes * 60
                 data["idle_deadline_at"] = min(deadline, float(hard)) if hard is not None else deadline
                 data["retention_mode"] = mode
-                # Retention is an explicit lifecycle transition.  The
-                # scheduler may still finish the current job afterwards, but
-                # the durable instance policy is already retained_idle.
                 state = "retained_idle"
+                if not data.get("native_comfy") and not data.get("current_job_id") and data.get("lease_id"):
+                    lease = self._find(session, "leases", data["lease_id"], owner)
+                    if lease is not None and lease.state == "idle":
+                        lease_data = self._data(lease)
+                        if lease_data.get("instance_id") != id or lease_data.get("current_job_id"):
+                            raise InstanceConflict("GPU 租约已发生变更")
+                        lease_data["idle_deadline_at"] = data["idle_deadline_at"]
+                        self._set(lease, lease_data, session=session)
             else:
                 data.update(retention_mode="save", idle_deadline_at=None, retention_reserved=0.0)
                 state = "releasing" if data.get("current_job_id") is None else instance.state

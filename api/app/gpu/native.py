@@ -371,7 +371,7 @@ def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None, smar
     if smart:
         # Refresh before sending so a pending watchdog tick observes policy
         # changes, stop requests, or a handoff that followed its snapshot.
-        with repo.store.dispatch_lock() as acquired:
+        with repo.store.admission_lock() as acquired:
             if not acquired:
                 return None
             fresh = repo.get("leases", lease["id"], lease["owner_id"])
@@ -437,7 +437,8 @@ def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None, smar
     if not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
         return result
     commit_now = float(clock())
-    with repo.store.dispatch_lock() as acquired:
+    lock = repo.store.admission_lock if smart else repo.store.dispatch_lock
+    with lock() as acquired:
         if not acquired:
             return result
         fresh = repo.get("leases", lease["id"], lease["owner_id"])

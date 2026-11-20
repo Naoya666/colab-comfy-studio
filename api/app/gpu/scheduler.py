@@ -186,7 +186,7 @@ class Scheduler:
 
     def _lifecycle(self, job: dict) -> str:
         policy = job.get("execution_policy") or {}
-        lifecycle = policy.get("lifecycle") or policy.get("mode")
+        lifecycle = policy.get("lifecycle") or job.get("lifecycle") or policy.get("mode")
         if lifecycle in {"save", "batch", "smart", "retain"}:
             return lifecycle
         if policy.get("retention") in {True, "retain"} or job.get("retention_requested"):
@@ -306,7 +306,12 @@ class Scheduler:
             instance = self._instance_call("complete", self._instance_job(job), success=success)
         except Exception as exc:
             raise SchedulerError(f"instance completion failed: {self._safe_error(exc)}") from exc
-        if isinstance(instance, dict) and instance.get("state") == "retained_idle":
+        if (
+            isinstance(instance, dict)
+            and instance.get("state") == "retained_idle"
+            and not instance.get("native_comfy")
+            and self._lifecycle(job) == "smart"
+        ):
             policy = job.get("execution_policy") or {}
             idle_seconds = policy.get("idle_seconds") if policy.get("mode") == "smart" else None
             if idle_seconds is not None:
@@ -1516,13 +1521,18 @@ class Scheduler:
                     error_message=job.get("error_message") or str(exc),
                 )
             if isinstance(instance, dict) and instance.get("state") == "retained_idle":
-                if lease:
-                    lease_patch = {"state": "idle", "current_job_id": None, "last_seen": self.clock()}
-                    if instance.get("idle_deadline_at") is not None:
-                        lease_patch["idle_deadline_at"] = instance["idle_deadline_at"]
-                    if instance.get("hard_deadline_at") is not None:
-                        lease_patch["deadline_epoch"] = instance["hard_deadline_at"]
-                    self._update("leases", lease["id"], lease_patch, job.get("owner_id"))
+                with self.db_store.admission_lock() as acquired:
+                    if not acquired:
+                        return job
+                    instance = self._service_instance_for_job(job)
+                    if lease and instance and instance.get("state") == "retained_idle":
+                        lease_patch = {"state": "idle", "current_job_id": None, "last_seen": self.clock()}
+                        if instance.get("idle_deadline_at") is not None:
+                            lease_patch["idle_deadline_at"] = instance["idle_deadline_at"]
+                        if instance.get("hard_deadline_at") is not None:
+                            lease_patch["deadline_epoch"] = instance["hard_deadline_at"]
+                        self._update("leases", lease["id"], lease_patch, job.get("owner_id"))
+            if isinstance(instance, dict) and instance.get("state") == "retained_idle":
                 if job.get("execution_id"):
                     self._update(
                         "executions",
@@ -1809,11 +1819,17 @@ class Scheduler:
 
         token = uuid.uuid4().hex
         durable_instance = self._get("instances", instance_id, owner_id) if instance_id else None
-        # Retained-idle cleanup is a normal lease-expiry path, not an orphan
-        # claim.  claim_orphan_lease deliberately rejects retained_idle so a
-        # concurrent allocation cannot be mistaken for an orphan.
-        use_claim = durable_instance is not None and lease.get("state") != "idle"
-        claimed = self.store.claim_orphan_lease(owner_id, lease["id"], instance_id, token, self.clock()) if use_claim else None
+        idle_cleanup = bool(
+            lease.get("state") == "idle"
+            and not lease.get("native_comfy")
+            and not lease.get("native_ready")
+            and durable_instance
+            and durable_instance.get("lease_id") == lease["id"]
+        )
+        use_claim = durable_instance is not None and (lease.get("state") != "idle" or idle_cleanup)
+        claimed = self.store.claim_orphan_lease(
+            owner_id, lease["id"], instance_id, token, self.clock(), idle_cleanup=idle_cleanup,
+        ) if use_claim else None
         if use_claim and not claimed:
             return False
         if claimed:
@@ -2128,9 +2144,7 @@ class Scheduler:
                     and instance.get("retention_mode") == "smart"
                     and associated
                     and associated.get("state") == "completed"
-                    and (
-                        associated.get("lifecycle") or (associated.get("execution_policy") or {}).get("lifecycle")
-                    ) == "smart"
+                    and self._lifecycle(associated) == "smart"
                 ):
                     from .native import keepalive_lease
 

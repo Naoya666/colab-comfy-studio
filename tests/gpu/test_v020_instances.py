@@ -326,13 +326,15 @@ def test_public_and_events_never_expose_handles_or_tokens(repo):
     assert all("token" not in str(event).lower() for event in service.events("owner-1", instance["id"]))
 
 
-def test_instance_retention_override_is_authoritative_and_deletion_requires_confirmation(repo):
+def test_completed_job_policy_takes_precedence_and_deletion_requires_confirmation(repo):
     service = InstanceService(repo, clock=lambda: 100.0, config={"max_idle_minutes": 30})
     instance = service.allocate(job(lifecycle="save"))
     retained = service.retention("owner-1", instance["id"], "retain", 10, "keep-key")
     assert retained["retention_mode"] == "retain"
     completed = service.complete(job(lifecycle="save"))
-    assert completed["state"] == "retained_idle"
+    assert completed["state"] == "releasing"
+    assert completed["retention_mode"] == "save"
+    assert completed["idle_deadline_at"] is None
 
     service.stop("owner-1", instance["id"], "stop-key")
     with pytest.raises(InstanceConflict):

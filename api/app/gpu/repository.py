@@ -753,8 +753,8 @@ class Repository:
         except (TypeError, ValueError):
             return True
 
-    def claim_orphan_lease(self, owner_id, lease_id, instance_id, token, now):
-        """Atomically fence an orphan lease and its instance before provider I/O.
+    def claim_orphan_lease(self, owner_id, lease_id, instance_id, token, now, *, idle_cleanup=False):
+        """Fence a lease and its instance before orphan or idle cleanup.
 
         Admission is intentionally used here instead of dispatch: allocation and
         lease binding take the same short admission lock, while the provider call
@@ -801,7 +801,23 @@ class Repository:
                         or lease_account_json != instance_account_json):
                     return None
                 current_job = instance_data.get('current_job_id') or instance.current_job_id
-                if current_job or instance.state in {'allocating', 'ready', 'busy', 'retained_idle', 'deleted', 'unknown'}:
+                if current_job or instance.state in {'allocating', 'ready', 'busy', 'deleted', 'unknown'}:
+                    return None
+                if idle_cleanup:
+                    if (
+                        lease.state != 'idle'
+                        or instance.state not in {'retained_idle', 'releasing', 'cleanup_pending'}
+                        or instance_data.get('lease_id') != lease_id
+                        or lease_data.get('current_job_id')
+                        or (
+                            instance.state == 'retained_idle'
+                            and not instance_data.get('manual_stop_requested')
+                            and now < min(float(lease_data.get('idle_deadline_at') or 0),
+                                          float(lease_data.get('deadline_epoch') or 0))
+                        )
+                    ):
+                        return None
+                elif instance.state == 'retained_idle' or lease.state == 'idle':
                     return None
                 if instance_data.get('cleanup_claim_token') not in {None, token} and self._claim_is_live(instance_data, now):
                     return None
