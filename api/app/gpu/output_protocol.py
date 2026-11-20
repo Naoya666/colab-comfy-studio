@@ -14,7 +14,13 @@ def verify_output(job, item):
     if not isinstance(item, dict) or (item.get("storage") or {}).get("provider") not in {"local", "mock"}:
         raise ArtifactError("unsupported output manifest storage")
     store = LocalArtifactStore(settings.data_dir / "assets" / "artifacts")
-    return store.verify_manifest(item, job["owner_id"], job["execution_id"])
+    verified, path = store.verify_manifest(item, job["owner_id"], job["execution_id"])
+    if (job.get("snapshot") or {}).get("creation_api"):
+        node, category = item.get("comfy_node"), item.get("comfy_category")
+        if node not in job["snapshot"]["bound_graph"] or category not in {"images", "gifs", "videos"}:
+            raise ArtifactError("invalid ComfyUI output node or category")
+        verified.update(comfy_node=node, comfy_category=category)
+    return verified, path
 
 
 def commit_output(db, job, item, metadata, storage=None):

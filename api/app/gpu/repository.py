@@ -1204,7 +1204,7 @@ class Repository:
             if data.get('provider',(data.get('execution_policy') or {}).get('provider','mock'))!='mock':
                 raise ValueError('same-job retry is currently Mock only')
             snapshot=data.get('snapshot') or {}
-            if data.get('prep') or any(snapshot.get(k) or data.get(k) for k in ('system_smoke','workflow_smoke','prep')) or (data.get('request_body') or {}).get('kind'):
+            if data.get('prep') or any(snapshot.get(k) or data.get(k) for k in ('system_smoke','workflow_smoke','prep','creation_warmup')) or (data.get('request_body') or {}).get('kind'):
                 raise ValueError('special job requires its confirmation entry')
             leases=session.scalars(select(GpuLeaseRow).where(GpuLeaseRow.owner_id==owner_id)).all()
             if any(row.data.get('owner_job_id')==job_id and row.state!='deleted' for row in leases):

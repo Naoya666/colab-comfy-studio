@@ -28,6 +28,8 @@ from .common import APIError, admin, current_user, envelope, get_store, ok, own
 from .compute_routes import _require_account
 from .compute_routes import router as compute_router
 from .config import settings
+from .creation_api import CreationHostMiddleware
+from .creation_api import admin_router as creation_api_router
 from .db import Store
 from .gpu import loras as lora_registry
 from .gpu.compute import GpuConfig, MockColabProvider
@@ -643,7 +645,7 @@ def retry_job(job_id: str, request: Request, user=Depends(current_user), st=Depe
     if not key:
         raise APIError("IDEMPOTENCY_REQUIRED", "再次生成需提供新的幂等键")
     raw=copy.deepcopy(original.get('request_body') or {})
-    if raw.get('kind') or any((original.get('snapshot') or {}).get(flag) or original.get(flag) for flag in ('system_smoke','workflow_smoke','prep')):
+    if raw.get('kind') or any((original.get('snapshot') or {}).get(flag) or original.get(flag) for flag in ('system_smoke','workflow_smoke','prep','creation_warmup')):
         raise APIError('SPECIAL_JOB_RETRY_REQUIRED','诊断或预热任务需回到对应入口重新确认',409)
     if original.get('resolved_seed') is not None:
         raw.setdefault('params',{})['seed']=original['resolved_seed']
@@ -945,6 +947,8 @@ if os.getenv("STUDIO_ATELIER_ENABLED", "0").strip().lower() in {"1", "true"}:
 app.include_router(account_router)
 app.include_router(instance_router)
 app.include_router(native_router)
+app.include_router(creation_api_router)
+app.add_middleware(CreationHostMiddleware, studio_app=app)
 app.add_middleware(NativeHostMiddleware, studio_app=app)
 app.include_router(history_router)
 app.include_router(compute_router)

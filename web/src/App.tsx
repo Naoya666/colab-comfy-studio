@@ -1,3 +1,4 @@
+import { CreationApiPage } from "./pages/CreationApiPage";
 import { ModelRunOverrides, type ModelOverride } from './components/ModelDependencies';
 import { NativeComfyPage } from './pages/NativeComfyPage';
 import { ModelLibraryPage } from './pages/ModelLibraryPage';
@@ -226,6 +227,18 @@ export default function App() {
   const desktop = useDesktopLayout();
   const [loggedIn, setLoggedIn] = useState(isLoggedIn());
   const [tab, setTab] = useState<Tab>('创作');
+  const [creationApiOpen, setCreationApiOpen] = useState(false);
+  const [adminRole, setAdminRole] = useState(false);
+  useEffect(() => {
+    let current = true;
+    setAdminRole(false);
+    if (loggedIn) {
+      apiFetch<{ role: string }>('/api/me').then(user => {
+        if (current) setAdminRole(user.role === 'admin');
+      }).catch(() => {});
+    }
+    return () => { current = false; };
+  }, [loggedIn]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState('');
   const [showProjectSheet, setShowProjectSheet] = useState(false);
@@ -1033,6 +1046,9 @@ export default function App() {
         {tab === '创作' && (
           <section className={styles.createWorkspace} aria-label="创作工作区">
             <h1 className={styles.desktopTitle}>创作</h1>
+            {adminRole && <button type="button" className="button ghost" aria-expanded={creationApiOpen}
+              onClick={() => setCreationApiOpen(open => !open)}>{creationApiOpen ? '返回创作' : 'API 设置'}</button>}
+            {adminRole && creationApiOpen ? <CreationApiPage accounts={accounts} /> :
             <div className={styles.createColumns}>
               <CreatePanel
                 desktop={desktop}
@@ -1077,7 +1093,7 @@ export default function App() {
               </CreatePanel>
               {desktop && projectId && <CreateResults key={projectId} jobs={previewJobs} count={currentSubmission?.ids.length || previewJobs.length}
                 gallery={projectGallery} error={galleryError} onOpen={setViewer} onJobs={() => navigate('任务')} />}
-            </div>
+            </div>}
           </section>
         )}
 

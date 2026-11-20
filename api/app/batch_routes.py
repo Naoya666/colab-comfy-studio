@@ -70,8 +70,6 @@ def build_batch_router(JobInput, admit_job, public_job):
                 raise APIError("REAL_GPU_DISABLED", "真实 GPU 未启用，不能提交真实批次", 403)
             if len(providers) > 1:
                 raise APIError("POLICY_INVALID", "同批次不能混用 Mock 与真实 Provider", 422)
-            if lifecycle in {"smart", "retain"} and os.getenv("GPU_REAL_RETENTION_VERIFIED") != "1" and os.getenv("GPU_REAL_RETENTION_TEST_ENABLED") != "1":
-                raise APIError("REAL_LIFECYCLE_UNVERIFIED", "真实 GPU 的智能/保留生命周期尚未完成真机验证", 503)
         repo = Repository(st)
         raw_request=body.model_dump()
         prior=next((batch for batch in repo.list('batches',user['id']) if batch.get('request_key')==key),None)

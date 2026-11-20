@@ -48,7 +48,7 @@ def _batch_client(tmp_path):
         return JSONResponse({"error": {"code": exc.code}}, status_code=exc.status)
 
     app.add_exception_handler(APIError, api_error)
-    app.include_router(build_batch_router(JobInput, lambda *a, **k: {}, lambda j: j), prefix="/api/gpu")
+    app.include_router(build_batch_router(JobInput, lambda _st, _user, job, _key, **_options: job, lambda j: j), prefix="/api/gpu")
     app.dependency_overrides[get_store] = lambda: Store(f"sqlite:///{tmp_path / 'b.sqlite'}")
     app.dependency_overrides[current_user] = lambda: {"id": "u1", "role": "user"}
     return TestClient(app)
@@ -60,13 +60,16 @@ def _body(mode):
     return {"jobs": [job], "mode": mode}
 
 
-def test_real_batch_blocked_when_offline_or_wrong_mode(monkeypatch, tmp_path):
+def test_real_batch_blocks_offline_and_admits_retention_modes_when_enabled(monkeypatch, tmp_path):
     c = _batch_client(tmp_path)
     monkeypatch.setenv("STUDIO_OFFLINE_TEST", "1")
     r = c.post("/api/gpu/batches", json=_body("batch"), headers={"Idempotency-Key": "k"})
     assert r.status_code == 403
     monkeypatch.delenv("STUDIO_OFFLINE_TEST")
     monkeypatch.setenv("GPU_REAL_ENABLED", "1")
-    r = c.post("/api/gpu/batches", json=_body("smart"), headers={"Idempotency-Key": "k"})
-    assert r.status_code == 503
-    assert r.json()['error']['code'] == 'REAL_LIFECYCLE_UNVERIFIED'
+    for lifecycle in ("smart", "retain"):
+        response = c.post("/api/gpu/batches", json=_body(lifecycle), headers={"Idempotency-Key": lifecycle})
+        assert response.status_code == 202, response.text
+        batch_id = response.json()["data"]["id"]
+        status = c.get(f"/api/gpu/batches/{batch_id}").json()["data"]
+        assert status["jobs"][0]["execution_policy"]["lifecycle"] == lifecycle

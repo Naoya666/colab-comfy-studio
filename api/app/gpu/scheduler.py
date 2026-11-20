@@ -22,7 +22,7 @@ from .compute import (
     default_provider_factory,
 )
 from .google import GoogleError
-from .instances import StudioModelStorageConflict
+from .instances import CreationInstancePending, StudioModelStorageConflict
 from .manifest import digest
 from .mcp import MCPError
 from .newgpu.executor_plugins import TrustedExecutorAdapter
@@ -52,6 +52,7 @@ _STAGE_TEXT = {
     "native_tunnel": "建立原生 ComfyUI 代理连接",
     "restore_env": "正在恢复运行环境",
     "restore_weights": "正在恢复模型文件",
+    "creation_warming": "加载模型并运行内部预热",
     "warm_reuse": "同一台机器已有模型，直接复用",
     "comfy_start": "正在启动 ComfyUI",
     "sampling": "采样中",
@@ -211,10 +212,16 @@ class Scheduler:
         return self.instance_service is not None and not job.get("legacy_scheduler_only")
 
     def _allocate_instance(self, job: dict) -> dict:
-        if not self._is_v020_job(job) or job.get("instance_id"):
+        if not self._is_v020_job(job):
+            return job
+        if job.get("instance_id"):
+            if job.get("creation_fingerprint") and not self._lease(job):
+                return self._reuse_instance_lease(job, self._service_instance_for_job(job))
             return job
         try:
             instance = self._instance_call("allocate", self._instance_job(job))
+        except CreationInstancePending:
+            return job
         except StudioModelStorageConflict as exc:
             return self._begin_failure(job, "gpu_instance_allocation_failed", str(exc))
         except Exception as exc:
@@ -550,7 +557,7 @@ class Scheduler:
         try:
             runtime = self._effective_runtime(job)
             provider = self._provider(job)
-            if self._provider_name(job) != "mock" and job.get("requested_spec"):
+            if self._provider_name(job) != "mock" and job.get("requested_spec") and not job.get("creation_fingerprint"):
                 try:
                     self._select_spec(job, provider)
                 except ProviderUnavailable as exc:
@@ -593,6 +600,7 @@ class Scheduler:
         if (
             self._provider_name(job) != "colab"
             or snapshot.get("prep")
+            or snapshot.get("creation_api")
             or snapshot.get("system_smoke")
             or not sha
             or not (snapshot.get("manifest") or {}).get("weight_files")
@@ -655,7 +663,8 @@ class Scheduler:
         now = self.clock()
         deadline = job.get("deadline_epoch")
         if deadline is None:
-            deadline = now + self._effective_runtime(job) * 60
+            minutes = self.config.max_runtime_minutes if job.get("creation_fingerprint") else self._effective_runtime(job)
+            deadline = now + minutes * 60
         payload = {
             "owner_job_id": job["id"],
             "provider": self._provider_name(job),
@@ -959,7 +968,8 @@ class Scheduler:
     def _expired(self, job: dict) -> bool:
         lease = self._lease(job)
         deadline = job.get("deadline_epoch") or (lease or {}).get("deadline_epoch")
-        return deadline is not None and self.clock() > float(deadline)
+        return any(value is not None and self.clock() > float(value)
+                   for value in (deadline, job.get("task_deadline_epoch")))
 
     def _prepare(self, job: dict) -> dict:
         lease = self._lease(job)
@@ -977,9 +987,20 @@ class Scheduler:
         if status.get("ready"):
             reported = status.get("runtime_spec")
             if reported and job.get("requested_spec"):
-                if self._spec_key({"key": reported.get("key", reported)}) != self._spec_key(job["requested_spec"]):
+                reused = (job.get("creation_fingerprint")
+                          and job.get("selection_reason") in {"reuse_idle", "requested_instance"})
+                if reused:
+                    from .specs import check_requirements
+
+                    try:
+                        check_requirements(job["snapshot"]["manifest"], reported)
+                    except ValueError as exc:
+                        return self._begin_failure(job, "gpu_spec_mismatch", str(exc))
+                elif self._spec_key({"key": reported.get("key", reported)}) != self._spec_key(job["requested_spec"]):
                     return self._begin_failure(job, "gpu_spec_mismatch", "实际分配规格与请求不匹配，已停止执行并释放实例")
                 job = self._update("jobs", job["id"], {"runtime_spec_reported": reported}, job.get("owner_id"))
+                if job.get("creation_fingerprint"):
+                    self._update("instances", job["instance_id"], {"runtime_spec_reported": reported}, job["owner_id"])
                 self._event(job, "preparing", "实际分配规格：" + str(reported), None)
             job = self._mark_instance("mark_ready", job)
             return self._set_state(job, "loading", "GPU runtime is ready")
@@ -1001,6 +1022,8 @@ class Scheduler:
             # The lease is owned by this job (see _lease), so cleaning it up here is safe.
             return self._begin_failure(job, "gpu_execution_prepare_failed", f"Execution registration refused: {exc}")
         execution_id = job["execution_id"]
+        if job.get("creation_fingerprint"):
+            self._update("instances", job["instance_id"], {"creation_runtime": None}, job["owner_id"])
         if (job.get("snapshot") or {}).get("native_comfy"):
             lease = self._update("leases", lease["id"], {"native_comfy": True}, job["owner_id"])
         try:
@@ -1099,11 +1122,28 @@ class Scheduler:
             job = self._set_state(job, 'running', 'GPU connection recovered', poll_retry_count=0, poll_retry_at=0)
         if result.get('execution_id') not in {None,job.get('execution_id')}:
             return self._begin_failure(job,'gpu_execution_id_mismatch','poll execution identity mismatch')
-        if result.get("gpu_diagnostics") and not job.get("gpu_reported"):
+        if result.get("gpu_diagnostics") and (not job.get("gpu_reported")
+                or (job.get("creation_fingerprint") and not job.get("gpu_diagnostics"))):
             job = self.store.record_gpu_diagnostics(job, result["gpu_diagnostics"]) or job
         state = result.get("state")
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else None
         if state == "completed":
+            if job.get("creation_fingerprint"):
+                runtime = result.get("creation_runtime") or {}
+                if (runtime.get("instance_id") != job.get("instance_id")
+                        or not runtime.get("process") or not runtime.get("environment")
+                        or runtime.get("workflow_sha256") != job["snapshot"].get("workflow_sha256")):
+                    return self._begin_failure(job, "creation_runtime_missing", "ComfyUI 未返回有效的进程与环境记录")
+                runtime = {**runtime, "lease_id": lease["id"], "fingerprint": job["creation_fingerprint"],
+                           "devices": (job.get("gpu_diagnostics") or {}).get("devices", []),
+                           "health_checked_at": self.clock()}
+                self._update("instances", job["instance_id"], {"creation_runtime": runtime}, job["owner_id"])
+                job = self._update("jobs", job["id"], {"creation_runtime": runtime}, job["owner_id"])
+                if job.get("warmup"):
+                    if runtime.get("warmup_completed") is not True:
+                        return self._begin_failure(job, "creation_warmup_incomplete", "预热图未完成")
+                    return self._set_state(job, "cleaning_up", "模型预热图已完成",
+                                           worker_timings=timings or {}, cleanup_final_state="completed")
             if (job.get("snapshot") or {}).get("native_comfy"):
                 from app.config import settings
 
@@ -1263,7 +1303,8 @@ class Scheduler:
             for index, output in enumerate(outputs):
                 if 'storage' in output:
                     from .output_protocol import commit_output
-                    assets.append(commit_output(self.db_store,job,output,result_metadata,storage=storage))
+                    metadata = {**result_metadata, **{k: output[k] for k in ("comfy_node", "comfy_category") if k in output}}
+                    assets.append(commit_output(self.db_store, job, output, metadata, storage=storage))
                     continue
                 content = output.get("content", b"")
                 if output.get("content_encoding") == "base64":
@@ -1689,6 +1730,9 @@ class Scheduler:
                 job = self._reuse_instance_lease(allocated, allocated)
                 if not job.get("instance_id"):
                     return job
+                if job.get("creation_fingerprint") and job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
+                    if not self._lease(job):
+                        return self._begin_failure(job, "creation_lease_unavailable", "实例租约已不可复用，请重试")
             elif job.get('compatibility_signature'):
                 with self.db_store.dispatch_lock() as acquired:
                     if not acquired:
@@ -1699,7 +1743,9 @@ class Scheduler:
                             break
             if not self._is_v020_job(job) and self._has_capacity_blocker(job):
                 return job
-            return self._set_state(job, "allocating", "GPU capacity available", awaiting_prep=False)
+            task_deadline = ({"task_deadline_epoch": self.clock() + self._effective_runtime(job) * 60}
+                             if job.get("creation_fingerprint") else {})
+            return self._set_state(job, "allocating", "GPU capacity available", awaiting_prep=False, **task_deadline)
         if state == "allocating":
             return self._allocation(job)
         if state == "preparing":
@@ -2082,6 +2128,29 @@ class Scheduler:
             recovered += 1
         return recovered
 
+    def _probe_creation_process(self, job, instance, lease):
+        runtime = instance.get("creation_runtime") or {}
+        if (runtime.get("lease_id") != lease["id"]
+                or self.clock() - float(runtime.get("health_checked_at") or 0) < 45):
+            return
+        try:
+            executor = self._executor(job)
+            probe = getattr(executor, "creation_process_health", None)
+            healthy = probe(self._lease_handle(lease), job, runtime) if probe else None
+        except Exception:
+            return  # A temporary coordinator connection error is not proof of a dead process.
+        if healthy is None:
+            return
+        with self.db_store.admission_lock() as acquired:
+            if not acquired:
+                return
+            latest = self._get("instances", instance["id"], instance["owner_id"])
+            if (latest and latest["state"] == "retained_idle" and latest.get("creation_runtime") == runtime
+                    and latest.get("lease_id") == lease["id"]):
+                self._update("instances", instance["id"], {
+                    "creation_runtime": {**runtime, "health_checked_at": self.clock()} if healthy else None,
+                }, instance["owner_id"])
+
     def watchdog(self) -> dict:
         """Independent process entrypoint for timeout, orphan, and cleanup compensation."""
         with self.db_store.dispatch_lock() as acquired:
@@ -2137,6 +2206,8 @@ class Scheduler:
             stopping = bool(instance and (instance.get("manual_stop_requested") or instance.get("state") in {"releasing", "cleanup_pending"}))
             if lease.get('state')=='idle' and not stopping and self.clock()<min(
                     float(lease.get('idle_deadline_at') or 0),float(lease.get('deadline_epoch') or 0)):
+                if instance and instance.get("creation_runtime") and associated and associated.get("creation_fingerprint"):
+                    self._probe_creation_process(associated, instance, lease)
                 if (
                     lease.get("provider") == "colab"
                     and not lease.get("native_ready")

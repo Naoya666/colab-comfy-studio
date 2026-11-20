@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 100 * 1024 * 1024
     allowed_hosts: list[str] = []
     studio_api_token: str = ""
+    creation_comfy_url: str = ""
     native_comfy_url: str = ""
     native_comfy_backend_url: str = ""
     native_comfy_idle_minutes: int = Field(default=120, ge=1)

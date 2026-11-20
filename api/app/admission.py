@@ -1,6 +1,5 @@
 """Job admission domain service: validate, freeze inputs, estimate and persist."""
 import copy
-import os
 
 from .common import APIError, own
 from .gpu import loras as lora_registry
@@ -111,13 +110,15 @@ def _resolve_drive_account_id(repo, owner_id, account_id):
     return AccountService(repo, owner_id).resolve_drive_account_id(account_id)
 
 
-def admit_job(st, user, body, key, *, validate_only=False):
+def admit_job(st, user, body, key, *, validate_only=False, creation=None, before_create=None):
     repo, registry = repo_registry(st, user)
     if not key or len(key) > 200:
         raise APIError("IDEMPOTENCY_REQUIRED", "必须提供 Idempotency-Key，重试必须沿用原值")
     existing = next((j for j in repo.list("jobs", user["id"]) if j.get("idempotency_key") == key), None)
     if existing:
-        if existing.get("body_hash") != digest(body):
+        same = (existing.get("creation_body_hash") == creation["creation_body_hash"]
+                if creation and creation.get("creation_key_id") else existing.get("body_hash") == digest(body))
+        if not same:
             raise APIError("IDEMPOTENCY_CONFLICT", "相同幂等键不能用于不同参数", 409)
         return existing
     project = own(st, "projects", body["project_id"], user)
@@ -127,9 +128,6 @@ def admit_job(st, user, body, key, *, validate_only=False):
         raise APIError("PROVIDER_INVALID", "仅允许已配置的 mock 或 colab Provider")
     if policy["provider"] == "colab" and not cfg.real_enabled:
         raise APIError("REAL_GPU_DISABLED", "真实 GPU 默认关闭：请先配置 OAuth、费率预算并完成模型审查")
-    if policy["provider"] == "colab" and policy["lifecycle"] in {"smart", "retain"}:
-        if os.getenv("GPU_REAL_RETENTION_VERIFIED") != "1" and os.getenv("GPU_REAL_RETENTION_TEST_ENABLED") != "1":
-            raise APIError("REAL_LIFECYCLE_UNVERIFIED", "真实 GPU 的智能/保留生命周期尚未完成真机验证", 503)
     workflow = registry.get_workflow(user["id"], body["workflow_key"], body["workflow_version"])
     if workflow is None:
         raise APIError("WORKFLOW_UNPUBLISHED", "工作流未发布或与模型不匹配", 404)
@@ -170,6 +168,10 @@ def admit_job(st, user, body, key, *, validate_only=False):
         "dependency_lock": workflow["manifest"].get("dependencies", {}),
     }
     snapshot["runtime_compute_spec"] = policy["resolved_compute_spec"]
+    if creation:
+        snapshot["creation_api"] = True
+        if creation.get("warmup"):
+            snapshot["creation_warmup"] = True
     baseline = None
     if policy["provider"] == "colab":
         if not workflow.get("review_approved") or workflow.get("smoke_test_kind") != "real":
@@ -184,7 +186,8 @@ def admit_job(st, user, body, key, *, validate_only=False):
         # a failed sample must never block admission.
         from .gpu import ccu
 
-        baseline = ccu.maybe_sample_balance(repo, user["id"], policy.get("account_id"))
+        if not creation:
+            baseline = ccu.maybe_sample_balance(repo, user["id"], policy.get("account_id"))
     baseline_fields: dict = {}
     if policy["provider"] == "colab" and baseline:
         baseline_fields = {
@@ -200,6 +203,7 @@ def admit_job(st, user, body, key, *, validate_only=False):
     from .gpu.model_sources import ModelError
     library = ModelLibrary(repo, user["id"])
     model_drive_account = None
+    binding = None
     try:
         binding = next((r for r in repo.list("model_dependencies", user["id"])
                         if r.get("workflow_id") == workflow["id"]), None)
@@ -217,7 +221,7 @@ def admit_job(st, user, body, key, *, validate_only=False):
         if binding:
             bound_models = []
             for ident in {d.get("model_id") for d in binding["dependencies"] if d.get("model_id")}:
-                if policy["provider"] == "colab":
+                if policy["provider"] == "colab" and not creation:
                     bound_models.append(library.check_remote(ident))
                 else:
                     bound_models.append(library.get(ident))
@@ -231,7 +235,17 @@ def admit_job(st, user, body, key, *, validate_only=False):
         raise APIError("MODEL_DEPENDENCIES_NOT_READY", str(exc), 409) from exc
     finally:
         library.close()
-    compute_fields["compatibility_signature"] = compatibility_signature(policy["provider"], snapshot, requested_spec, workflow["workflow_key"], workflow["workflow_version"])
+    environment = {k: v for k, v in snapshot.items() if k not in {"creation_api", "creation_warmup"}}
+    compute_fields["compatibility_signature"] = compatibility_signature(
+        policy["provider"], environment, requested_spec, workflow["workflow_key"], workflow["workflow_version"]
+    )
+    if creation:
+        compute_fields.update(creation, creation_binding_digest=digest(
+            {"dependencies": binding["dependencies"] if binding else None}))
+        compute_fields["creation_fingerprint"] = compatibility_signature(
+            policy["provider"], {k: v for k, v in environment.items() if k != "runtime_compute_spec"},
+            None, workflow["workflow_key"], workflow["workflow_version"],
+        )
     if validate_only:
         return {**body, **compute_fields, "execution_policy": policy,
                 "requested_account_id": policy.get("account_id"),
@@ -247,7 +261,12 @@ def admit_job(st, user, body, key, *, validate_only=False):
             raise APIError("SCHEDULER_BUSY", "队列正在同步，请用相同幂等键稍后重试", 503, True)
         from .gpu.native import guard_generation
 
-        guard_generation(repo, user["id"], policy)
+        if before_create:
+            reused = before_create(repo, {**compute_fields, "snapshot": snapshot, "execution_policy": policy})
+            if reused:
+                return reused
+        else:
+            guard_generation(repo, user["id"], policy)
         job, created = repo.create_job(user["id"], body, key, admitted={
             **compute_fields,
             "execution_policy": policy,

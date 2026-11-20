@@ -278,7 +278,7 @@ def _stop_service_if_owned(service_dir: Path) -> bool:
         (service_dir / COMFY_SERVICE_STATE).unlink(missing_ok=True)
 
 
-def _start_comfy_service(service_dir: Path, fingerprint: str, cache_reason: str) -> dict:
+def _start_comfy_service(service_dir: Path, fingerprint: str, cache_reason: str, *, deadline=None) -> dict:
     comfy = service_dir / "ComfyUI"
     if not comfy.is_dir() or comfy.is_symlink():
         raise WorkerError("Comfy service checkout is unavailable")
@@ -310,7 +310,19 @@ def _start_comfy_service(service_dir: Path, fingerprint: str, cache_reason: str)
         _SERVICE_HANDLES[process.pid] = process
         _SERVICE_LOG_HANDLES[process.pid] = log_handle
         _atomic_json(service_dir / COMFY_SERVICE_STATE, state)
-        _http_json(_service_api_url("/system_stats"), timeout=5)
+        if deadline is None:
+            _http_json(_service_api_url("/system_stats"), timeout=5)
+        else:
+            while time.time() < deadline:
+                try:
+                    _http_json(_service_api_url("/system_stats"), timeout=5)
+                    break
+                except WorkerError:
+                    if process.poll() is not None:
+                        raise WorkerError("Comfy worker exited during startup")
+                    time.sleep(1)
+            else:
+                raise WorkerError("Comfy worker startup timed out")
         return {**state, "system_stats": True, "service_dir": str(service_dir)}
     except Exception:
         try:
@@ -1407,7 +1419,96 @@ def _prepare_native_weights(api, native_dir, graph, weights, loras, payload, dea
     raise WorkerError("Native model preparation exceeded this Studio job's runtime limit")
 
 
-def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _Stages) -> list[dict]:
+def _creation_service(service_dir, payload, manifest, commit, nodes, checked, user_loras, stages, deadline):
+    def environment_fingerprint():
+        environment = _service_fingerprint(commit, nodes, checked, manifest)
+        encoded = json.dumps([environment, user_loras], sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    fingerprint = environment_fingerprint()
+    state = _read_service_state(service_dir)
+    if state:
+        # An absent PID or different start time is a stale marker. Never signal that PID.
+        try:
+            metadata = _process_metadata(state["pid"])
+        except (KeyError, WorkerError):
+            metadata = {}
+        if metadata.get("start_id") != state.get("process_start_id"):
+            (service_dir / COMFY_SERVICE_STATE).unlink(missing_ok=True)
+            state = None
+        else:
+            _trusted_process_metadata(service_dir, state)
+    if state and state["env_fingerprint"] == fingerprint:
+        try:
+            _http_json(_service_api_url("/system_stats"), timeout=5)
+        except WorkerError:
+            pass
+        else:
+            stages.start("warm_reuse")
+            return {**state, "cache_reason": "hot_reuse"}, {"source": "hot_reuse"}, []
+    if state:
+        pid = state["pid"]
+        _stop_service_if_owned(service_dir)
+        stop_deadline = min(deadline, time.time() + 10)
+        while time.time() < stop_deadline:
+            try:
+                metadata = _process_metadata(pid)
+            except WorkerError:
+                break
+            if metadata["start_id"] != state["process_start_id"] or not metadata["cmdline"]:
+                break
+            # The worker that started this child exited. Wait for the process group to close.
+            time.sleep(0.2)
+        else:
+            raise WorkerError("上一个 ComfyUI 进程尚未退出")
+    comfy = service_dir / "ComfyUI"
+    parked = service_dir / "previous"
+    if comfy.exists() and state and state["env_fingerprint"] != fingerprint:
+        shutil.rmtree(parked, ignore_errors=True)
+        comfy.rename(parked)
+    service_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stages.start("restore_env")
+    timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
+    env_cache = _drive_cache(payload, "runtime_folder_id") if payload.get("use_drive_cache", True) else None
+    env = _restore_env(service_dir, commit, timeout, env_cache, build=False, custom_nodes=nodes)
+    stages.start("restore_weights")
+    weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False,
+                               warm_models=_local_models(parked) if parked.is_dir() else None,
+                               use_drive_cache=payload.get("use_drive_cache", True))
+    shutil.rmtree(parked, ignore_errors=True)
+    if user_loras:
+        stages.start("restore_loras")
+        _restore_user_loras(comfy, user_loras, _lora_drive_cache(payload))
+    stages.start("comfy_start")
+    service = _start_comfy_service(service_dir, environment_fingerprint(), "cold_start", deadline=deadline)
+    return service, env, weights
+
+
+def _runtime_evidence(service, payload, warmup):
+    return {"instance_id": payload["instance_id"],
+            "process": f"{service['pid']}:{service['process_start_id']}",
+            "environment": service["env_fingerprint"],
+            "workflow_sha256": payload["snapshot"]["workflow_sha256"],
+            "cache_reason": service["cache_reason"], "warmup_completed": warmup}
+
+
+def _remove_warm_outputs(comfy, item):
+    for result in (item.get("outputs") or {}).values():
+        for category in ("images", "gifs", "videos"):
+            for entry in result.get(category, []) if isinstance(result, dict) else []:
+                folder = entry.get("type") if isinstance(entry, dict) else None
+                if (folder not in {"output", "temp"} or not isinstance(entry.get("filename"), str)
+                        or entry.get("subfolder") != "studio_warmup"):
+                    continue
+                if Path(entry["filename"]).name != entry["filename"]:
+                    continue
+                base = (comfy / folder).resolve()
+                path = (base / str(entry.get("subfolder", "")) / entry["filename"]).resolve()
+                if path.is_relative_to(base) and path.is_file():
+                    path.unlink()
+
+
+def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _Stages, *, service_dir=None) -> list[dict]:
     commit = manifest.get("comfy_commit", manifest.get("comfy_version"))
     if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
         raise WorkerError("Comfy workflow must lock a 40-character commit")
@@ -1418,20 +1519,27 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
         if not isinstance(node, dict) or node.get("class_type") not in allowlist:
             raise WorkerError("bound graph contains an unreviewed node")
     native_marker = NATIVE_SERVICE_MARKER
-    native_state = json.loads(native_marker.read_text()) if native_marker.is_file() else None
+    native_state = json.loads(native_marker.read_text()) if native_marker.is_file() and not service_dir else None
     shared_native = native_state is not None
     if shared_native and native_state.get("model_storage_mode") != "local":
         raise WorkerError("创作模式需要 Colab 本地模型。当前原生 ComfyUI 使用 Drive 挂载，请改用兼容实例或停止原生会话后重试")
     if shared_native and native_state.get("commit") != commit:
         raise WorkerError("Studio workflow uses a different ComfyUI version; stop native session before switching versions")
-    comfy = Path(native_state["comfy"]) if shared_native else root / "ComfyUI"
+    comfy = Path(native_state["comfy"]) if shared_native else (service_dir or root) / "ComfyUI"
     user_loras = (payload.get("snapshot") or {}).get("lora_files") or []
     _check_loras(graph, manifest, user_loras)
     timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
     nodes = _reviewed_custom_nodes(manifest.get("custom_nodes"))
     checked = _validate_weights(manifest)
     fingerprint = _warm_fingerprint(commit, nodes, checked)
-    if shared_native:
+    deadline = min(time.time() + min(float(payload.get("max_runtime_minutes", 10)) * 60, 600 * 60),
+                   float(payload.get("deadline_epoch") or float("inf")))
+    warmup = bool((payload.get("snapshot") or {}).get("creation_warmup"))
+    service = None
+    if service_dir:
+        service, env, weights = _creation_service(
+            service_dir, payload, manifest, commit, nodes, checked, user_loras, stages, deadline)
+    elif shared_native:
         _local_models(comfy)
         _verify_checkout(comfy, commit)
         # The shared process already loaded its nodes. Never install packages or restart it under queued native work.
@@ -1456,24 +1564,25 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
         weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False,
                                    warm_models=warm_models, use_drive_cache=payload.get("use_drive_cache", True))
     try:
-        if user_loras and not shared_native:
+        if user_loras and not (shared_native or service):
             stages.start("restore_loras")
             _restore_user_loras(comfy, user_loras, _lora_drive_cache(payload))
         if not shared_native:
             _local_models(comfy)
             _check_local_tree(comfy / "output")  # ComfyUI also registers model folders under its output directory.
             _write_input_files(comfy, payload.get("snapshot") or {})
-        stages.start("comfy_start")
+        if not service:
+            stages.start("comfy_start")
         log_path = root / "comfy.log"
         log = log_path.open("ab", buffering=0)
         process = None
         try:
             port = COMFY_SERVICE_PORT
-            if not shared_native:
+            if not (shared_native or service):
                 with socket.socket() as listener:
                     listener.bind((COMFY_SERVICE_HOST, 0))
                     port = listener.getsockname()[1]
-            process = None if shared_native else subprocess.Popen(
+            process = None if shared_native or service else subprocess.Popen(
                 [sys.executable, "main.py", "--listen", COMFY_SERVICE_HOST, "--port", str(port)],
                 cwd=comfy,
                 stdout=log,
@@ -1481,7 +1590,8 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                 shell=False,
                 start_new_session=True,
             )
-            deadline = time.time() + min(float(payload.get("max_runtime_minutes", 10)) * 60, 600 * 60)
+            if not service:
+                deadline = time.time() + min(float(payload.get("max_runtime_minutes", 10)) * 60, 600 * 60)
             api = f"http://{COMFY_SERVICE_HOST}:{port}"
             while time.time() < deadline:
                 try:
@@ -1505,7 +1615,15 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                     _write_input_files(comfy, payload.get("snapshot") or {})
                 if process is not None and process.poll() is not None:
                     raise WorkerError("Comfy worker exited before queue submission")
-                stages.start("sampling")
+                if time.time() >= deadline:
+                    raise WorkerError("Comfy execution timed out before submission")
+                stages.start("creation_warming" if warmup else "sampling")
+                if warmup:
+                    # Isolate reviewed outputs that support a prefix. Otherwise keep the private
+                    # VM file in case Comfy returns a cached result to the first real request.
+                    for node in graph.values():
+                        if "filename_prefix" in node["inputs"]:
+                            node["inputs"]["filename_prefix"] = "studio_warmup/" + payload["execution_id"]
                 try:
                     queued = _http_json(api + "/prompt", "POST", {"prompt": graph}, timeout=30, **submit_args)
                 except WorkerError as exc:
@@ -1529,15 +1647,20 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                             data = message[1] if len(message) > 1 and isinstance(message[1], dict) else {}
                             detail = f"{data.get('node_type')}: {data.get('exception_message')}"
                     raise WorkerError(f"Comfy workflow failed: {detail}"[:500])
-                if status.get("completed") is not True and not item.get("outputs"):
+                if status.get("completed") is not True and (service or not item.get("outputs")):
                     time.sleep(2)
                     continue
                 stages.end()
+                if service:
+                    _atomic_json(root / "creation-runtime.json", _runtime_evidence(service, payload, warmup))
+                if warmup:
+                    _remove_warm_outputs(comfy, item)
+                    return []
                 outputs = []
                 total = 0
                 output_dir = root / "outputs"
                 output_dir.mkdir(mode=0o700, exist_ok=True)
-                for node_output in (item.get("outputs") or {}).values():
+                for node_id, node_output in (item.get("outputs") or {}).items():
                     if not isinstance(node_output, dict):
                         continue
                     for category in ("images", "gifs", "videos"):
@@ -1552,15 +1675,20 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                             request = Request(
                                 api + "/view?" + query, headers={"Accept": "application/octet-stream"}
                             )
-                            target = output_dir / filename
+                            stored_name = filename
+                            if service:
+                                stem = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:100]
+                                stored_name = f"{len(outputs)}-{stem}{Path(filename).suffix.lower()}"
+                            target = output_dir / stored_name
                             output_limit = payload.get('_local_artifact_limit', MAX_OUTPUT_BYTES)
                             with urlopen(request, timeout=30) as response:
                                 size = _stream_output(response, target, output_limit - total)
                             total += size
                             outputs.append(
                                 {
-                                    "filename": filename,
+                                    "filename": target.name,
                                     "mime": mime,
+                                    **({"comfy_node": node_id, "comfy_category": category} if service else {}),
                                     "path": str(target.relative_to(root)),
                                     "size": size,
                                     "metadata": {
@@ -1582,7 +1710,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                     process.kill()
             log.close()
     finally:
-        if not shared_native:
+        if not (shared_native or service_dir):
             _warm_put(root, fingerprint)  # restore succeeded above, so the tree is reusable even if this job failed later
 
 
@@ -1646,26 +1774,39 @@ def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
             outputs = _run_prep(root, payload, manifest, stages)
         else:
             local_payload = {**payload, '_local_artifact_limit': min(artifact_store.max_size, 2*1024**3)} if artifact_store is not None else {k:v for k,v in payload.items() if k!='_local_artifact_limit'}
-            outputs = _run_comfy(root, local_payload, manifest, graph, stages)
+            if snapshot.get("creation_api"):
+                service_dir = _comfy_service_dir(payload.get("instance_id"))
+                with _file_lock(service_dir.parent / "creation-service.lock"):
+                    outputs = _run_comfy(root, local_payload, manifest, graph, stages, service_dir=service_dir)
+            else:
+                outputs = _run_comfy(root, local_payload, manifest, graph, stages)
+        runtime_path = root / "creation-runtime.json"
+        evidence = {"creation_runtime": json.loads(runtime_path.read_text())} if snapshot.get("creation_api") else {}
         if artifact_store is not None:
             artifacts = []
             for item in outputs:
                 source = root / item['path']
                 if source.is_symlink() or root.resolve() not in source.resolve().parents:
                     raise WorkerError('worker output escaped execution directory')
-                artifacts.append(artifact_store.publish_file(
-                    payload['owner_id'], payload['execution_id'], source, item['mime']))
+                artifact = artifact_store.publish_file(payload["owner_id"], payload["execution_id"], source, item["mime"])
+                artifacts.append({**artifact, **{k: item[k] for k in ("comfy_node", "comfy_category") if k in item}})
             _atomic_json(root / 'meta.json', {'execution_id': payload['execution_id'], 'artifacts': artifacts})
-            _status(root, 'completed', artifacts=artifacts, timings=stages.timings)
+            _status(root, 'completed', artifacts=artifacts, timings=stages.timings, **evidence)
         else:
             _atomic_json(root / "meta.json", {"execution_id": payload.get("execution_id"), "outputs": outputs})
-            _status(root, "completed", outputs=outputs, timings=stages.timings)
+            _status(root, "completed", outputs=outputs, timings=stages.timings, **evidence)
     except Exception as exc:  # noqa: BLE001 - worker must persist every failure
         stages.end()
         message = _safe_error(exc)
         log = root / "comfy.log"
+        if not log.is_file() or not log.stat().st_size:
+            if (payload.get("snapshot") or {}).get("creation_api") and payload.get("instance_id"):
+                with contextlib.suppress(OSError, WorkerError):
+                    log = _comfy_service_dir(payload["instance_id"]) / "comfy.log"
         if log.is_file():
-            message = (message + " | comfy.log: " + log.read_text("utf-8", "replace")[-500:])[:1400]
+            with log.open("rb") as stream:
+                stream.seek(max(0, log.stat().st_size - 500))
+                message = (message + " | comfy.log: " + stream.read(500).decode("utf-8", "replace"))[:1400]
         _status(root, "failed", error_code="gpu_worker_failed", error_message=message, timings=stages.timings)
 
 

@@ -1,0 +1,15 @@
+# Replace the listening address and allow rule with the dedicated private
+# interface and SillyTavern IP when it runs in a container.
+server {
+    listen 127.0.0.1:8189;
+    server_name localhost;
+    client_max_body_size 1m;
+    location / {
+        proxy_pass http://127.0.0.1:8788;
+        proxy_set_header Host comfy-api.example.com;
+        # Include file owned by root, mode 0600:
+        # proxy_set_header Authorization "Bearer YOUR_CREATION_API_KEY";
+        include /etc/nginx/secrets/studio-creation-auth.conf;
+        proxy_http_version 1.1;
+    }
+}

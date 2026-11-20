@@ -19,6 +19,7 @@ export interface RuntimeSelectionProps {
   accounts: GpuAccount[];
   instances: GpuInstance[];
   provider: Provider;
+  showInstances?: boolean;
   onChange: (value: RuntimeSelectionValue) => void;
 }
 
@@ -47,7 +48,7 @@ function instanceLabel(instance: GpuInstance): string {
   return `${instance.instance_label || instance.label || instanceId(instance)} · ${gpuLabel(instance)} · ${instance.state || '状态未知'}${cutoff ? ` · 截止 ${formatInstanceTime(cutoff)}` : ''}`;
 }
 
-export function RuntimeSelection({ value, accounts, instances, provider, onChange }: RuntimeSelectionProps) {
+export function RuntimeSelection({ value, accounts, instances, provider, showInstances = true, onChange }: RuntimeSelectionProps) {
   const selectedAccount = accounts.find((account) => account.account_id === value.accountId);
   const sameAccount = instances.filter((instance) => !value.accountId || instance.account_id === value.accountId);
   const reusableInstances = sameAccount.filter((instance) => instanceReusable(instance));
@@ -71,7 +72,7 @@ export function RuntimeSelection({ value, accounts, instances, provider, onChang
       <div className={styles.selectionPanel}>
         <div>
           <p className={styles.eyebrow}>运行设置</p>
-          <h3>选择账号与机器</h3>
+          <h3>{showInstances ? "选择账号与机器" : "选择账号与策略"}</h3>
         </div>
         <div className={styles.selectionRow}>
           <label htmlFor="runtime-account">账号
@@ -82,7 +83,7 @@ export function RuntimeSelection({ value, accounts, instances, provider, onChang
           </label>
           {accountReason && <span className={styles.selectionHint}>{accountReason}</span>}
         </div>
-        <div className={styles.selectionRow}>
+        {showInstances && <div className={styles.selectionRow}>
           <label htmlFor="runtime-instance">机器
             <select id="runtime-instance" value={value.instanceId || ''} onChange={(event) => update({ instanceId: event.target.value || null })} disabled={(!candidateInstances.length && Boolean(value.accountId))}>
               <option value="">自动分配兼容机器</option>
@@ -91,7 +92,7 @@ export function RuntimeSelection({ value, accounts, instances, provider, onChang
           </label>
           {selectedAccount && <span className={styles.selectionHint}>当前账号：{selectedAccount.alias}。指定机器时不会静默切换到其他账号。</span>}
           {instanceReason && <span className={styles.selectionHint}>{instanceReason}</span>}
-        </div>
+        </div>}
         <div className={styles.selectionRow}>
           <label htmlFor="runtime-lifecycle">任务完成后的策略
             <select id="runtime-lifecycle" value={value.lifecycle} onChange={(event) => update({ lifecycle: event.target.value as RuntimeLifecycle })}>

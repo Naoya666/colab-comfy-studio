@@ -37,6 +37,10 @@ class InstanceConflict(InstanceServiceError):
     """The resource changed state or is owned by another active operation."""
 
 
+class CreationInstancePending(InstanceConflict):
+    """An eligible Studio VM is still starting or finishing an earlier job."""
+
+
 class StudioModelStorageConflict(InstanceConflict):
     """A native Drive mount cannot supply locally loaded Studio weights."""
 
@@ -380,8 +384,36 @@ class InstanceService:
         data = self._data(instance)
         if self._value(data, "account_id") != account_id:
             return False
-        if data.get("native_draining"):
+        creation = (job.get("snapshot") or {}).get("creation_api")
+        if self._provider(job) != data.get("provider", "colab") and creation:
             return False
+        if data.get("native_draining") or data.get("manual_stop_requested"):
+            return False
+        if creation and data.get("native_comfy"):
+            return False
+        if data.get("creation_runtime") and not creation:
+            # A separate Studio process on this VM would compete for the resident service's memory.
+            return False
+        if creation:
+            if (data.get("retention_mode") == "batch"
+                    and (data.get("creation_runtime") or {}).get("fingerprint") != job.get("creation_fingerprint")):
+                return False
+            lease = self._find(session, "leases", data["lease_id"], instance.owner_id) if data.get("lease_id") else None
+            if lease is None or lease.state != "idle":
+                return False
+            lease_data = self._data(lease)
+            if any(lease_data.get(key) is not None and self.clock() >= float(lease_data[key])
+                   for key in ("deadline_epoch", "idle_deadline_at")):
+                return False
+            actual = data.get("runtime_spec_reported") or data.get("runtime_spec_requested")
+            if not actual:
+                return False
+            from .specs import check_requirements
+
+            try:
+                check_requirements(job["snapshot"]["manifest"], actual)
+            except ValueError:
+                return False
         if data.get("native_comfy") and data.get("lease_id"):
             from .native import restart_active
 
@@ -401,13 +433,50 @@ class InstanceService:
         if instance.state not in self._IDLE_STATES:
             return False
         requested = job.get("requested_spec") or (job.get("execution_policy") or {}).get("requested_spec")
-        if requested:
+        if requested and not creation:
             from .specs import spec_key
             previous = data.get("runtime_spec_requested")
             if not previous or spec_key(previous) != spec_key(requested):
                 return False
         signature = job.get("compatibility_signature")
-        return data.get("native_comfy") or not signature or data.get("compatibility_signature") == signature
+        return creation or data.get("native_comfy") or not signature or data.get("compatibility_signature") == signature
+
+    def creation_capacity(self, job, jobs):
+        """Check a reusable lease or an earlier job which can leave one for this request."""
+        owner = job["owner_id"]
+        requested = self._requested(job, "account_id") or self._job_policy(job).get("account_id")
+        with self._tx() as session:
+            accounts = self._legal_accounts(session, owner, job["project_id"], "colab", requested)
+            account_ids = {self._account_id(account) for account in accounts}
+            if any(self._compatible(session, instance, job, self._data(instance).get("account_id"))
+                   for instance in self._rows(session, "instances", owner)
+                   if self._data(instance).get("account_id") in account_ids):
+                return True
+        return any(
+            row.get("creation_fingerprint") and not row.get("creation_existing_only")
+            and not row.get("cancel_requested")
+            and row.get("state") in {"queued", "validating", "waiting_for_capacity", "allocating",
+                                     "preparing", "loading", "running", "uploading", "cleaning_up"}
+            and (row.get("execution_policy", {}).get("lifecycle") in {"smart", "retain"}
+                 or (row.get("execution_policy", {}).get("lifecycle") == "batch"
+                     and row["creation_fingerprint"] == job["creation_fingerprint"]))
+            and (not (account := row.get("account_id") or row.get("requested_account_id")) or account in account_ids)
+            for row in jobs
+        )
+
+    def _creation_reuse_cost(self, job, instance):
+        if not job.get("creation_fingerprint"):
+            return job
+        from .rates import minute_rate
+        from .specs import spec_key
+
+        data = self._data(instance)
+        actual = data.get("runtime_spec_reported") or data.get("runtime_spec_requested")
+        rate = minute_rate(spec_key(actual), self._cfg("unit_rate"))
+        before = float(job.get("unit_rate") or rate)
+        cap = float(job["max_runtime_minutes"])
+        return {**job, "unit_rate": rate, "budget_units": max(float(job.get("budget_units") or 0), rate * cap),
+                "estimated_units": round(float(job.get("estimated_units") or 0) * rate / before, 3)}
 
     def _claim_existing(self, session, instance, job, account, key, stable_id, reason, units):
         data = self._data(instance)
@@ -466,6 +535,10 @@ class InstanceService:
                 raise InstanceConflict("job already belongs to another instance")
             data.update(account_id=account_id, instance_id=instance.id, budget_reserved=units,
                         account_alias_snapshot=account_alias)
+            if job.get("creation_fingerprint"):
+                data.update(selection_reason=self._data(instance).get("selection_reason"),
+                            unit_rate=job["unit_rate"], estimated_units=job["estimated_units"],
+                            budget_units=job["budget_units"])
             if not data.get("drive_account_id") and drive_account_id:
                 data["drive_account_id"] = drive_account_id
             if job.get("lease_id") is not None:
@@ -519,6 +592,7 @@ class InstanceService:
                 account = next((a for a in accounts if self._account_id(a) == data.get("account_id")), None)
                 if account is None or not self._compatible(session, instance, job, self._account_id(account)):
                     raise InstanceConflict("指定实例不兼容或已被占用")
+                job = self._creation_reuse_cost(job, instance)
                 units = self._reserve_budget(session, job, account, provider)
                 return self._claim_existing(session, instance, job, account, key, stable_id, "requested_instance", units)
 
@@ -526,18 +600,38 @@ class InstanceService:
             idle = [r for r in self._rows(session, "instances", owner_id) if r.id != stable_id and r.state not in {"unknown", "cleanup_pending"}]
             if requested_account:
                 account = accounts[0]
-                candidates = [r for r in idle if self._compatible(session, r, job, self._account_id(account))]
+                candidates = [r for r in idle if self._compatible(session, r, job, account_id)]
             else:
                 candidates = [r for r in idle if any(self._compatible(session, r, job, self._account_id(a)) for a in accounts)]
                 account = None
-                if candidates:
-                    selected = sorted(candidates, key=lambda r: r.updated_at or r.created_at, reverse=True)[0]
-                    account = next(a for a in accounts if self._account_id(a) == self._data(selected).get("account_id"))
-                    candidates = [selected]
             if candidates:
-                instance = candidates[0]
+                fingerprint = job.get("creation_fingerprint")
+                if fingerprint:
+                    instance = max(candidates, key=lambda row: (
+                        (self._data(row).get("creation_runtime") or {}).get("fingerprint") == fingerprint,
+                        row.updated_at or row.created_at,
+                    ))
+                elif requested_account:
+                    instance = candidates[0]
+                else:
+                    instance = max(candidates, key=lambda row: row.updated_at or row.created_at)
+                if account is None:
+                    account = next(a for a in accounts if self._account_id(a) == self._data(instance).get("account_id"))
+                job = self._creation_reuse_cost(job, instance)
                 units = self._reserve_budget(session, job, account, provider)
                 return self._claim_existing(session, instance, job, account, key, stable_id, "reuse_idle", units)
+
+            if job.get("creation_fingerprint"):
+                identities = {self._account_id(account) for account in accounts}
+                if any(instance.state in {"allocating", "ready", "busy", "releasing"}
+                       and not self._data(instance).get("native_comfy")
+                       and self._data(instance).get("provider") == provider
+                       and self._data(instance).get("account_id") in identities
+                       and self._data(instance).get("current_job_id") != job["id"]
+                       for instance in idle):
+                    raise CreationInstancePending("等待当前创作实例完成启动或任务")
+                if job.get("creation_existing_only"):
+                    raise AllocationError("没有可复用实例，请先在创作 → API 设置启动工作流")
 
             if provider == "colab":
                 for instance in idle:
@@ -600,7 +694,14 @@ class InstanceService:
             elif data.get("native_comfy"):
                 mode = "retain"
             hard = data.get("hard_deadline_at")
-            retain = (success or data.get("native_comfy")) and mode in {"retain", "smart"} and not data.get("manual_stop_requested") and (hard is None or self.clock() < float(hard))
+            reuse_batch = mode == "batch" and job.get("creation_fingerprint") and any(
+                row.id != job["id"] and row.state in {"queued", "validating", "waiting_for_capacity"}
+                and not self._data(row).get("cancel_requested")
+                and self._data(row).get("creation_fingerprint") == job["creation_fingerprint"]
+                and self._requested(self._data(row), "account_id") in (None, data.get("account_id"))
+                for row in self._rows(session, "jobs", job["owner_id"])
+            )
+            retain = (success or data.get("native_comfy")) and (mode in {"retain", "smart"} or reuse_batch) and not data.get("manual_stop_requested") and (hard is None or self.clock() < float(hard))
             data.update(current_job_id=None, last_seen_at=self.clock(), retention_mode=mode)
             if not data.get("native_comfy"):
                 data.update(idle_deadline_at=None, retention_reserved=0.0)
@@ -611,7 +712,7 @@ class InstanceService:
                     or data.get("retain_idle_minutes")
                     or self._cfg("default_idle_minutes", self._cfg("max_idle_minutes", 15))
                 )
-                minutes = max(1.0, float(minutes))
+                minutes = 1.0 if reuse_batch else max(1.0, float(minutes))
                 if not data.get("native_comfy"):
                     minutes = min(30.0, minutes)
                 data["retain_idle_minutes"] = minutes

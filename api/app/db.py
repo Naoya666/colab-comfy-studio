@@ -72,6 +72,7 @@ ProjectRow = _entity("ProjectRow", "projects")
 AssetRow = _entity("AssetRow", "assets")
 SettingRow = _entity("SettingRow", "settings")
 ProviderCredentialRow = _entity("ProviderCredentialRow", "provider_credentials")
+CreationApiKeyRow = _entity("CreationApiKeyRow", "creation_api_keys")
 NativeApiKeyRow = _entity("NativeApiKeyRow", "native_api_keys")
 NativeApiPromptRow = _entity("NativeApiPromptRow", "native_api_prompts")
 MODELS.update(
@@ -81,6 +82,7 @@ MODELS.update(
         "assets": AssetRow,
         "settings": SettingRow,
         "provider_credentials": ProviderCredentialRow,
+        "creation_api_keys": CreationApiKeyRow,
         "native_api_keys": NativeApiKeyRow,
         "native_api_prompts": NativeApiPromptRow,
     }

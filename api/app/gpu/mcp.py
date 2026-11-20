@@ -23,7 +23,7 @@ import httpx
 from app.security import decrypt_secret
 
 from .google import GoogleService
-from .runtime_worker import MAX_OUTPUT_BYTES
+from .runtime_worker import COMFY_SERVICE_ROOT, MAX_OUTPUT_BYTES, _instance_service_name, _service_api_url
 
 log = logging.getLogger("studio.mcp")
 MCP_ENDPOINT = "https://colaboratory.googleapis.com/mcp"
@@ -162,7 +162,7 @@ if not _status_path.exists():
 else:
     _status = _json.loads(_status_path.read_text(encoding="utf-8"))
     if isinstance(_status, dict):
-        _result.update({{key: _status.get(key) for key in ("state", "error_code", "error_message", "stage", "timings", "stage_started", "gpu_diagnostics") if key in _status}})
+        _result.update({{key: _status.get(key) for key in ("state", "error_code", "error_message", "stage", "timings", "stage_started", "gpu_diagnostics", "creation_runtime") if key in _status}})
     if _result.get("state") == "completed" and _meta_path.exists():
         _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
         _artifacts = _meta.get("artifacts") if isinstance(_meta, dict) else None
@@ -650,6 +650,12 @@ class MCPGPUExecutor:
                 "runtime_folder_id": cache.get("runtime_folder_id"),
                 "access_token": cache.get("access_token"),
             }
+        if snapshot.get("creation_api"):
+            payload["instance_id"] = job.get("instance_id")
+            deadlines = [job.get("deadline_epoch"), job.get("task_deadline_epoch")]
+            payload["deadline_epoch"] = min((float(d) for d in deadlines if d is not None), default=None)
+            if job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
+                payload["snapshot"] = {**snapshot, "runtime_compute_spec": None}
         if "lora_drive_cache" in job:
             loras = job["lora_drive_cache"]
             payload["lora_drive_cache"] = (
@@ -669,6 +675,32 @@ class MCPGPUExecutor:
                         raise
                     time.sleep(2 * (attempt + 1))
         return self._tool("execute_code", {"session": session, "executionId": execution_id, "code": code})
+
+    def creation_process_health(self, handle: dict, job: dict, runtime: dict) -> bool | None:
+        """Read the process identity on an already allocated idle VM."""
+        ident = runtime.get("process", "")
+        if not isinstance(ident, str) or not re.fullmatch(r"[1-9][0-9]*:[0-9]+", ident):
+            return False
+        pid, start = ident.split(":")
+        name = _instance_service_name(job["instance_id"])
+        service = str(COMFY_SERVICE_ROOT / name / "ComfyUI")
+        loopback = _service_api_url("/system_stats")
+        session = self._session(handle, job["id"])
+        code = f"""import json, os, urllib.request
+from pathlib import Path
+proc = Path("/proc") / {pid!r}
+healthy = False
+try:
+    stat = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+    if stat[19] == {start!r} and os.readlink(proc / "cwd") == {service!r}:
+        with urllib.request.urlopen({loopback!r}, timeout=3) as response:
+            healthy = response.status == 200
+except (OSError, IndexError):
+    pass
+print(json.dumps({{"healthy": healthy}}))
+"""
+        result = self._exec_code_on_handle(handle, session, str(uuid.uuid4()), code)
+        return result.get("healthy") if isinstance(result, dict) else None
 
     def start(self, handle: dict, job: dict, execution_id: str) -> dict:
         execution_id = _uuid4(execution_id)
@@ -725,6 +757,10 @@ class MCPGPUExecutor:
             }
         if state != "completed":
             raise MCPError("Colab状态值无效")
+        if (job.get("snapshot") or {}).get("creation_api"):
+            evidence["creation_runtime"] = result.get("creation_runtime")
+            if job["snapshot"].get("creation_warmup"):
+                return {**evidence, "state": "completed", "timings": result.get("timings") or {}}
         if 'artifacts' in result:
             artifacts=result['artifacts']
             if (not isinstance(artifacts,list) or not 1 <= len(artifacts) <= 100
@@ -758,7 +794,10 @@ class MCPGPUExecutor:
                         if not chunk or len(chunk) > 1024**2:
                             raise MCPError('artifact chunk size invalid')
                         offset = objects.append(key, self.owner_id, execution_id, offset, chunk)
-                    local.append(objects.verify(key, self.owner_id, execution_id))
+                    verified = objects.verify(key, self.owner_id, execution_id)
+                    if (job.get("snapshot") or {}).get("creation_api"):
+                        verified.update(comfy_node=item.get("comfy_node"), comfy_category=item.get("comfy_category"))
+                    local.append(verified)
                 artifacts = local
             return {**evidence, 'state':'completed','artifacts':artifacts,
                     'timings':result.get('timings') or {}}
