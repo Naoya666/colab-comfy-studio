@@ -2121,6 +2121,20 @@ class Scheduler:
             stopping = bool(instance and (instance.get("manual_stop_requested") or instance.get("state") in {"releasing", "cleanup_pending"}))
             if lease.get('state')=='idle' and not stopping and self.clock()<min(
                     float(lease.get('idle_deadline_at') or 0),float(lease.get('deadline_epoch') or 0)):
+                if (
+                    lease.get("provider") == "colab"
+                    and not lease.get("native_ready")
+                    and instance
+                    and instance.get("retention_mode") == "smart"
+                    and associated
+                    and associated.get("state") == "completed"
+                    and (
+                        associated.get("lifecycle") or (associated.get("execution_policy") or {}).get("lifecycle")
+                    ) == "smart"
+                ):
+                    from .native import keepalive_lease
+
+                    keepalive_lease(self.store, lease, self.clock, provider_factory=self._provider, smart=True)
                 continue
             expired = float(lease.get("deadline_epoch") or 0) < self.clock()
             if (

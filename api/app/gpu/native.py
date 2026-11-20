@@ -324,7 +324,35 @@ def _lease_identity(lease):
     ))
 
 
-def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None):
+def _smart_keepalive_allowed(repo, lease, now):
+    instance_id = lease.get("instance_id")
+    instance = repo.get("instances", instance_id, lease["owner_id"]) if instance_id else None
+    if (
+        not instance
+        or lease.get("native_comfy")
+        or lease.get("native_ready")
+        or lease.get("native_draining")
+        or lease.get("cleanup_claim_token")
+        or instance.get("native_comfy")
+        or instance.get("runtime_deleted")
+        or instance.get("state") != "retained_idle"
+        or instance.get("retention_mode") != "smart"
+        or instance.get("lease_id") != lease["id"]
+        or instance.get("account_id") != lease.get("account_id")
+        or instance.get("current_job_id")
+        or instance.get("manual_stop_requested")
+        or instance.get("cleanup_claim_token")
+    ):
+        return False
+    return now < min(
+        float(lease.get("idle_deadline_at") or 0),
+        float(lease.get("deadline_epoch") or 0),
+        float(instance.get("idle_deadline_at") or 0),
+        float(instance.get("hard_deadline_at") or 0),
+    )
+
+
+def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None, smart=False):
     """Send bounded Colab TFE + proxy/kernel keep-alive only while retention gates hold."""
     if (
         not isinstance(lease, dict)
@@ -339,6 +367,22 @@ def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None):
         return None
     if provider_factory is None and not (lease.get("tunnel_endpoint") or lease.get("proxy_url") or isinstance(lease.get("handle"), dict)):
         return None
+    identity = _lease_identity(lease)
+    if smart:
+        # Refresh before sending so a pending watchdog tick observes policy
+        # changes, stop requests, or a handoff that followed its snapshot.
+        with repo.store.dispatch_lock() as acquired:
+            if not acquired:
+                return None
+            fresh = repo.get("leases", lease["id"], lease["owner_id"])
+            if (
+                not fresh
+                or fresh.get("state") != "idle"
+                or _lease_identity(fresh) != identity
+                or not _smart_keepalive_allowed(repo, fresh, clock())
+            ):
+                return None
+            lease = fresh
     now = float(clock())
     deadline = lease.get("deadline_epoch")
     if deadline is not None and now >= float(deadline):
@@ -361,7 +405,6 @@ def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None):
         return None
     last_kernel_exec = float(lease.get("native_last_kernel_exec_at") or 0)
     run_kernel_exec = last_kernel_exec <= 0 or (now - last_kernel_exec) >= KERNEL_EXEC_INTERVAL_SECONDS
-    identity = _lease_identity(lease)
     job_stub = {
         "id": lease.get("owner_job_id"),
         "owner_id": lease["owner_id"],
@@ -388,7 +431,7 @@ def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None):
             "lease_patch": {},
         }
     finally:
-        if owns_provider and provider is not None:
+        if owns_provider or (smart and isinstance(provider, GoogleColabProvider)):
             provider.close()
 
     if not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
@@ -408,6 +451,8 @@ def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None):
             return None
         fresh_deadline = fresh.get("deadline_epoch")
         if fresh_deadline is not None and commit_now >= float(fresh_deadline):
+            return None
+        if smart and not _smart_keepalive_allowed(repo, fresh, commit_now):
             return None
         patch = dict(result.get("lease_patch") or {})
         patch["native_last_keepalive_at"] = commit_now

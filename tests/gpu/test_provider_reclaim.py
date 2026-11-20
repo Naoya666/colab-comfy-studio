@@ -76,6 +76,50 @@ def reclaim_events(repo):
     return [event for event in repo.list("events", "owner") if event.get("reason") == RUNTIME_MISSING]
 
 
+def test_studio_watchdog_only_keeps_smart_colab_leases_alive(runtime):
+    repo = runtime
+    repo.update("leases", "lease", {"native_comfy": False, "native_ready": False}, "owner")
+    repo.update("jobs", "job", {"snapshot": {}, "execution_policy": {"lifecycle": "smart"}}, "owner")
+    repo.update("instances", "instance", {"retention_mode": "smart", "idle_deadline_at": 1500}, "owner")
+    deadline = repo.get("leases", "lease")["deadline_epoch"]
+    heartbeats = []
+
+    class Provider(ControlPlane):
+        def keep_alive(self, lease, *, run_kernel_exec):
+            assert lease["id"] == "lease"
+            heartbeats.append(run_kernel_exec)
+            return {"ok": True, "kernel_exec": "ok" if run_kernel_exec else "skipped"}
+
+    now = 1000
+    watch = scheduler(repo, Provider({"ready": True}), lambda: now)
+    watch.watchdog()
+    now = 1059
+    watch.watchdog()
+    assert heartbeats == [True]
+    now = 1060
+    watch.watchdog()
+    now = 1240
+    watch.watchdog()
+    assert heartbeats == [True, False, True]
+    assert repo.get("leases", "lease")["deadline_epoch"] == deadline
+    assert repo.get("instances", "instance")["idle_deadline_at"] == 1500
+
+    # An instance-level override takes precedence over the original job's policy.
+    repo.update("instances", "instance", {"retention_mode": "retain"}, "owner")
+    now = 1300
+    watch.watchdog()
+    assert heartbeats == [True, False, True]
+    repo.update("instances", "instance", {"retention_mode": "smart"}, "owner")
+    repo.update("jobs", "job", {"execution_policy": {"lifecycle": "retain"}}, "owner")
+    now = 1400
+    watch.watchdog()
+    assert heartbeats == [True, False, True]
+    repo.update("jobs", "job", {"execution_policy": {"lifecycle": "smart"}}, "owner")
+    now = 1500
+    watch.watchdog()
+    assert heartbeats == [True, False, True]
+
+
 def test_retained_native_reclaim_reaches_api_and_preserves_success(runtime, monkeypatch):
     repo = runtime
     monkeypatch.setattr(native, "busy", lambda: True)
