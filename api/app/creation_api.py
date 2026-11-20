@@ -16,7 +16,6 @@ from .admission import _account_is_usable, _google_status, admit_job
 from .common import APIError, admin, current_user, get_store, ok
 from .config import settings
 from .db import utc_isoformat, utcnow
-from .gpu.compute import GpuConfig
 from .gpu.instances import InstanceService
 from .gpu.manifest import (
     _binding,
@@ -55,7 +54,7 @@ def config(store, owner):
     saved = store.get("settings", f"creation-api:{owner}", owner)
     if saved:
         return saved["policy"]
-    return Config(max_runtime_minutes=min(30, GpuConfig.from_env().max_runtime_minutes)).model_dump()
+    return Config().model_dump()
 
 
 def execution_policy(cfg):
@@ -323,7 +322,6 @@ def admin_status(request: Request, user=Depends(current_user), store=Depends(get
     owner = user["id"]
     repo = Repository(store)
     return ok({"url": settings.creation_comfy_url, "config": config(store, owner),
-               "max_runtime_limit": GpuConfig.from_env().max_runtime_minutes,
                "keys": [public_key(row) for row in store.list(KEYS, owner)],
                "workflows": [public_workflow(row) for row in eligible(repo, owner)],
                "warmups": [warm_status(repo, row) for row in repo.list("jobs", owner) if row.get("warmup")][:20]}, request)
@@ -340,8 +338,6 @@ def save_config(body: Config, request: Request, user=Depends(current_user), stor
         if cfg["gpu"]["variant"] != "VARIANT_GPU":
             raise ValueError("请选择 GPU 计算规格")
         execution_policy(cfg)
-        if cfg["max_runtime_minutes"] > GpuConfig.from_env().max_runtime_minutes:
-            raise ValueError("单个任务最长运行时间超过服务端上限")
     except (ValidationError, ValueError) as exc:
         raise APIError("CREATION_CONFIG_INVALID", str(exc)) from exc
     if cfg["account_id"]:

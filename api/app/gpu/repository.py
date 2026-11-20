@@ -336,9 +336,11 @@ class Repository:
             stmt = select(model).where(model.id == id)
             if owner_id is not None:
                 stmt = stmt.where(model.owner_id == owner_id)
+            if kind == "workflows":
+                stmt = stmt.where(model.state.is_distinct_from("deleted"))
             return self._row(session.scalar(stmt))
 
-    def list(self, kind, owner_id=None, project_id=None):
+    def list(self, kind, owner_id=None, project_id=None, *, include_deleted=False):
         model = self._model(kind)
         with self.store.db_lock(), self.store.Session() as session:
             stmt = select(model).order_by(model.created_at.desc())
@@ -346,7 +348,24 @@ class Repository:
                 stmt = stmt.where(model.owner_id == owner_id)
             if project_id is not None:
                 stmt = stmt.where(model.project_id == project_id)
+            if kind == "workflows" and not include_deleted:
+                stmt = stmt.where(model.state.is_distinct_from("deleted"))
             return [self._row(row) for row in session.scalars(stmt).all()]
+
+    def delete_workflow(self, owner_id, workflow_id):
+        with self.store.db_lock(), self.store.Session.begin() as session:
+            if self.store.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            row = session.scalar(select(GpuWorkflowRow).where(
+                GpuWorkflowRow.id == workflow_id, GpuWorkflowRow.owner_id == owner_id,
+            ).with_for_update())
+            if row is None:
+                raise KeyError(workflow_id)
+            if row.state != "deleted":
+                row.state = "deleted"
+                row.data = {**(row.data or {}), "state": "deleted", "active": False}
+                row.version += 1
+                row.updated_at = utcnow()
 
     def record_gpu_diagnostics(self, job, diagnostics):
         """Save worker-measured devices on the running job, its lease and instance."""
@@ -381,9 +400,15 @@ class Repository:
     def update(self, kind, id, patch, owner_id=None):
         model = self._model(kind)
         with self.store.db_lock(), self.store.Session.begin() as session:
+            # SQLite ignores FOR UPDATE. Serialize workflow writers before
+            # reading so validation cannot overwrite a concurrent deletion.
+            if kind == "workflows" and self.store.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
             stmt = select(model).where(model.id == id)
             if owner_id is not None:
                 stmt = stmt.where(model.owner_id == owner_id)
+            if kind == "workflows":
+                stmt = stmt.where(model.state.is_distinct_from("deleted")).with_for_update()
             row = session.scalar(stmt)
             if row is None:
                 raise KeyError(id)
@@ -1214,7 +1239,7 @@ class Repository:
             transient={
                 'execution_id','lease_id','outputs','output_asset_ids','persisted_outputs','error_code','error_message',
                 'cancel_requested','requested_outcome','cleanup_final_state','cleanup_attempts','cleanup_next_epoch',
-                'upload_attempts','started_epoch','stopped_at','deadline_epoch','validated_epoch','budget_reserved',
+                'upload_attempts','started_epoch','stopped_at','deadline_epoch','task_deadline_epoch','validated_epoch','budget_reserved',
                 'runtime_deleted','actual_units','prep_report','progress','awaiting_prep',
                 'instance_completion_recorded','instance_id','instance_state','instance_bound','account_id',
                 'requested_instance_id',

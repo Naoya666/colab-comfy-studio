@@ -64,9 +64,10 @@ def test_host_keys_saved_config_and_output_scope(monkeypatch, tmp_path):
     admin_auth = {"Authorization": "Bearer admin-test"}
     with TestClient(app) as client:
         status = client.get(base, headers=admin_auth).json()["data"]
-        cfg = {**status["config"], "auto_start": True, "lifecycle": "smart", "retain_idle_minutes": 7}
+        cfg = {**status["config"], "auto_start": True, "lifecycle": "smart",
+               "retain_idle_minutes": 90, "max_runtime_minutes": 1500}
         assert client.put(base + "/config", headers=admin_auth, json=cfg).json()["data"] == cfg
-        bad = client.put(base + "/config", headers=admin_auth, json={**cfg, "retain_idle_minutes": 31})
+        bad = client.put(base + "/config", headers=admin_auth, json={**cfg, "retain_idle_minutes": 0})
         assert bad.status_code == 422
         assert Store(dburl).get("settings", "creation-api:owner", "owner")["policy"] == cfg
 
@@ -104,6 +105,12 @@ def test_host_keys_saved_config_and_output_scope(monkeypatch, tmp_path):
         view = "/view?filename=image.png&subfolder=" + media
         assert client.get(view, headers=auth).content == b"verified-test-bytes"
         assert client.get(view, headers=other_auth).status_code == 404
+        assert client.delete(f"/api/gpu/workflows/{other['id']}", headers=admin_auth).status_code == 404
+        assert client.delete(f"/api/gpu/workflows/{first['id']}", headers=admin_auth).status_code == 200
+        available = client.get(base, headers=admin_auth).json()["data"]["workflows"]
+        assert [workflow["id"] for workflow in available] == [second["id"]]
+        assert client.get(f"/api/gpu/workflows/{first['id']}/schema", headers=admin_auth).status_code == 404
+        assert client.get(view, headers=auth).content == b"verified-test-bytes"
         assert client.put(base + "/keys/" + row["id"], headers=admin_auth,
                           json={"name": "Tavern", "workflow_ids": [second["id"]]}).status_code == 200
         assert client.get(view, headers=auth).status_code == 404

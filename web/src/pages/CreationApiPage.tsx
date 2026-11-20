@@ -28,7 +28,7 @@ type Warmup = {
   gpu_reported?: string;
   creation_runtime?: { instance_id: string; process: string; devices?: { name: string }[] };
 };
-type Status = { url: string; config: Config; max_runtime_limit: number; keys: Key[]; workflows: Workflow[]; warmups: Warmup[] };
+type Status = { url: string; config: Config; keys: Key[]; workflows: Workflow[]; warmups: Warmup[] };
 type Match = {
   status: 'matched' | 'unmatched' | 'ambiguous';
   matches: { workflow: Workflow; params: Record<string, unknown> }[];
@@ -134,7 +134,7 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
           onChange={gpu => { if (gpu) setDraft({ ...draft, gpu }); }} label="默认 GPU" requireSelection />
         <div className="field">
           <label htmlFor="creation-timeout">单个任务最长运行时间（分钟）</label>
-          <input id="creation-timeout" type="number" min={1} max={status.max_runtime_limit}
+          <input id="creation-timeout" type="number" min={1} step={1}
             value={draft.max_runtime_minutes} onChange={e => setDraft({ ...draft, max_runtime_minutes: Number(e.target.value) })} />
         </div>
         <label><input type="checkbox" checked={draft.auto_start}

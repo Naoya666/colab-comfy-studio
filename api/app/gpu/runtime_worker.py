@@ -1532,8 +1532,10 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
     nodes = _reviewed_custom_nodes(manifest.get("custom_nodes"))
     checked = _validate_weights(manifest)
     fingerprint = _warm_fingerprint(commit, nodes, checked)
-    deadline = min(time.time() + min(float(payload.get("max_runtime_minutes", 10)) * 60, 600 * 60),
-                   float(payload.get("deadline_epoch") or float("inf")))
+    runtime_seconds = float(payload.get("max_runtime_minutes", 10)) * 60
+    if not payload.get("generation_timeouts"):
+        runtime_seconds = min(runtime_seconds, 600 * 60)
+    deadline = min(time.time() + runtime_seconds, float(payload.get("deadline_epoch") or float("inf")))
     warmup = bool((payload.get("snapshot") or {}).get("creation_warmup"))
     service = None
     if service_dir:
@@ -1590,8 +1592,8 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                 shell=False,
                 start_new_session=True,
             )
-            if not service:
-                deadline = time.time() + min(float(payload.get("max_runtime_minutes", 10)) * 60, 600 * 60)
+            if not service and not payload.get("generation_timeouts"):
+                deadline = time.time() + runtime_seconds
             api = f"http://{COMFY_SERVICE_HOST}:{port}"
             while time.time() < deadline:
                 try:

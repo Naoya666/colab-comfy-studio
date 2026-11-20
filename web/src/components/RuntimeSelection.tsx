@@ -102,7 +102,7 @@ export function RuntimeSelection({ value, accounts, instances, provider, showIns
         </div>
         {(value.lifecycle === 'smart' || value.lifecycle === 'retain') && <div className={styles.selectionRow}>
           <label htmlFor="retain-idle-minutes">空闲保留时间（分钟）
-            <input id="retain-idle-minutes" type="number" min={1} max={30} step={1} value={value.retainIdleMinutes} onChange={(event) => update({ retainIdleMinutes: Math.max(1, Math.min(30, Number(event.target.value) || 1)) })} />
+            <input id="retain-idle-minutes" type="number" min={1} step={1} value={value.retainIdleMinutes} onChange={(event) => update({ retainIdleMinutes: Number(event.target.value) })} />
           </label>
           <p className={styles.cuHint}>保留期间仍会累计站内估算 CU；官方实际扣费来源未知，不显示为 0，也不承诺 Colab 永久在线。硬截止仍由服务端控制。</p>
         </div>}

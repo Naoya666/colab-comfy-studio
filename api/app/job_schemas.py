@@ -33,7 +33,7 @@ class Policy(BaseModel):
     provider: Literal["mock", "colab"] = "mock"
     # Kept for wire compatibility with v0.1 clients.
     shutdown_after_job: bool = True
-    max_runtime_minutes: int = Field(default=60, ge=1, le=1440)
+    max_runtime_minutes: int = Field(default=60, ge=1)
     idle_grace_minutes: int = Field(default=0, ge=0, le=30)
 
     compute_spec: dict | None = None
@@ -42,7 +42,7 @@ class Policy(BaseModel):
     account_id: str | None = None
     instance_id: str | None = None
     lifecycle: Literal["save", "batch", "smart", "retain"] | None = None
-    retain_idle_minutes: int = Field(default=15, ge=1, le=30)
+    retain_idle_minutes: int = Field(default=15, ge=1)
 
     @field_validator("account_id", "instance_id")
     @classmethod

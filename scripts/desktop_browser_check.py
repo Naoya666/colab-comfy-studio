@@ -59,6 +59,9 @@ with sync_playwright() as playwright:
     page.goto(BASE)
     page.locator("input[type=password]").fill("mock-local-only")
     page.get_by_role("button", name="进入工作台").click()
+    api_settings = page.get_by_role("button", name="API 设置", exact=True)
+    expect(api_settings).to_have_class("button")
+    assert api_settings.bounding_box()["x"] > page.get_by_role("heading", name="创作", exact=True).bounding_box()["x"]
     page.get_by_role("button", name="新建项目").click()
     project_dialog = page.get_by_role("dialog", name="新建项目")
     project_dialog.get_by_role("textbox", name="项目名称").fill("桌面布局验证")
@@ -108,7 +111,7 @@ with sync_playwright() as playwright:
         page.evaluate("(theme) => { document.documentElement.dataset.theme = theme; }", theme)
         for width in [360, 390, 799, 800, 960, 1024, 1100, 1440, 1920]:
             page.set_viewport_size({"width": width, "height": 900})
-            for name in ["创作", "任务", "作品", "原生 ComfyUI", "模型库", "算力", "设置"]:
+            for name in ["创作", "任务", "作品", "原生 ComfyUI", "工作流与模型", "模型库", "算力", "设置"]:
                 if name == "设置":
                     page.get_by_role("button", name="打开设置").click()
                 else:

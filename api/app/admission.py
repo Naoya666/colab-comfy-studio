@@ -25,7 +25,7 @@ def _job_estimate(repo, owner, workflow, policy, cfg, params) -> dict:
     """Shown estimate is realistic; budget_units keeps reserving the max-runtime worst case."""
     if policy["provider"] == "mock":
         return {"estimated_units": 0.0, "unit_rate": cfg.unit_rate}
-    cap = min(policy["max_runtime_minutes"], cfg.max_runtime_minutes)
+    cap = policy["max_runtime_minutes"]
     manifest = workflow["manifest"]
     picked = mode_param(manifest)
     mode = params.get(picked[0]) if picked else None
@@ -128,9 +128,10 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
         raise APIError("PROVIDER_INVALID", "仅允许已配置的 mock 或 colab Provider")
     if policy["provider"] == "colab" and not cfg.real_enabled:
         raise APIError("REAL_GPU_DISABLED", "真实 GPU 默认关闭：请先配置 OAuth、费率预算并完成模型审查")
-    workflow = registry.get_workflow(user["id"], body["workflow_key"], body["workflow_version"])
-    if workflow is None:
-        raise APIError("WORKFLOW_UNPUBLISHED", "工作流未发布或与模型不匹配", 404)
+    try:
+        workflow = registry.get_workflow(user["id"], body["workflow_key"], body["workflow_version"])
+    except KeyError as exc:
+        raise APIError("WORKFLOW_UNPUBLISHED", "工作流未发布或与模型不匹配", 404) from exc
     if workflow.get("state") != "published" or workflow["model_id"] != body["model_id"]:
         raise APIError("WORKFLOW_UNPUBLISHED", "工作流未发布或与模型不匹配")
     model = next((m for m in registry.models(user["id"]) if m["model_id"] == body["model_id"]), None)
@@ -141,7 +142,12 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
     validate_manifest(workflow["manifest"], workflow["api_graph"], workflow["object_info"])
     requested_spec, compute_warnings = resolve_compute(workflow["manifest"], policy.get("compute_spec"))
     policy["resolved_compute_spec"] = requested_spec.get("key") if requested_spec else None
-    compute_fields = {"requested_spec": requested_spec, "compute_warnings": compute_warnings}
+    compute_fields = {
+        "requested_spec": requested_spec,
+        "compute_warnings": compute_warnings,
+        "workflow_version_id": workflow["id"],
+        "generation_timeouts": True,
+    }
     preset = own(repo, "presets", body["preset_id"], user) if body.get("preset_id") else None
     if preset and preset["workflow_version_id"] != workflow["id"]:
         raise APIError("PRESET_INCOMPATIBLE", "预设属于不同工作流版本，请先迁移预设")
@@ -253,7 +259,7 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
                 **({"drive_account_id": model_drive_account or _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if model_drive_account or policy.get("account_id") else {}),
                 "snapshot": snapshot, "params": params,
                 "resolved_seed": params.get("seed"),
-                "max_runtime_minutes": min(policy["max_runtime_minutes"], cfg.max_runtime_minutes),
+                "max_runtime_minutes": policy["max_runtime_minutes"],
                 **_job_estimate(repo, user["id"], workflow, policy, cfg, params)}
     # A worker cannot observe a queued record without its immutable snapshot.
     with st.admission_lock() as acquired:
@@ -261,6 +267,8 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
             raise APIError("SCHEDULER_BUSY", "队列正在同步，请用相同幂等键稍后重试", 503, True)
         from .gpu.native import guard_generation
 
+        if repo.get("workflows", workflow["id"], user["id"]) is None:
+            raise APIError("WORKFLOW_UNPUBLISHED", "工作流版本已删除", 409)
         if before_create:
             reused = before_create(repo, {**compute_fields, "snapshot": snapshot, "execution_policy": policy})
             if reused:
@@ -279,7 +287,7 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
             "params": params,
             "resolved_seed": params.get("seed"),
             "atelier_project_id": project.get("atelier_project_id"),
-            "max_runtime_minutes": min(policy["max_runtime_minutes"], cfg.max_runtime_minutes),
+            "max_runtime_minutes": policy["max_runtime_minutes"],
             **_job_estimate(repo, user["id"], workflow, policy, cfg, params),
         })
         if created:

@@ -52,9 +52,10 @@ def test_explicit_legacy_and_new_lifecycle_conflict():
         Policy(shutdown_after_job=True, idle_grace_minutes=0, lifecycle="retain")
 
 
-def test_retain_idle_minutes_is_bounded():
-    with pytest.raises(ValidationError):
-        Policy(lifecycle="retain", retain_idle_minutes=31)
+def test_generation_timeouts_accept_minutes_above_previous_limits():
+    policy = Policy(lifecycle="retain", retain_idle_minutes=90, max_runtime_minutes=1500)
+    assert policy.retain_idle_minutes == 90
+    assert policy.max_runtime_minutes == 1500
     with pytest.raises(ValidationError):
         Policy(lifecycle="retain", retain_idle_minutes=0)
 

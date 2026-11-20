@@ -92,6 +92,8 @@ def build_batch_router(JobInput, admit_job, public_job):
             from .gpu.native import guard_generation
 
             for job in validated:
+                if (workflow_id := job.get("workflow_version_id")) and repo.get("workflows", workflow_id, user["id"]) is None:
+                    raise APIError("WORKFLOW_UNPUBLISHED", "工作流版本已删除", 409)
                 guard_generation(repo, user["id"], job["execution_policy"])
             try:
                 storage_mode = "batch" if lifecycle == "retain" else lifecycle

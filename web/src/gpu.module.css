@@ -286,6 +286,8 @@
 .checkline { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 
 /* 桌面工作区 */
+.createHeader { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.createHeader:has(> button) { margin-bottom: 12px; }
 .desktopTitle { display: none; }
 .nativeWorkspace, .nativeColumns, .nativeControls, .nativeActivity, .nativeFieldPair { display: grid; gap: 12px; min-width: 0; align-content: start; }
 .nativeControls > button { justify-self: start; }
@@ -306,7 +308,8 @@
     padding: 24px clamp(18px, 2.1vw, 36px) 40px;
     justify-self: center;
   }
-  .desktopTitle { display: block; margin-bottom: 16px; font-size: 1.5rem; }
+  .createHeader { margin-bottom: 16px; }
+  .desktopTitle { display: block; margin: 0; font-size: 1.5rem; }
   .pageTitle h2, .pageHead h2 { font-size: 1.35rem; }
   .createColumns { display: grid; align-items: start; gap: 20px; min-width: 0; }
   .createForm { display: grid; gap: 12px; min-width: 0; }

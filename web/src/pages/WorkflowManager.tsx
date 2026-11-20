@@ -2,7 +2,7 @@ import { ModelDependencies } from '../components/ModelDependencies';
 import { ImageWorkflowImport } from '../components/ImageWorkflowImport';
 import { ImageDraftConfiguration } from '../components/ImageDraftConfiguration';
 import { Fragment, useCallback, useMemo, useRef, useState } from 'react';
-import { ChevronDown, Search } from 'lucide-react';
+import { ChevronDown, Search, Trash2 } from 'lucide-react';
 import type { GpuWorkflow } from '../lib/gpu-api';
 import { Pager } from '../components/ui';
 import { WorkflowActivationPanel } from '../components/WorkflowActivation';
@@ -31,7 +31,7 @@ async function fetchWorkflowGraphPreview(workflow: Pick<GpuWorkflow, 'workflow_k
 }
 
 export function WorkflowsPanel({
-  workflows, projectId = '', projectTitle = '', onImport, onValidate, onPublish, onRollback, onDeactivate, onActivated, onOpenJob, onUseProject,
+  workflows, projectId = '', projectTitle = '', onImport, onValidate, onPublish, onRollback, onDeactivate, onDelete, deleting = false, onActivated, onOpenJob, onUseProject,
 }: {
   workflows: GpuWorkflow[];
   projectId?: string;
@@ -41,6 +41,8 @@ export function WorkflowsPanel({
   onPublish: (workflow: GpuWorkflow) => void;
   onRollback: (workflow: GpuWorkflow) => void;
   onDeactivate?: (workflow: GpuWorkflow) => void;
+  onDelete?: (workflow: GpuWorkflow) => void;
+  deleting?: boolean;
   onActivated: () => void;
   onOpenJob?: (jobId: string, projectId?: string) => void;
   onUseProject?: (projectId: string) => void;
@@ -77,7 +79,7 @@ export function WorkflowsPanel({
     return list.sort((a, b) => a.key.localeCompare(b.key));
   }, [workflows]);
 
-    const q = query.trim().toLowerCase();
+  const q = query.trim().toLowerCase();
   const visible = groups.filter((g) => !q || g.items.some((item) => workflowSearchText(item).toLowerCase().includes(q)) || `${g.key} ${g.modelId}`.toLowerCase().includes(q));
   const pages = Math.max(1, Math.ceil(visible.length / GROUPS_PER_PAGE));
   const safePage = Math.min(page, pages - 1);
@@ -166,6 +168,9 @@ export function WorkflowsPanel({
                             {!published && <button className="button ghost small" type="button" onClick={() => onPublish(wf)} title="发布不会跳过冒烟和模型启用检查">发布</button>}
                             {published && wf.active && onDeactivate ? <button className="button secondary small" type="button" title="不再作为默认版本。已经在跑的任务会继续完成。" onClick={() => onDeactivate(wf)}>停用</button> : null}
                             {published && !wf.active && <button className="button secondary small" type="button" onClick={() => onRollback(wf)}>设为当前</button>}
+                            {onDelete && <button className="button danger small" type="button" disabled={deleting} onClick={() => {
+                              if (window.confirm(`删除「${workflowTitle(wf)}」v${wf.workflow_version}？该版本将无法再用于新任务，已有任务和作品会保留。`)) onDelete(wf);
+                            }}><Trash2 size={14} aria-hidden />删除</button>}
                           </span>
                         </div>
                         <ModelDependencies workflowId={wf.id} onDraft={onActivated} />

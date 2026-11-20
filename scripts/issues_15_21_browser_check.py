@@ -244,7 +244,6 @@ def main():
         page.screenshot(path=str(OUT / "issues-17-project-names.png"))
         page.get_by_role("button", name="colab", exact=True).click()
 
-        page.get_by_role("button", name="打开设置").click()
         page.get_by_role("button", name="工作流与模型").click()
         page.get_by_text("MiniMax H3 图生视频（带声音）").wait_for()
         page.get_by_role("button", name="MiniMax H3 图生视频（带声音）").click()

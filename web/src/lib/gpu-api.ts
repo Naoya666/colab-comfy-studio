@@ -209,6 +209,7 @@ export const importGpuWorkflow = (bundle: WorkflowBundle) => apiFetch<GpuWorkflo
 export const validateGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/validate`, post({}));
 export const publishGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/publish`, post({ confirmed: true }));
 export const rollbackGpuWorkflow = (workflow_key: string, version: string | number) => apiFetch<GpuWorkflow>('/api/gpu/workflows/rollback', post({ workflow_key, version }));
+export const deleteGpuWorkflow = (id: string) => apiFetch<{ id: string }>(`/api/gpu/workflows/${encodeURIComponent(id)}`, { method: 'DELETE' });
 export const deactivateGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/deactivate`, post({ confirmed: true }));
 
 export type ActivationStep = { key: string; label: string; done: boolean; next?: boolean; running?: boolean; failed?: boolean };
@@ -350,8 +351,8 @@ export const getGoogleClientConfig = (accountId?: string) => apiFetch<GoogleClie
 export const saveGoogleClientConfig = (body: {account_id?: string; client_id?: string; client_secret?: string; client_json?: Record<string, unknown>; confirmed: true}) => apiFetch<GoogleClientConfig>('/api/gpu/auth/google/config', post(body));
 export const getReferenceAssets = (projectId: string) => apiFetch<GalleryAsset[]>(`/api/assets?project_id=${encodeURIComponent(projectId)}`);
 
-export function createGpuBatch(jobs: GpuJobRequest[], mode: 'save'|'smart'|'batch'|'retain', idleSeconds: number, idempotencyKey: string) {
-  return apiFetch<{ id: string; job_ids: string[] }>('/api/gpu/batches', {method:'POST',headers:{'Idempotency-Key':idempotencyKey},body:JSON.stringify({jobs,mode,idle_seconds:Math.min(300, Math.max(0, idleSeconds))})});
+export function createGpuBatch(jobs: GpuJobRequest[], mode: 'save'|'smart'|'batch'|'retain', idempotencyKey: string) {
+  return apiFetch<{ id: string; job_ids: string[] }>('/api/gpu/batches', {method:'POST',headers:{'Idempotency-Key':idempotencyKey},body:JSON.stringify({jobs,mode})});
 }
 
 export const retryGpuAttempt = (id: string, key: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/attempts`, { method: "POST", headers: { "Idempotency-Key": key }, body: JSON.stringify({}) });

@@ -344,11 +344,14 @@ def _smart_keepalive_allowed(repo, lease, now):
         or instance.get("cleanup_claim_token")
     ):
         return False
+    hard_deadline = instance.get("hard_deadline_at")
+    if hard_deadline is None and lease.get("generation_timeouts"):
+        hard_deadline = lease.get("deadline_epoch")
     return now < min(
         float(lease.get("idle_deadline_at") or 0),
         float(lease.get("deadline_epoch") or 0),
         float(instance.get("idle_deadline_at") or 0),
-        float(instance.get("hard_deadline_at") or 0),
+        float(hard_deadline or 0),
     )
 
 

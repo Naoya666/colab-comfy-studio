@@ -100,6 +100,8 @@ export function ModelDependencies({workflowId, onDraft}: {workflowId:string; onD
   const [models, setModels] = useState<LibraryModel[]>([]);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [unboundOnly, setUnboundOnly] = useState(false);
+  const dependencies = record?.dependencies.filter(dep => !unboundOnly || !dep.model_id) ?? [];
   const refresh = useCallback(async () => {const [r,c] = await Promise.all([dependencyApi<DependencyRecord>(workflowId), libraryApi<Catalog>()]); setRecord(r); setModels(c.items);}, [workflowId]);
   useEffect(() => {void refresh().catch(e => setError(apiMessage(e))); const id=setInterval(() => {void refresh().catch(() => {});}, 4000); return () => clearInterval(id);}, [refresh]);
   async function action(fn:() => Promise<unknown>) {setError(''); try {await fn(); await refresh();} catch(e) {setError(apiMessage(e));}}
@@ -109,8 +111,10 @@ export function ModelDependencies({workflowId, onDraft}: {workflowId:string; onD
     <p className="muted small">模型准备、来源可信度和工作流运行验证分别管理。替换已审核模型后，可生成绑定草稿并按现有流程审核、验证和发布。</p>
     <button className="button secondary small" onClick={() => void action(async () => {await dependencyApi(workflowId, 'draft'); setMessage('已创建绑定草稿，请在工作流列表配置、审核并验证'); onDraft?.();})}>将当前绑定生成新草稿</button>
     {error && <p role="alert" className="status error">{error}</p>}{message && <p role="status">{message}</p>}
-    {!record?.dependencies.length && <p className="muted">未发现可可靠识别的模型引用。可为自定义节点配置识别规则。</p>}
-    {record?.dependencies.map(dep => <DependencyRow key={dep.id} dep={dep} models={models} workflowId={workflowId} refresh={refresh}
+    {record && <label><input type="checkbox" checked={unboundOnly} onChange={e => setUnboundOnly(e.target.checked)} /> 只显示未绑定的模型</label>}
+    {record && !record.dependencies.length && <p className="muted">未发现可可靠识别的模型引用。可为自定义节点配置识别规则。</p>}
+    {unboundOnly && Boolean(record?.dependencies.length) && !dependencies.length && <p className="muted" role="status">所有模型依赖均已绑定。</p>}
+    {dependencies.map(dep => <DependencyRow key={dep.id} dep={dep} models={models} workflowId={workflowId} refresh={refresh}
       onBind={(id, strengths, disabled) => {const chosen = models.find(m => m.id === id); const unknown = dep.architecture === 'unknown' || chosen?.architecture === 'unknown'; if (unknown && !window.confirm('依赖或模型架构未知，请确认该模型兼容当前工作流。模型身份变化仍需重新审核。')) return; void action(() => dependencyApi(workflowId, 'bind', {dependency_id:dep.id, model_id:id, strengths, disabled, confirm_unknown:unknown}));}} />)}
   </div></details>;
 }

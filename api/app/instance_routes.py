@@ -21,7 +21,7 @@ class RetentionInput(BaseModel):
     # compatibility alias used by the first offline API clients.
     mode: Literal["save", "smart", "retain"] | None = None
     retention_mode: Literal["save", "smart", "retain"] | None = None
-    idle_minutes: int = Field(default=0, ge=0, le=30)
+    idle_minutes: int = Field(default=0, ge=0)
     key: str | None = Field(default=None, min_length=1, max_length=200)
     expected_version: int | None = Field(default=None, ge=0)
 

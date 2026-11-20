@@ -1,3 +1,4 @@
+import { WorkflowsPanel } from './pages/WorkflowManager';
 import { CreationApiPage } from "./pages/CreationApiPage";
 import { ModelRunOverrides, type ModelOverride } from './components/ModelDependencies';
 import { NativeComfyPage } from './pages/NativeComfyPage';
@@ -10,13 +11,13 @@ import { CreatePanel } from './pages/CreatePage';
 import { CreateResults } from './components/CreateResults';
 import { ComputePage, ThemePicker } from './pages/ComputePage';
 import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { Sparkles, Zap, Image as ImageIcon, Cpu, Settings as SettingsIcon, Folder, ChevronDown, X, Plus, Check, Maximize2, Star, Download, Trash2, RotateCcw, Triangle, Boxes, Workflow } from 'lucide-react';
+import { Sparkles, Zap, Image as ImageIcon, Cpu, Settings as SettingsIcon, Folder, ChevronDown, X, Plus, Check, Maximize2, Star, Download, Trash2, RotateCcw, Triangle, Boxes, Workflow, Layers, KeyRound, ArrowLeft } from 'lucide-react';
 import {
-  apiMessage, assetUrl, cancelGpuJob, createGpuJob, createGpuBatch, createProject, deleteAsset, disconnectGoogle,
+  apiMessage, assetUrl, cancelGpuJob, createGpuJob, createGpuBatch, createProject, deleteAsset, deleteGpuWorkflow,
   apiFetch,
   getGpuComputeSpecs, getGpuGallery, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
   getGpuPresets, getReferenceAssets, getGpuSettings, getGpuUsage, getGpuWorkflowSchema, getGpuWorkflows, getProjects, importGpuWorkflow,
-  isLoggedIn, login, publishGpuWorkflow, retryGpuJob, retryGpuAttempt, startGoogleAuth, stopGpuCompute, updateAsset, uploadAsset,
+  isLoggedIn, login, publishGpuWorkflow, retryGpuJob, retryGpuAttempt, stopGpuCompute, updateAsset, uploadAsset,
   validateGpuWorkflow, rollbackGpuWorkflow, deactivateGpuWorkflow, saveGpuPreset, ApiError, type ComputeSpec, type GalleryAsset, type GpuJob, type GpuPreset,
   type GpuManifest, type GpuModel, type GpuSettings, type GpuUsage, type GpuWorkflow, type Project, type Provider,
 } from './lib/gpu-api';
@@ -38,10 +39,10 @@ import { useDesktopLayout } from './lib/desktop-layout';
 import { readableState } from './lib/ui-helpers';
 import styles from './gpu.module.css';
 
-const tabs = ['创作', '任务', '作品', '算力', '模型库', '原生 ComfyUI'] as const;
+const tabs = ['创作', '任务', '作品', '工作流与模型', '模型库', '算力', '原生 ComfyUI'] as const;
 type Tab = typeof tabs[number] | '设置';
-const desktopTabs: Tab[] = ['创作', '任务', '作品', '原生 ComfyUI', '模型库', '算力', '设置'];
-const tabIcons = { 创作: Sparkles, 任务: Zap, 作品: ImageIcon, 算力: Cpu, 模型库: Boxes, '原生 ComfyUI': Workflow, 设置: SettingsIcon };
+const desktopTabs: Tab[] = ['创作', '任务', '作品', '原生 ComfyUI', '工作流与模型', '模型库', '算力', '设置'];
+const tabIcons = { 创作: Sparkles, 任务: Zap, 作品: ImageIcon, 算力: Cpu, 模型库: Boxes, '工作流与模型': Layers, '原生 ComfyUI': Workflow, 设置: SettingsIcon };
 const terminalStates = new Set(['completed', 'succeeded', 'failed', 'failed_final', 'cancelled', 'cancelled_local', 'blocked']);
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -654,7 +655,7 @@ export default function App() {
         // 批次沿用用户选定的账号、实例与生命周期，不再静默改成 batch。
         const batch = await createGpuBatch(Array.from({length:batchCount},(_,index)=>({...body,
           params:{...body.params,...(typeof body.params.seed === 'number' && body.params.seed >= 0 ? {seed:body.params.seed+index} : {})}})),
-          runtimeChoice.lifecycle, runtimeChoice.retainIdleMinutes * 60, idempotencyKey.current);
+          runtimeChoice.lifecycle, idempotencyKey.current);
         ids = batch.job_ids || [];
       } else {
         ids = [(await createGpuJob(body, idempotencyKey.current)).id];
@@ -1045,9 +1046,14 @@ export default function App() {
       <main className={styles.page}>
         {tab === '创作' && (
           <section className={styles.createWorkspace} aria-label="创作工作区">
-            <h1 className={styles.desktopTitle}>创作</h1>
-            {adminRole && <button type="button" className="button ghost" aria-expanded={creationApiOpen}
-              onClick={() => setCreationApiOpen(open => !open)}>{creationApiOpen ? '返回创作' : 'API 设置'}</button>}
+            <div className={styles.createHeader}>
+              <h1 className={styles.desktopTitle}>创作</h1>
+              {adminRole && <button type="button" className={creationApiOpen ? 'button secondary' : 'button'} aria-expanded={creationApiOpen}
+                onClick={() => setCreationApiOpen(open => !open)}>
+                {creationApiOpen ? <ArrowLeft size={16} aria-hidden /> : <KeyRound size={16} aria-hidden />}
+                {creationApiOpen ? '返回创作' : 'API 设置'}
+              </button>}
+            </div>
             {adminRole && creationApiOpen ? <CreationApiPage accounts={accounts} /> :
             <div className={styles.createColumns}>
               <CreatePanel
@@ -1160,6 +1166,46 @@ export default function App() {
         )}
         {tab === '模型库' && <ModelLibraryPage />}
         {tab === '原生 ComfyUI' && <NativeComfyPage accounts={accounts} instances={instances} desktop={desktop} />}
+        {tab === '工作流与模型' && (
+          <section className={styles.stack}>
+            <div className={styles.subHead}><h2>工作流与模型</h2></div>
+            {error && <p className="status error" role="alert">{error}</p>}
+            <WorkflowsPanel
+              workflows={workflows}
+              onImport={(bundle) => void importWorkflow(bundle)}
+              onValidate={(wf) => void action('validate', async () => {
+                await validateGpuWorkflow(wf.id);
+                setWorkflows(await getGpuWorkflows());
+              })}
+              onPublish={(wf) => void action('publish', async () => {
+                await publishGpuWorkflow(wf.id);
+                setWorkflows(await getGpuWorkflows());
+              })}
+              onRollback={(wf) => void action('rollback', async () => {
+                await rollbackGpuWorkflow(wf.workflow_key, wf.workflow_version);
+                setWorkflows(await getGpuWorkflows());
+              })}
+              onDelete={adminRole ? (wf) => void action('delete-workflow', async () => {
+                await deleteGpuWorkflow(wf.id);
+                setWorkflows(current => current.filter(item => item.id !== wf.id));
+              }) : undefined}
+              deleting={loading === 'delete-workflow'}
+              onDeactivate={(wf) => void action('deactivate', async () => {
+                await deactivateGpuWorkflow(wf.id);
+                setWorkflows(await getGpuWorkflows());
+              })}
+              projectId={projectId}
+              projectTitle={activeProject ? projectOptionLabel(activeProject, projects) : ''}
+              onOpenJob={(jobId, jobProjectId) => {
+                if (jobProjectId) chooseProject(jobProjectId);
+                setTab('任务');
+                inspectJob(jobId);
+              }}
+              onUseProject={(id) => { chooseProject(id); setTab('任务'); }}
+              onActivated={() => { void getGpuWorkflows().then(setWorkflows); void getGpuModels().then(setModels).catch(() => undefined); }}
+            />
+          </section>
+        )}
         {tab === '设置' && (
           <SettingsPanel
             accounts={accounts}
@@ -1170,45 +1216,10 @@ export default function App() {
             usage={usage}
             specs={specs}
             specsNote={specsNote}
-            workflows={workflows}
             loading={loading}
             error={error}
-            onConnect={(purpose) => void action('connect', async () => {
-              const url = await startGoogleAuth(purpose);
-              if (url) window.location.href = url;
-            })}
-            onDisconnect={(purpose) => void action('disconnect', async () => {
-              await disconnectGoogle(purpose);
-              setSettings(await getGpuSettings());
-            })}
             onCheck={() => void checkGpu()}
             onStop={() => setConfirm('stop')}
-            onImport={(bundle) => void importWorkflow(bundle)}
-            onValidate={(wf) => void action('validate', async () => {
-              await validateGpuWorkflow(wf.id);
-              setWorkflows(await getGpuWorkflows());
-            })}
-            onPublish={(wf) => void action('publish', async () => {
-              await publishGpuWorkflow(wf.id);
-              setWorkflows(await getGpuWorkflows());
-            })}
-            onRollback={(wf) => void action('rollback', async () => {
-              await rollbackGpuWorkflow(wf.workflow_key, wf.workflow_version);
-              setWorkflows(await getGpuWorkflows());
-            })}
-            onDeactivate={(wf) => void action('deactivate', async () => {
-              await deactivateGpuWorkflow(wf.id);
-              setWorkflows(await getGpuWorkflows());
-            })}
-            projectId={projectId}
-            projectTitle={activeProject ? projectOptionLabel(activeProject, projects) : ''}
-            onOpenJob={(jobId, jobProjectId) => {
-              if (jobProjectId) chooseProject(jobProjectId);
-              setTab('任务');
-              inspectJob(jobId);
-            }}
-            onUseProject={(id) => { chooseProject(id); setTab('任务'); }}
-            onActivated={() => { void getGpuWorkflows().then(setWorkflows); void getGpuModels().then(setModels).catch(() => undefined); }}
             onLogout={() => {
               sessionStorage.removeItem('colab-gpu-studio-token');
               setLoggedIn(false);

@@ -161,7 +161,6 @@ export function CreatePanel({
   const excluded = useMemo(() => [promptKey, ...(hasSize ? ['width', 'height'] : [])], [promptKey, hasSize]);
   const split = useMemo(() => splitParams(manifest, excluded), [manifest, excluded]);
   const promptValue = String(params[promptKey] ?? '');
-  const maxMinutesCap = typeof settings?.budget?.max_runtime_minutes === 'number' ? settings.budget.max_runtime_minutes : 60;
   const patch = (next: Record<string, unknown>) => setParams({ ...params, ...next });
 
   if (!projectId) {
@@ -213,7 +212,9 @@ export function CreatePanel({
                 <small className="muted">{activeWorkflow.workflow_key}{subtitle ? ` · ${subtitle}` : ''}</small>
               </span>
             </button>
-          ) : <p className="muted small">还没有可用的工作流，请先到「设置 › 工作流与模型」发布一个。</p>}
+          ) : <p className="muted small">{workflows.some(wf => wf.state === 'published')
+            ? '请切换到一个已发布的工作流。'
+            : '还没有可用的工作流，请先到「工作流与模型」发布一个。'}</p>}
           <details className={`foldable ${styles.presetBox}`}>
             <summary>参数预设{presets.filter((p) => p.workflow_version_id === workflowId).length ? `（${presets.filter((p) => p.workflow_version_id === workflowId).length}）` : ''}</summary>
             <div className="foldContent">
@@ -365,7 +366,7 @@ export function CreatePanel({
           {runtime === 'colab' && (
             <div className="field">
               <label htmlFor="max-runtime">单个任务最长运行（分钟）</label>
-              <input id="max-runtime" type="number" inputMode="numeric" min={5} max={maxMinutesCap} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
+              <input id="max-runtime" type="number" inputMode="numeric" min={5} step={1} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
               <span className={styles.hint}>超时会被强制关机，已花的 CU 不退。</span>
             </div>
           )}

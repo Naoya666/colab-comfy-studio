@@ -68,7 +68,8 @@ def seed_builtin_templates(registry, owner_id: str) -> None:
     bundles = _bundles()
     known_models = {row.get("model_id") for row in registry.models(owner_id)}
     known_workflows = {
-        (row.get("workflow_key"), row.get("workflow_version")) for row in registry.workflows(owner_id)
+        (row.get("workflow_key"), row.get("workflow_version"))
+        for row in registry.repo.list("workflows", owner_id, include_deleted=True)
     }
     for bundle in bundles:
         model_id = bundle["model_id"]

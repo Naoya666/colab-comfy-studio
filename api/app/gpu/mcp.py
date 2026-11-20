@@ -650,10 +650,13 @@ class MCPGPUExecutor:
                 "runtime_folder_id": cache.get("runtime_folder_id"),
                 "access_token": cache.get("access_token"),
             }
-        if snapshot.get("creation_api"):
-            payload["instance_id"] = job.get("instance_id")
+        if job.get("generation_timeouts"):
+            payload["generation_timeouts"] = True
+        if job.get("generation_timeouts") or snapshot.get("creation_api"):
             deadlines = [job.get("deadline_epoch"), job.get("task_deadline_epoch")]
             payload["deadline_epoch"] = min((float(d) for d in deadlines if d is not None), default=None)
+        if snapshot.get("creation_api"):
+            payload["instance_id"] = job.get("instance_id")
             if job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
                 payload["snapshot"] = {**snapshot, "runtime_compute_spec": None}
         if "lora_drive_cache" in job:

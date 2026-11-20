@@ -501,7 +501,7 @@ class Scheduler:
         requested = self.config.max_runtime_minutes if requested is None else int(requested)
         if requested <= 0:
             raise SchedulerError("max runtime must be positive")
-        if (job.get("snapshot") or {}).get("native_comfy"):
+        if job.get("generation_timeouts") or (job.get("snapshot") or {}).get("native_comfy"):
             return requested
         return min(requested, self.config.max_runtime_minutes)
 
@@ -663,8 +663,11 @@ class Scheduler:
         now = self.clock()
         deadline = job.get("deadline_epoch")
         if deadline is None:
-            minutes = self.config.max_runtime_minutes if job.get("creation_fingerprint") else self._effective_runtime(job)
-            deadline = now + minutes * 60
+            deadline = now + self._effective_runtime(job) * 60
+            if job.get("generation_timeouts"):
+                deadline = job.get("task_deadline_epoch") or deadline
+            elif job.get("creation_fingerprint"):
+                deadline = now + self.config.max_runtime_minutes * 60
         payload = {
             "owner_job_id": job["id"],
             "provider": self._provider_name(job),
@@ -677,6 +680,8 @@ class Scheduler:
             "create_attempts": 0,
             "deadline_epoch": deadline,
         }
+        if job.get("generation_timeouts"):
+            payload["generation_timeouts"] = True
         for key in ("instance_id", "account_id"):
             if job.get(key) is not None:
                 payload[key] = job[key]
@@ -1572,6 +1577,8 @@ class Scheduler:
                             lease_patch["idle_deadline_at"] = instance["idle_deadline_at"]
                         if instance.get("hard_deadline_at") is not None:
                             lease_patch["deadline_epoch"] = instance["hard_deadline_at"]
+                        elif lease.get("generation_timeouts") and instance.get("idle_deadline_at") is not None:
+                            lease_patch["deadline_epoch"] = instance["idle_deadline_at"]
                         self._update("leases", lease["id"], lease_patch, job.get("owner_id"))
             if isinstance(instance, dict) and instance.get("state") == "retained_idle":
                 if job.get("execution_id"):
@@ -1744,7 +1751,13 @@ class Scheduler:
             if not self._is_v020_job(job) and self._has_capacity_blocker(job):
                 return job
             task_deadline = ({"task_deadline_epoch": self.clock() + self._effective_runtime(job) * 60}
-                             if job.get("creation_fingerprint") else {})
+                             if job.get("generation_timeouts") or job.get("creation_fingerprint") else {})
+            if job.get("generation_timeouts"):
+                lease = self._lease(job)
+                if lease and lease.get("generation_timeouts") and lease.get("hard_deadline_at") is None:
+                    deadline = task_deadline["task_deadline_epoch"]
+                    self._update("leases", lease["id"], {"deadline_epoch": deadline}, job["owner_id"])
+                    task_deadline["deadline_epoch"] = deadline
             return self._set_state(job, "allocating", "GPU capacity available", awaiting_prep=False, **task_deadline)
         if state == "allocating":
             return self._allocation(job)

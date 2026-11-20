@@ -1,9 +1,8 @@
 import { ModelSourceSettings, ModelStorageSettings } from './ModelLibraryPage';
 import { useState } from 'react';
-import { Settings, ChevronLeft, ChevronRight, Monitor, Gauge, Plug, Cpu, Layers, LogOut, Search, Square } from 'lucide-react';
-import { WorkflowsPanel } from './WorkflowManager';
+import { Settings, ChevronLeft, Monitor, Gauge, Plug, Cpu, LogOut, Search, Square } from 'lucide-react';
 import { ThemePicker } from './ComputePage';
-import type { ComputeSpec, GpuSettings, GpuUsage, GpuWorkflow } from '../lib/gpu-api';
+import type { ComputeSpec, GpuSettings, GpuUsage } from '../lib/gpu-api';
 import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
 import { AccountDirectory, type GpuAccount } from '../components/AccountDirectory';
 import { InstanceCenter } from '../components/InstanceCenter';
@@ -14,31 +13,17 @@ import styles from '../gpu.module.css';
 import { cuNumber } from '../lib/ui-helpers';
 
 export function SettingsPanel({
-  settings, usage, specs, specsNote = '', workflows, loading, error, accounts = [], onAccountsChange, instances = [], onRefreshInstances,
-  projectId = '', projectTitle = '',
-  onConnect, onDisconnect, onCheck, onStop, onImport, onValidate, onPublish, onRollback, onDeactivate, onActivated, onOpenJob, onUseProject, onLogout, onBack,
+  settings, usage, specs, specsNote = '', loading, error, accounts = [], onAccountsChange, instances = [], onRefreshInstances,
+  onCheck, onStop, onLogout, onBack,
 }: {
   settings: GpuSettings | null;
   usage?: GpuUsage | null;
   specs: ComputeSpec[];
   specsNote?: string;
-  workflows: GpuWorkflow[];
   loading: string;
   error: string;
-  onConnect: (purpose: 'drive' | 'colab') => void;
-  onDisconnect: (purpose: 'drive' | 'colab') => void;
   onCheck: () => void;
   onStop: () => void;
-  onImport: (bundle: string) => void;
-  onValidate: (workflow: GpuWorkflow) => void;
-  onPublish: (workflow: GpuWorkflow) => void;
-  onRollback: (workflow: GpuWorkflow) => void;
-  onDeactivate?: (workflow: GpuWorkflow) => void;
-  onActivated?: () => void;
-  projectId?: string;
-  projectTitle?: string;
-  onOpenJob?: (jobId: string, projectId?: string) => void;
-  onUseProject?: (projectId: string) => void;
   onLogout: () => void;
   onBack?: () => void;
   instances?: GpuInstance[];
@@ -46,28 +31,12 @@ export function SettingsPanel({
   accounts?: GpuAccount[];
   onAccountsChange?: (accounts: GpuAccount[]) => void;
 }) {
-  const [view, setView] = useState<'main' | 'workflows'>('main');
   const [oauthConfigured, setOauthConfigured] = useState(false);
 
   const activeCount = Number(usage?.active_runtimes ?? 0);
   const dailyCap = Number(usage?.daily_limit || settings?.budget?.daily_units || 0);
   const used = Number(usage?.actual_units || usage?.estimated_units || 0);
   const pct = dailyCap > 0 ? Math.min(100, Math.round((used / dailyCap) * 100)) : 0;
-  const familyCount = new Set(workflows.map((w) => w.workflow_key)).size;
-
-  if (view === 'workflows') {
-    return (
-      <div className={styles.stack}>
-        <div className={styles.subHead}>
-          <button type="button" className={styles.backBtn} onClick={() => setView('main')}><ChevronLeft size={18} strokeWidth={1.6} aria-hidden />设置</button>
-          <h2>工作流与模型</h2>
-        </div>
-        <WorkflowsPanel workflows={workflows} projectId={projectId} projectTitle={projectTitle} onImport={onImport} onValidate={onValidate} onPublish={onPublish} onRollback={onRollback} onDeactivate={onDeactivate} onActivated={onActivated || (() => undefined)} onOpenJob={onOpenJob} onUseProject={onUseProject} />
-        {error && <p className="status error" role="alert">{error}</p>}
-      </div>
-    );
-  }
-
   return (
     <div className={`${styles.stack} ${styles.workspaceGrid}`}>
       <div className={`${styles.subHead} ${styles.workspaceWide}`}>
@@ -116,12 +85,6 @@ export function SettingsPanel({
         {specsNote && <p className="muted small" role="status">{specsNote}</p>}
         {specs.length ? <ComputeSpecs specs={specs} /> : null}
       </Card>
-
-      <button type="button" className={styles.navRow} onClick={() => setView('workflows')}>
-        <Layers size={18} strokeWidth={1.5} aria-hidden />
-        <span><strong>工作流与模型</strong><small className="muted">{familyCount} 个工作流 · {workflows.length} 个版本</small></span>
-        <ChevronRight size={18} strokeWidth={1.5} aria-hidden />
-      </button>
 
       <button className="button secondary big" type="button" onClick={onLogout}><LogOut size={17} strokeWidth={1.6} aria-hidden />退出登录</button>
       {error && <p className="status error" role="alert">{error}</p>}

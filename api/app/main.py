@@ -530,6 +530,19 @@ def deactivate_workflow(
     return ok(registry.deactivate(user["id"], workflow_id), request)
 
 
+@router.delete("/workflows/{workflow_id}")
+def delete_workflow(workflow_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    admin(user)
+    with st.admission_lock() as acquired:
+        if not acquired:
+            raise APIError("SCHEDULER_BUSY", "工作流管理繁忙，请重试", 503, True)
+        try:
+            Repository(st).delete_workflow(user["id"], workflow_id)
+        except KeyError as exc:
+            raise APIError("NOT_FOUND", "工作流不存在或不属于当前用户", 404) from exc
+    return ok({"id": workflow_id}, request)
+
+
 @router.get("/presets")
 def presets(
     request: Request,

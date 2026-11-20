@@ -705,7 +705,7 @@ class InstanceService:
             data.update(current_job_id=None, last_seen_at=self.clock(), retention_mode=mode)
             if not data.get("native_comfy"):
                 data.update(idle_deadline_at=None, retention_reserved=0.0)
-            state = "retained_idle" if retain else "releasing"
+            released_for_budget = False
             if retain:
                 minutes = (
                     policy.get("retain_idle_minutes")
@@ -713,12 +713,27 @@ class InstanceService:
                     or self._cfg("default_idle_minutes", self._cfg("max_idle_minutes", 15))
                 )
                 minutes = 1.0 if reuse_batch else max(1.0, float(minutes))
-                if not data.get("native_comfy"):
+                if not data.get("native_comfy") and not job.get("generation_timeouts"):
                     minutes = min(30.0, minutes)
-                data["retain_idle_minutes"] = minutes
-                data["idle_deadline_at"] = min(self.clock() + float(minutes) * 60, float(hard)) if hard is not None else self.clock() + float(minutes) * 60
+                now = self.clock()
+                deadline = min(now + minutes * 60, float(hard)) if hard is not None else now + minutes * 60
+                if job.get("generation_timeouts") and not data.get("native_comfy") and data.get("provider") == "colab":
+                    try:
+                        account = self._account_row(session, data.get("account_id"), instance.owner_id)
+                        if account is None:
+                            raise BudgetError("GPU account is not configured")
+                        units = self._retention_units("colab", (deadline - now) / 60, data.get("unit_rate"))
+                        self._check_budget(session, account, units)
+                        data["retention_reserved"] = units
+                    except BudgetError:
+                        retain = False
+                        released_for_budget = True
+                if retain:
+                    data.update(retain_idle_minutes=minutes, idle_deadline_at=deadline)
+            state = "retained_idle" if retain else "releasing"
             self._set(instance, data, state=state, session=session)
-            self._emit(session, instance.owner_id, instance.project_id, instance.id, job.get("id"), state, "job completed" if success else "job failed")
+            message = "GPU idle retention budget exceeded" if released_for_budget else ("job completed" if success else "job failed")
+            self._emit(session, instance.owner_id, instance.project_id, instance.id, job.get("id"), state, message)
             return self._dict(instance)
 
     def bind_lease(self, job, lease):
@@ -738,7 +753,9 @@ class InstanceService:
                 raise InstanceConflict("实例已被清理流程围栏")
             if data.get("current_job_id") not in {None, job.get("id")}:
                 raise InstanceConflict("instance is owned by another job")
-            deadline = lease_data.get("hard_deadline_at") or lease_data.get("deadline_epoch")
+            deadline = lease_data.get("hard_deadline_at")
+            if deadline is None and not lease_data.get("generation_timeouts"):
+                deadline = lease_data.get("deadline_epoch")
             current = data.get("hard_deadline_at")
             if deadline is not None:
                 deadline = float(deadline)
@@ -796,8 +813,8 @@ class InstanceService:
             minutes = float(idle_minutes)
         except (TypeError, ValueError) as exc:
             raise AllocationError("idle_minutes is invalid") from exc
-        if minutes < 0 or minutes > float(self._cfg("max_idle_minutes", 30)):
-            raise AllocationError("idle retention exceeds configured limit")
+        if not math.isfinite(minutes) or minutes < 0:
+            raise AllocationError("idle_minutes is invalid")
         body = {"mode": mode, "idle_minutes": minutes, "expected_version": expected_version}
         with self._admission(), self._tx() as session:
             operation, prior, done = self._operation(session, owner, id, "retention", key, body)
@@ -811,6 +828,10 @@ class InstanceService:
             if instance.state in {"releasing", "deleted", "unknown", "cleanup_pending", "quarantined"}:
                 raise InstanceConflict("instance can no longer be retained")
             data = self._data(instance)
+            lease = self._find(session, "leases", data["lease_id"], owner) if data.get("lease_id") else None
+            lease_data = self._data(lease) if lease is not None else {}
+            if not lease_data.get("generation_timeouts") and minutes > float(self._cfg("max_idle_minutes", 30)):
+                raise AllocationError("idle retention exceeds configured limit")
             provider = data.get("provider", "mock")
             hard = data.get("hard_deadline_at")
             if mode in {"retain", "smart"}:
@@ -827,14 +848,13 @@ class InstanceService:
                 data["idle_deadline_at"] = min(deadline, float(hard)) if hard is not None else deadline
                 data["retention_mode"] = mode
                 state = "retained_idle"
-                if not data.get("native_comfy") and not data.get("current_job_id") and data.get("lease_id"):
-                    lease = self._find(session, "leases", data["lease_id"], owner)
-                    if lease is not None and lease.state == "idle":
-                        lease_data = self._data(lease)
-                        if lease_data.get("instance_id") != id or lease_data.get("current_job_id"):
-                            raise InstanceConflict("GPU 租约已发生变更")
-                        lease_data["idle_deadline_at"] = data["idle_deadline_at"]
-                        self._set(lease, lease_data, session=session)
+                if not data.get("native_comfy") and not data.get("current_job_id") and lease is not None and lease.state == "idle":
+                    if lease_data.get("instance_id") != id or lease_data.get("current_job_id"):
+                        raise InstanceConflict("GPU 租约已发生变更")
+                    lease_data["idle_deadline_at"] = data["idle_deadline_at"]
+                    if lease_data.get("generation_timeouts") and hard is None:
+                        lease_data["deadline_epoch"] = data["idle_deadline_at"]
+                    self._set(lease, lease_data, session=session)
             else:
                 data.update(retention_mode="save", idle_deadline_at=None, retention_reserved=0.0)
                 state = "releasing" if data.get("current_job_id") is None else instance.state

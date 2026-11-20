@@ -126,7 +126,7 @@ class Registry:
                 self.repo.create("models", owner_id, spec)
         existing = [
             row
-            for row in self.workflows(owner_id)
+            for row in self.repo.list("workflows", owner_id, include_deleted=True)
             if row.get("workflow_key") == "demo-mock" and row.get("workflow_version") == 1
         ]
         if existing:
@@ -221,7 +221,7 @@ class Registry:
         # The unique database identity remains the final race arbiter.
         for _ in range(8):
             versions = []
-            for row in self.workflows(owner_id):
+            for row in self.repo.list("workflows", owner_id, include_deleted=True):
                 if row.get("workflow_key") == key and isinstance(row.get("workflow_version"), int):
                     versions.append(row["workflow_version"])
             payload["workflow_version"] = max(versions, default=0) + 1
