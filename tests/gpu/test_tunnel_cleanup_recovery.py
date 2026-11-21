@@ -49,7 +49,6 @@ def test_watchdog_reconciles_stuck_cli_allocation(monkeypatch, confirmed):
     monkeypatch.setattr(provider, "_tunnel_assignments", lambda: [])
     monkeypatch.setattr(provider, "delete", forbidden)
     scheduler = Scheduler(repo, provider_factory=lambda job: provider, clock=lambda: now)
-    monkeypatch.setattr(scheduler, "_measure_spend", lambda job, lease: {})
 
     try:
         scheduler.watchdog()
@@ -62,9 +61,6 @@ def test_watchdog_reconciles_stuck_cli_allocation(monkeypatch, confirmed):
     assert job["error_code"] == "gpu_allocation_aborted"
     assert lease["state"] == ("deleted" if confirmed else "cleanup_pending")
     assert instance["state"] == ("deleted" if confirmed else "releasing")
-    with repo.store.Session() as session:
-        reserved = 0 if confirmed else 8
-        assert scheduler.instances._budget_totals(session, "owner", "account") == (reserved, reserved)
 
 
 class IntentRecoveryTests(unittest.TestCase):

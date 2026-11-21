@@ -1,13 +1,19 @@
-"""A bounded CUDA-only feasibility job, governed by the same scheduler and budget."""
+"""Colab CU accounting endpoints and a CUDA feasibility job."""
 
-from fastapi import APIRouter, Depends, Request
+import time
+from datetime import date as LocalDate
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Query, Request
 
 from .common import APIError, admin, current_user, get_store, ok
 from .gpu import ccu
 from .gpu.colab import GoogleColabProvider
 from .gpu.compute import GpuConfig
+from .gpu.cu_guard import CuGuardService
 from .gpu.google import GoogleService
 from .gpu.manifest import digest
+from .gpu.rates import minute_rate
 from .gpu.repository import Repository
 
 router = APIRouter(prefix="/api/gpu")
@@ -17,8 +23,42 @@ router = APIRouter(prefix="/api/gpu")
 def cu_balance(request: Request, user=Depends(current_user), st=Depends(get_store)):
     if not ccu.sampling_enabled():
         raise APIError("CCU_SAMPLING_DISABLED", "当前环境未启用 Colab CU 余额查询", 409)
-    snapshots = ccu.balance_snapshots(Repository(st), user["id"])
-    return ok({**ccu.summarize(snapshots), "snapshots": snapshots}, request)
+    repo = Repository(st)
+    owner = user["id"]
+    ccu.sync_sessions(repo, owner, time.time())
+    snapshots = ccu.balance_snapshots(repo, owner)
+    guard = CuGuardService(repo)
+    guard.enforce(owner)
+    return ok({**ccu.summarize(snapshots), "snapshots": snapshots, "guard": guard.state(owner)}, request)
+
+
+@router.get("/cu/guard")
+def get_cu_guard(request: Request, user=Depends(current_user), st=Depends(get_store)):
+    return ok(CuGuardService(Repository(st)).state(user["id"]), request)
+
+
+@router.put("/cu/guard")
+def put_cu_guard(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    admin(user)
+    guard = CuGuardService(Repository(st))
+    state = guard.save(user["id"], body)
+    guard.enforce(user["id"])
+    return ok(state, request)
+
+
+@router.get("/cu/sessions")
+def get_cu_sessions(
+    request: Request,
+    date: LocalDate | None = None,
+    kind: Literal["all", "single_job", "smart_reuse", "native_comfy", "prep", "smoke"] = "all",
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
+    rows, total = ccu.sessions(Repository(st), user["id"], date=date.isoformat() if date else None,
+                               kind=kind, limit=limit, offset=offset)
+    return ok({"sessions": rows, "total": total, "limit": limit, "offset": offset}, request)
 
 
 def _require_account(repo, owner_id: str, account_id: str | None, *, require_allocation: bool = True) -> dict | None:
@@ -48,8 +88,6 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
         raise APIError("CONFIRMATION_REQUIRED", "此测试会真实消费点数，必须明确确认", 403)
     if not cfg.real_enabled:
         raise APIError("REAL_GPU_DISABLED", "真实 GPU 开关尚未启用")
-    if cfg.unit_rate is None or cfg.unit_rate <= 0:
-        raise APIError("RATE_UNKNOWN", "必须先填写每分钟估算费率和预算")
     account_id = body.get("account_id")
     if not isinstance(account_id, str) or not account_id.strip():
         raise APIError("ACCOUNT_REQUIRED", "真实冒烟必须明确选择Google账号", 422)
@@ -62,11 +100,11 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
     raw = {
         "kind": "system-cuda-smoke",
         "requested_spec": body.get("spec"),
-        "max_runtime_minutes": min(5, cfg.max_runtime_minutes),
+        "max_runtime_minutes": 5,
         "execution_policy": {
             "provider": "colab",
             "account_id": account_id,
-            "max_runtime_minutes": min(5, cfg.max_runtime_minutes),
+            "max_runtime_minutes": 5,
             "shutdown_after_job": True,
         },
     }
@@ -74,6 +112,7 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
         if previous.get("body_hash") != digest(raw):
             raise APIError("IDEMPOTENCY_CONFLICT", "幂等键已用于其他参数", 409)
         return ok({"id": previous["id"], "job_id": previous["id"], "state": previous["state"]}, request, 202)
+    CuGuardService(repo).check(user["id"], "colab", account_id)
     google = GoogleService(repo, user["id"], account_id=account_id)
     if not google.status()["colab"]["connected"]:
         raise APIError("GOOGLE_NOT_CONNECTED", "请先完成个人 Colab OAuth 授权")
@@ -101,6 +140,7 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
             )
         job, created = repo.create_job(user["id"], raw, key)
         if created:
+            rate = minute_rate(eligible[0], fallback_rate=cfg.unit_rate)
             snapshot = {
                 "system_smoke": True,
                 "manifest": {
@@ -131,8 +171,8 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
                     "snapshot": snapshot,
                     "requested_spec": eligible[0],
                     "max_runtime_minutes": raw["max_runtime_minutes"],
-                    "estimated_units": raw["max_runtime_minutes"] * cfg.unit_rate,
-                    "unit_rate": cfg.unit_rate,
+                    "estimated_units": raw["max_runtime_minutes"] * rate if rate is not None else None,
+                    "unit_rate": rate,
                 },
                 user["id"],
             )

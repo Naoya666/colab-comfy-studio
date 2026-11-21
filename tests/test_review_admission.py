@@ -117,7 +117,7 @@ def test_workflow_review_locks_dependencies_and_allows_all_graph_nodes():
     assert reviewed["manifest"]["node_allowlist"] == ["CheckpointLoaderSimple"]
 
 
-def test_real_smoke_rejects_over_budget_before_create(monkeypatch):
+def test_real_smoke_rejects_daily_cu_fuse_before_create(monkeypatch):
     st = Store("sqlite:///:memory:")
     repo = Repository(st)
     model = valid_model(repo)
@@ -143,6 +143,7 @@ def test_real_smoke_rejects_over_budget_before_create(monkeypatch):
         ],
     )
 
+    monkeypatch.setenv("GPU_DAILY_UNITS", "0")
     with pytest.raises(review_routes.APIError) as exc:
         review_routes.real_smoke(
             workflow["id"],
@@ -158,7 +159,7 @@ def test_real_smoke_rejects_over_budget_before_create(monkeypatch):
             OWNER,
             st,
         )
-    assert exc.value.code == "GPU_BUDGET_EXCEEDED"
+    assert exc.value.code == "CU_DAILY_LIMIT_REACHED"
     assert repo.list("jobs", OWNER["id"]) == []
 
 

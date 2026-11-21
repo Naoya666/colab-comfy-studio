@@ -4,8 +4,9 @@ import {
   ChevronRight, ChevronDown, Minus, Plus, X, Check, Trash2, Save,
 } from 'lucide-react';
 import type {
-  GalleryAsset, GpuManifest, GpuModel, GpuPreset, GpuSettings, GpuWorkflow, Provider,
+  GalleryAsset, GpuManifest, GpuModel, GpuPreset, GpuSettings, GpuUsage, GpuWorkflow, Provider,
 } from '../lib/gpu-api';
+import { getGpuWorkflowSchema } from '../lib/gpu-api';
 import { GpuParamForm, splitParams } from '../components/GpuParamForm';
 import { ReferencePicker, supportsReferences } from '../components/ReferencePicker';
 import { RuntimeSelection } from '../components/RuntimeSelection';
@@ -15,7 +16,7 @@ import { Card, InfoTip, Segmented } from '../components/ui';
 import { ConfirmDialog } from '../components/Feedback';
 import { RUNTIME_HELP } from '../lib/labels';
 import { workflowTitle, workflowUsage } from '../lib/workflow-copy';
-import { parameterList, parameterKey, shown } from '../lib/ui-helpers';
+import { parameterList, parameterKey, cuNumber, shown } from '../lib/ui-helpers';
 import styles from '../gpu.module.css';
 
 type Category = 'image' | 'video';
@@ -57,7 +58,7 @@ function buildSizes(defW: number, defH: number, step: number, min: number, max: 
 }
 
 export function CreatePanel({
-  projectId, models, workflows, presets, settings, manifest, params, setParams, gallery,
+  projectId, models, workflows, presets, settings, usage, computeSpec, onEditGuard, manifest, params, setParams, gallery,
   selectedAssets, setSelectedAssets, uploadProgress, onUpload, setModelId, workflowId, setWorkflowId,
   runtime, setRuntime, maxRuntime, setMaxRuntime, batchCount, setBatchCount, batchMode,
   runtimeChoice, accounts, instances, onRuntimeChoiceChange,
@@ -72,6 +73,9 @@ export function CreatePanel({
   workflows: GpuWorkflow[];
   presets: GpuPreset[];
   settings: GpuSettings | null;
+  usage: GpuUsage | null;
+  computeSpec: Record<string, unknown> | null;
+  onEditGuard: () => void;
   manifest: GpuManifest | null;
   params: Record<string, unknown>;
   setParams: Dispatch<SetStateAction<Record<string, unknown>>>;
@@ -110,6 +114,17 @@ export function CreatePanel({
   const [selectedPresetId, setSelectedPresetId] = useState('');
   const [deletingPreset, setDeletingPreset] = useState<GpuPreset | null>(null);
   const [runtimeExpanded, setRuntimeExpanded] = useState(false);
+
+  const [estimatedSchema, setEstimatedSchema] = useState<GpuManifest | null>(null);
+  useEffect(() => {
+    setEstimatedSchema(null);
+    if (runtime !== 'colab' || !computeSpec || !workflowId) return;
+    let live = true;
+    void getGpuWorkflowSchema(workflowId, computeSpec).then(value => {
+      if (live) setEstimatedSchema(value);
+    }, () => {});
+    return () => { live = false; };
+  }, [computeSpec, runtime, workflowId]);
 
   /* ───── 工作流分组：同一个 workflow_key 的所有版本归为一族 ───── */
   const families = useMemo(() => {
@@ -220,8 +235,28 @@ export function CreatePanel({
     );
   }
 
+  const guard = usage?.guard;
+  const blockedAccounts = guard?.hard_tripped_accounts || [];
+  const candidateAccounts = accounts.filter(account => account.enabled !== false && account.allow_allocation !== false);
+  const floorBlocked = runtimeChoice.accountId
+    ? blockedAccounts.some(account => account.account_id === runtimeChoice.accountId)
+    : candidateAccounts.length > 0 && candidateAccounts.every(account => blockedAccounts.some(blocked => blocked.account_id === account.account_id));
+  const cuBlocked = runtime === 'colab' && (guard?.soft_tripped || floorBlocked);
+  const estimateSource = computeSpec ? estimatedSchema : manifest;
+  const variant = parameterList(estimateSource).find(parameter => parameter.variants);
+  const mode = variant && params[parameterKey(variant, 0)];
+  const estimates = estimateSource?.estimates as Record<string, number | null> | undefined;
+  const estimate = typeof mode === 'string' && estimates ? estimates[mode] : estimateSource?.estimated_units;
+  const cuHint = runtime === 'colab' && <>
+    {cuBlocked && <p className="status error" role="alert">
+      {floorBlocked ? guard?.message : guard?.daily_message}。
+      <button className={styles.linkButton} type="button" onClick={onEditGuard}>查看 CU 熔断设置</button>
+    </p>}
+    <p className="muted small">{estimate == null ? '估算费率未知' : `每个任务约 ${cuNumber(estimate)} CU（参考）`}</p>
+  </>;
+
   const submitButton = (
-    <button className={desktop ? 'button' : 'button big'} disabled={!draftReady || loading === 'submit'} type="button" onClick={onSubmit}>
+    <button className={desktop ? 'button' : 'button big'} disabled={!draftReady || loading === 'submit' || !!cuBlocked} type="button" onClick={onSubmit}>
       <Sparkles size={18} strokeWidth={1.8} aria-hidden />{loading === 'submit' ? '提交中…' : '立即生成'}
     </button>
   );
@@ -275,12 +310,12 @@ export function CreatePanel({
               {runtime === 'colab' && (
                 <div className="field">
                   <label htmlFor="max-runtime">单个任务最长运行（分钟）</label>
-                  <input id="max-runtime" type="number" inputMode="numeric" min={5} step={1} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
+                  <input id="max-runtime" type="number" inputMode="numeric" min={1} step={1} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
                   <span className={styles.hint}>超时会被强制关机，已花的 CU 不退。</span>
                 </div>
               )}
               <p className="muted small">
-                {runtime === 'mock' ? RUNTIME_HELP.mock : `${RUNTIME_HELP.colab}今日限额 ${shown(settings?.budget?.daily_units)} CU。`}
+                {runtime === 'mock' ? RUNTIME_HELP.mock : `${RUNTIME_HELP.colab}今日已扣 ${cuNumber(usage?.today_actual_cu)} CU${guard?.daily_limit_cu == null ? '' : ` / ${cuNumber(guard.daily_limit_cu)} CU`}。`}
               </p>
             </div>
           )}
@@ -505,10 +540,11 @@ export function CreatePanel({
 
         {children}
 
-        {!desktop && <Card icon={<Play size={17} strokeWidth={1.6} aria-hidden />} title="开始生成">{submitButton}{submitError}</Card>}
+        {!desktop && <Card icon={<Play size={17} strokeWidth={1.6} aria-hidden />} title="开始生成">{cuHint}{submitButton}{submitError}</Card>}
       </section>
       {desktop && <div className={styles.createSubmit}>
         {submitError}
+        {cuHint}
         <div className={styles.submitRow}>
           <span>{runtime === 'mock' ? '离线模拟' : 'Colab GPU'} · {batchCount} 个任务</span>
           {submitButton}

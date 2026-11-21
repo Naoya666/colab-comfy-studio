@@ -280,7 +280,8 @@ def test_native_admission_idempotent_across_restart_and_gpu_switch(proxy, monkey
     assert native.model_storage(job["execution_policy"]) == native.model_storage(body)
     with pytest.raises(APIError, match="停止实例"):
         native.admit(repo, "owner", {**body, "model_storage_mode": "local"}, "change-model-storage")
-    assert job["estimated_units"] == job["max_runtime_minutes"] * 0.01
+    assert job["estimated_units"] is None
+    assert job["unit_rate"] == pytest.approx(1.15 / 60)
     assert 0 <= job["native_session_deadline_epoch"] - time.time() <= job["max_runtime_minutes"] * 60
     assert native.admit(Repository(store), "owner", body, "native-start")["id"] == job["id"]
     assert native.admit(Repository(store), "owner", body, "another-browser")["id"] == job["id"]

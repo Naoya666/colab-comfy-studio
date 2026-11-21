@@ -1,4 +1,4 @@
-"""Human review gates and the budgeted real-model smoke-test workflow.
+"""Human review gates and the real-model smoke-test workflow.
 
 This router is deliberately the only admission path for an unenabled real
 model.  It records review evidence, creates only an immutable queued job, and
@@ -29,7 +29,6 @@ from .gpu.rates import estimate as estimate_units
 from .gpu.rates import mode_param
 from .gpu.repository import Repository
 from .gpu.runtime_worker import REVIEWED_CUSTOM_NODES, _reviewed_custom_nodes, _validate_weights
-from .gpu.scheduler import Scheduler
 from .storage import read_asset
 
 router = APIRouter(prefix="/api/gpu")
@@ -279,22 +278,12 @@ def _require_workflow_spec(manifest, requested_key):
         raise APIError("WORKFLOW_GPU_SPEC_MISMATCH", "冒烟GPU必须匹配工作流声明的型号和内存规格，不会自动升级显卡")
 
 
-def _budget_check(st, owner: str, cfg: GpuConfig, units: float) -> None:
-    if not math.isfinite(units) or units <= 0:
-        raise APIError("RATE_UNKNOWN", "真实GPU费率或预算无效")
-    if units > cfg.max_job_units:
-        raise APIError("GPU_BUDGET_EXCEEDED", "真实冒烟预算超过单任务上限")
-    daily, monthly = Scheduler(st, config=cfg)._usage_totals(owner)
-    if daily + units > cfg.daily_units or monthly + units > cfg.monthly_units:
-        raise APIError("GPU_BUDGET_EXCEEDED", "真实冒烟预算超过账户日/月上限")
-
-
-def _runtime_cap(row: Mapping, cfg: GpuConfig) -> int:
+def _runtime_cap(row: Mapping) -> int:
     """Return the server-enforced runtime ceiling for this workflow."""
     declared = (row.get("manifest") or {}).get("max_runtime_minutes", 5)
     if isinstance(declared, bool) or not isinstance(declared, int) or declared < 1:
         raise APIError("WORKFLOW_INVALID", "manifest.max_runtime_minutes必须是正整数")
-    return min(declared, cfg.max_runtime_minutes)
+    return declared
 
 
 def activation_inputs(manifest: Mapping | None) -> list[dict]:
@@ -686,7 +675,7 @@ def real_smoke(
             raise APIError("ASSET_PROJECT_MISMATCH", "参考素材不属于当前项目")
 
     cfg = GpuConfig.from_env()
-    runtime = _runtime_cap(row, cfg)
+    runtime = _runtime_cap(row)
     raw = {
         "project_id": project["id"],
         "model_id": row["model_id"],
@@ -723,22 +712,17 @@ def real_smoke(
 
     if not cfg.real_enabled:
         raise APIError("REAL_GPU_DISABLED", "GPU_REAL_ENABLED尚未启用")
-    if cfg.unit_rate is None or cfg.unit_rate <= 0:
-        raise APIError("RATE_UNKNOWN", "必须先配置真实GPU每分钟估算费率")
+    from .gpu.cu_guard import CuGuardService
+    CuGuardService(repo).check(user["id"], "colab", account_id)
     google = GoogleService(repo, user["id"], account_id=account_id)
     if not google.status().get("colab", {}).get("connected"):
         raise APIError("GOOGLE_NOT_CONNECTED", "请先完成个人Colab OAuth授权")
     chosen_spec = _eligible_spec(
         GoogleColabProvider(repo, user["id"], account_id=account_id).list_specs(), requested_key
     )
-    # 大模型要先下载权重；声明值仍受服务端全局上限约束。冒烟上限与步骤标签、任务记录使用同一个数。
-    estimated = runtime * cfg.unit_rate  # budget worst case
     picked = mode_param(row["manifest"])
     shown, rate = estimate_units(repo, user["id"], row["workflow_key"], row["manifest"], chosen_spec.get("key"), runtime,
                                  mode=params.get(picked[0]) if picked else None)
-    # Check once before the lock for a fast response and again inside the lock
-    # so concurrent admissions cannot reserve the same budget twice.
-    _budget_check(st, user["id"], cfg, estimated)
     snapshot = {
         **snapshot_parts,
         "bound_graph": bound,
@@ -782,7 +766,6 @@ def real_smoke(
         from .gpu.native import guard_generation
 
         guard_generation(repo, user["id"], raw["execution_policy"])
-        _budget_check(st, user["id"], cfg, estimated)
         job, created = repo.create_job(user["id"], raw, key)
         if created:
             job = repo.update(
@@ -806,7 +789,6 @@ def real_smoke(
                     "max_runtime_minutes": runtime,
                     "estimated_units": shown,
                     "unit_rate": rate,
-                    "budget_units": estimated,
                     "workflow_smoke": True,
                     "system_smoke": False,
                     "smoke_compatibility_signature": compatibility,
@@ -1045,7 +1027,7 @@ def workflow_activation(
     model = next((item for item in repo.list("models", user["id"]) if item.get("model_id") == row.get("model_id")), None)
     cfg = GpuConfig.from_env()
     try:
-        runtime_cap = _runtime_cap(row, cfg)
+        runtime_cap = _runtime_cap(row)
     except APIError as exc:
         runtime_cap = None
         # Keep activation read-only and useful for a malformed draft; the
@@ -1111,8 +1093,6 @@ def workflow_activation(
         blockers.append("模型缺少来源或许可字段，无法完成审查")
     if not cfg.real_enabled:
         blockers.append("服务端未开启真实 GPU（GPU_REAL_ENABLED）")
-    elif cfg.unit_rate is None or cfg.unit_rate <= 0:
-        blockers.append("服务端未配置 GPU 计价费率")
     if runtime_error:
         blockers.append(runtime_error)
 

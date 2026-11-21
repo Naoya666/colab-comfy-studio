@@ -12,6 +12,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from app.common import APIError
+
+from . import ccu
 from .colab import RUNTIME_MISSING, ColabAllocationError, GoogleColabProvider, runtime_status
 from .compute import (
     ComputeError,
@@ -21,6 +24,7 @@ from .compute import (
     default_executor_factory,
     default_provider_factory,
 )
+from .cu_guard import CuGuardService
 from .google import GoogleError
 from .instances import CreationInstancePending, StudioModelStorageConflict
 from .manifest import digest
@@ -222,6 +226,8 @@ class Scheduler:
             instance = self._instance_call("allocate", self._instance_job(job))
         except CreationInstancePending:
             return job
+        except APIError as exc:
+            return self._begin_failure(job, exc.code, exc.message)
         except StudioModelStorageConflict as exc:
             return self._begin_failure(job, "gpu_instance_allocation_failed", str(exc))
         except Exception as exc:
@@ -345,6 +351,10 @@ class Scheduler:
         if not instance_id:
             return
         instance = instance if isinstance(instance, dict) else {}
+        if self._provider_name(job) == "colab":
+            ended_at = self._instance_epoch(instance.get("deletion_confirmed_at")) or ended_at
+            self._close_cu_session(job["owner_id"], instance_id, ended_at, "confirmed_delete")
+            return
         started_at = (
             instance.get("allocation_requested_at")
             or job.get("started_epoch")
@@ -392,19 +402,20 @@ class Scheduler:
             return job
         return self._merge_instance(job, instance)
 
-    def _close_unstarted_instance(self, job: dict, lease: dict) -> dict:
+    def _close_unstarted_instance(self, job: dict, lease: dict | None) -> dict:
         """任务在创建运行时之前就失败时，远端没有机器可删，实例直接收尾。
 
         否则实例会一直停在「释放中」，看起来像失败后还在继续跑。
         """
         if not self._is_v020_job(job) or not job.get("instance_id"):
             return job
+        lease = lease or {}
         if lease.get("handle") or int(lease.get("create_attempts") or 0):
             return job
         instance = self._service_instance_for_job(job)
-        if not instance or instance.get("state") != "releasing" or instance.get("lease_id") not in (None, lease["id"]):
+        if not instance or instance.get("state") != "releasing" or instance.get("lease_id") not in (None, lease.get("id")):
             return job
-        instance = self._instance_call("mark_deleted", job.get("owner_id"), job["instance_id"], confirmed=True)
+        instance = self._instance_call("mark_deleted", job.get("owner_id"), job["instance_id"], confirmed=True, expected_version=instance.get("version"))
         return self._merge_instance(job, instance)
 
     def _factory(self, factory: Callable, job: dict):
@@ -498,52 +509,10 @@ class Scheduler:
         requested = job.get("max_runtime_minutes")
         if requested is None:
             requested = (job.get("execution_policy") or {}).get("max_runtime_minutes")
-        requested = self.config.max_runtime_minutes if requested is None else int(requested)
-        if requested <= 0:
+        requested = self.config.max_runtime_minutes if requested is None else requested
+        if type(requested) is not int or requested <= 0:
             raise SchedulerError("max runtime must be positive")
-        if job.get("generation_timeouts") or (job.get("snapshot") or {}).get("native_comfy"):
-            return requested
-        return min(requested, self.config.max_runtime_minutes)
-
-    def _usage_totals(self, owner_id: str) -> tuple[float, float]:
-        now = self.clock()
-        daily = monthly = 0.0
-        for row in self._list("usage", owner_id):
-            units = float(row.get("units") or 0)
-            stamp = float(row.get("created_epoch") or row.get("epoch") or 0)
-            monthly += units if stamp >= now - 31 * 86400 else 0
-            daily += units if stamp >= now - 86400 else 0
-        for row in self._list("jobs", owner_id):
-            if row.get("budget_reserved") and row.get("state") not in TERMINAL_STATES:
-                units = float(row["budget_reserved"])
-                daily += units
-                monthly += units
-        return daily, monthly
-
-    def _reserve_budget(self, job: dict, provider: Any) -> tuple[bool, str | None, dict]:
-        # The requested provider remains authoritative even when a test double
-        # is injected for a colab job.
-        is_mock = self._provider_name(job) == "mock"
-        raw_units = job.get("budget_units", job.get("estimated_units"))
-        if raw_units is None and self.config.unit_rate is not None:
-            raw_units = self._effective_runtime(job) * self.config.unit_rate
-        if raw_units is None:
-            if is_mock:
-                raw_units = 0.0
-            else:
-                return False, "gpu_budget_unknown", {"error_message": "real GPU task has no unit estimate"}
-        try:
-            units = float(raw_units)
-        except (TypeError, ValueError):
-            return False, "gpu_budget_invalid", {"error_message": "estimated units are invalid"}
-        if units < 0 or units > self.config.max_job_units:
-            return False, "gpu_budget_exceeded", {"error_message": "job unit limit exceeded"}
-        if is_mock:
-            return True, None, {"simulated_units": units}
-        daily, monthly = self._usage_totals(job["owner_id"])
-        if daily + units > self.config.daily_units or monthly + units > self.config.monthly_units:
-            return False, "gpu_budget_exceeded", {"error_message": "GPU budget exceeded"}
-        return True, None, {"budget_reserved": units}
+        return requested
 
     def _validate(self, job: dict) -> dict:
         if not self.config.enabled:
@@ -556,6 +525,7 @@ class Scheduler:
             )
         try:
             runtime = self._effective_runtime(job)
+            self._check_cu(job)
             provider = self._provider(job)
             if self._provider_name(job) != "mock" and job.get("requested_spec") and not job.get("creation_fingerprint"):
                 try:
@@ -564,7 +534,8 @@ class Scheduler:
                     return self._begin_failure(job, "gpu_provider_unavailable", self._safe_error(exc))
                 except Exception as exc:
                     return self._begin_failure(job, "gpu_spec_invalid", self._safe_error(exc))
-            ok, code, patch = self._reserve_budget(job, provider)
+        except APIError as exc:
+            return self._begin_failure(job, exc.code, exc.message)
         except Exception as exc:
             return self._set_state(
                 job,
@@ -573,10 +544,17 @@ class Scheduler:
                 error_code="gpu_provider_unavailable",
                 error_message=self._safe_error(exc),
             )
-        if not ok:
-            return self._set_state(job, "failed", "GPU budget rejected", error_code=code, **patch)
-        patch.update({"max_runtime_minutes": runtime, "validated_epoch": self.clock()})
-        return self._set_state(job, "waiting_for_capacity", "GPU job validated", **patch)
+        return self._set_state(job, "waiting_for_capacity", "GPU job validated",
+                               max_runtime_minutes=runtime, validated_epoch=self.clock())
+
+    def _check_cu(self, job):
+        if self._provider_name(job) != "colab":
+            return
+        policy = job.get("execution_policy") or {}
+        CuGuardService(self.store, self.clock).check(
+            job["owner_id"], self._provider_name(job),
+            job.get("account_id") or policy.get("account_id"), job.get("instance_id") or policy.get("instance_id"),
+        )
 
     def _leases_for(self, owner_id: str | None = None) -> list[dict]:
         return self._list("leases", owner_id)
@@ -814,6 +792,9 @@ class Scheduler:
             {"handle": handle, "state": "cleanup_pending", "last_seen": self.clock()},
             job.get("owner_id"),
         )
+        recovered_lease = self._get("leases", lease["id"], job["owner_id"])
+        if recovered_lease:
+            ccu.open_instance_session(self.store, job, recovered_lease, lease.get("create_started") or self.clock())
         try:
             confirmed = bool(provider.delete(handle))
         except Exception as exc:
@@ -835,18 +816,15 @@ class Scheduler:
         return False
 
     def _sample_allocation_baseline(self, job: dict, lease: dict) -> dict:
-        # Smoke and CPU-prep jobs bypass normal admission's balance sample.
-        # Never invent a baseline after a possibly billable create has started.
+        # Take the baseline before the first billable provider call.
         if (self._provider_name(job) != "colab" or job.get("ccu_before") is not None
                 or int(lease.get("create_attempts") or 0) > 0):
             return job
-        from . import ccu
-
-        baseline = ccu.maybe_sample_balance(self.store, job["owner_id"], job.get("account_id"))
+        baseline = ccu.sample_and_record(self.store, job["owner_id"], job.get("account_id"), "alloc_before")
         if not baseline:
             return job
         return self._update("jobs", job["id"], {
-            "ccu_before": baseline["balance"], "ccu_before_at": baseline["at"],
+            "ccu_before": baseline["balance"], "ccu_before_at": baseline["sampled_at"],
             "ccu_before_source": "google_balance",
         }, job["owner_id"])
 
@@ -865,10 +843,15 @@ class Scheduler:
         except SchedulerError as exc:
             return self._begin_failure(job, "gpu_instance_conflict", str(exc))
         try:
+            self._check_cu(job)
+        except APIError as exc:
+            return self._begin_failure(job, exc.code, exc.message)
+        try:
             provider = self._provider(job)
         except Exception as exc:
             return self._begin_failure(job, "gpu_provider_unavailable", self._safe_error(exc))
         if lease.get("handle"):
+            ccu.open_instance_session(self.store, job, lease, job.get("started_epoch") or lease.get("create_started") or self.clock())
             return self._set_state(job, "preparing", "GPU runtime allocation recovered")
         try:
             if isinstance(provider, DisabledProvider):
@@ -886,6 +869,10 @@ class Scheduler:
         if attempts > self.config.create_retries:
             return self._begin_failure(job, "gpu_create_failed", "GPU runtime allocation failed")
         job = self._sample_allocation_baseline(job, lease)
+        try:
+            self._check_cu(job)
+        except APIError as exc:
+            return self._begin_failure(job, exc.code, exc.message)
         attempts += 1
         lease = self._update(
             "leases",
@@ -924,12 +911,13 @@ class Scheduler:
             if recovered is False and attempts > self.config.create_retries:
                 return self._begin_failure(job, "gpu_create_failed", "GPU runtime allocation failed")
             return job
-        self._update(
+        lease = self._update(
             "leases",
             lease["id"],
             {"state": "active", "handle": handle, "last_seen": self.clock()},
             job.get("owner_id"),
         )
+        ccu.open_instance_session(self.store, job, lease, self.clock())
         return self._set_state(
             job,
             "preparing",
@@ -952,7 +940,7 @@ class Scheduler:
             self._update(
                 "leases", lease["id"], {"state": "deleted", "last_seen": self.clock()}, job.get("owner_id")
             )
-        if lease:
+        if lease or job.get("instance_id"):
             return self._set_state(
                 job,
                 "cleaning_up",
@@ -1049,6 +1037,9 @@ class Scheduler:
             )
         except Exception as exc:
             return self._begin_failure(job, "gpu_start_failed", self._safe_error(exc))
+        current = self._get("jobs", job["id"], job["owner_id"])
+        if current and current.get("cancel_requested") and current.get("error_code") == "CU_BALANCE_FLOOR_REACHED":
+            return current
         if isinstance(result, dict) and result.get("execution_id") not in {None, execution_id}:
             return self._begin_failure(job, "gpu_execution_id_mismatch", "executor changed execution ID")
         job = self._mark_instance("job_busy", job)
@@ -1123,6 +1114,9 @@ class Scheduler:
                 return self._set_state(job, 'running', 'GPU connection interrupted; retry pending',
                     poll_retry_count=retries, poll_retry_at=self.clock() + min(2**retries, 30))
             return self._begin_failure(job, "gpu_poll_failed", self._safe_error(exc))
+        current = self._get("jobs", job["id"], job["owner_id"])
+        if current and current.get("cancel_requested") and current.get("error_code") == "CU_BALANCE_FLOOR_REACHED":
+            return current
         if job.get('poll_retry_count') or job.get('poll_retry_at'):
             job = self._set_state(job, 'running', 'GPU connection recovered', poll_retry_count=0, poll_retry_at=0)
         if result.get('execution_id') not in {None,job.get('execution_id')}:
@@ -1376,92 +1370,24 @@ class Scheduler:
             cleanup_final_state="completed",
         )
 
-    def _measure_spend(self, job: dict, lease: dict | None) -> dict:
-        """Measure the real Google spend for this job when the balance is observable.
-
-        Attribution is only exclusive when no other lease on the same account was
-        active, otherwise the delta may include a sibling job and is flagged.
-        """
-        if self._provider_name(job) == "mock" or not job.get("account_id"):
-            return {}
-        owner_id = job.get("owner_id")
-        if not owner_id:
-            return {}
-        from . import ccu
-
-        before = job.get("ccu_before")
-        after = ccu.maybe_sample_balance(self.store, owner_id, job.get("account_id"))
-        contended = ccu.active_lease_count(
-            self.store,
-            owner_id,
-            job.get("account_id"),
-            exclude_lease_id=(lease or {}).get("id"),
-        ) > 0
-        patch: dict = {"ccu_measured_at": self.clock()}
-        if after:
-            patch["ccu_after"] = after["balance"]
-            patch["ccu_after_at"] = after["at"]
-        measured = ccu.reconcile(before, patch.get("ccu_after"))
-        if measured is not None:
-            patch["actual_units"] = measured
-            patch["ccu_attribution"] = "contended" if contended else "exclusive"
-            patch["ccu_source"] = "google_balance"
-        elif before is None:
-            patch["ccu_source"] = "baseline_missing"
-        else:
-            patch["ccu_source"] = "after_missing"
-        return patch
+    def _close_cu_session(self, owner, instance_id, ended_at, reason):
+        ccu.close_instance_session(self.store, owner, instance_id, ended_at, reason)
 
     def _record_usage(self, job: dict, lease: dict, stopped_at: float) -> None:
-        if any(row.get("job_id") == job.get("id") and row.get("execution_id") == job.get("execution_id")
-               for row in self._list("usage", job.get("owner_id"))):
-            return
-        started = float(job.get("started_epoch") or lease.get("created_epoch") or stopped_at)
-        elapsed_minutes = max(0.0, stopped_at - started) / 60.0
-        is_mock = self._provider_name(job) == "mock"
-        rate = float(job.get("unit_rate") or self.config.unit_rate or 0)
-        estimate = 0.0 if is_mock else elapsed_minutes * rate
-        spend: dict = {}
-        if not is_mock:
-            try:
-                spend = self._measure_spend(job, lease)
-            except Exception as exc:  # noqa: BLE001 - never fail a finished job on accounting
-                logging.getLogger(__name__).warning("ccu reconciliation failed: %s", type(exc).__name__)
-                spend = {}
-        measured = spend.get("actual_units")
-        payload = {
-            "job_id": job["id"],
-            "execution_id": job.get('execution_id'),
-            "provider": self._provider_name(job),
-            "mock": is_mock,
-            "units": estimate,
-            "units_estimate": estimate,
-            "units_actual": measured if not is_mock else 0.0,
-            "ccu_before": job.get("ccu_before"),
-            "ccu_after": spend.get("ccu_after"),
-            "ccu_attribution": spend.get("ccu_attribution"),
-            "ccu_source": spend.get("ccu_source", "not_sampled" if not is_mock else "simulated"),
-            "source": "google_balance" if measured is not None else ("simulated" if is_mock else "administrator_estimate"),
-            "unit_rate": rate,
-            "elapsed_minutes": elapsed_minutes,
-            "started_at": started,
-            "stopped_at": stopped_at,
-            "created_epoch": stopped_at,
-            "simulated": is_mock,
-            "simulated_units": float(job.get("simulated_units") or 0),
-        }
-        self.store.record_usage_once(job["owner_id"], payload)
-        self._update(
-            "jobs",
-            job["id"],
-            {
-                "actual_units": 0.0 if is_mock else measured,
-                "stopped_at": stopped_at,
-                "runtime_deleted": True,
-                **{key: value for key, value in spend.items() if key.startswith("ccu_")},
-            },
-            job.get("owner_id"),
-        )
+        if self._provider_name(job) == "mock":
+            started = float(job.get("started_epoch") or lease.get("created_epoch") or stopped_at)
+            self.store.record_usage_once(job["owner_id"], {
+                "job_id": job["id"], "execution_id": job.get("execution_id"), "provider": "mock",
+                "mock": True, "simulated": True, "units": 0.0, "units_estimate": 0.0, "units_actual": 0.0,
+                "elapsed_minutes": max(0, stopped_at - started) / 60, "created_epoch": stopped_at,
+                "started_at": started, "stopped_at": stopped_at, "source": "simulated",
+            })
+        else:
+            self._close_cu_session(job["owner_id"], job.get("instance_id") or lease.get("instance_id"), stopped_at, "confirmed_delete")
+        self._update("jobs", job["id"], {
+            "stopped_at": stopped_at, "runtime_deleted": True,
+            **({"actual_units": 0.0} if self._provider_name(job) == "mock" else {}),
+        }, job["owner_id"])
 
     def _finish_cleanup(self, job: dict, state: str, message: str, **patch) -> dict:
         if state in {"completed", "cancelled"} and job.get("error_code") in {
@@ -1531,16 +1457,24 @@ class Scheduler:
 
     def _cleanup(self, job: dict) -> dict:
         lease = self._lease(job)
+        observation = None
         if lease:
-            observation = self._inspect_runtime(lease, job.get("claim_token"))
+            if not lease.get("force_stop"):
+                observation = self._inspect_runtime(lease, job.get("claim_token"))
             if observation == "stale":
                 return self._get("jobs", job["id"], job["owner_id"]) or job
             if observation == "missing" or lease.get("remote_delete_source") == RUNTIME_MISSING:
                 current = self._get("jobs", job["id"], job["owner_id"]) or job
                 final_state = current.get("cleanup_final_state") or "failed"
+                self._record_usage(current, lease, self.clock())
                 return self._finish_cleanup(current, final_state, "GPU cleanup completed")
-        job = self._trusted_plugin_cleanup(job, lease)
-        if lease and job.get("batch_id") and job.get("cleanup_final_state") == "completed":
+        if not (lease or {}).get("force_stop"):
+            job = self._trusted_plugin_cleanup(job, lease)
+        instance = self._service_instance_for_job(job)
+        retention_allowed = not (instance or {}).get("manual_stop_requested")
+        if self._provider_name(job) == "colab":
+            retention_allowed = retention_allowed and not CuGuardService(self.store, self.clock).state(job["owner_id"])["soft_tripped"]
+        if lease and retention_allowed and job.get("batch_id") and job.get("cleanup_final_state") == "completed":
             waiting = [j for j in self._list("jobs", job["owner_id"])
                        if j.get("batch_id") == job["batch_id"] and j["state"] not in TERMINAL_STATES
                        and j["id"] != job["id"] and not j.get("cancel_requested")]
@@ -1610,15 +1544,18 @@ class Scheduler:
                     self._update('executions',job['execution_id'],{'state':'completed','finished_at':self.clock()},job['owner_id'])
                 return self._set_state(job,'completed','Mock outputs verified; idle lease retained')
         if not lease:
+            job = self._close_unstarted_instance(job, None)
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
+        if lease.get("state") == "creating" and not lease.get("handle") and not lease.get("create_attempts"):
+            lease = self._update("leases", lease["id"], {"state": "deleted", "last_seen": self.clock()}, job["owner_id"])
         if lease.get("state") == "deleted":
             job = self._close_unstarted_instance(job, lease)
             self._record_usage(job, lease, self.clock())
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         next_epoch = float(lease.get("cleanup_next_epoch") or 0)
-        if self.clock() < next_epoch or observation == "unknown":
+        if self.clock() < next_epoch or (observation == "unknown" and not lease.get("force_stop")):
             return job
-        if lease.get("native_ready"):
+        if lease.get("native_ready") and not lease.get("force_stop"):
             from .native import protect_lease
             if protect_lease(self.store, lease, self.clock, check_remote=observation is None):
                 return job
@@ -1637,10 +1574,12 @@ class Scheduler:
             )
             return self._set_state(job, "failed", "GPU cleanup was refused", error_code="gpu_cleanup_refused")
         try:
-            status = provider.inspect(handle)
-            observation = runtime_status(status) if lease.get("provider") == "colab" else None
-            confirmed = observation == "missing" if observation else status.get("deleted") is True
-            if not confirmed and observation != "unknown":
+            confirmed = False
+            if not lease.get("force_stop"):
+                status = provider.inspect(handle)
+                observation = runtime_status(status) if lease.get("provider") == "colab" else None
+                confirmed = observation == "missing" if observation else status.get("deleted") is True
+            if not confirmed and (observation != "unknown" or lease.get("force_stop")):
                 response = provider.delete(handle)
                 # A truthy response is not enough: providers may return an
                 # accepted/pending response before the remote runtime is gone.
@@ -1728,6 +1667,10 @@ class Scheduler:
         if state == "waiting_for_capacity":
             # CPU cache preparation owns the first wait.  Do not allocate a
             # durable/runtime instance until the prep decision is settled.
+            try:
+                self._check_cu(job)
+            except APIError as exc:
+                return self._begin_failure(job, exc.code, exc.message)
             if self._await_prep(job):
                 return job if job.get("awaiting_prep") else self._update("jobs", job["id"], {"awaiting_prep": True}, job.get("owner_id"))
             if self._is_v020_job(job):
@@ -1837,10 +1780,10 @@ class Scheduler:
         lease = self._get("leases", lease["id"], lease.get("owner_id")) or lease
         if lease.get("state") == "deleted":
             return False
-        observation = self._inspect_runtime(lease)
+        observation = None if lease.get("force_stop") else self._inspect_runtime(lease)
         if observation in {"missing", "stale", "unknown"}:
             return observation == "missing"
-        if lease.get("native_ready"):
+        if lease.get("native_ready") and not lease.get("force_stop"):
             from .native import protect_lease
             if protect_lease(self.store, lease, self.clock, check_remote=False):
                 return False
@@ -1880,8 +1823,7 @@ class Scheduler:
         durable_instance = self._get("instances", instance_id, owner_id) if instance_id else None
         idle_cleanup = bool(
             lease.get("state") == "idle"
-            and not lease.get("native_comfy")
-            and not lease.get("native_ready")
+            and (not lease.get("native_comfy") or lease.get("native_draining") or lease.get("force_stop"))
             and durable_instance
             and durable_instance.get("lease_id") == lease["id"]
         )
@@ -1940,9 +1882,11 @@ class Scheduler:
             provider = self._provider(job)
             if hasattr(provider, "recover_handle"):
                 handle = provider.recover_handle(handle)
-            status = provider.inspect(handle)
-            observation = runtime_status(status) if lease.get("provider") == "colab" else None
-            confirmed = observation == "missing" if observation else status.get("deleted") is True
+            confirmed = False
+            if not lease.get("force_stop"):
+                status = provider.inspect(handle)
+                observation = runtime_status(status) if lease.get("provider") == "colab" else None
+                confirmed = observation == "missing" if observation else status.get("deleted") is True
             # Without a durable instance claim nothing fences a new lease on the
             # same instance, so recheck right before the remote delete.
             if not confirmed and not claimed and instance_id and any(
@@ -1953,7 +1897,7 @@ class Scheduler:
             ):
                 finish(False, "same instance acquired by another live lease")
                 return False
-            if not confirmed and observation != "unknown":
+            if not confirmed and (observation != "unknown" or lease.get("force_stop")):
                 response = provider.delete(handle)
                 confirmed = response is True or (
                     isinstance(response, dict) and response.get("deleted") is True
@@ -2077,11 +2021,14 @@ class Scheduler:
             error = None if confirmed else "remote deletion not unambiguously confirmed"
         except Exception as exc:
             confirmed, error = False, self._safe_error(exc)
-        return bool(self.store.finish_orphan_instance(
+        finished = bool(self.store.finish_orphan_instance(
             instance["owner_id"], self._instance_id(instance), lease["id"], token, self.clock(),
             confirmed=confirmed, error=error, expected_version=claim_instance.get("version"),
             expected_lease_version=claim_lease.get("version"),
         )) and confirmed
+        if finished:
+            self._close_cu_session(instance["owner_id"], self._instance_id(instance), self.clock(), "orphan_reconciliation")
+        return finished
 
     def _reconcile_deleted_lease_instances(self, leases: list[dict]) -> int:
         """Converge old releasing rows only with durable remote-delete evidence."""
@@ -2170,8 +2117,15 @@ class Scheduler:
             if not acquired:
                 return {"acquired": False, "recovered": 0, "reason": "busy"}
             candidates = self._leases_for()
+        owners = {lease["owner_id"] for lease in candidates if lease.get("provider") == "colab"}
+        guard = CuGuardService(self.store, self.clock)
+        for owner in owners:
+            ccu.sync_sessions(self.store, owner, self.clock())
+            guard.enforce(owner)
+        if owners:
+            candidates = self._leases_for()
         recovered = 0
-        observations = {lease["id"]: self._inspect_runtime(lease) for lease in candidates}
+        observations = {lease["id"]: self._inspect_runtime(lease) for lease in candidates if not lease.get("force_stop")}
         recovered += sum(result == "missing" for result in observations.values())
         all_jobs = self._list("jobs")
         jobs = [
@@ -2206,7 +2160,7 @@ class Scheduler:
                 continue
             instance_id = lease.get("instance_id")
             instance = self._get("instances", instance_id, lease["owner_id"]) if instance_id else None
-            if lease.get("native_ready"):
+            if lease.get("native_ready") and not lease.get("force_stop"):
                 from .native import protect_lease
                 if protect_lease(
                     self.store,
@@ -2216,7 +2170,8 @@ class Scheduler:
                     provider_factory=self.provider_factory,
                 ):
                     continue
-            stopping = bool(instance and (instance.get("manual_stop_requested") or instance.get("state") in {"releasing", "cleanup_pending"}))
+            stopping = (bool(instance and (instance.get("manual_stop_requested") or instance.get("state") in {"releasing", "cleanup_pending"}))
+                        or (lease.get("native_comfy") and lease.get("cu_fuse") == "soft_daily_limit"))
             if lease.get('state')=='idle' and not stopping and self.clock()<min(
                     float(lease.get('idle_deadline_at') or 0),float(lease.get('deadline_epoch') or 0)):
                 if instance and instance.get("creation_runtime") and associated and associated.get("creation_fingerprint"):
@@ -2236,7 +2191,7 @@ class Scheduler:
                 continue
             expired = float(lease.get("deadline_epoch") or 0) < self.clock()
             if (
-                associated is None and expired
+                associated is None and (expired or stopping)
             ) or (
                 associated
                 and associated.get("state") in TERMINAL_STATES

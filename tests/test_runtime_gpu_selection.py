@@ -158,7 +158,7 @@ def test_runtime_memory_is_not_assumed_80gb_and_wrong_device_stops_before_load()
         _check_compute_hardware({}, evidence, key("L4"))
 
 
-def test_cu_estimate_uses_runtime_spec_and_unknown_gpu_requires_explicit_rate():
+def test_cu_estimate_uses_runtime_spec_and_unknown_gpu_can_start_without_rate(monkeypatch):
     from app.admission import _job_estimate
     from app.gpu.compute import GpuConfig
     from app.gpu.rates import minute_rate
@@ -170,8 +170,9 @@ def test_cu_estimate_uses_runtime_spec_and_unknown_gpu_requires_explicit_rate():
     default = _job_estimate(repo, "o", workflow, policy, cfg, {})
     override = _job_estimate(repo, "o", workflow, {**policy, "resolved_compute_spec": key("A100")}, cfg, {})
     assert override["unit_rate"] > default["unit_rate"]
-    with pytest.raises(ValueError, match="无已知估算费率"):
-        minute_rate(key("unknown-gpu"))
+    monkeypatch.delenv("GPU_UNIT_RATE", raising=False)
+    assert minute_rate(key("unknown-gpu")) is None
+    assert minute_rate(key("T4"), live_rate_hourly=6) == 0.1
     assert minute_rate(key("G4"), fallback_rate=0.2) == 0.2
 
 
@@ -221,7 +222,6 @@ def test_selected_spec_is_sent_to_real_provider_http_adapter_with_mock_transport
 
 def test_real_job_admission_persists_override_and_keeps_default_artifact(monkeypatch):
     from app import admission
-    from app.gpu import ccu
     from app.gpu.compute import GpuConfig
     from app.job_schemas import JobInput
 
@@ -243,7 +243,6 @@ def test_real_job_admission_persists_override_and_keeps_default_artifact(monkeyp
     project = store.create("projects", "owner", {"title": "test"})
     monkeypatch.setattr(admission.GpuConfig, "from_env", lambda: GpuConfig(real_enabled=True, unit_rate=0.1))
     monkeypatch.setattr(admission, "_google_status", lambda *a: {"colab": {"connected": True}})
-    monkeypatch.setattr(ccu, "maybe_sample_balance", lambda *a: None)
     body = JobInput(
         project_id=project["id"],
         model_id="demo-mock",

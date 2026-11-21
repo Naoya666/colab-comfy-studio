@@ -55,76 +55,9 @@ from .storage import asset_path, delete_asset_file, save_asset
 
 
 def usage(st, owner):
-    repo = Repository(st)
-    cfg = GpuConfig.from_env()
-    now = time.time()
-    rows = repo.list("usage", owner)
-    real = [r for r in rows if not r.get("mock") and not r.get("simulated") and r.get("provider") != "mock"]
-    estimate = sum(float(r.get("units_estimate", r.get("units", 0)) or 0) for r in real)
-    daily = sum(
-        float(r.get("units_estimate", r.get("units", 0)) or 0)
-        for r in real
-        if float(r.get("created_epoch", 0)) > now - 86400
-    )
-    leases = [r for r in repo.list("leases", owner) if r.get("state") != "deleted"]
-    measured = [r for r in real if r.get("units_actual") is not None]
-    measured_actual = sum(float(r.get("units_actual") or 0) for r in measured)
-    measured_estimate = sum(float(r.get("units_estimate", r.get("units", 0)) or 0) for r in measured)
-    from .gpu import ccu
+    from .gpu.ccu import usage_summary
 
-    ccu_state = ccu.read_state()
-    recent = []
-    jobs_sorted = sorted(
-        repo.list("jobs", owner), key=lambda item: str(item.get("updated_at") or ""), reverse=True
-    )
-    for job in jobs_sorted[:12]:
-        if job.get("provider") == "mock":
-            continue
-        recent.append(
-            {
-                "job_id": job.get("id"),
-                "state": job.get("state"),
-                "finished_at": job.get("stopped_at") or job.get("updated_at"),
-                "estimated_units": job.get("estimated_units"),
-                "actual_units": job.get("actual_units"),
-                "ccu_before": job.get("ccu_before"),
-                "ccu_after": job.get("ccu_after"),
-                "ccu_attribution": job.get("ccu_attribution"),
-                "ccu_source": job.get("ccu_source"),
-            }
-        )
-    return {
-        "estimated_units": estimate if cfg.unit_rate is not None else None,
-        "actual_units": measured_actual if measured else None,
-        "daily_estimated_units": daily if cfg.unit_rate is not None else None,
-        "unit_rate": cfg.unit_rate,
-        "rate_unit": "compute_units_per_minute",
-        "rate_source": "administrator_estimate" if cfg.unit_rate is not None else "unknown",
-        "daily_limit": cfg.daily_units,
-        "monthly_limit": cfg.monthly_units,
-        "max_job_units": cfg.max_job_units,
-        "max_runtime_minutes": cfg.max_runtime_minutes,
-        "active_runtimes": len(leases),
-        "ledger": rows,
-        "reconciliation": {
-            "measured_jobs": len(measured),
-            "unmeasured_jobs": len(real) - len(measured),
-            "measured_actual_units": round(measured_actual, 6) if measured else None,
-            "measured_estimated_units": round(measured_estimate, 6) if measured else None,
-            "variance_units": round(measured_actual - measured_estimate, 6) if measured else None,
-            "recent": recent,
-        },
-        "ccu": {
-            **ccu.summarize(ccu_state.get("snapshots") or {}),
-            "sampled_at": ccu_state.get("updated_at"),
-            "snapshots": ccu_state.get("snapshots") or {},
-            "anomalies": ccu_state.get("anomalies") or [],
-        },
-        "notice": (
-            "月费/实扣以 Google 账户为准：实测值取任务前后余额差；"
-            "估算值按管理员费率推算，可能与实际不一致。Mock 不创建 GPU，不产生真实点数消费。"
-        ),
-    }
+    return usage_summary(Repository(st), owner)
 
 
 @asynccontextmanager
@@ -386,12 +319,20 @@ def workflows(
 
 
 @router.get("/workflows/{workflow_id}/schema")
-def workflow_schema(workflow_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
+def workflow_schema(workflow_id: str, request: Request, compute_spec: str | None = None,
+                    user=Depends(current_user), st=Depends(get_store)):
     repo = Repository(st)
     row = own(repo, "workflows", workflow_id, user)
     manifest = row["manifest"]
-    cap = min(manifest.get("max_runtime_minutes", 30), GpuConfig.from_env().max_runtime_minutes)
+    cap = manifest.get("max_runtime_minutes", 30)
     spec = manifest.get("compute_spec")
+    if compute_spec is not None:
+        from .gpu.specs import spec_key
+
+        try:
+            spec = spec_key(json.loads(compute_spec))
+        except ValueError as exc:
+            raise APIError("COMPUTE_SPEC_INVALID", "无效的 GPU 规格", 422) from exc
     picked = mode_param(manifest)
     if picked:
         estimates = {m: estimate_units(repo, user["id"], row["workflow_key"], manifest, spec, cap, mode=m)[0] for m in picked[1]["variants"]}
@@ -963,9 +904,14 @@ def compute_specs(
     repo = Repository(st)
     _require_account(repo, user["id"], account_id, require_allocation=False)
     from .gpu.colab import GoogleColabProvider
+    from .gpu.rates import minute_rate
 
     try:
-        return ok(GoogleColabProvider(repo, user["id"], account_id=account_id or None).list_specs(), request)
+        specs = GoogleColabProvider(repo, user["id"], account_id=account_id or None).list_specs()
+        for spec in specs:
+            rate = minute_rate(spec)
+            spec["reference_rate_hourly"] = round(rate * 60, 6) if rate is not None else None
+        return ok(specs, request)
     except APIError:
         raise
     except Exception as exc:

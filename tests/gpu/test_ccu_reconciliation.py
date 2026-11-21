@@ -1,12 +1,9 @@
 """CU reconciliation: balance sampling, attribution and idle-runtime detection."""
 
-import time
-
 import pytest
 from app.db import Store
 from app.gpu import ccu
 from app.gpu.repository import Repository
-from app.gpu.scheduler import Scheduler
 
 OWNER = "owner-1"
 
@@ -34,112 +31,123 @@ def test_normalize_subscription_supports_tunnel_and_rest_shapes():
     assert ccu.normalize_subscription({}) == {"balance": None, "rate": None, "assignments": None}
 
 
-def test_reconcile_never_invents_or_returns_negative():
-    assert ccu.reconcile(2500.0, 2499.825) == pytest.approx(0.175)
-    assert ccu.reconcile(10, 11) is None
-    assert ccu.reconcile(None, 5) is None
-    assert ccu.reconcile(5, None) is None
+def sample(repo, balance, at, account="acc-1", source="tick", **fields):
+    return ccu.sample_and_record(repo, OWNER, account, source,
+                                 sampler=lambda *_: {"balance": balance, **fields}, now=at)
 
 
-@pytest.mark.parametrize("kind", ["workflow_smoke", "prep"])
-def test_allocation_samples_missing_smoke_and_prep_baseline_and_records_delta(tmp_path, monkeypatch, kind):
+def open_session(repo, ident, kind, start, *, account="acc-1", accelerator="L4"):
+    repo.create("instances", OWNER, {
+        "provider": "colab", "account_id": account, "state": "busy", "lease_id": f"lease-{ident}",
+    }, record_id=ident)
+    policy = {"lifecycle": "smart" if kind == "smart_reuse" else "save"}
+    snapshot = {"native_comfy": kind == "native_comfy", "system_smoke": kind == "smoke"}
+    job = repo.create("jobs", OWNER, {
+        "provider": "colab", "account_id": account, "instance_id": ident, "state": "running",
+        "execution_policy": policy, "snapshot": snapshot, "prep": kind == "prep",
+    }, record_id=f"job-{ident}")
+    lease = repo.create("leases", OWNER, {
+        "provider": "colab", "account_id": account, "instance_id": ident, "state": "active",
+        "owner_job_id": job["id"], "handle": {"runtime_name": f"runtime-{ident}"},
+        "selected_spec": {"accelerator": accelerator, "variant": "VARIANT_CPU" if accelerator == "NONE" else "VARIANT_GPU"},
+    }, record_id=f"lease-{ident}")
+    ccu.open_instance_session(repo, job, lease, start)
+    return job
+
+
+def test_owner_deltas_topup_midnight_and_failed_sample(tmp_path, monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from app.config import settings
+    from app.gpu.cu_guard import CuGuardService
+
     repo = make_repo(tmp_path)
-    job, _ = repo.create_job(OWNER, {"execution_policy": {"provider": "colab"}}, "baseline")
-    job = repo.update("jobs", job["id"], {
-        "provider": "colab", "account_id": "acc-1", kind: True, "started_epoch": 120,
-    }, OWNER)
-    samples = iter([
-        {"balance": 100.0, "at": 100.0},
-        {"balance": 99.8, "at": 180.0},
-    ])
-    monkeypatch.setattr(ccu, "maybe_sample_balance", lambda *args: next(samples))
-    scheduler = Scheduler(repo, clock=lambda: 180.0)
-    job = scheduler._sample_allocation_baseline(job, {"create_attempts": 0})
-    assert job["ccu_before"] == 100.0
-    assert job["ccu_before_at"] == 100.0
-    scheduler._record_usage(job, {"id": "lease-1"}, 180.0)
-    measured = repo.get("jobs", job["id"], OWNER)
-    assert measured["actual_units"] == pytest.approx(0.2)
-    assert measured["ccu_source"] == "google_balance"
-    assert repo.list("usage", OWNER)[0]["units_actual"] == pytest.approx(0.2)
+    monkeypatch.setattr(settings, "studio_timezone", "Asia/Shanghai")
+    midnight = datetime(2026, 11, 21, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+    repo.create("accounts", OWNER, {"enabled": True}, record_id="acc-1")
+    guard = CuGuardService(repo, lambda: midnight - 1)
+    guard.save(OWNER, {"daily_limit_cu": 2, "min_balance_cu": 10})
+    sample(repo, 12, midnight - 60)
+    sample(repo, 10, midnight - 1)
+    assert guard.state(OWNER)["status"] == "hard_balance_floor"
+    sample(repo, None, midnight - 0.5)
+    assert guard.state(OWNER)["status"] == "soft_daily_limit"
+    assert ccu.snapshots(repo, OWNER)["acc-1"]["error"] == "sample_failed"
+    guard = CuGuardService(repo, lambda: midnight)
+    assert guard.state(OWNER)["status"] == "ok"
+    sample(repo, 40, midnight)
+    sample(repo, 39, midnight + 1)
+    sample(repo, 39, midnight + 2)
+    rows = sorted(repo.list("ccu_ledger", OWNER), key=lambda row: row["sampled_at"])
+    assert [r["state"] for r in rows] == ["baseline", "spend", "topup", "spend"]
+    assert [r["delta_spent"] for r in rows] == [0, 2, 0, 1]
+    assert [r["local_date"] for r in rows] == ["2026-11-20"] * 2 + ["2026-11-21"] * 2
+    assert guard.state(OWNER)["today_actual_cu"] == 1
+    assert ccu.usage_summary(repo, OWNER)["history_actual_cu"] == 3
+    assert repo.list("ccu_ledger", "other-owner") == []
 
 
-@pytest.mark.parametrize("provider,before,attempts", [("mock", None, 0), ("colab", 0, 0), ("colab", None, 1)])
-def test_allocation_does_not_resample_or_backfill_after_create(tmp_path, monkeypatch, provider, before, attempts):
+@pytest.mark.parametrize("kind", ["single_job", "native_comfy", "prep", "smoke"])
+def test_session_attributes_live_and_delayed_charges_then_seals(tmp_path, monkeypatch, kind):
     repo = make_repo(tmp_path)
-    scheduler = Scheduler(repo)
-    def forbidden(*args):
-        raise AssertionError("Must not sample an existing baseline, mock, or started allocation")
-    monkeypatch.setattr(ccu, "maybe_sample_balance", forbidden)
-    job = {"provider": provider, "ccu_before": before}
-    assert scheduler._sample_allocation_baseline(job, {"create_attempts": attempts}) is job
+    repo.create("accounts", OWNER, {"enabled": True}, record_id="acc-1")
+    job = open_session(repo, "first", kind, 1010)
+    sample(repo, 20, 1000, source="alloc_before")
+    sample(repo, 19.8, 1070, rate_hourly=1.5, assignments=1)
+    assert repo.get("jobs", job["id"], OWNER)["actual_units"] == pytest.approx(0.2)
+    row = repo.list("instance_usage_segments", OWNER)[0]
+    assert row["estimated_cu"] == pytest.approx(0.025)
+    monkeypatch.setattr(ccu, "sampling_enabled", lambda: True)
+    monkeypatch.setattr(ccu, "sample_account_balance", lambda *_: {"balance": 19.6, "at": 1101})
+    ccu.close_instance_session(repo, OWNER, "first", 1100, "confirmed_delete")
+    row = repo.list("instance_usage_segments", OWNER)[0]
+    assert row["state"] == "reconciling"
+    assert row["session_kind"] == kind
+    assert row["ccu_after"] == 19.6
+    assert row["actual_cu"] == pytest.approx(0.4)
+    sample(repo, 19.1, 1160)
+    ccu.tick_ccu(repo, OWNER, now=1220, sampler=lambda *_: {"balance": 18.9})
+    row = repo.list("instance_usage_segments", OWNER)[0]
+    assert row["state"] == "closed" and row["actual_cu"] == pytest.approx(0.9)
+    assert repo.get("jobs", job["id"], OWNER)["actual_units"] == pytest.approx(0.9)
+    assert ccu.usage_summary(repo, OWNER)["history_actual_cu"] == pytest.approx(1.1)
 
 
-def test_allocation_sampling_failure_remains_fail_soft(tmp_path, monkeypatch):
-    scheduler = Scheduler(make_repo(tmp_path))
-    monkeypatch.setattr(ccu, "maybe_sample_balance", lambda *args: None)
-    job = {"provider": "colab", "owner_id": OWNER, "account_id": "acc-1"}
-    assert scheduler._sample_allocation_baseline(job, {}) is job
-
-
-def test_measure_spend_uses_balance_delta_and_flags_contention(tmp_path, monkeypatch):
+def test_reuse_job_and_idle_attribution_and_new_instance_seals_previous(tmp_path):
     repo = make_repo(tmp_path)
-    job = {
-        "id": "job-1",
-        "owner_id": OWNER,
-        "account_id": "acc-1",
-        "provider": "colab",
-        "ccu_before": 100.0,
-    }
-    monkeypatch.setattr(
-        ccu,
-        "maybe_sample_balance",
-        lambda *args, **kwargs: {"balance": 99.5, "rate": 1.5, "assignments": 1, "at": 123.0},
-    )
-    scheduler = Scheduler(repo, clock=lambda: 200.0)
-
-    patch = scheduler._measure_spend(job, None)
-    assert patch["actual_units"] == pytest.approx(0.5)
-    assert patch["ccu_after"] == 99.5
-    assert patch["ccu_attribution"] == "exclusive"
-    assert patch["ccu_source"] == "google_balance"
-
-    repo.create(
-        "leases",
-        OWNER,
-        {
-            "provider": "colab",
-            "account_id": "acc-1",
-            "runtime_id": "studio-other1",
-            "request_id": "11111111-1111-4111-8111-111111111111",
-            "owner_job_id": "job-other",
-            "state": "active",
-        },
-        record_id="lease-other",
-    )
-    contended = scheduler._measure_spend(job, None)
-    assert contended["ccu_attribution"] == "contended"
+    job = open_session(repo, "first", "smart_reuse", 1000)
+    repo.update("jobs", job["id"], {"state": "completed", "execution_seconds": 100}, OWNER)
+    repo.create("jobs", OWNER, {"instance_id": "first", "state": "completed", "execution_seconds": 200}, record_id="second-job")
+    sample(repo, 20, 1000)
+    sample(repo, 16, 1400)
+    ccu.close_instance_session(repo, OWNER, "first", 1400, "watchdog")
+    sample(repo, 15, 1460, source="alloc_before")
+    open_session(repo, "next", "single_job", 1461)
+    sample(repo, 14, 1470)
+    rows = {row["instance_id"]: row for row in repo.list("instance_usage_segments", OWNER)}
+    first = rows["first"]
+    assert first["state"] == "closed" and first["actual_cu"] == 5
+    assert [row["actual_cu"] for row in first["jobs"]] == [1.25, 2.5]
+    assert first["idle_cu"] == 1.25
+    assert rows["next"]["actual_cu"] == 1
+    assert ccu.sessions(repo, OWNER, date=ccu.local_date(1000), kind="smart_reuse", limit=1)[1] == 1
 
 
-def test_measure_spend_is_fail_soft_without_samples(tmp_path, monkeypatch):
+def test_multiple_online_instances_share_debit_by_spec_rate(tmp_path):
     repo = make_repo(tmp_path)
-    job = {"id": "job-2", "owner_id": OWNER, "account_id": "acc-1", "provider": "colab", "ccu_before": 10.0}
-    monkeypatch.setattr(ccu, "maybe_sample_balance", lambda *args, **kwargs: None)
-    scheduler = Scheduler(repo, clock=lambda: 300.0)
-
-    patch = scheduler._measure_spend(job, None)
-    assert "actual_units" not in patch
-    assert patch["ccu_source"] == "after_missing"
-
-    job_no_baseline = {"id": "job-3", "owner_id": OWNER, "account_id": "acc-1", "provider": "colab"}
-    missing = scheduler._measure_spend(job_no_baseline, None)
-    assert missing["ccu_source"] == "baseline_missing"
-    assert "actual_units" not in missing
+    open_session(repo, "gpu", "single_job", 1000)
+    open_session(repo, "cpu", "prep", 1000, accelerator="NONE")
+    sample(repo, 20, 1000)
+    sample(repo, 18.29, 1060, assignments=2, rate_hourly=100)
+    rows = {row["instance_id"]: row for row in repo.list("instance_usage_segments", OWNER)}
+    assert rows["gpu"]["actual_cu"] == pytest.approx(1.64)
+    assert rows["cpu"]["actual_cu"] == pytest.approx(0.07)
+    assert all(row["attribution"] == "prorated" for row in rows.values())
 
 
 def test_tick_ccu_flags_dedupes_and_resolves_idle_runtime(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
-    monkeypatch.setattr(ccu, "_state_path", lambda: tmp_path / "ccu_state.json")
     repo.create(
         "accounts",
         OWNER,
@@ -169,7 +177,6 @@ def test_tick_ccu_flags_dedupes_and_resolves_idle_runtime(tmp_path, monkeypatch)
 
 def test_tick_ccu_does_not_flag_when_a_job_owns_the_assignment(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
-    monkeypatch.setattr(ccu, "_state_path", lambda: tmp_path / "ccu_state.json")
     repo.create(
         "accounts",
         OWNER,
@@ -196,7 +203,8 @@ def test_usage_reports_measured_versus_estimated(tmp_path, monkeypatch):
     from app import main
 
     repo = make_repo(tmp_path)
-    now = time.time()
+    cutover = repo.store.get("settings", "cu-ledger-cutover")["epoch"]
+    now = cutover - 1
     repo.create(
         "usage",
         OWNER,
@@ -223,10 +231,8 @@ def test_usage_reports_measured_versus_estimated(tmp_path, monkeypatch):
         },
         record_id="usage-unmeasured",
     )
-    monkeypatch.setattr(
-        ccu, "read_state", lambda: {"snapshots": {}, "anomalies": [], "updated_at": 5.0}
-    )
 
+    repo.create("usage", OWNER, {"provider": "colab", "units_actual": 1.0, "created_epoch": cutover + 1})
     result = main.usage(repo.store, OWNER)
     reconciliation = result["reconciliation"]
     assert reconciliation["measured_jobs"] == 1
@@ -234,7 +240,9 @@ def test_usage_reports_measured_versus_estimated(tmp_path, monkeypatch):
     assert reconciliation["measured_actual_units"] == pytest.approx(0.175)
     assert reconciliation["variance_units"] == pytest.approx(0.175 - 0.26)
     assert result["actual_units"] == pytest.approx(0.175)
-    assert "ccu" in result and result["ccu"]["sampled_at"] == 5.0
+    assert result["today_actual_cu"] == 0
+    assert result["daily_history"][0]["legacy_actual_cu"] == pytest.approx(0.175)
+    assert sum(day["actual_cu"] for day in result["daily_history"]) == result["history_actual_cu"]
 
 
 def test_manual_balance_queries_owner_accounts_and_preserves_zero(tmp_path, monkeypatch):
@@ -275,4 +283,33 @@ def test_manual_balance_queries_owner_accounts_and_preserves_zero(tmp_path, monk
     assert balances["snapshots"]["zero"]["balance"] == 0
     assert balances["snapshots"]["unavailable"]["balance"] is None
     assert balances["snapshots"]["unavailable"]["error"] == "sample_failed"
-    assert not ccu._state_path().exists()
+    assert {row["source"] for row in repo.list("ccu_ledger", OWNER)} == {"manual"}
+
+
+def test_cu_guard_http_validates_and_persists_owner_limits(tmp_path, monkeypatch):
+    from app.common import current_user, get_store
+    from app.main import app
+    from fastapi.testclient import TestClient
+
+    repo = make_repo(tmp_path)
+    monkeypatch.setenv("GPU_DAILY_UNITS", "12.5")
+    user = {"id": OWNER, "role": "admin"}
+    monkeypatch.setitem(app.dependency_overrides, current_user, lambda: user)
+    monkeypatch.setitem(app.dependency_overrides, get_store, lambda: repo.store)
+    client = TestClient(app)
+    path = "/api/gpu/cu/guard"
+    assert client.get(path).json()["data"]["daily_limit_cu"] == 12.5
+    monkeypatch.setenv("GPU_DAILY_UNITS", "4")
+    assert client.get(path).json()["data"]["daily_limit_cu"] == 12.5
+    for value in [-1, "2", True, 10**500]:
+        assert client.put(path, json={"daily_limit_cu": value}).status_code == 422
+    assert client.put(path, json={"daily_limit_cu": 0, "min_balance_cu": 2}).json()["data"]["status"] == "soft_daily_limit"
+    reopened = make_repo(tmp_path)
+    monkeypatch.setitem(app.dependency_overrides, get_store, lambda: reopened.store)
+    usage = client.get("/api/gpu/usage").json()["data"]
+    assert usage["guard"]["daily_limit_cu"] == 0
+    assert usage["guard"]["min_balance_cu"] == 2
+    user["role"] = "user"
+    assert client.put(path, json={"daily_limit_cu": None}).status_code == 403
+    user["role"] = "admin"
+    assert client.put(path, json={"daily_limit_cu": None, "min_balance_cu": None}).json()["data"]["status"] == "ok"

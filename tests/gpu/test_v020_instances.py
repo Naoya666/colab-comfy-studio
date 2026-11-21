@@ -4,11 +4,13 @@ import threading
 from pathlib import Path
 
 import pytest
+from app.common import APIError
 from app.db import MODELS, Base, CommonMixin, Store
+from app.gpu import ccu
 from app.gpu import repository as repository_module
+from app.gpu.cu_guard import CuGuardService
 from app.gpu.instances import (
     AllocationError,
-    BudgetError,
     InstanceConflict,
     InstanceService,
 )
@@ -170,131 +172,53 @@ def test_retention_never_extends_hard_deadline_and_usage_replay_is_free(repo):
     assert two["actual_units"] is None
 
 
-def test_real_allocation_requires_explicit_rate_and_project_allowlist(repo):
-    account(repo, provider="colab", allowed_projects=["project-1"])
-    service = InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": None})
-    with pytest.raises(BudgetError):
-        service.allocate(job(provider="colab", execution_policy={"provider": "colab"}))
+def test_real_allocation_without_rate_or_account_budget_preserves_project_allowlist(repo):
+    account(repo, provider="colab", allowed_projects=["project-1"], budget=None)
+    service = InstanceService(repo, clock=lambda: 100.0)
+    selected = service.allocate(job(provider="colab", execution_policy={"provider": "colab"}, max_runtime_minutes=120))
+    assert selected["account_id"] == "acct-1"
+    assert not selected.get("budget_reserved")
 
-    service = InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": 0.1})
     repo.update("accounts", "acct-1", {"allowed_projects": ["other-project"]}, "owner-1")
     with pytest.raises(AllocationError):
-        service.allocate(job(provider="colab", execution_policy={"provider": "colab"}))
+        service.allocate(job(provider="colab", job_id="different", execution_policy={"provider": "colab"}))
 
 
-@pytest.mark.parametrize("rate", [0, -1, float("nan"), float("inf")])
-def test_real_budget_rate_must_be_finite_and_positive(repo, rate):
+def test_missing_signature_does_not_reuse_real_instance(repo):
     account(repo, provider="colab", allowed_projects=["project-1"])
-    with pytest.raises(BudgetError):
-        InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": rate}).allocate(
-            job(provider="colab", execution_policy={"provider": "colab"}, max_runtime_minutes=5)
-        )
+    idle = repo.create("instances", "owner-1", {
+        "account_id": "acct-1", "provider": "colab", "state": "retained_idle", "current_job_id": None,
+    }, record_id="missing-signature")
+    service = InstanceService(repo, clock=lambda: 100.0)
+    selected = service.allocate(job(provider="colab", execution_policy={"provider": "colab"}))
+    assert selected["id"] != idle["id"]
 
 
-def test_real_budget_is_account_and_global_safe_and_missing_signature_does_not_reuse(repo):
-    account(repo, provider="colab", allowed_projects=["project-1"], budget={"daily": 20.0, "monthly": 50.0})
-    repo.create(
-        "instance_usage_segments",
-        "owner-1",
-        {"account_id": "acct-1", "instance_id": "old", "estimated_units": 4.0, "actual_units": None},
-        record_id="segment-1",
-    )
-    repo.create(
-        "instances",
-        "owner-1",
-        {
-            "account_id": "acct-1", "provider": "colab", "state": "busy", "current_job_id": "old-job",
-            "budget_reserved": 1.0, "compatibility_signature": "compat-v1",
-        },
-        record_id="busy-old",
-    )
-    with pytest.raises(BudgetError):
-        InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": 0.1, "daily_units": 5.0}).allocate(
-            job(provider="colab", budget_units=1.0, execution_policy={"provider": "colab"})
-        )
-
-    idle = repo.create(
-        "instances", "owner-1",
-        {"account_id": "acct-1", "provider": "colab", "state": "retained_idle", "current_job_id": None},
-        record_id="missing-signature",
-    )
-    result = InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": 0.1, "daily_units": 20.0}).allocate(
-        job(provider="colab", job_id="job-new", budget_units=1.0, execution_policy={"provider": "colab"})
-    )
-    assert result["id"] != idle["id"]
+def test_real_auto_allocation_skips_only_accounts_at_the_balance_floor(repo):
+    for key in ("acct-1", "acct-2"):
+        account(repo, key, provider="colab", allowed_projects=["project-1"])
+        ccu.sample_and_record(repo, "owner-1", key, "tick", now=90,
+                              sampler=lambda *_: {"balance": 5 if key == "acct-1" else 40})
+    guard = CuGuardService(repo, lambda: 100)
+    guard.save("owner-1", {"min_balance_cu": 5})
+    service = InstanceService(repo, clock=lambda: 100.0)
+    with pytest.raises(APIError) as exc:
+        service.allocate(job(provider="colab", requested_account_id="acct-1", execution_policy={"provider": "colab"}))
+    assert exc.value.code == "CU_BALANCE_FLOOR_REACHED"
+    assert service.allocate(job(provider="colab", execution_policy={"provider": "colab"}))["account_id"] == "acct-2"
 
 
-def test_real_global_budget_sums_reservations_across_accounts(repo):
-    account(repo, "acct-1", provider="colab", allowed_projects=["project-1"], budget={"daily": 10.0, "monthly": 50.0})
-    account(repo, "acct-2", provider="colab", allowed_projects=["project-1"], budget={"daily": 10.0, "monthly": 50.0})
-    repo.create(
-        "instances",
-        "owner-1",
-        {"account_id": "acct-2", "provider": "colab", "state": "retained_idle", "budget_reserved": 1.5},
-        record_id="retained-acct-2",
-    )
-    repo.create(
-        "instances",
-        "owner-1",
-        {"account_id": "acct-2", "provider": "colab", "state": "releasing", "budget_reserved": 1.5},
-        record_id="releasing-acct-2",
-    )
-
-    service = InstanceService(
-        repo,
-        clock=lambda: 100.0,
-        config={"unit_rate": 0.1, "daily_units": 5.0, "monthly_units": 50.0},
-    )
-    with pytest.raises(BudgetError):
-        service.allocate(
-            job(
-                provider="colab",
-                requested_account_id="acct-1",
-                budget_units=2.1,
-                execution_policy={"provider": "colab"},
-            )
-        )
-
-
-def test_real_allocation_rejects_account_without_nested_budget(repo):
-    account(repo, "acct-1", provider="colab", allowed_projects=["project-1"])
-    service = InstanceService(
-        repo,
-        clock=lambda: 100.0,
-        config={"unit_rate": 0.1, "daily_units": 100.0, "monthly_units": 100.0},
-    )
-    with pytest.raises(BudgetError):
-        service.allocate(
-            job(
-                provider="colab",
-                requested_account_id="acct-1",
-                budget_units=1.0,
-                execution_policy={"provider": "colab"},
-            )
-        )
-
-
-def test_real_retention_reserves_idle_fee_against_budget(repo):
-    account(repo, "acct-1", provider="colab", allowed_projects=["project-1"], budget={"daily": 1.5, "monthly": 20.0})
-    service = InstanceService(
-        repo,
-        clock=lambda: 100.0,
-        config={"unit_rate": 0.1, "daily_units": 100.0, "monthly_units": 100.0, "max_idle_minutes": 30},
-    )
-    instance = service.allocate(
-        job(
-            provider="colab",
-            requested_account_id="acct-1",
-            budget_units=1.0,
-            execution_policy={"provider": "colab"},
-        )
-    )
-    with pytest.raises(BudgetError):
-        service.retention("owner-1", instance["id"], "retain", 10, "retention-over-budget")
-
-    repo.update("accounts", "acct-1", {"budget": {"daily": 3.0, "monthly": 20.0}}, "owner-1")
-    retained = service.retention("owner-1", instance["id"], "retain", 10, "retention-with-reserve")
-    assert retained["retention_reserved"] == 1.0
+def test_real_retention_uses_daily_spend_without_reserving_idle_fee(repo):
+    account(repo, "acct-1", provider="colab", budget={"daily": 0.001})
+    service = InstanceService(repo, clock=lambda: 100.0)
+    instance = service.allocate(job(provider="colab", execution_policy={"provider": "colab"}))
+    retained = service.retention("owner-1", instance["id"], "retain", 10, "retention")
+    assert retained["state"] == "retained_idle"
+    assert not retained.get("retention_reserved")
+    CuGuardService(repo, lambda: 100).save("owner-1", {"daily_limit_cu": 0})
+    with pytest.raises(APIError) as exc:
+        service.retention("owner-1", instance["id"], "retain", 15, "retention-after-limit")
+    assert exc.value.code == "CU_DAILY_LIMIT_REACHED"
 
 
 def test_usage_reports_request_to_confirmed_deletion_duration(repo):

@@ -108,8 +108,8 @@ def test_cleanup_pending_blocks_next_job_until_watchdog():
     assert drive(scheduler, second["id"])["state"] == "completed"
 
 
-def test_budget_rejection_precedes_provider_create(monkeypatch):
-    monkeypatch.setenv("GPU_DAILY_UNITS", "1")
+def test_daily_cu_fuse_precedes_provider_create(monkeypatch):
+    monkeypatch.setenv("GPU_DAILY_UNITS", "0")
     store = MemoryStore()
     job = make_job(store, job_id="over-budget", provider="colab", estimated_units=2)
     provider = MockColabProvider()
@@ -122,7 +122,7 @@ def test_budget_rejection_precedes_provider_create(monkeypatch):
     for _ in range(5):
         scheduler.tick()
     result = store.get("jobs", job["id"])
-    assert result["state"] == "failed" and "budget" in result["error_code"] and provider.create_calls == 0
+    assert result["state"] == "failed" and result["error_code"] == "CU_DAILY_LIMIT_REACHED" and provider.create_calls == 0
 
 
 def test_timeout_cleans_up_without_polling_forever():
@@ -370,30 +370,6 @@ def test_real_sqlite_usage_ledger_is_actual_and_idempotent_after_delete(tmp_path
     assert len(repo.list("usage", "u1")) == 1
 
 
-def test_real_usage_is_administrator_estimate_until_provider_billing(tmp_path):
-    base, repo, job = sqlite_job(tmp_path, provider="colab", estimated_units=2)
-    lease = repo.create(
-        "leases",
-        "u1",
-        {
-            "owner_job_id": job["id"],
-            "provider": "colab",
-            "state": "deleted",
-            "request_id": str(uuid.uuid4()),
-            "runtime_id": "studio-billing",
-            "created_epoch": 1000,
-        },
-    )
-    scheduler = Scheduler(base, config=GpuConfig(real_enabled=True, unit_rate=2))
-    scheduler._record_usage({**job, "provider": "colab", "started_epoch": 1000}, lease, 1120)
-    usage = repo.list("usage", "u1")[0]
-    assert usage["units_estimate"] == 4
-    assert usage["units"] == 4
-    assert usage["units_actual"] is None
-    assert usage["source"] == "administrator_estimate"
-    assert repo.get("jobs", job["id"])["actual_units"] is None
-
-
 def test_watchdog_cleans_terminal_lease_only_when_owner_matches(tmp_path):
     base = Store(f"sqlite:///{tmp_path / 'terminal-lease.db'}")
     repo = Repository(base)
@@ -454,3 +430,23 @@ def test_real_sqlite_completed_without_outputs_is_failure_and_cleaned(tmp_path):
     result = drive(scheduler, job["id"])
     assert result["state"] == "failed" and result["error_code"] == "gpu_empty_outputs"
     assert provider.deleted
+
+
+def test_daily_cu_fuse_releases_unstarted_instance_between_allocation_ticks():
+    from app.gpu.cu_guard import CuGuardService
+
+    repo = MemoryStore()
+    repo.create("accounts", "u1", {"enabled": True, "connected": True}, record_id="account")
+    job = make_job(repo, provider="colab")
+    provider = MockColabProvider()
+    scheduler = Scheduler(repo, provider_factory=lambda _: provider)
+    for _ in range(3):
+        scheduler.tick()
+    reserved = repo.get("jobs", job["id"])
+    assert reserved["state"] == "allocating" and reserved["instance_id"]
+    CuGuardService(repo).save("u1", {"daily_limit_cu": 0})
+    result = drive(scheduler, job["id"])
+    assert result["error_code"] == "CU_DAILY_LIMIT_REACHED"
+    assert result["state"] == "failed" and provider.create_calls == 0
+    assert repo.get("instances", reserved["instance_id"])["state"] == "deleted"
+    assert repo.list("instance_usage_segments", "u1") == []

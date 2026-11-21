@@ -278,7 +278,7 @@ def test_activation_prefers_completed_pending_acceptance_over_newer_failure_and_
 
     data = body(review_routes.workflow_activation(workflow["id"], request(), user=OWNER, st=st))
 
-    assert data["max_runtime_minutes"] == 5
+    assert data["max_runtime_minutes"] == 20
     assert data["smoke"]["job_id"] == completed["id"]
     assert data["smoke"]["state"] == "completed"
     assert data["smoke"]["acceptance_state"] == "pending"

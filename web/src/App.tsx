@@ -407,6 +407,12 @@ export default function App() {
   const submitting = useRef(false);
   const [settings, setSettings] = useState<GpuSettings | null>(null);
   const [usage, setUsage] = useState<GpuUsage | null>(null);
+  const usageSequence = useRef(0);
+  const refreshUsage = useCallback(async (signal?: AbortSignal) => {
+    const sequence = ++usageSequence.current;
+    const value = await getGpuUsage();
+    if (!signal?.aborted && sequence === usageSequence.current) setUsage(value);
+  }, []);
   const [specs, setSpecs] = useState<ComputeSpec[]>([]);
   const [specsNote, setSpecsNote] = useState('');
   const [error, setError] = useState('');
@@ -544,10 +550,9 @@ export default function App() {
       getGpuWorkflows(),
       getGpuPresets(),
       getGpuSettings(),
-      getGpuUsage(),
     ]).then((results) => {
       if (!alive) return;
-      const [projR, modR, wfR, preR, setR, useR] = results;
+      const [projR, modR, wfR, preR, setR] = results;
       if (projR.status === 'fulfilled') {
         setProjects(projR.value);
         const list = projR.value;
@@ -573,7 +578,6 @@ export default function App() {
       }
       if (preR.status === 'fulfilled') setPresets(preR.value);
       if (setR.status === 'fulfilled') setSettings(setR.value);
-      if (useR.status === 'fulfilled') setUsage(useR.value);
     }).catch((cause) => alive && setError(apiMessage(cause)));
     return () => { alive = false; };
   }, [loggedIn, loginRefresh]);
@@ -601,6 +605,15 @@ export default function App() {
     resourceRefresh.current = () => void refreshResources();
     return () => { resourceRefresh.current = null; };
   }, [refreshResources]);
+
+  useSmartPoll(async signal => {
+    try { await refreshUsage(signal); } catch { /* Retry on the next refresh. */ }
+  }, {
+    enabled: loggedIn,
+    active: tab === '算力' || tab === '设置' || tab === '原生 ComfyUI' || hasActiveInstances,
+    activeMs: 10000,
+    idleMs: 25000,
+  });
 
   useSmartPoll(refreshResources, {
     enabled: loggedIn,
@@ -1426,6 +1439,12 @@ export default function App() {
                 <CreatePanel
                   desktop={desktop}
                   draftReady={workflowParamsReady}
+                  usage={usage}
+                  computeSpec={selectedCompute}
+                  onEditGuard={() => {
+                    navigate('设置');
+                    window.requestAnimationFrame(() => document.getElementById('cu-guard')?.scrollIntoView({ block: 'center' }));
+                  }}
                   gpuSelection={runtime === 'colab' ? <WorkflowGpuSelection manifest={manifest} accountId={runtimeChoice.accountId} value={selectedCompute} onChange={chooseGpu} /> : null}
                   projectId={projectId}
                   models={models}
@@ -1539,6 +1558,8 @@ export default function App() {
           <ComputePage
             settings={settings}
             usage={usage}
+            canEditGuard={adminRole}
+            onRefreshUsage={refreshUsage}
             instances={instances}
             onContinue={continueInstance}
             onOpenWorkbench={openInstanceWorkbench}
@@ -1616,7 +1637,7 @@ export default function App() {
           </section>
         )}
 
-        {tab === '原生 ComfyUI' && <NativeComfyPage accounts={accounts} instances={instances} desktop={desktop} />}
+        {tab === '原生 ComfyUI' && <NativeComfyPage usage={usage} accounts={accounts} instances={instances} desktop={desktop} />}
 
         {tab === '设置' && (
           <SettingsPanel
@@ -1624,6 +1645,8 @@ export default function App() {
             onAccountsChange={setAccounts}
             settings={settings}
             usage={usage}
+            canEditGuard={adminRole}
+            onRefreshUsage={refreshUsage}
             error={error}
             onOpenCompute={() => navigate('算力')}
             onLogout={() => {

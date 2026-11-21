@@ -174,9 +174,8 @@ def test_retained_native_reclaim_reaches_api_and_preserves_success(runtime, monk
         assert all(lease["state"] == "deleted" for lease in repo.list("leases"))
     assert len(reclaim_events(repo)) == len(repo.list("instance_usage_segments")) == len(provider.calls) == 1
     usage = repo.list("instance_usage_segments")[0]
-    assert usage["actual_units"] is None and usage["estimated_units"] == 0.1
-    with repo.store.Session() as session:
-        assert watch.instances._budget_totals(session, "owner", "account") == (0.1, 0.1)
+    assert usage["actual_cu"] == 0 and usage["state"] == "reconciling"
+    assert usage["session_kind"] == "native_comfy" and usage["close_reason"] == RUNTIME_MISSING
 
 
 def test_legacy_timestamp_requires_fresh_evidence_and_reuses_backoff_after_restart(runtime):
@@ -280,10 +279,10 @@ def test_second_watchdog_and_retry_after_rollback_are_idempotent(runtime, monkey
     repo = runtime
     watch = scheduler(repo, ControlPlane())
 
-    def interrupted(*args):
+    def interrupted(*args, **kwargs):
         raise RuntimeError("simulated shutdown before usage and event commit")
 
-    monkeypatch.setattr(watch.instances, "_record_usage", interrupted)
+    monkeypatch.setattr("app.gpu.ccu.close_instance_session", interrupted)
     with pytest.raises(RuntimeError, match="simulated shutdown"):
         watch.watchdog()
     reopened = Repository(Store(repo.store.url))
@@ -291,9 +290,98 @@ def test_second_watchdog_and_retry_after_rollback_are_idempotent(runtime, monkey
     assert reopened.get("leases", "lease")["state"] == "idle"
     assert not reclaim_events(reopened)
 
+    monkeypatch.undo()
+
     def competing_watchdog():
         assert scheduler(reopened, ControlPlane()).watchdog()["recovered"] == 1
         return {"deleted": True}
 
     assert scheduler(repo, ControlPlane(competing_watchdog)).watchdog()["recovered"] == 0
     assert len(reclaim_events(reopened)) == len(reopened.list("instance_usage_segments")) == 1
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_native_cu_fuse_drains_or_deletes_using_confirmation(runtime, monkeypatch, forced):
+    from app.common import APIError
+    from app.gpu import ccu
+    from app.gpu.cu_guard import CuGuardService
+
+    repo = runtime
+    now = 1000
+    busy = True
+
+    class Provider:
+        calls = 0
+
+        def inspect(self, _handle):
+            assert not forced, "forced shutdown should immediately use provider deletion"
+            return {"ready": True, "deleted": False}
+
+        def delete(self, _handle):
+            self.calls += 1
+            return self.calls > 1
+
+    provider = Provider()
+    monkeypatch.setattr(native, "busy", lambda: busy)
+    watch = scheduler(repo, lambda _: provider, lambda: now)
+    guard = CuGuardService(repo, lambda: now)
+    guard.save("owner", {"min_balance_cu": 5} if forced else {"daily_limit_cu": 1})
+    for stamp, balance in [(990, 6), (999, 5)]:
+        ccu.sample_and_record(repo, "owner", "account", "tick", sampler=lambda *_: {"balance": balance}, now=stamp)
+
+    watch.watchdog()
+    lease = repo.get("leases", "lease", "owner")
+    assert lease["native_draining"] is True
+    with pytest.raises(APIError, match="实例正在释放"):
+        native.begin_write(repo, lease)
+    if not forced:
+        assert lease["state"] == "idle" and provider.calls == 0
+        busy = False
+        now += 1
+        watch.watchdog()
+    assert provider.calls == 1
+    assert repo.get("leases", "lease")["state"] == "cleanup_pending"
+    assert repo.get("instances", "instance")["state"] != "deleted"
+    now += 3
+    assert watch.watchdog()["recovered"] == 1
+    assert provider.calls == 2
+    assert repo.get("leases", "lease")["state"] == "deleted"
+    assert repo.get("jobs", "job")["state"] == "completed"
+    assert repo.list("instance_usage_segments", "owner")[0]["state"] == "reconciling"
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_cu_fuse_respects_current_creation_job_and_cancels_only_for_balance_floor(runtime, forced):
+    from app.gpu import ccu
+    from app.gpu.cu_guard import CuGuardService
+
+    repo = runtime
+    repo.update("leases", "lease", {"native_ready": False, "native_comfy": False, "state": "active"}, "owner")
+    repo.update("instances", "instance", {"state": "busy", "current_job_id": "job"}, "owner")
+    repo.update("jobs", "job", {"state": "running", "execution_started_at": 900, "snapshot": {},
+                                "execution_policy": {"lifecycle": "smart"}}, "owner")
+    provider = ControlPlane({"ready": True, "deleted": False})
+    provider.inspect = lambda _: {"ready": True, "deleted": False}
+    deletes = []
+    provider.delete = lambda handle: deletes.append(handle["runtime_name"]) or True
+
+    watch = scheduler(repo, provider)
+    guard = CuGuardService(repo, watch.clock)
+    guard.save("owner", {"min_balance_cu": 5} if forced else {"daily_limit_cu": 1})
+    for stamp, balance in [(990, 6), (999, 5)]:
+        ccu.sample_and_record(repo, "owner", "account", "tick", sampler=lambda *_: {"balance": balance}, now=stamp)
+    watch.watchdog()
+    if not forced:
+        assert repo.get("jobs", "job")["state"] == "running"
+        assert not deletes
+        assert repo.get("instances", "instance")["state"] == "busy"
+        repo.transition_job("job", "owner", "cleaning_up", "task complete",
+                            {"cleanup_final_state": "completed"}, 1001)
+        watch.watchdog()
+    job = repo.get("jobs", "job")
+    assert job["state"] == ("cancelled" if forced else "completed")
+    assert job["execution_seconds"] == (100 if forced else 101)
+    assert deletes == ["runtimes/studio-reclaim"]
+    assert repo.get("instances", "instance")["state"] == "deleted"
+    assert any(event.get("reason") == ("hard_balance_floor" if forced else "soft_daily_limit")
+               for event in repo.list("events", "owner"))

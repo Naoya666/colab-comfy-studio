@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { Cpu, Layers, Monitor, Cloud, HardDrive, Leaf, Boxes, Sparkles, ChevronDown, Info, Square, Search } from 'lucide-react';
-import { apiMessage, queryCcuBalance, type CcuBalance, type ComputeSpec, type GpuSettings, type GpuUsage } from '../lib/gpu-api';
+import { apiMessage, queryCcuBalance, type ComputeSpec, type GpuSettings, type GpuUsage } from '../lib/gpu-api';
+import { CuGuardSettings } from '../components/CuGuardSettings';
+import { CuSessionDetails } from '../components/CuSessionDetails';
 import { ComputeSpecs } from '../components/ComputeSpecs';
 import { InstanceCenter } from '../components/InstanceCenter';
 import type { GpuInstance } from '../components/AccountDirectory';
@@ -11,19 +13,18 @@ import { cuNumber, formatDateTime, shown } from '../lib/ui-helpers';
 
 const STRATEGY_ICON = { save: Leaf, batch: Boxes, smart: Sparkles } as const;
 
-function CcuBalanceQuery() {
-  const [result, setResult] = useState<CcuBalance | null>(null);
+function CcuBalanceQuery({ usage, refresh }: { usage: GpuUsage | null; refresh: () => Promise<void> }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const accounts = Object.entries(result?.snapshots || {});
-  const partial = accounts.some(([, snapshot]) => snapshot.balance == null);
+  const accounts = usage?.accounts || [];
+  const partial = accounts.some(snapshot => snapshot.error || snapshot.balance == null);
 
   async function query() {
     setLoading(true);
-    setResult(null);
     setError('');
     try {
-      setResult(await queryCcuBalance());
+      await queryCcuBalance();
+      await refresh();
     } catch (e) {
       setError(apiMessage(e));
     } finally {
@@ -38,13 +39,14 @@ function CcuBalanceQuery() {
       </button>
     </div>
     {error && <p className="status error" role="alert">{error}</p>}
-    {result && <div className={styles.stack} role="status">
+    {usage && <div className={styles.stack} role="status">
       {!accounts.length && <p className="muted small">暂无启用的 Colab 账号。可在设置中添加并授权。</p>}
-      {result.total_balance != null && <p>
-        {partial ? '已查到的余额合计' : 'Colab 剩余 CU 合计'} <strong>{cuNumber(result.total_balance)} CU</strong>
+      {usage.ccu?.total_balance != null && <p>
+        {partial ? '已查到的余额合计' : 'Colab 剩余 CU 合计'} <strong>{cuNumber(usage.ccu?.total_balance)} CU</strong>
       </p>}
-      {accounts.map(([id, snapshot]) => <p key={id} className="small">
-        <strong>{snapshot.alias || id}</strong> · {snapshot.balance == null ? '暂时无法读取余额' : `${cuNumber(snapshot.balance)} CU`}
+      {accounts.map(snapshot => <p key={snapshot.account_id} className="small">
+        <strong>{snapshot.alias || snapshot.account_id}</strong> · {snapshot.balance == null ? '暂时无法读取余额' : `${cuNumber(snapshot.balance)} CU`}
+        {snapshot.error && <span className="muted"> · 最近查询失败</span>}
         {snapshot.sampled_at != null && <span className="muted"> · {formatDateTime(snapshot.sampled_at * 1000)}</span>}
       </p>)}
     </div>}
@@ -52,10 +54,12 @@ function CcuBalanceQuery() {
 }
 
 export function ComputePage({
-  settings, usage, instances = [], onStop, onCheck, onContinue, onOpenWorkbench, onRefreshInstances, loadingStop, loadingCheck, specs = [], specsNote = '', error = '',
+  settings, usage, canEditGuard, onRefreshUsage, instances = [], onStop, onCheck, onContinue, onOpenWorkbench, onRefreshInstances, loadingStop, loadingCheck, specs = [], specsNote = '', error = '',
 }: {
   settings: GpuSettings | null;
   usage: GpuUsage | null;
+  canEditGuard: boolean;
+  onRefreshUsage: () => Promise<void>;
   instances?: GpuInstance[];
   onStop?: () => void;
   onCheck?: () => void;
@@ -71,10 +75,8 @@ export function ComputePage({
   const [open, setOpen] = useState<string>('');
   const realEnabled = Boolean(settings?.real_enabled) && settings?.offline_mode !== true;
   const activeCount = Number(usage?.active_runtimes ?? 0);
-  const estimated = usage?.estimated_units;
-  const actual = usage?.actual_units;
-  const limit = usage?.daily_limit || settings?.budget?.daily_units;
-  const recon = usage?.reconciliation;
+  const actual = usage?.today_actual_cu;
+  const limit = usage?.guard?.daily_limit_cu;
   const unresolved = (usage?.ccu?.anomalies || []).filter((item) => !item.resolved_at);
 
   return (
@@ -95,35 +97,26 @@ export function ComputePage({
 
       <Card icon={<HardDrive size={17} strokeWidth={1.6} aria-hidden />} title="CU 用量">
         <div className={styles.grid2}>
-          <div className={styles.statBox}><small className="muted">今日预估</small><strong>{cuNumber(estimated)}<em> CU</em></strong>{!realEnabled && <small className="muted">模拟估算</small>}</div>
-          <div className={styles.statBox}><small className="muted">实际扣除</small><strong>{cuNumber(actual)}<em> CU</em></strong>{(actual === null || actual === undefined) && <small className="muted">暂无数据</small>}</div>
-          <div className={styles.statBox}><small className="muted">每日上限</small><strong>{shown(limit)}<em> CU</em></strong></div>
-          <div className={styles.statBox}><small className="muted">在线机器</small><strong>{activeCount}</strong></div>
+          <div className={styles.statBox}><small className="muted">今日扣费 · {usage?.local_date || '—'}</small>
+            <strong>{cuNumber(actual)}<em> CU</em></strong>
+            {limit != null && actual != null && <>
+              <small>{cuNumber(actual)} / {cuNumber(limit)} CU</small>
+              <progress aria-label="今日 CU 上限使用进度" max={limit || 1} value={limit === 0 ? 1 : Math.min(actual, limit)} />
+            </>}
+          </div>
+          <div className={styles.statBox}><small className="muted">历史累计扣费</small><strong>{cuNumber(usage?.history_actual_cu)}<em> CU</em></strong></div>
+          <div className={styles.statBox}><small className="muted">当前剩余 CU</small><strong>{cuNumber(usage?.ccu?.total_balance)}<em> CU</em></strong>
+            {usage?.ccu?.sampled_at && <small className="muted">{formatDateTime(usage.ccu.sampled_at * 1000)}</small>}
+          </div>
         </div>
-        <CcuBalanceQuery />
+        <CcuBalanceQuery usage={usage} refresh={onRefreshUsage} />
+        {unresolved.length > 0 && <p className={styles.cuWarning}>
+          检测到空转机器 · {unresolved.map(item => `${item.alias || item.account_id}（${shown(item.assignments)} 台）`).join('、')}
+        </p>}
       </Card>
 
-      <Card icon={<HardDrive size={17} strokeWidth={1.6} aria-hidden />} title="扣费对账（Google 实测）">
-        <div className={styles.grid2}>
-          <div className={styles.statBox}><small className="muted">实测扣费</small><strong>{cuNumber(recon?.measured_actual_units)}<em> CU</em></strong><small className="muted">任务前后余额差</small></div>
-          <div className={styles.statBox}><small className="muted">同期估算</small><strong>{cuNumber(recon?.measured_estimated_units)}<em> CU</em></strong><small className="muted">按费率高估多</small></div>
-          <div className={styles.statBox}><small className="muted">差额</small><strong>{cuNumber(recon?.variance_units)}<em> CU</em></strong><small className="muted">实测 − 估算</small></div>
-          <div className={styles.statBox}><small className="muted">可对账任务</small><strong>{shown(recon?.measured_jobs)}<em> / {shown((recon?.measured_jobs || 0) + (recon?.unmeasured_jobs || 0))}</em></strong></div>
-        </div>
-        {unresolved.length > 0 && (
-          <p className="small" style={{ color: '#b3261e' }}>
-            检测到空转机器：{unresolved.map((item) => `${item.alias || item.account_id}（${shown(item.assignments)} 台 / 无在跑任务）`).join('；')}
-          </p>
-        )}
-        {(recon?.recent || []).slice(0, 4).map((row) => (
-          <div key={String(row.job_id)} className="muted small">
-            {String(row.job_id || '').slice(0, 8)} · {row.state || '-'} · 实测 {cuNumber(row.actual_units)} CU · 估算 {cuNumber(row.estimated_units)} CU
-            {row.ccu_attribution === 'contended' ? ' · 与其它任务重叠，仅供参考' : ''}
-            {row.actual_units === null || row.actual_units === undefined ? ' · 未采到余额' : ''}
-          </div>
-        ))}
-        <p className="muted small">Google 不提供按任务账单，实测值取任务前后账户余额差；同一账号并行时只能算区间。</p>
-      </Card>
+      <CuGuardSettings guard={usage?.guard} canEdit={canEditGuard} onSaved={onRefreshUsage} />
+      <div className={styles.workspaceWide}><CuSessionDetails usage={usage} /></div>
 
       <Card icon={<Layers size={17} strokeWidth={1.6} aria-hidden />} title="运行策略">
         <div className={styles.strategyList}>
@@ -148,7 +141,7 @@ export function ComputePage({
         <InstanceCenter instances={instances} onContinue={onContinue} onOpenWorkbench={onOpenWorkbench} onRefresh={onRefreshInstances} />
       </div>
 
-      <div className={styles.note}><Info size={16} strokeWidth={1.6} aria-hidden /><span>{realEnabled ? '用量数据来自站内记录，可能与 Google 账单略有出入。' : '模拟模式的数据仅供演示，不代表真实账单。'}</span></div>
+      <div className={styles.note}><Info size={16} strokeWidth={1.6} aria-hidden /><span>{realEnabled ? '每日扣费来自 Google 账户余额流水，按工作台时区切日。' : '模拟模式的数据仅供演示，不代表真实账单。'}</span></div>
 
       <div className={styles.twoButtons}>
         <button className="button" style={{ flex: 1 }} disabled={loadingCheck} type="button" onClick={onCheck}>

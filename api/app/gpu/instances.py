@@ -1,7 +1,7 @@
 """Persistent instance allocation and lifecycle domain service.
 
 The service is deliberately repository-facing rather than provider-facing.  It
-makes the short, durable admission decision (account + instance + budget),
+makes the short, durable admission decision for the account and instance,
 then leaves provider I/O to the scheduler.  Every state change increments the
 row version and uses a conditional SQL UPDATE, so a process restart or a
 second scheduler cannot silently steal an instance.
@@ -44,9 +44,6 @@ class CreationInstancePending(InstanceConflict):
 class StudioModelStorageConflict(InstanceConflict):
     """A native Drive mount cannot supply locally loaded Studio weights."""
 
-
-class BudgetError(InstanceServiceError):
-    """Allocation or retention has no safe, configured budget."""
 
 
 class InstanceService:
@@ -236,120 +233,6 @@ class InstanceService:
             raise AllocationError("没有可分配的授权账号")
         return sorted(legal, key=lambda row: self._account_id(row))
 
-    def _estimate_units(self, job, provider):
-        if provider == "mock":
-            return 0.0
-        rate = self._cfg("unit_rate")
-        if rate is None:
-            raise BudgetError("real GPU allocation requires an explicit unit_rate")
-        try:
-            rate = float(rate)
-        except (TypeError, ValueError) as exc:
-            raise BudgetError("GPU unit_rate is invalid") from exc
-        if not math.isfinite(rate) or rate <= 0:
-            raise BudgetError("GPU unit_rate must be finite and positive")
-        raw = job.get("budget_units", job.get("estimated_units"))
-        if raw is None:
-            minutes = job.get("max_runtime_minutes") or self._job_policy(job).get("max_runtime_minutes") or self._cfg("max_runtime_minutes", 0)
-            raw = float(minutes) * rate
-        try:
-            units = float(raw)
-        except (TypeError, ValueError) as exc:
-            raise BudgetError("GPU budget estimate is invalid") from exc
-        if not math.isfinite(units) or units < 0:
-            raise BudgetError("GPU budget estimate is invalid")
-        maximum = self._cfg("max_job_units")
-        if maximum is not None and units > float(maximum):
-            raise BudgetError("GPU budget exceeded")
-        return units
-
-    def _account_budget_limits(self, account):
-        """Read the account-directory budget shape and fail closed when absent."""
-        account_data = self._data(account)
-        nested = account_data.get("budget")
-        nested = nested if isinstance(nested, Mapping) else {}
-        # The UI/API stores budget.daily/monthly.  The flat names remain a
-        # narrow migration compatibility path, but global config is never used
-        # as a substitute for an unconfigured real account.
-        daily = self._value(nested, "daily", "daily_units", "daily_budget_units")
-        monthly = self._value(nested, "monthly", "monthly_units", "monthly_budget_units")
-        if daily is None:
-            daily = self._value(account_data, "daily_units", "daily_budget_units", "budget_units")
-        if monthly is None:
-            monthly = self._value(account_data, "monthly_units", "monthly_budget_units")
-        if daily is None:
-            raise BudgetError("GPU account budget is not configured")
-        try:
-            daily = float(daily)
-            monthly = None if monthly is None else float(monthly)
-        except (TypeError, ValueError) as exc:
-            raise BudgetError("GPU account budget is invalid") from exc
-        if not math.isfinite(daily) or daily < 0 or (monthly is not None and (not math.isfinite(monthly) or monthly < 0)):
-            raise BudgetError("GPU account budget is invalid")
-        return daily, monthly
-
-    def _budget_totals(self, session, owner_id, account_id=None):
-        """Return billed usage plus every still-live instance reservation."""
-        now = float(self.clock())
-        daily = monthly = 0.0
-        for row in self._rows(session, "instance_usage_segments", owner_id):
-            data = self._data(row)
-            if account_id is not None and data.get("account_id") not in {None, account_id}:
-                continue
-            value = data.get("actual_units") if data.get("actual_units") is not None else data.get("estimated_units")
-            if value is None:
-                continue
-            value = float(value)
-            stamp = data.get("created_epoch", data.get("epoch", data.get("started_at")))
-            stamp = float(stamp) if stamp is not None else None
-            if stamp is None or stamp >= now - 31 * 86400:
-                monthly += value
-            if stamp is None or stamp >= now - 86400:
-                daily += value
-
-        for row in self._rows(session, "instances", owner_id):
-            data = self._data(row)
-            if account_id is not None and data.get("account_id") != account_id:
-                continue
-            # retained_idle and releasing are billable until remote deletion is
-            # confirmed.  Unknown/cleanup states are also fail-closed here.
-            if row.state == "deleted":
-                continue
-            reserved = float(data.get("budget_reserved") or 0) + float(data.get("retention_reserved") or 0)
-            daily += reserved
-            monthly += reserved
-        return daily, monthly
-
-    def _check_budget(self, session, account, additional_units):
-        account_daily, account_monthly = self._account_budget_limits(account)
-        global_daily = self._cfg("daily_units")
-        global_monthly = self._cfg("monthly_units")
-        if global_daily is None:
-            raise BudgetError("GPU global budget is not configured")
-
-        account_id = self._account_id(account)
-        account_daily_used, account_monthly_used = self._budget_totals(session, account.owner_id, account_id)
-        global_daily_used, global_monthly_used = self._budget_totals(session, account.owner_id)
-        if account_daily_used + additional_units > account_daily or (account_monthly is not None and account_monthly_used + additional_units > account_monthly):
-            raise BudgetError("GPU account budget exceeded")
-        if global_daily_used + additional_units > global_daily or (global_monthly is not None and global_monthly_used + additional_units > global_monthly):
-            raise BudgetError("GPU global budget exceeded")
-
-    def _reserve_budget(self, session, job, account, provider):
-        units = self._estimate_units(job, provider)
-        if provider == "mock":
-            return 0.0
-        self._check_budget(session, account, units)
-        return units
-
-    def _retention_units(self, provider, minutes, unit_rate=None):
-        if provider == "mock":
-            return 0.0
-        rate = max(float(unit_rate or 0), float(self._cfg("unit_rate") or 0))
-        if not rate or rate <= 0:
-            raise BudgetError("real GPU retention requires a positive unit_rate")
-        return float(minutes) * rate
-
     def _cursor_id(self, owner_id, project_id):
         return str(uuid.uuid5(uuid.NAMESPACE_URL, f"colab-gpu-allocation-cursor:{owner_id}:{project_id or ''}"))
 
@@ -435,6 +318,7 @@ class InstanceService:
         requested = job.get("requested_spec") or (job.get("execution_policy") or {}).get("requested_spec")
         if requested and not creation:
             from .specs import spec_key
+
             previous = data.get("runtime_spec_requested")
             if not previous or spec_key(previous) != spec_key(requested):
                 return False
@@ -464,36 +348,38 @@ class InstanceService:
             for row in jobs
         )
 
-    def _creation_reuse_cost(self, job, instance):
+    def _creation_reuse_cost(self, session, job, instance):
         if not job.get("creation_fingerprint"):
             return job
+        from .ccu import instance_live_rate
         from .rates import minute_rate
-        from .specs import spec_key
 
         data = self._data(instance)
         actual = data.get("runtime_spec_reported") or data.get("runtime_spec_requested")
-        rate = minute_rate(spec_key(actual), self._cfg("unit_rate"))
-        before = float(job.get("unit_rate") or rate)
-        cap = float(job["max_runtime_minutes"])
-        return {**job, "unit_rate": rate, "budget_units": max(float(job.get("budget_units") or 0), rate * cap),
-                "estimated_units": round(float(job.get("estimated_units") or 0) * rate / before, 3)}
+        live_rate = instance_live_rate(session, instance.owner_id, instance.account_id, instance.id)
+        rate = minute_rate(actual, live_rate_hourly=live_rate, fallback_rate=self._cfg("unit_rate"))
+        before = job.get("unit_rate")
+        estimate = job.get("estimated_units")
+        if rate is not None and before and estimate is not None:
+            estimate = round(estimate * rate / before, 3)
+        return {**job, "unit_rate": rate, "estimated_units": estimate}
 
-    def _claim_existing(self, session, instance, job, account, key, stable_id, reason, units):
+    def _claim_existing(self, session, instance, job, account, key, stable_id, reason):
         data = self._data(instance)
         if data.get("current_job_id") not in {None, job.get("id")}:
             raise InstanceConflict("实例已被其他任务占用")
         data.update(
             current_job_id=job["id"], account_id=self._account_id(account), allocation_key=key,
-            selection_reason=reason, budget_reserved=units, retention_reserved=0.0, unit_rate=job.get("unit_rate"),
+            selection_reason=reason,
             allocation_requested_at=data.get("allocation_requested_at") or self.clock(), last_seen_at=self.clock(),
             manual_stop_requested=False, runtime_deleted=False, idle_deadline_at=None,
         )
         self._set(instance, data, state="allocating", expected_version=instance.version, session=session)
-        self._bind_job_rows(session, job, instance, account, units)
+        self._bind_job_rows(session, job, instance, account)
         self._emit(session, job["owner_id"], instance.project_id, instance.id, job["id"], "allocating", "instance allocated")
         return self._dict(instance)
 
-    def _create_instance(self, session, job, account, key, stable_id, units, reason):
+    def _create_instance(self, session, job, account, key, stable_id, reason):
         model = self._model("instances")
         now = self._utcnow()
         policy = self._job_policy(job)
@@ -503,7 +389,7 @@ class InstanceService:
             "unit_rate": job.get("unit_rate"),
             "runtime_spec_requested": job.get("requested_spec") or policy.get("requested_spec"),
             "retention_mode": job.get("lifecycle") or policy.get("lifecycle") or "save",
-            "selection_reason": reason, "budget_reserved": units, "retention_reserved": 0.0,
+            "selection_reason": reason,
             "allocation_requested_at": self.clock(), "generation": 0,
             "manual_stop_requested": False, "runtime_deleted": False, "last_seen_at": self.clock(),
         }
@@ -515,11 +401,11 @@ class InstanceService:
             session.flush()
         except IntegrityError as exc:
             raise InstanceConflict("实例分配发生竞争，请重试") from exc
-        self._bind_job_rows(session, job, row, account, units)
+        self._bind_job_rows(session, job, row, account)
         self._emit(session, job["owner_id"], row.project_id, row.id, job["id"], "allocating", "instance allocated")
         return self._dict(row)
 
-    def _bind_job_rows(self, session, job, instance, account, units):
+    def _bind_job_rows(self, session, job, instance, account):
         account_id = self._account_id(account) if account is not None else self._value(self._data(instance), "account_id")
         account_data = self._data(account) if account is not None else {}
         account_alias = self._value(account_data, "alias", "label", default=None) if account is not None else None
@@ -533,12 +419,11 @@ class InstanceService:
             existing = data.get("instance_id")
             if existing not in {None, instance.id}:
                 raise InstanceConflict("job already belongs to another instance")
-            data.update(account_id=account_id, instance_id=instance.id, budget_reserved=units,
+            data.update(account_id=account_id, instance_id=instance.id,
                         account_alias_snapshot=account_alias)
             if job.get("creation_fingerprint"):
                 data.update(selection_reason=self._data(instance).get("selection_reason"),
-                            unit_rate=job["unit_rate"], estimated_units=job["estimated_units"],
-                            budget_units=job["budget_units"])
+                            unit_rate=job["unit_rate"], estimated_units=job["estimated_units"])
             if not data.get("drive_account_id") and drive_account_id:
                 data["drive_account_id"] = drive_account_id
             if job.get("lease_id") is not None:
@@ -574,6 +459,17 @@ class InstanceService:
             if existing is not None and self._data(existing).get("allocation_key") == key:
                 return self._dict(existing)
             accounts = self._legal_accounts(session, owner_id, project_id, provider, requested_account)
+            if provider == "colab":
+                from .cu_guard import CuGuardService
+                guard = CuGuardService(self.repo, self.clock)
+                keys = [self._account_id(account) for account in accounts]
+                if requested_instance and not requested_account:
+                    selected = self._find(session, "instances", requested_instance, owner_id)
+                    selected_account = selected.account_id if selected else None
+                    if selected_account in keys:
+                        keys = [selected_account]
+                eligible = guard.filter_accounts(guard.state_in(session, owner_id), keys)
+                accounts = [account for account in accounts if self._account_id(account) in eligible]
             account_id = self._account_id(accounts[0]) if requested_account else None
 
             if requested_instance:
@@ -592,9 +488,8 @@ class InstanceService:
                 account = next((a for a in accounts if self._account_id(a) == data.get("account_id")), None)
                 if account is None or not self._compatible(session, instance, job, self._account_id(account)):
                     raise InstanceConflict("指定实例不兼容或已被占用")
-                job = self._creation_reuse_cost(job, instance)
-                units = self._reserve_budget(session, job, account, provider)
-                return self._claim_existing(session, instance, job, account, key, stable_id, "requested_instance", units)
+                job = self._creation_reuse_cost(session, job, instance)
+                return self._claim_existing(session, instance, job, account, key, stable_id, "requested_instance")
 
             # Reuse is deliberately attempted before advancing the persistent RR cursor.
             idle = [r for r in self._rows(session, "instances", owner_id) if r.id != stable_id and r.state not in {"unknown", "cleanup_pending"}]
@@ -617,9 +512,8 @@ class InstanceService:
                     instance = max(candidates, key=lambda row: row.updated_at or row.created_at)
                 if account is None:
                     account = next(a for a in accounts if self._account_id(a) == self._data(instance).get("account_id"))
-                job = self._creation_reuse_cost(job, instance)
-                units = self._reserve_budget(session, job, account, provider)
-                return self._claim_existing(session, instance, job, account, key, stable_id, "reuse_idle", units)
+                job = self._creation_reuse_cost(session, job, instance)
+                return self._claim_existing(session, instance, job, account, key, stable_id, "reuse_idle")
 
             if job.get("creation_fingerprint"):
                 identities = {self._account_id(account) for account in accounts}
@@ -643,8 +537,7 @@ class InstanceService:
                         raise StudioModelStorageConflict("创作模式需要本地模型，当前原生实例使用 Drive 挂载，请改用兼容实例")
                     raise InstanceConflict("原生 ComfyUI 会话仍占用 GPU，请复用同一规格或先停止旧实例")
             account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
-            units = self._reserve_budget(session, job, account, provider)
-            return self._create_instance(session, job, account, key, stable_id, units, "requested_account" if requested_account else "round_robin")
+            return self._create_instance(session, job, account, key, stable_id, "requested_account" if requested_account else "round_robin")
 
     # ---- scheduler lifecycle -------------------------------------------------------
     def _instance_for_job(self, session, job, owner_id=None):
@@ -693,6 +586,10 @@ class InstanceService:
                 mode = "save"
             elif data.get("native_comfy"):
                 mode = "retain"
+            elif data.get("provider") == "colab":
+                from .cu_guard import CuGuardService
+                if CuGuardService(self.repo, self.clock).state_in(session, instance.owner_id)["soft_tripped"]:
+                    mode = "save"
             hard = data.get("hard_deadline_at")
             reuse_batch = mode == "batch" and job.get("creation_fingerprint") and any(
                 row.id != job["id"] and row.state in {"queued", "validating", "waiting_for_capacity"}
@@ -705,7 +602,6 @@ class InstanceService:
             data.update(current_job_id=None, last_seen_at=self.clock(), retention_mode=mode)
             if not data.get("native_comfy"):
                 data.update(idle_deadline_at=None, retention_reserved=0.0)
-            released_for_budget = False
             if retain:
                 minutes = (
                     policy.get("retain_idle_minutes")
@@ -717,22 +613,10 @@ class InstanceService:
                     minutes = min(30.0, minutes)
                 now = self.clock()
                 deadline = min(now + minutes * 60, float(hard)) if hard is not None else now + minutes * 60
-                if job.get("generation_timeouts") and not data.get("native_comfy") and data.get("provider") == "colab":
-                    try:
-                        account = self._account_row(session, data.get("account_id"), instance.owner_id)
-                        if account is None:
-                            raise BudgetError("GPU account is not configured")
-                        units = self._retention_units("colab", (deadline - now) / 60, data.get("unit_rate"))
-                        self._check_budget(session, account, units)
-                        data["retention_reserved"] = units
-                    except BudgetError:
-                        retain = False
-                        released_for_budget = True
-                if retain:
-                    data.update(retain_idle_minutes=minutes, idle_deadline_at=deadline)
+                data.update(retain_idle_minutes=minutes, idle_deadline_at=deadline)
             state = "retained_idle" if retain else "releasing"
             self._set(instance, data, state=state, session=session)
-            message = "GPU idle retention budget exceeded" if released_for_budget else ("job completed" if success else "job failed")
+            message = "job completed" if success else "job failed"
             self._emit(session, instance.owner_id, instance.project_id, instance.id, job.get("id"), state, message)
             return self._dict(instance)
 
@@ -763,7 +647,7 @@ class InstanceService:
             data.update(lease_id=lease_id, current_job_id=job.get("id"), last_seen_at=self.clock())
             self._set(instance, data, state=instance.state, session=session)
             account = self._account_row(session, data.get("account_id"), instance.owner_id)
-            self._bind_job_rows(session, {**dict(job), "lease_id": lease_id}, instance, account, data.get("budget_reserved", 0.0))
+            self._bind_job_rows(session, {**dict(job), "lease_id": lease_id}, instance, account)
             try:
                 lease_row = self._find(session, "leases", lease_id, instance.owner_id)
             except ValueError:
@@ -832,17 +716,12 @@ class InstanceService:
             lease_data = self._data(lease) if lease is not None else {}
             if not lease_data.get("generation_timeouts") and minutes > float(self._cfg("max_idle_minutes", 30)):
                 raise AllocationError("idle retention exceeds configured limit")
-            provider = data.get("provider", "mock")
             hard = data.get("hard_deadline_at")
             if mode in {"retain", "smart"}:
-                retention_units = self._retention_units(provider, minutes, data.get("unit_rate"))
-                if provider != "mock":
-                    account = self._account_row(session, data.get("account_id"), owner)
-                    if account is None:
-                        raise BudgetError("GPU account is not configured")
-                    previous = float(data.get("retention_reserved") or 0.0)
-                    self._check_budget(session, account, max(0.0, retention_units - previous))
-                data["retention_reserved"] = retention_units
+                if data.get("provider") == "colab":
+                    from .cu_guard import CuGuardService
+                    guard = CuGuardService(self.repo, self.clock)
+                    guard.filter_accounts(guard.state_in(session, owner), [data.get("account_id")])
                 data["retain_idle_minutes"] = minutes
                 deadline = self.clock() + minutes * 60
                 data["idle_deadline_at"] = min(deadline, float(hard)) if hard is not None else deadline
@@ -892,7 +771,9 @@ class InstanceService:
             return result
 
     def mark_deleted(self, owner, id, expected_version=None, confirmed=False, remote_deleted=False):
-        with self._admission(), self._tx() as session:
+        from . import ccu
+
+        with self._admission(), ccu.transaction(self.repo, owner) as session:
             instance = self._find(session, "instances", id, owner)
             if instance is None:
                 raise KeyError(id)
@@ -910,11 +791,16 @@ class InstanceService:
                 last_seen_at=confirmed_at,
             )
             self._set(instance, data, state="deleted", session=session)
+            account = ccu.close_instance_session(self.repo, owner, id, confirmed_at, "confirmed_delete", session=session)
             self._emit(session, owner, instance.project_id, id, None, "deleted", "remote deletion confirmed")
-            return self._dict(instance)
+            result = self._dict(instance)
+        if account:
+            ccu.sample_and_record(self.repo, owner, account, "delete_after")
+        return result
 
     def apply_runtime_inspection(self, lease_snapshot, instance_version, job_snapshot, identity, status, checked_at, claim_token):
         """Commit a Colab observation only while the inspected binding still owns the runtime."""
+        from . import ccu
         from .native import _lease_identity
 
         owner = lease_snapshot["owner_id"]
@@ -924,7 +810,8 @@ class InstanceService:
             with self.store.dispatch_lock() as acquired:
                 if not acquired:
                     return False
-                with self._admission(), self._tx() as session:
+                write = ccu.transaction(self.repo, owner) if status == "missing" else self._tx()
+                with self._admission(), write as session:
                     lease = self._find(session, "leases", lease_id, owner)
                     instance = self._find(session, "instances", lease_snapshot["instance_id"], owner)
                     if lease is None or instance is None:
@@ -983,12 +870,15 @@ class InstanceService:
                             and binding.get("runtime_id") == current["runtime_id"]
                         ):
                             return False
-                    self._close_reclaimed_runtime(session, instance, lease, current, job_data, identity, checked_at)
-                    return True
+                    account = self._close_reclaimed_runtime(session, instance, lease, current, job_data, identity, checked_at)
+            if account:
+                ccu.sample_and_record(self.repo, owner, account, "delete_after")
+            return True
         except InstanceConflict:
             return False
 
     def _close_reclaimed_runtime(self, session, instance, lease, binding, job, identity, checked_at):
+        from . import ccu
         from .colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
 
         owner = instance.owner_id
@@ -1028,19 +918,12 @@ class InstanceService:
                 if outcome not in {"completed", "cancelled"}:
                     payload.update(requested_outcome="failed", cleanup_final_state="failed",
                                    error_code=RUNTIME_MISSING, error_message=RUNTIME_MISSING_MESSAGE)
-                payload["state"] = state
+                payload.update(state=state, **ccu.execution_finished(payload, checked_at))
             self._set(related, payload, state=state, session=session)
-        started = data.get("allocation_requested_at") or job.get("started_epoch")
-        rate = float(data.get("unit_rate") or job.get("unit_rate") or self._cfg("unit_rate", 0) or 0)
-        self._record_usage(session, owner, {
-            "instance_id": instance.id, "job_id": job_id, "segment_key": f"instance-lifetime:{instance.id}",
-            "started_at": started, "ended_at": checked_at, "allocation_requested_at": started,
-            "deletion_confirmed_at": checked_at, "actual_units": None,
-            "estimated_units": max(0.0, checked_at - float(started)) / 60 * rate if started else None,
-        })
         self._emit(session, owner, instance.project_id, instance.id, job_id, "deleted",
                    RUNTIME_MISSING_MESSAGE, reason=RUNTIME_MISSING, source="colab_inspect",
                    checked_at=checked_at, lease_id=lease.id)
+        return ccu.close_instance_session(self.repo, owner, instance.id, checked_at, RUNTIME_MISSING, session=session)
 
     # ---- accounting, events and safe reads ----------------------------------------
     def record_usage(self, owner, payload):

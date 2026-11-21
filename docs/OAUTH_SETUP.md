@@ -27,19 +27,16 @@
 
 > **备用方式**：如果你不喜欢网页导入，也可以把 `GPU_GOOGLE_CLIENT_ID`、`GPU_GOOGLE_CLIENT_SECRET`、`GPU_GOOGLE_REDIRECT_URI` 直接填进服务器的 `.env` 文件里再重启容器。
 
-## 第三步：开启真实 GPU 开关与预算保护
+## 第三步：开启真实 GPU 与 CU 熔断保护
 
 授权连上之后，默认还是不会开真 GPU 的。确认要开始跑图前，编辑服务器的 `.env`：
 
 ```ini
 GPU_REAL_ENABLED=1
 GPU_STORAGE=drive
-# 填写每分钟消耗的 CU 估算值（例如 L4 约 0.027，T4 约 0.019），不填正数不允许跑真机
-GPU_UNIT_RATE=0.027
-GPU_DAILY_UNITS=10
-GPU_MONTHLY_UNITS=100
-GPU_MAX_JOB_UNITS=5
-GPU_MAX_RUNTIME_MINUTES=60
+STUDIO_TIMEZONE=Asia/Shanghai
 ```
 
-改完重启服务，就可以去跑一次 CUDA 冒烟或激活内置工作流了。每次任务跑完，系统都会校验作品并自动删掉 Colab runtime。
+在算力页或设置页的「CU 熔断保护」设置今日总上限与余额底线。今日扣费按工作台时区切日。已保存配置在服务重启后继续生效。原有 `GPU_DAILY_UNITS` 只用于首次初始化，`GPU_UNIT_RATE` 只用于未知 GPU 规格的参考估算。
+
+改完重启服务，就可以去跑一次 CUDA 冒烟或激活内置工作流了。系统会按所选运行策略释放或保留实例，保留期间继续计费。

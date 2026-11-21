@@ -61,10 +61,11 @@ def main():
 
                 auto_export_tick(store)
             if args.mode == "worker" and time.time() - last_ccu_tick >= 60:
-                # Balance snapshots and leaked-runtime detection: read-only, no CU cost.
+                # Refresh account balances before applying the runtime fuses.
                 last_ccu_tick = time.time()
                 try:
                     from .gpu.ccu import tick_ccu
+                    from .gpu.cu_guard import CuGuardService
                     from .gpu.repository import Repository
 
                     repo = Repository(store)
@@ -73,6 +74,7 @@ def main():
                     )
                     for owner_id in owner_ids:
                         tick_ccu(repo, owner_id)
+                        CuGuardService(repo).enforce(owner_id)
                 except Exception as exc:  # noqa: BLE001 - never stop the queue for accounting
                     log.warning("ccu tick failed: %s", type(exc).__name__)
             if result.get("advanced"):

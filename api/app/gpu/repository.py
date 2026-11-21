@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import Mapping
 
-from sqlalchemy import String, UniqueConstraint, inspect, select, text
+from sqlalchemy import Index, String, UniqueConstraint, inspect, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -74,6 +74,13 @@ class GpuUsageRow(CommonMixin, Base):
     __tablename__ = "gpu_usage"
 
 
+class GpuCcuLedgerRow(CommonMixin, Base):
+    __tablename__ = "gpu_ccu_ledger"
+    account_id: Mapped[str] = mapped_column(String(64), index=True)
+    local_date: Mapped[str] = mapped_column(String(10), index=True)
+    __table_args__ = (Index("ix_gpu_ccu_ledger_owner_date", "owner_id", "local_date"),)
+
+
 class GpuFileRow(CommonMixin, Base):
     __tablename__ = "gpu_files"
 
@@ -138,6 +145,7 @@ _GPU_MODELS = {
     "events": GpuEventRow,
     "presets": GpuPresetRow,
     "usage": GpuUsageRow,
+    "ccu_ledger": GpuCcuLedgerRow,
     "files": GpuFileRow,
     "credentials": GpuCredentialRow,
     "accounts": GpuAccountRow,
@@ -162,11 +170,27 @@ def ensure_schema(store: Store) -> None:
         store._gpu_schema_ready = True
 
 
+def ensure_cu_cutover(connection):
+    """Record the first accounting cutover for Alembic and automatic SQLite upgrades."""
+    table = db_module.SettingRow.__table__
+    key = "cu-ledger-cutover"
+    if connection.scalar(select(table.c.id).where(table.c.id == key)) is not None:
+        return
+    if connection.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+    connection.execute(insert(table).values(
+        id=key, data={"epoch": time.time()}, version=0, created_at=utcnow(), updated_at=utcnow(),
+    ).on_conflict_do_nothing(index_elements=[table.c.id]))
+
+
 def _initialize_schema(store: Store) -> None:
     for attempt in range(6):
         try:
             with store.engine.begin() as connection:
                 Base.metadata.create_all(connection, tables=_GPU_TABLES, checkfirst=True)
+                ensure_cu_cutover(connection)
                 # Older databases need explicit migrations. Inspect this connection
                 # so reflection cannot request a second checkout from the pool.
                 inspector = inspect(connection)
@@ -265,7 +289,7 @@ class Repository:
         # v0.2 stores identity in typed columns as well as JSON.  Old rows may
         # have only the typed value after Alembic 0003; expose and reconcile it
         # at the repository boundary instead of silently dropping ownership.
-        for field in ("account_id", "instance_id", "current_job_id"):
+        for field in ("account_id", "instance_id", "current_job_id", "local_date"):
             if hasattr(row, field):
                 value = getattr(row, field)
                 if value is not None:
@@ -320,7 +344,7 @@ class Repository:
             "created_at": utcnow(),
             "updated_at": utcnow(),
         }
-        for field in ("account_id", "instance_id", "current_job_id"):
+        for field in ("account_id", "instance_id", "current_job_id", "local_date"):
             if hasattr(model, field) and field in payload:
                 kwargs[field] = payload[field]
         if model is GpuWorkflowRow:
@@ -412,21 +436,21 @@ class Repository:
         with self.store.db_lock(), self.store.Session.begin() as session:
             # SQLite ignores FOR UPDATE. Serialize workflow writers before
             # reading so validation cannot overwrite a concurrent deletion.
-            if kind == "workflows" and self.store.engine.dialect.name == "sqlite":
+            if kind in {"workflows", "jobs"} and self.store.engine.dialect.name == "sqlite":
                 session.execute(text("BEGIN IMMEDIATE"))
             stmt = select(model).where(model.id == id)
             if owner_id is not None:
                 stmt = stmt.where(model.owner_id == owner_id)
             if kind == "workflows":
                 stmt = stmt.where(model.state.is_distinct_from("deleted")).with_for_update()
-            row = session.scalar(stmt)
+            row = session.scalar(stmt.with_for_update())
             if row is None:
                 raise KeyError(id)
             if kind == "workflows" and row.state == "published" and set(patch) - {"active"}:
                 raise ValueError("已发布workflow版本不可覆写")
             changes = copy.deepcopy(dict(patch))
             row.data = {**(row.data or {}), **changes}
-            for field in ("account_id", "instance_id", "current_job_id"):
+            for field in ("account_id", "instance_id", "current_job_id", "local_date"):
                 if hasattr(model, field) and field in changes:
                     setattr(row, field, changes[field])
             if "state" in changes:
@@ -728,7 +752,9 @@ class Repository:
                 return False
             if next_execution is not None and not execution_matches(next_execution, next_job_id):
                 return False
+            from .ccu import execution_finished
             job.data={**job.data,'state':'completed','runtime_deleted':False,'stopped_at':now,
+                      **execution_finished(job.data, now),
                       **({'instance_id':instance.id,'account_id':account_id} if instance is not None else {})}
             job.state='completed'
             if instance is not None:
@@ -859,6 +885,7 @@ class Repository:
                         or (
                             instance.state == 'retained_idle'
                             and not instance_data.get('manual_stop_requested')
+                            and not (lease_data.get('native_comfy') and lease_data.get('native_draining'))
                             and now < min(float(lease_data.get('idle_deadline_at') or 0),
                                           float(lease_data.get('deadline_epoch') or 0))
                         )
@@ -987,7 +1014,7 @@ class Repository:
 
                 instance_identity = {}
                 lease_identity = {}
-                for key in ("account_id", "instance_id", "current_job_id"):
+                for key in ("account_id", "instance_id", "current_job_id", "local_date"):
                     value, valid = identity(instance, instance_data, key)
                     if not valid:
                         return None
@@ -1102,10 +1129,13 @@ class Repository:
         expected_lease_version=None
     ):
         """Persist or release a fenced historical-instance reconciliation."""
+        from . import ccu
+
+        account = None
         with self.store.admission_lock(timeout=1.0) as acquired:
             if not acquired:
                 return False
-            with self.store.db_lock(), self.store.Session.begin() as session:
+            with ccu.transaction(self, owner_id) as session:
                 instance = session.scalar(select(GpuInstanceRow).where(
                     GpuInstanceRow.id == instance_id, GpuInstanceRow.owner_id == owner_id
                 ))
@@ -1220,8 +1250,13 @@ class Repository:
                 lease.data = lease_data
                 lease.version += 1
                 lease.updated_at = utcnow()
-                session.flush()
-                return True
+                if confirmed:
+                    account = ccu.close_instance_session(
+                        self, owner_id, instance_id, now, "orphan_reconciliation", session=session,
+                    )
+        if account:
+            ccu.sample_and_record(self, owner_id, account, "delete_after")
+        return True
 
     def record_usage_once(self, owner_id, payload):
         # Deterministic primary key provides DB-enforced dedupe across processes.
@@ -1262,6 +1297,7 @@ class Repository:
                 'execution_id','lease_id','outputs','output_asset_ids','persisted_outputs','error_code','error_message',
                 'cancel_requested','requested_outcome','cleanup_final_state','cleanup_attempts','cleanup_next_epoch',
                 'upload_attempts','started_epoch','stopped_at','deadline_epoch','task_deadline_epoch','validated_epoch','budget_reserved',
+                'execution_started_at','execution_ended_at','execution_seconds','ccu_before','ccu_after','ccu_after_at',
                 'runtime_deleted','actual_units','prep_report','progress','awaiting_prep',
                 'instance_completion_recorded','instance_id','instance_state','instance_bound','account_id',
                 'requested_instance_id',
@@ -1332,7 +1368,7 @@ class Repository:
                 return self._row(job)
             execution_id=str(uuid.uuid4())
             attempt=int(job.data.get('attempt_number') or 0)+1
-            job.data={**job.data,'execution_id':execution_id,'attempt_number':attempt}
+            job.data={**job.data,'execution_id':execution_id,'attempt_number':attempt,'execution_started_at':now}
             job.version+=1
             job.updated_at=utcnow()
             lease_data = lease.data or {}
@@ -1363,6 +1399,12 @@ class Repository:
                 return self._row(job)
             if job.state in terminal:
                 return self._row(job)
+            if (job.data.get("cancel_requested") and job.data.get("error_code") == "CU_BALANCE_FLOOR_REACHED"
+                    and state not in {"cleaning_up", "cleanup_pending", "cancelled"}):
+                return self._row(job)
+            if state in terminal | {'cleaning_up', 'cleanup_pending'}:
+                from .ccu import execution_finished
+                patch = {**patch, **execution_finished(job.data, now)}
             job.state=state
             job.data={**job.data,**copy.deepcopy(patch),'state':state}
             job.version+=1

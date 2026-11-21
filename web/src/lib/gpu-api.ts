@@ -86,38 +86,68 @@ export interface GpuJob {
 }
 export interface GpuEvent { id?: string; state?: string; event_type?: string; message?: string; progress?: number; created_at?: string; payload?: Record<string, unknown>; [key: string]: unknown; }
 export interface GalleryAsset { id: string; project_id: string; mime: string; filename?: string; thumbnail_url?: string; download_url?: string; favorite?: boolean; gpu_job_id?: string; source_job_id?: string; batch_id?: string; workflow_key?: string; created_at?: string; mock?: boolean; metadata?: Record<string, unknown>; [key: string]: unknown; }
-export interface CcuSnapshot { alias?: string | null; balance?: number | null; rate?: number | null; assignments?: number | null; active_jobs?: number | null; active_leases?: number | null; sampled_at?: number | null; error?: string; }
+export interface CcuSnapshot {
+  alias?: string | null;
+  balance?: number | null;
+  rate_hourly?: number | null;
+  assignments?: number | null;
+  sampled_at?: number | null;
+  error?: string | null;
+}
+export interface CuAccount extends CcuSnapshot {
+  account_id: string;
+  today_actual_cu: number;
+  history_actual_cu: number;
+  below_floor: boolean;
+}
+export interface CuGuard {
+  daily_limit_cu: number | null;
+  min_balance_cu: number | null;
+  status: 'ok' | 'soft_daily_limit' | 'hard_balance_floor';
+  soft_tripped: boolean;
+  hard_tripped_accounts: { account_id: string; alias: string | null; balance: number }[];
+  message: string | null;
+  daily_message: string | null;
+}
+export type CuSessionKind = 'single_job' | 'smart_reuse' | 'native_comfy' | 'prep' | 'smoke';
+export interface CuSession {
+  instance_id: string;
+  account_id: string;
+  session_kind: CuSessionKind;
+  state: 'open' | 'reconciling' | 'closed';
+  gpu_label: string;
+  started_at: number;
+  ended_at?: number | null;
+  elapsed_minutes: number;
+  actual_cu: number;
+  estimated_cu: number | null;
+  idle_cu: number;
+  draining: boolean;
+  jobs: { job_id: string; workflow_key?: string | null; state: string; execution_seconds: number; actual_cu: number }[];
+}
 export interface CcuBalance {
   total_balance: number | null;
   snapshots: Record<string, CcuSnapshot>;
+  guard: CuGuard;
 }
 export interface CcuAnomaly { account_id: string; alias?: string | null; assignments?: number | null; first_seen?: number | null; last_seen?: number | null; resolved_at?: number | null; }
-export interface UsageReconciliationRow { job_id?: string; state?: string | null; estimated_units?: number | null; actual_units?: number | null; ccu_attribution?: string | null; ccu_source?: string | null; }
 export interface GpuUsage {
-  estimated_units?: number | null;
-  actual_units?: number | null;
-  unit_rate?: number | null;
-  daily_limit?: number | null;
-  monthly_limit?: number | null;
-  max_runtime_minutes?: number | null;
-  active_runtimes?: number | null;
-  reconciliation?: {
-    measured_jobs?: number;
-    unmeasured_jobs?: number;
-    measured_actual_units?: number | null;
-    measured_estimated_units?: number | null;
-    variance_units?: number | null;
-    recent?: UsageReconciliationRow[];
-  };
+  local_date?: string;
+  timezone?: string;
+  today_actual_cu?: number;
+  history_actual_cu?: number;
+  active_runtimes?: number;
+  guard?: CuGuard;
+  accounts?: CuAccount[];
+  daily_history?: { date: string; actual_cu: number; legacy_actual_cu?: number; sessions: number }[];
+  active_sessions?: CuSession[];
+  recent_sessions?: CuSession[];
+  recent_sessions_count?: number;
   ccu?: {
-    accounts?: number;
     total_balance?: number | null;
-    assignments?: number;
     sampled_at?: number | null;
-    snapshots?: Record<string, CcuSnapshot>;
     anomalies?: CcuAnomaly[];
   };
-  [key: string]: unknown;
 }
 export interface GpuSettings { provider_default?: Provider; real_enabled?: boolean; google?: { colab?: { connected?: boolean; configured?: boolean; scopes?: string[] }; drive?: { connected?: boolean; configured?: boolean; scopes?: string[] } }; budget?: Record<string, unknown>; storage?: string; [key: string]: unknown; }
 export interface ComputeSpec {
@@ -130,6 +160,7 @@ export interface ComputeSpec {
   eligible?: boolean;
   key?: Record<string, unknown> | string;
   reason?: string;
+  reference_rate_hourly?: number | null;
   [key: string]: unknown;
 }
 export interface WorkflowBundle { manifest: GpuManifest; api_graph: Record<string, unknown>; object_info: Record<string, unknown>; editable_graph?: Record<string, unknown>; }
@@ -206,7 +237,10 @@ export const renameProject = (id: string, title: string) => apiFetch<Project>(`/
 export const deleteProject = (id: string) => apiFetch<{ deleted: boolean; id: string }>(`/api/gpu/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
 export const getGpuModels = () => apiFetch<GpuModel[]>('/api/gpu/models');
 export const getGpuWorkflows = (modelId?: string) => apiFetch<GpuWorkflow[]>(`/api/gpu/workflows${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`);
-export const getGpuWorkflowSchema = (id: string) => apiFetch<GpuManifest>(`/api/gpu/workflows/${encodeURIComponent(id)}/schema`);
+export const getGpuWorkflowSchema = (id: string, spec?: Record<string, unknown>) => {
+  const query = spec ? `?compute_spec=${encodeURIComponent(JSON.stringify(spec))}` : '';
+  return apiFetch<GpuManifest>(`/api/gpu/workflows/${encodeURIComponent(id)}/schema${query}`);
+};
 export const importGpuWorkflow = (bundle: WorkflowBundle) => apiFetch<GpuWorkflow>('/api/gpu/workflows/import', post(bundle));
 export const validateGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/validate`, post({}));
 export const publishGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/publish`, post({ confirmed: true }));
@@ -267,7 +301,14 @@ export const clearGpuJobHistory = (body: { project_id?: string; scope?: 'all_ter
 export const clearCreationWarmups = () =>
   apiFetch<{ cleared: number }>('/api/gpu/creation-api/warmups/clear', post({}));
 export const getGpuGallery = (projectId: string) => apiFetch<GalleryAsset[]>(`/api/gpu/gallery?project_id=${encodeURIComponent(projectId)}`);
-export const getGpuUsage = () => apiFetch<GpuUsage>('/api/gpu/usage');
+export const getGpuUsage = () => apiFetch<GpuUsage>('/api/gpu/usage', { cache: 'no-store' });
+export const saveCuGuard = (limits: Pick<CuGuard, 'daily_limit_cu' | 'min_balance_cu'>) =>
+  apiFetch<CuGuard>('/api/gpu/cu/guard', { method: 'PUT', body: JSON.stringify(limits) });
+export function getCuSessions({ kind, date, limit, offset }: { kind: CuSessionKind | 'all'; date: string; limit: number; offset: number }) {
+  const query = new URLSearchParams({ kind, limit: String(limit), offset: String(offset) });
+  if (date) query.set('date', date);
+  return apiFetch<{ sessions: CuSession[]; total: number }>(`/api/gpu/cu/sessions?${query}`, { cache: 'no-store' });
+}
 export const queryCcuBalance = () => apiFetch<CcuBalance>('/api/gpu/compute/cu-balance', { cache: 'no-store' }, 60000);
 export const getGpuSettings = () => apiFetch<GpuSettings>('/api/gpu/settings');
 export const getGpuComputeSpecs = (provider: Provider, accountId?: string | null) => {

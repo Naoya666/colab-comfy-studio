@@ -1,12 +1,24 @@
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+    studio_timezone: str = "Asia/Shanghai"
+
+    @field_validator("studio_timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("STUDIO_TIMEZONE must be an IANA timezone") from exc
+        return value
+
     database_url: str = "sqlite:///./data/studio.db"
     data_dir: Path = Path("./data")
     site_url: str = "http://localhost:8788"

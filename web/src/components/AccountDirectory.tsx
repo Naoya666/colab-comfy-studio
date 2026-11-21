@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { RefreshCw } from 'lucide-react';
-import { apiMessage, createGoogleAccount, disconnectGoogleAccount, getGoogleAccounts, startGoogleAccountAuth, updateGoogleAccount } from '../lib/gpu-api';
+import { apiMessage, createGoogleAccount, disconnectGoogleAccount, getGoogleAccounts, startGoogleAccountAuth, updateGoogleAccount, type CuAccount } from '../lib/gpu-api';
+import { cuNumber } from '../lib/ui-helpers';
 import styles from './v020.module.css';
 
 export type AccountStatus = 'connected' | 'needs_reauth' | 'disabled' | 'error' | string;
@@ -95,6 +96,7 @@ export interface AccountDirectoryApi {
 export interface AccountDirectoryProps {
   /** Optional externally loaded list. When supplied it is kept in sync with the view. */
   accounts?: GpuAccount[];
+  balances?: CuAccount[];
   api?: Partial<AccountDirectoryApi>;
   onAccountsChange?: (accounts: GpuAccount[]) => void;
 }
@@ -161,13 +163,12 @@ function safeAuthRedirect(value: { authorization_url?: string } | string): strin
   }
 }
 
-export function AccountDirectory({ accounts: suppliedAccounts, api, onAccountsChange }: AccountDirectoryProps) {
+export function AccountDirectory({ accounts: suppliedAccounts, balances = [], api, onAccountsChange }: AccountDirectoryProps) {
   const accountApi = useMemo(() => ({ ...defaultAccountApi, ...api }), [api]);
   const [accounts, setAccounts] = useState<GpuAccount[]>(suppliedAccounts || []);
   const [alias, setAlias] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editAlias, setEditAlias] = useState('');
-  const [budgetDraft, setBudgetDraft] = useState<Record<string, string>>({});
   const [disconnecting, setDisconnecting] = useState<GpuAccount | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState('');
@@ -279,6 +280,7 @@ export function AccountDirectory({ accounts: suppliedAccounts, api, onAccountsCh
         <div className={styles.empty}><strong>还没有账号目录</strong><span>先新增别名，再分别完成 Colab / Drive 授权。</span></div>
       ) : <div className={styles.stack}>
         {accounts.map((account) => {
+          const balance = balances.find(row => row.account_id === account.account_id);
           const active = activeCount(account);
           const colab = authStatus(account, 'colab');
           const drive = authStatus(account, 'drive');
@@ -332,7 +334,12 @@ export function AccountDirectory({ accounts: suppliedAccounts, api, onAccountsCh
                     </select>
                   </label>
                 )}
-                <label className={styles.budgetField}><span>安全预算（站内估算 CU）</span><input type="number" min="0" step="any" value={budgetDraft[account.account_id] ?? (typeof account.budget === 'object' && account.budget ? String((account.budget as Record<string, unknown>).daily_units ?? (account.budget as Record<string, unknown>).daily ?? '') : account.budget_limit ?? '')} disabled={Boolean(busy)} onChange={(event) => setBudgetDraft({ ...budgetDraft, [account.account_id]: event.target.value })} onBlur={(event) => { const value = event.target.value.trim(); if (value !== '') void updateAccount(account, { budget: { ...(typeof account.budget === 'object' && account.budget ? account.budget : {}), daily: Number(value), daily_units: Number(value) } }, `account-budget-${account.account_id}`, '账号预算已更新。'); }} /></label>
+                <div className="small">
+                  余额 {cuNumber(balance?.balance)} CU · 今日扣费 {cuNumber(balance?.today_actual_cu)} CU
+                  {balance?.below_floor && <span className={styles.warningInline}> · 已触及余额底线</span>}
+                  {balance?.error && <span className="muted"> · 最近查询失败</span>}
+                  {balance?.balance != null && !balance.below_floor && !balance.error && <span className="muted"> · 底线正常</span>}
+                </div>
               </div>
               <div className={styles.cardActions}>
                 <button type="button" className={styles.buttonSecondary} disabled={Boolean(busy)} onClick={() => { setEditingId(account.account_id); setEditAlias(account.alias || ''); }}>改名</button>

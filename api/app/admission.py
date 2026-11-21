@@ -22,16 +22,25 @@ def repo_registry(st, user):
 
 
 def _job_estimate(repo, owner, workflow, policy, cfg, params) -> dict:
-    """Shown estimate is realistic; budget_units keeps reserving the max-runtime worst case."""
+    """Estimate the cost of the submitted workflow and inputs."""
     if policy["provider"] == "mock":
         return {"estimated_units": 0.0, "unit_rate": cfg.unit_rate}
     cap = policy["max_runtime_minutes"]
     manifest = workflow["manifest"]
     picked = mode_param(manifest)
     mode = params.get(picked[0]) if picked else None
-    units, rate = estimate_units(repo, owner, workflow["workflow_key"], manifest, (policy.get("resolved_compute_spec") or manifest.get("compute_spec")), cap, mode=mode, fallback_rate=cfg.unit_rate)
-    units = round(min(units * length_factor(manifest, params), cap * rate), 3)
-    return {"estimated_units": units, "unit_rate": rate, "budget_units": cap * max(rate, cfg.unit_rate or 0)}
+    live_rate = None
+    if policy.get("instance_id") and policy.get("account_id"):
+        from .gpu.ccu import instance_live_rate
+
+        with repo.store.db_lock(), repo.store.Session() as session:
+            live_rate = instance_live_rate(session, owner, policy["account_id"], policy["instance_id"])
+    spec = policy.get("resolved_compute_spec") or manifest.get("compute_spec")
+    units, rate = estimate_units(repo, owner, workflow["workflow_key"], manifest, spec, cap,
+                                 mode=mode, fallback_rate=cfg.unit_rate, live_rate_hourly=live_rate)
+    if units is not None:
+        units = round(min(units * length_factor(manifest, params), cap * rate), 3)
+    return {"estimated_units": units, "unit_rate": rate}
 
 
 def _resource(repo, kind, resource_id, user, code, message):
@@ -127,7 +136,7 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
     if policy["provider"] not in {"mock", "colab"}:
         raise APIError("PROVIDER_INVALID", "仅允许已配置的 mock 或 colab Provider")
     if policy["provider"] == "colab" and not cfg.real_enabled:
-        raise APIError("REAL_GPU_DISABLED", "真实 GPU 默认关闭：请先配置 OAuth、费率预算并完成模型审查")
+        raise APIError("REAL_GPU_DISABLED", "真实 GPU 默认关闭：请先配置 OAuth 并完成模型审查")
     try:
         workflow = registry.get_workflow(user["id"], body["workflow_key"], body["workflow_version"])
     except KeyError as exc:
@@ -178,29 +187,19 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
         snapshot["creation_api"] = True
         if creation.get("warmup"):
             snapshot["creation_warmup"] = True
-    baseline = None
     if policy["provider"] == "colab":
         if not workflow.get("review_approved") or workflow.get("smoke_test_kind") != "real":
             raise APIError("REVIEW_REQUIRED", "真实工作流尚未通过后台审核及真实冒烟")
         snapshot["manifest"] = {**snapshot["manifest"], "state": "published", "reviewed": True}
-        if cfg.unit_rate is None:
-            raise APIError("RATE_UNKNOWN", "未设置可信的估算费率，拒绝开机")
-        status = _google_status(repo, user["id"], policy.get("account_id"))
-        if not status["colab"]["connected"]:
+        account = policy.get("account_id")
+        if account:
+            connected = _google_status(repo, user["id"], account)["colab"]["connected"]
+        else:
+            candidates = [row.get("account_id") or row["id"] for row in repo.list("accounts", user["id"])
+                          if _account_is_usable(row) and row.get("provider", "colab") in {"colab", "google"}]
+            connected = any(_google_status(repo, user["id"], key)["colab"]["connected"] for key in candidates or [None])
+        if not connected:
             raise APIError("GOOGLE_NOT_CONNECTED", "请先授权对应 Google Colab 账户")
-        # Baseline balance so the cleanup stage can measure the real spend. Best effort:
-        # a failed sample must never block admission.
-        from .gpu import ccu
-
-        if not creation:
-            baseline = ccu.maybe_sample_balance(repo, user["id"], policy.get("account_id"))
-    baseline_fields: dict = {}
-    if policy["provider"] == "colab" and baseline:
-        baseline_fields = {
-            "ccu_before": baseline["balance"],
-            "ccu_before_at": baseline["at"],
-            "ccu_before_source": "google_balance",
-        }
     # After the published stamp, so the curated LoRA weight files stay in the manifest the runtime restores.
     if body.get("loras"):
         _apply_loras(repo, user, workflow, body["loras"], snapshot, policy["provider"])
@@ -273,6 +272,8 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
             reused = before_create(repo, {**compute_fields, "snapshot": snapshot, "execution_policy": policy})
             if reused:
                 return reused
+            from .gpu.cu_guard import CuGuardService
+            CuGuardService(repo).check(user["id"], policy["provider"], policy.get("account_id"), policy.get("instance_id"))
         else:
             guard_generation(repo, user["id"], policy)
         job, created = repo.create_job(user["id"], body, key, admitted={
@@ -281,7 +282,6 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
             **({"account_id": policy.get("account_id")} if policy.get("account_id") else {}),
             "requested_account_id": policy.get("account_id"),
             "requested_instance_id": policy.get("instance_id"),
-            **(baseline_fields),
             **({"drive_account_id": model_drive_account or _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if model_drive_account or policy.get("account_id") else {}),
             "snapshot": snapshot,
             "params": params,

@@ -5,15 +5,18 @@ import { ThemePicker } from './ComputePage';
 import type { GpuSettings, GpuUsage } from '../lib/gpu-api';
 import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
 import { AccountDirectory, type GpuAccount } from '../components/AccountDirectory';
+import { CuGuardSettings } from '../components/CuGuardSettings';
 import { Card } from '../components/ui';
 import styles from '../gpu.module.css';
 import { cuNumber } from '../lib/ui-helpers';
 
 export function SettingsPanel({
-  settings, usage, error, accounts = [], onAccountsChange, onOpenCompute, onLogout, onBack,
+  settings, usage, canEditGuard, onRefreshUsage, error, accounts = [], onAccountsChange, onOpenCompute, onLogout, onBack,
 }: {
   settings: GpuSettings | null;
   usage?: GpuUsage | null;
+  canEditGuard: boolean;
+  onRefreshUsage: () => Promise<void>;
   error: string;
   onOpenCompute?: () => void;
   onLogout: () => void;
@@ -24,9 +27,11 @@ export function SettingsPanel({
   const [oauthConfigured, setOauthConfigured] = useState(false);
 
   const activeCount = Number(usage?.active_runtimes ?? 0);
-  const dailyCap = Number(usage?.daily_limit || settings?.budget?.daily_units || 0);
-  const used = Number(usage?.actual_units || usage?.estimated_units || 0);
-  const pct = dailyCap > 0 ? Math.min(100, Math.round((used / dailyCap) * 100)) : 0;
+  const dailyCap = usage?.guard?.daily_limit_cu;
+  const used = usage?.today_actual_cu;
+  const pct = dailyCap != null && used != null
+    ? (dailyCap === 0 ? '已达上限' : `${Math.round((used / dailyCap) * 100)}%`)
+    : '—';
 
   return (
     <div className={`${styles.stack} ${styles.workspaceGrid}`}>
@@ -42,13 +47,13 @@ export function SettingsPanel({
       <Card
         icon={<Gauge size={17} strokeWidth={1.6} aria-hidden />}
         title="用量与额度"
-        aside={<span className="pill">已用 {pct}%</span>}
+        aside={<span className="pill">{usage?.local_date || '—'}</span>}
       >
         <div className={styles.grid2}>
           <div className={styles.statBox}><small className="muted">运行中机器</small><strong>{activeCount}</strong></div>
-          <div className={styles.statBox}><small className="muted">每日上限</small><strong>{dailyCap || '—'}<em> CU</em></strong></div>
-          <div className={styles.statBox}><small className="muted">已用</small><strong>{cuNumber(used)}<em> CU</em></strong></div>
-          <div className={styles.statBox}><small className="muted">使用率</small><strong>{pct}%</strong></div>
+          <div className={styles.statBox}><small className="muted">今日总上限</small><strong>{dailyCap == null ? '不限' : <>{cuNumber(dailyCap)}<em> CU</em></>}</strong></div>
+          <div className={styles.statBox}><small className="muted">今日扣费</small><strong>{cuNumber(used)}<em> CU</em></strong></div>
+          <div className={styles.statBox}><small className="muted">使用率</small><strong>{pct}</strong></div>
         </div>
         {onOpenCompute && (
           <button type="button" className="button secondary small" onClick={onOpenCompute}>
@@ -56,6 +61,8 @@ export function SettingsPanel({
           </button>
         )}
       </Card>
+
+      <CuGuardSettings guard={usage?.guard} canEdit={canEditGuard} onSaved={onRefreshUsage} />
 
       <div className={`${styles.stack} ${styles.workspaceWide}`}>
         <ModelStorageSettings />
@@ -67,7 +74,7 @@ export function SettingsPanel({
         title="Google 账号"
         aside={settings?.offline_mode ? <span className="pill">离线模式</span> : oauthConfigured ? <span className="pill solid">应用已配置</span> : undefined}
       >
-        <AccountDirectory accounts={accounts} onAccountsChange={onAccountsChange} />
+        <AccountDirectory balances={usage?.accounts} accounts={accounts} onAccountsChange={onAccountsChange} />
         {!settings?.offline_mode && (
           <details className="foldable">
             <summary>Google 应用配置（首次使用）</summary>

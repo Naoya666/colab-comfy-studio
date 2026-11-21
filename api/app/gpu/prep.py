@@ -3,20 +3,13 @@
 from __future__ import annotations
 
 import copy
-import os
 
-from .compute import GpuConfig
 from .manifest import digest
 
 # Standard CPU runtime (~0.07 CU/h); the prep job never needs a GPU.
 PREP_SPEC_KEY = {"variant": "VARIANT_CPU", "accelerator": "NONE", "shape": "SHAPE_STANDARD"}
 PREP_MAX_MINUTES = 40
 _DROP = {"bound_graph", "resolved_params", "workflow_smoke", "system_smoke", "target_workflow_id", "target_model_id"}
-
-
-def prep_unit_rate() -> float:
-    """CU per minute for the CPU runtime; override with GPU_CPU_UNIT_RATE (default is a rounded-up 0.12 CU/h)."""
-    return float(os.getenv("GPU_CPU_UNIT_RATE", "0.002"))
 
 
 def is_prep(job: dict) -> bool:
@@ -64,8 +57,7 @@ def create_prep_job(
     repo, owner_id: str, project_id: str, snapshot_parts: dict, meta: dict, key: str, for_job_id: str | None = None
 ) -> dict:
     """Persist one CPU prep job. ``snapshot_parts`` is the reviewed snapshot (manifest/api_graph/object_info...)."""
-    cfg = GpuConfig.from_env()
-    runtime = min(PREP_MAX_MINUTES, cfg.max_runtime_minutes)
+    runtime = PREP_MAX_MINUTES
     account_id = meta.get("account_id")
     drive_account_id = meta.get("drive_account_id") or account_id
     snapshot = {
@@ -106,7 +98,7 @@ def create_prep_job(
                 "params": {},
                 "requested_spec": {"key": dict(PREP_SPEC_KEY)},
                 "max_runtime_minutes": runtime,
-                **_prep_estimate(repo, owner_id, meta, snapshot, runtime),
+                **_prep_estimate(repo, owner_id, meta, snapshot),
                 "prep": True,
                 **({"for_job_id": for_job_id} if for_job_id else {}),
                 **({"account_id": account_id, "requested_account_id": account_id} if account_id else {}),
@@ -122,8 +114,8 @@ def prep_idempotency_key(workflow_sha256: str, suffix: str = "") -> str:
     return "prep-" + digest({"sha": workflow_sha256, "n": suffix})[:48]
 
 
-def _prep_estimate(repo, owner_id: str, meta: dict, snapshot: dict, runtime: int) -> dict:
+def _prep_estimate(repo, owner_id: str, meta: dict, snapshot: dict) -> dict:
     from .rates import estimate
 
     units, rate = estimate(repo, owner_id, meta["workflow_key"], snapshot.get("manifest") or {}, PREP_SPEC_KEY, 20, prep=True)
-    return {"estimated_units": units, "unit_rate": rate, "budget_units": runtime * prep_unit_rate()}
+    return {"estimated_units": units, "unit_rate": rate}

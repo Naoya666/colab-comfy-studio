@@ -173,9 +173,9 @@ test('Google OAuth config writes include account_id only for account-specific ap
 });
 
 test('createGpuBatch accepts the v0.2 retain mode and envelopes are unwrapped', async () => {
-  const result = await api.createGpuBatch([], 'retain', 900, 'batch-1');
+  const result = await api.createGpuBatch([], 'retain', 'batch-1');
   assert.deepEqual(result, { ok: true });
   const request = lastRequest();
   assert.equal(header(request, 'Idempotency-Key'), 'batch-1');
-  assert.deepEqual(JSON.parse(request.init.body), { jobs: [], mode: 'retain', idle_seconds: 300 });
+  assert.deepEqual(JSON.parse(request.init.body), { jobs: [], mode: 'retain' });
 });

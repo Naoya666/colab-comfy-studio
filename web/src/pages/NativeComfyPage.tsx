@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { ArrowUpRight } from 'lucide-react';
-import { apiFetch, apiMessage } from '../lib/gpu-api';
+import { apiFetch, apiMessage, type GpuUsage } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import { NativeModelSettings, type ModelStorage } from '../components/NativeModelSettings';
 import { NativeModelPreparation } from '../components/NativeModelPreparation';
@@ -9,7 +9,7 @@ import type { GpuAccount, GpuInstance } from '../components/AccountDirectory';
 import { formatInstanceTime } from '../lib/instance-time';
 import { submitNativeHandoff } from '../lib/native-handoff';
 import { jobStateLabel } from '../lib/job-stage-rows';
-import { terminalStates } from '../lib/ui-helpers';
+import { cuNumber, terminalStates } from '../lib/ui-helpers';
 import { useSmartPoll } from '../lib/smart-poll';
 import styles from '../gpu.module.css';
 
@@ -28,7 +28,7 @@ const restartMessages: Record<RestartPhase, string> = {
   failed: 'ComfyUI 重启失败',
 };
 
-export function NativeComfyPage({ accounts, instances, desktop }: { accounts: GpuAccount[]; instances: GpuInstance[]; desktop: boolean }) {
+export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage: GpuUsage | null; accounts: GpuAccount[]; instances: GpuInstance[]; desktop: boolean }) {
   const [account, setAccount] = useState(accounts.find(a => a.enabled !== false && a.allow_allocation !== false)?.account_id || '');
   const [spec, setSpec] = useState<Record<string, unknown> | null>(null);
   const [status, setStatus] = useState<NativeStatus | null>(null);
@@ -50,6 +50,11 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
   const restartDialog = useRef<HTMLDialogElement>(null);
   const sendingRestart = useRef(false);
   const sendingStart = useRef(false);
+  const scheduledSession = usage?.active_sessions?.find(session => session.instance_id === status?.instance_id);
+  const selectedBalance = usage?.accounts?.find(row => row.account_id === account);
+  const currentGuard = usage?.guard;
+  const blocked = currentGuard?.soft_tripped || selectedBalance?.below_floor;
+
   async function enter(newTab: boolean, signal?: AbortSignal) {
     if (opening.current || signal?.aborted) return;
     const popup = newTab ? window.open('', '_blank') : null;
@@ -155,6 +160,10 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
       <NativeApiSettings accounts={accounts} />
     </div>
     <p>打开官方节点编辑器。可以直接导入工作流 JSON 或拖入带工作流的原图，使用原生保存、扩展和 Manager。</p>
+    {scheduledSession && <div className={styles.inlinePanel} role="status">
+      已运行 {scheduledSession.elapsed_minutes.toFixed(1)} 分钟 · 实扣 {cuNumber(scheduledSession.actual_cu)} CU
+      {scheduledSession.draining && <p className={styles.cuWarning}>正在排空会话，队列与 Drive 同步空闲后释放。</p>}
+    </div>}
     <div className={styles.nativeColumns}>
       <div className={styles.nativeControls}>
         {desktop && <h2>{status?.ready || restartInProgress ? '当前会话' : '会话配置'}</h2>}
@@ -186,7 +195,12 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
             <option value="">选择账号</option>
             {accounts.filter(a => a.enabled !== false && a.allow_allocation !== false).map(a => <option key={a.account_id} value={a.account_id}>{a.alias || a.account_id}</option>)}
           </select></label>
-          <WorkflowGpuSelection manifest={null} accountId={account} value={spec} onChange={value => { setSpec(value); key.current = crypto.randomUUID(); }} />
+          <WorkflowGpuSelection manifest={null} accountId={account} value={spec} onChange={value => { setSpec(value); key.current = crypto.randomUUID(); }}
+            rateHint={rate => <p className="muted small">{rate == null || rate <= 0 ? '估算费率未知' : <>
+              {String(spec?.accelerator || 'GPU')} 约 {cuNumber(rate)} CU/小时
+              {selectedBalance?.balance != null && !selectedBalance.error && ` · 当前余额约可运行 ${(selectedBalance.balance / rate).toFixed(1)} 小时`}
+            </>}</p>} />
+          {blocked && <p className="status error" role="alert">{selectedBalance?.below_floor ? currentGuard?.message : currentGuard?.daily_message}</p>}
           {storage && <NativeModelSettings value={storage} onChange={value => { setStorage(value); key.current = crypto.randomUUID(); }} />}
           <div className={styles.nativeFieldPair}>
             <label className="field">空闲回收时间（分钟）
@@ -199,7 +213,7 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
             </label>
           </div>
           <p className="muted small">参数在本次启动时生效。到期后停止接收新任务，等待生成和同步完成后释放 GPU。调整已有原生会话的参数需先停止旧实例。</p>
-          <button className="button" disabled={starting || startupPending || !account || !spec || !status?.configured || !validTimeouts || !validStorage} onClick={() => void start()}>
+          <button className="button" disabled={!!blocked || starting || startupPending || !account || !spec || !status?.configured || !validTimeouts || !validStorage} onClick={() => void start()}>
             {starting ? '正在提交…' : startupPending ? '正在启动…' : desktop ? '启动 / 复用 GPU' : '启动 / 复用 GPU 并进入'}
           </button>
           {status && !status.configured && <p className="status">请按部署文档配置原生 ComfyUI 域名和隧道。</p>}

@@ -55,7 +55,8 @@
 | `NATIVE_COMFY_CACHE_MAX_AGE_MINUTES` | `60`，VFS 缓存自上次访问起的保留分钟数 |
 | `NATIVE_COMFY_MAX_UPLOAD_MB` | `2048`，传给 ComfyUI `--max-upload-size`；Cloudflare 套餐仍可能限制单次请求大小 |
 | `STUDIO_API_TOKEN` | 标准 API 客户端使用的现有 Bearer Token |
-| `GPU_MAX_RUNTIME_MINUTES` | 复用原有会话期限；期限后拒绝新的原生写入，已入队任务和 Drive 同步完成后才释放 |
+
+原生会话到期后暂停新的提示词与上传，等待既有队列和 Drive 同步完成后释放。触发今日 CU 上限时也会进入排空状态，触及账号余额底线时会直接请求释放并等待 Colab 确认。
 
 Colab 初始化安装 fuse3、固定 rclone v1.70.3（核对 [官方 release SHA256SUMS](https://github.com/rclone/rclone/releases/download/v1.70.3/SHA256SUMS)）和 cloudflared；需 Colab 支持 FUSE、系统包安装以及访问官方依赖源。这部分必须在真实 runtime 验证，不支持时启动任务会明确失败并走已有清理流程。GPU 参数保持自动选择，不使用固定 L4/highvram/tmpfs 优化。
 

@@ -251,7 +251,7 @@ JobInput、执行策略、BatchInput 都禁止额外字段，拼错名称可能�
 
 - `provider` 仅支持 `mock` / `colab`。
 - 当前强制 `shutdown_after_job=true`、`idle_grace_minutes=0`，不能靠客户端延长闲置。
-- `max_runtime_minutes` 请求范围 1–1440，默认 60；**实际还受服务器 `GPU_MAX_RUNTIME_MINUTES` 上限约束**，填 120 不保证得到 120。应先查询 `/settings` 或 `/usage`。
+- `max_runtime_minutes` 接受正整数，默认 60 分钟。新任务是否受 CU 熔断限制可通过 `/api/gpu/cu/guard` 查询。
 - 批次可复用兼容 runtime，因此某个子任务完成并不意味着整个批次已释放 GPU。
 - GPU 类型来自已审查的工作流 `compute_spec`，不是在普通 JobInput 顶层随便填 `gpu`。
 

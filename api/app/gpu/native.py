@@ -96,6 +96,8 @@ def restart_active(lease):
 
 def guard_generation(repo, owner, policy):
     if policy.get("provider") == "colab":
+        from .cu_guard import CuGuardService
+        CuGuardService(repo).check(owner, "colab", policy.get("account_id"), policy.get("instance_id"))
         lease = active_lease(repo, owner)
         if lease and policy.get("instance_id") in {None, lease.get("instance_id")} and restart_active(lease):
             raise APIError("NATIVE_RESTARTING", "原生 ComfyUI 正在重启，请等当前操作完成后重试", 409, True)
@@ -164,6 +166,8 @@ def admit(repo, owner, body, key, *, api_key_id=None):
             if previous.get("native_request_hash") != digest(body):
                 raise APIError("IDEMPOTENCY_CONFLICT", "幂等键参数冲突", 409)
             return previous
+        from .cu_guard import CuGuardService
+        CuGuardService(repo).check(owner, "colab", account, body.get("instance_id"))
         running = next((j for j in repo.list("jobs", owner)
                         if (j.get("snapshot") or {}).get("native_comfy") and j["state"] not in TERMINAL), None)
         live = active_lease(repo, owner)
@@ -202,8 +206,8 @@ def admit(repo, owner, body, key, *, api_key_id=None):
             requested_instance = instance["id"]
         from app.compute_routes import _require_account
         _require_account(repo, owner, account)
-        if not cfg.unit_rate or cfg.unit_rate <= 0:
-            raise APIError("RATE_UNKNOWN", "请先配置 GPU_UNIT_RATE 与预算", 422)
+        from .rates import minute_rate
+        rate = minute_rate(body["spec"], fallback_rate=cfg.unit_rate)
         project = "native-comfy-" + owner
         if not repo.store.get("projects", project, owner):
             repo.store.create("projects", owner, {"title": "原生 ComfyUI", "system": True}, record_id=project)
@@ -219,9 +223,9 @@ def admit(repo, owner, body, key, *, api_key_id=None):
             "requested_instance_id": requested_instance, "requested_spec": body["spec"],
             "lifecycle": "retain", "execution_policy": policy,
             "model_id": "native-comfy", "workflow_key": "system/native-comfy", "workflow_version": 1,
-            "max_runtime_minutes": timeouts["max_runtime_minutes"], "unit_rate": cfg.unit_rate,
+            "max_runtime_minutes": timeouts["max_runtime_minutes"], "unit_rate": rate,
             "native_session_deadline_epoch": time.time() + timeouts["max_runtime_minutes"] * 60,
-            "estimated_units": timeouts["max_runtime_minutes"] * cfg.unit_rate,
+            "estimated_units": None,
             "snapshot": {"native_comfy": True, "native_plugin_generation": body.get("plugin_generation"), "bound_graph": {},
                          "manifest": {"reviewed": True, "state": "published", "comfy_commit": commit,
                                       "compute_spec": body["spec"].get("key", body["spec"])}}}, owner)
@@ -475,7 +479,7 @@ def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None, smar
 
 def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_factory=None):
     """Fence idle shutdown against new uploads/prompts under the existing dispatch lock."""
-    if not lease.get("native_comfy"):
+    if not lease.get("native_comfy") or lease.get("force_stop"):
         return False
     if GpuConfig.from_env().real_enabled:
         try:
@@ -506,7 +510,11 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
         instance = repo.get("instances", lease.get("instance_id"), lease["owner_id"]) or {}
         manual = bool(instance.get("manual_stop_requested"))
         expired = clock() >= float(lease.get("deadline_epoch") or float("inf"))
-        if not manual:
+        if lease.get("force_stop") or instance.get("force_stop"):
+            return False
+        if lease.get("cu_fuse") == "soft_daily_limit" and not manual:
+            retained = upstream_busy or bool(active_writes(lease, clock())) or clock() - float(lease.get("native_http_heartbeat") or 0) < 30
+        elif not manual:
             if restart_active(lease) and not expired:
                 retained = True
             elif upstream_busy:

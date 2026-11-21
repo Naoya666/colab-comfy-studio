@@ -2,11 +2,11 @@
 
 Rates are measured Colab prices (CU per hour). Expected minutes come from the median of the
 last completed runs of the same workflow and mode, each scaled back to the default frames x pixels, else the manifest's typical_minutes, else the cap.
-Budget caps still reserve the max-runtime worst case; this number is only what the user sees.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import statistics
 
@@ -14,17 +14,25 @@ HOURLY = {"L4": 1.64, "T4": 1.15, "A100": 5.37, "NONE": 0.07}
 T4_HIGHMEM = 1.2
 
 
-def minute_rate(spec_key: dict | None, fallback_rate: float | None = None) -> float:
-    key = spec_key or {}
-    accel = str(key.get("accelerator") or "NONE").upper()
+def minute_rate(spec_key: dict | str | None, live_rate_hourly: float | None = None,
+                fallback_rate: float | None = None) -> float | None:
+    if live_rate_hourly is not None and math.isfinite(live_rate_hourly) and live_rate_hourly > 0:
+        return live_rate_hourly / 60
+    key = {"accelerator": spec_key} if isinstance(spec_key, str) else (spec_key or {})
+    if isinstance(key.get("key"), dict):
+        key = key["key"]
+    accel = str(key.get("accelerator") or "").upper()
+    if not accel and key.get("variant") in {"CPU", "VARIANT_CPU"}:
+        accel = "NONE"
     if accel == "T4" and "HIGHMEM" in str(key.get("shape", "")).upper():
         return T4_HIGHMEM / 60
-    if accel in HOURLY:
-        return HOURLY[accel] / 60
-    configured = fallback_rate if fallback_rate is not None else float(os.getenv("GPU_UNIT_RATE") or 0)
-    if configured <= 0:
-        raise ValueError(f"{accel} 无已知估算费率，请管理员设置 GPU_UNIT_RATE（CU/分钟）")
-    return configured
+    if accel in HOURLY or accel == "CPU":
+        return HOURLY["NONE" if accel == "CPU" else accel] / 60
+    try:
+        configured = float(fallback_rate if fallback_rate is not None else os.getenv("GPU_UNIT_RATE") or 0)
+    except ValueError:
+        return None
+    return configured if math.isfinite(configured) and configured > 0 else None
 
 
 def mode_param(manifest: dict) -> tuple[str, dict] | None:
@@ -38,14 +46,11 @@ def expected_minutes(
 ) -> float:
     picked = mode_param(manifest)
     key = picked[0] if picked else None
-    jobs = {j["id"]: j for j in repo.list("jobs", owner)}
     # Each run is normalised back to the default size (a 10 s sample must not make 5 s look dear).
     runs = [
-        float(u["elapsed_minutes"]) / (1.0 if prep else length_factor(manifest, (j.get("snapshot") or {}).get("resolved_params") or {}))
-        for u in sorted(repo.list("usage", owner), key=lambda u: u.get("created_epoch") or 0)
-        if u.get("elapsed_minutes")
-        and not u.get("mock")
-        and (j := jobs.get(u.get("job_id")))
+        float(j["execution_seconds"]) / 60 / (1.0 if prep else length_factor(manifest, (j.get("snapshot") or {}).get("resolved_params") or {}))
+        for j in sorted(repo.list("jobs", owner), key=lambda j: j.get("execution_ended_at") or 0)
+        if j.get("execution_seconds") and j.get("provider") == "colab"
         and j.get("state") == "completed"
         and bool(j.get("prep")) == prep
         and j.get("workflow_key") == workflow_key
@@ -60,9 +65,12 @@ def expected_minutes(
 def estimate(
     repo, owner: str, workflow_key: str | None, manifest: dict, spec_key: dict | None, cap: float,
     prep: bool = False, mode: str | None = None, fallback_rate: float | None = None,
-) -> tuple[float, float]:
+    live_rate_hourly: float | None = None,
+) -> tuple[float | None, float | None]:
     """Returns (estimated CU, CU per minute)."""
-    rate = minute_rate(spec_key, fallback_rate)
+    rate = minute_rate(spec_key, live_rate_hourly=live_rate_hourly, fallback_rate=fallback_rate)
+    if rate is None:
+        return None, None
     return round(expected_minutes(repo, owner, workflow_key, manifest, cap, prep, mode) * rate, 3), rate
 
 

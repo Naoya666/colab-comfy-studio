@@ -170,15 +170,15 @@ def test_smoke_runtime_policy_matches_the_cap_and_names_the_project(monkeypatch)
     ))
     job = repo.get("jobs", created["job_id"], OWNER["id"])
     assert job["project_id"] == "project-user"
-    assert job["max_runtime_minutes"] == 30
-    assert job["execution_policy"]["max_runtime_minutes"] == 30
+    assert job["max_runtime_minutes"] == 40
+    assert job["execution_policy"]["max_runtime_minutes"] == 40
     event = next(item for item in repo.list("events", OWNER["id"]) if item.get("job_id") == job["id"])
-    assert "最长 30 分钟" in event["message"]
+    assert "最长 40 分钟" in event["message"]
     activation = body(review_routes.workflow_activation(workflow["id"], request(), user=OWNER, st=store))
-    assert activation["max_runtime_minutes"] == 30
-    assert "≤30 分钟" in next(step["label"] for step in activation["steps"] if step["key"] == "real_smoke")
+    assert activation["max_runtime_minutes"] == 40
+    assert "≤40 分钟" in next(step["label"] for step in activation["steps"] if step["key"] == "real_smoke")
     assert activation["smoke"]["project_id"] == "project-user"
-    assert activation["smoke"]["max_runtime_minutes"] == 30
+    assert activation["smoke"]["max_runtime_minutes"] == 40
 
 
 def test_deactivate_clears_the_default_and_leaves_inflight_jobs():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Protocol
@@ -32,9 +33,10 @@ class GpuConfig:
     enabled: bool = True
     real_enabled: bool = False
     max_runtime_minutes: int = 30
+    unit_rate: float | None = None
+    # Legacy constructor arguments. CU enforcement reads the owner's persisted settings.
     daily_units: float = 10.0
     monthly_units: float = 100.0
-    unit_rate: float | None = None
     max_job_units: float = 5.0
     create_retries: int = 2
     create_timeout_seconds: float = 30.0
@@ -68,11 +70,14 @@ class GpuConfig:
 
     @classmethod
     def from_env(cls) -> "GpuConfig":
-        max_runtime = int(cls._number("GPU_MAX_RUNTIME_MINUTES", 30))
         retries = int(cls._number("GPU_CREATE_RETRIES", 2))
-        if max_runtime <= 0 or retries < 0:
-            raise ValueError("GPU runtime must be positive and retries non-negative")
-        rate_text = os.getenv("GPU_UNIT_RATE", "").strip()
+        if retries < 0:
+            raise ValueError("GPU create retries must be non-negative")
+        try:
+            rate = float(os.getenv("GPU_UNIT_RATE") or 0)
+        except ValueError:
+            rate = 0
+        unit_rate = rate if math.isfinite(rate) and rate > 0 else None
         trusted_allowlist = tuple(
             item.strip()
             for item in os.getenv("GPU_TRUSTED_EXECUTOR_ALLOWLIST", "").split(",")
@@ -81,11 +86,7 @@ class GpuConfig:
         return cls(
             enabled=cls._bool("GPU_ENABLED", True),
             real_enabled=False if os.getenv("STUDIO_OFFLINE_TEST") == "1" else cls._bool("GPU_REAL_ENABLED", False),
-            max_runtime_minutes=max_runtime,
-            daily_units=cls._number("GPU_DAILY_UNITS", 10),
-            monthly_units=cls._number("GPU_MONTHLY_UNITS", 100),
-            unit_rate=None if not rate_text else float(rate_text),
-            max_job_units=cls._number("GPU_MAX_JOB_UNITS", 5),
+            unit_rate=unit_rate,
             create_retries=retries,
             create_timeout_seconds=cls._number("GPU_CREATE_TIMEOUT_SECONDS", 30),
             cleanup_retry_base_seconds=max(0.0, cls._number("GPU_CLEANUP_RETRY_BASE_SECONDS", 2)),

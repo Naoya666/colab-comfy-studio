@@ -193,6 +193,7 @@ def test_legacy_settings_keeps_google_status_on_unscoped_default_slot(monkeypatc
     monkeypatch.setenv("GPU_REAL_ENABLED", "1")
     repo = MemoryRepo()
     monkeypatch.setattr(main_module, "Repository", lambda _store: repo)
+    monkeypatch.setattr(main_module, "usage", lambda *_: {})
     repo.create(
         "credentials",
         OWNER,
@@ -266,6 +267,9 @@ def test_cuda_smoke_routes_explicit_account_to_google_provider_and_job(monkeypat
     monkeypatch.setattr(compute_routes, "GoogleColabProvider", Provider)
     store = SmokeStore()
     monkeypatch.setattr(compute_routes, "Repository", SmokeRepo)
+    from app.gpu.cu_guard import CuGuardService
+
+    monkeypatch.setattr(CuGuardService, "check", lambda *_: None)
     store.rows["accounts"].append(
         {
             "id": SECONDARY,

@@ -9,7 +9,6 @@ import pytest
 from app.db import Store
 from app.gpu.colab import GoogleColabProvider
 from app.gpu.compute import GpuConfig
-from app.gpu.instances import BudgetError
 from app.gpu.repository import Repository
 from app.gpu.scheduler import Scheduler
 
@@ -61,23 +60,10 @@ class InspectOnlyColab(GoogleColabProvider):
         pytest.fail("an empty account-wide runtime list is not deletion evidence")
 
 
-def assert_budget(scheduler, reserved):
-    with scheduler.db_store.Session() as session:
-        assert scheduler.instances._budget_totals(session, "owner", "account") == (reserved, reserved)
-        account = scheduler.instances._account_row(session, "account", "owner")
-        if reserved:
-            with pytest.raises(BudgetError):
-                scheduler.instances._check_budget(session, account, 3)
-        else:
-            scheduler.instances._check_budget(session, account, 3)
-        with pytest.raises(BudgetError):
-            scheduler.instances._check_budget(session, account, 11)
-
-
 @pytest.mark.parametrize("response", [
     "gone", "active", "ambiguous-404", "timeout", "forbidden", "server-error", "malformed",
 ])
-def test_owned_runtime_inspection_controls_handoff_budget(historical_handoff, response):
+def test_owned_runtime_inspection_fences_handoff_cleanup(historical_handoff, response):
     repo = historical_handoff
     requests = []
     if response == "ambiguous-404":
@@ -103,11 +89,9 @@ def test_owned_runtime_inspection_controls_handoff_budget(historical_handoff, re
         provider = InspectOnlyColab(repo, "owner", account_id="account", client=client, google=OfflineGoogle())
         scheduler = Scheduler(repo, provider_factory=lambda job: provider,
                               clock=lambda: 1000, config=GpuConfig(daily_units=10, monthly_units=10))
-        assert_budget(scheduler, 8)
         assert scheduler.watchdog()["recovered"] == int(response == "gone")
         previous = repo.get("instances", "previous-instance", "owner")
         assert previous["state"] == ("deleted" if response == "gone" else "cleanup_pending")
-        assert_budget(scheduler, 0 if response == "gone" else 8)
         assert requests == [("GET", "/v1beta/runtimes/studio-orphan")]
         # A successful confirmation is idempotent; errors respect upstream backoff.
         assert scheduler.watchdog()["recovered"] == 0
@@ -135,5 +119,4 @@ def test_adapter_confirmation_cannot_finalize_changed_lease(historical_handoff, 
                               clock=lambda: 1000, config=GpuConfig(daily_units=10, monthly_units=10))
         assert scheduler.watchdog()["recovered"] == 0
         assert repo.get("instances", "previous-instance", "owner")["state"] != "deleted"
-        assert_budget(scheduler, 8)
         assert calls == [("GET", "/v1beta/runtimes/studio-orphan")]

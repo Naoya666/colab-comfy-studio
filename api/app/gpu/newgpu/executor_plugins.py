@@ -279,7 +279,7 @@ def build_trusted_executor_input(
         },
         "budget": {
             "reserved_units": job.get("budget_reserved"),
-            "estimated_units": job.get("budget_units", job.get("estimated_units")),
+            "estimated_units": job.get("estimated_units"),
         },
         "lifecycle": {
             "cancel_requested": bool(job.get("cancel_requested")),

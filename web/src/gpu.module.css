@@ -629,3 +629,12 @@
 .projectManageRow { display: flex; align-items: center; gap: 6px; }
 .projectManageRow .projectRow { flex: 1; min-width: 0; }
 .assetsSubBar { max-width: 340px; }
+
+.cuWarning {
+  padding: .65rem .8rem;
+  border: 1px solid currentColor;
+  border-radius: .5rem;
+  color: light-dark(#8a4500, #ffc179);
+}
+
+.cuSessionTiming { display: block; font-size: .8rem; color: var(--muted); }

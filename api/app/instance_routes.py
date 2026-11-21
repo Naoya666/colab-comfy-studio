@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .common import APIError, current_user, ok
-from .gpu.instances import AllocationError, BudgetError, InstanceConflict, InstanceServiceError
+from .gpu.instances import AllocationError, InstanceConflict, InstanceServiceError
 from .gpu.workbench import WorkbenchError
 from .presenters import public_job
 
@@ -92,8 +92,6 @@ def _repo(request: Request):
 def _domain_error(exc):
     if isinstance(exc, InstanceConflict):
         return APIError("INSTANCE_CONFLICT", str(exc), 409, True)
-    if isinstance(exc, BudgetError):
-        return APIError("BUDGET_REJECTED", str(exc), 409)
     if isinstance(exc, AllocationError):
         return APIError("INSTANCE_OPERATION_REJECTED", str(exc), 422)
     if isinstance(exc, KeyError):

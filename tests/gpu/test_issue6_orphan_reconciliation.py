@@ -1,9 +1,11 @@
 """Issue #6 regressions: safely converge historical orphan instances."""
 
 import pytest
+from app.common import APIError
 from app.db import Store
+from app.gpu import ccu
 from app.gpu.compute import GpuConfig
-from app.gpu.instances import BudgetError
+from app.gpu.cu_guard import CuGuardService
 from app.gpu.repository import Repository
 from app.gpu.scheduler import Scheduler
 
@@ -114,23 +116,16 @@ def orphan(tmp_path):
     return repo, scheduler, provider
 
 
-def reservation(scheduler):
-    with scheduler.db_store.Session() as session:
-        return scheduler.instances._budget_totals(session, "owner", "account")
-
-
 @pytest.mark.parametrize("state", ["releasing", "cleanup_pending"])
 def test_watchdog_reconciles_historical_deleted_handoff_lease(orphan, state):
     repo, scheduler, provider = orphan
     repo.update("instances", "previous-instance", {"state": state}, "owner")
 
-    assert reservation(scheduler) == (8, 8)
     assert scheduler.watchdog()["recovered"] == 1
 
     instance = repo.get("instances", "previous-instance", "owner")
     assert instance["state"] == "deleted"
     assert instance["remote_deleted"] is True
-    assert reservation(scheduler) == (0, 0)
     lease = repo.get("leases", "shared-lease", "owner")
     assert lease["remote_delete_source"] == "orphan_reconciliation_provider_confirmation"
     assert provider.inspect_calls[0]["runtime_id"] == "studio-orphan"
@@ -141,13 +136,12 @@ def test_watchdog_reconciles_historical_deleted_handoff_lease(orphan, state):
     assert len(provider.inspect_calls) == 1
 
 
-def test_unknown_remote_state_keeps_historical_reservation(orphan):
+def test_active_remote_runtime_keeps_instance_pending(orphan):
     repo, scheduler, provider = orphan
     provider.status = {"deleted": False, "ready": True}
 
     assert scheduler.watchdog()["recovered"] == 0
     assert repo.get("instances", "previous-instance", "owner")["state"] in {"releasing", "cleanup_pending"}
-    assert reservation(scheduler) == (8, 8)
 
 
 @pytest.mark.parametrize("status", [
@@ -159,13 +153,12 @@ def test_unknown_remote_state_keeps_historical_reservation(orphan):
     PermissionError("offline provider permission denied"),
     TimeoutError("offline provider timeout"),
 ])
-def test_ambiguous_or_failed_inspection_never_releases_budget(orphan, status):
+def test_ambiguous_or_failed_inspection_never_finalizes_instance(orphan, status):
     repo, scheduler, provider = orphan
     provider.status = status
 
     assert scheduler.watchdog()["recovered"] == 0
     assert repo.get("instances", "previous-instance", "owner")["state"] == "cleanup_pending"
-    assert reservation(scheduler) == (8, 8)
     assert provider.create_calls == provider.delete_calls == 0
 
 
@@ -197,8 +190,6 @@ def test_identity_and_live_work_guards_fail_closed(orphan, case):
 
     assert scheduler.watchdog()["recovered"] == 0
     assert repo.get("instances", "previous-instance", "owner")["state"] in {"releasing", "cleanup_pending"}
-    with scheduler.db_store.Session() as session:
-        assert scheduler.instances._budget_totals(session, "owner") == (8, 8)
     assert provider.inspect_calls == []
     assert provider.create_calls == provider.delete_calls == 0
 
@@ -285,11 +276,13 @@ def test_historical_finish_clears_typed_current_job_binding(orphan):
     assert repo.get("instances", "previous-instance", "owner")["current_job_id"] is None
 
 
-def test_budget_still_enforces_limits_after_reconciliation(orphan):
+def test_daily_fuse_still_enforces_spend_after_reconciliation(orphan):
     repo, scheduler, _ = orphan
+    guard = CuGuardService(repo, scheduler.clock)
+    guard.save("owner", {"daily_limit_cu": 1})
+    for now, balance in [(970, 10), (990, 9)]:
+        ccu.sample_and_record(repo, "owner", "account", "tick", sampler=lambda *_: {"balance": balance}, now=now)
     assert scheduler.watchdog()["recovered"] == 1
-    with scheduler.db_store.Session() as session:
-        account = scheduler.instances._account_row(session, "account", "owner")
-        scheduler.instances._check_budget(session, account, 3)
-        with pytest.raises(BudgetError):
-            scheduler.instances._check_budget(session, account, 11)
+    with pytest.raises(APIError) as exc:
+        guard.check("owner", "colab", "account")
+    assert exc.value.code == "CU_DAILY_LIMIT_REACHED"
