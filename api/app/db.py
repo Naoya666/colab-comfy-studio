@@ -108,6 +108,8 @@ class Store:
         if self.url in {"sqlite:///:memory:", "sqlite://"}:
             kwargs["poolclass"] = StaticPool
         self._memory_lock = threading.RLock()
+        self._schema_lock = threading.Lock()
+        self._gpu_schema_ready = False
         self._dispatch_state = threading.local()
         self.engine = create_engine(self.url, connect_args=connect_args, **kwargs)
         if self.engine.dialect.name == "sqlite" and self.engine.url.database not in {None, "", ":memory:"}:
@@ -116,18 +118,23 @@ class Store:
         self.create_all()
 
     def create_all(self) -> None:
-        lock = self._sqlite_dispatch_lock_path()
-        if lock is None:
-            with self.db_lock():
-                Base.metadata.create_all(self.engine)
-            return
-        # 启动器会同时拉起 API 和 worker 两个进程；首次启动时两边一起建表，
-        # 后到的一方会报 table already exists，所以建表要跨进程串行。
-        from .filelocks import file_lock
+        with self.schema_lock():
+            Base.metadata.create_all(self.engine)
 
-        with lock.with_name(lock.name.replace(".dispatch.lock", ".schema.lock")).open("a+") as handle:
-            with file_lock(handle):
-                Base.metadata.create_all(self.engine)
+    @contextmanager
+    def schema_lock(self):
+        """Serialize schema initialization, including across SQLite processes."""
+        with self.db_lock(), self._schema_lock:
+            lock_path = self._sqlite_dispatch_lock_path()
+            if lock_path is None:
+                yield
+                return
+            from .filelocks import file_lock
+
+            schema_path = lock_path.with_name(lock_path.name.replace(".dispatch.lock", ".schema.lock"))
+            with schema_path.open("a+") as handle:
+                with file_lock(handle):
+                    yield
 
     @contextmanager
     def db_lock(self):

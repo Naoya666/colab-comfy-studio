@@ -152,61 +152,71 @@ for _kind, _model in _GPU_MODELS.items():
 
 
 def ensure_schema(store: Store) -> None:
+    """Initialize the GPU schema once per Store after a successful migration."""
+    if store._gpu_schema_ready:
+        return
+    with store.schema_lock():
+        if store._gpu_schema_ready:
+            return
+        _initialize_schema(store)
+        store._gpu_schema_ready = True
+
+
+def _initialize_schema(store: Store) -> None:
     for attempt in range(6):
         try:
-            with store.db_lock():
-                Base.metadata.create_all(store.engine, tables=_GPU_TABLES, checkfirst=True)
-                # create_all does not migrate a database made by an older
-                # build.  Add the two identity columns and the unique index
-                # idempotently before any workflow can be written.
-                columns = {column["name"] for column in inspect(store.engine).get_columns("gpu_workflows")}
-                with store.engine.begin() as connection:
-                    if "workflow_key" not in columns:
-                        connection.execute(
-                            text("ALTER TABLE gpu_workflows ADD COLUMN workflow_key VARCHAR(255)")
-                        )
-                    if "workflow_version" not in columns:
-                        connection.execute(
-                            text("ALTER TABLE gpu_workflows ADD COLUMN workflow_version VARCHAR(64)")
-                        )
-                    if store.engine.dialect.name in {"sqlite", "postgresql"}:
-                        connection.execute(
-                            text(
-                                "CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_workflows_owner_key_version ON gpu_workflows (owner_id, workflow_key, workflow_version)"
-                            )
-                        )
-                    for table, column_specs in {
-                        "gpu_jobs": {"account_id": "VARCHAR(64)", "instance_id": "VARCHAR(64)"},
-                        "gpu_executions": {"account_id": "VARCHAR(64)", "instance_id": "VARCHAR(64)"},
-                        "gpu_leases": {"account_id": "VARCHAR(64)", "instance_id": "VARCHAR(64)"},
-                        "gpu_credentials": {"account_id": "VARCHAR(64)"},
-                    }.items():
-                        existing = {column["name"] for column in inspect(store.engine).get_columns(table)}
-                        for column, column_type in column_specs.items():
-                            if column not in existing:
-                                connection.execute(
-                                    text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
-                                )
-                        for column in column_specs:
-                            connection.execute(
-                                text(
-                                    f"CREATE INDEX IF NOT EXISTS ix_{table}_{column}_v020 "
-                                    f"ON {table} ({column})"
-                                )
-                            )
+            with store.engine.begin() as connection:
+                Base.metadata.create_all(connection, tables=_GPU_TABLES, checkfirst=True)
+                # Older databases need explicit migrations. Inspect this connection
+                # so reflection cannot request a second checkout from the pool.
+                inspector = inspect(connection)
+                columns = {column["name"] for column in inspector.get_columns("gpu_workflows")}
+                if "workflow_key" not in columns:
+                    connection.execute(
+                        text("ALTER TABLE gpu_workflows ADD COLUMN workflow_key VARCHAR(255)")
+                    )
+                if "workflow_version" not in columns:
+                    connection.execute(
+                        text("ALTER TABLE gpu_workflows ADD COLUMN workflow_version VARCHAR(64)")
+                    )
+                if store.engine.dialect.name in {"sqlite", "postgresql"}:
                     connection.execute(
                         text(
-                            "CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_instances_owner_current_job "
-                            "ON gpu_instances (owner_id, current_job_id)"
+                            "CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_workflows_owner_key_version ON gpu_workflows (owner_id, workflow_key, workflow_version)"
                         )
                     )
-                    # DDL alone cannot reconstruct the v0.2 identity graph.
-                    # Keep startup safe and local: this helper only repairs
-                    # owner/account/instance identity metadata and never calls
-                    # OAuth, Colab, or Drive.
-                    from .legacy_migration import upgrade_legacy_identity
+                for table, column_specs in {
+                    "gpu_jobs": {"account_id": "VARCHAR(64)", "instance_id": "VARCHAR(64)"},
+                    "gpu_executions": {"account_id": "VARCHAR(64)", "instance_id": "VARCHAR(64)"},
+                    "gpu_leases": {"account_id": "VARCHAR(64)", "instance_id": "VARCHAR(64)"},
+                    "gpu_credentials": {"account_id": "VARCHAR(64)"},
+                }.items():
+                    existing = {column["name"] for column in inspector.get_columns(table)}
+                    for column, column_type in column_specs.items():
+                        if column not in existing:
+                            connection.execute(
+                                text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+                            )
+                    for column in column_specs:
+                        connection.execute(
+                            text(
+                                f"CREATE INDEX IF NOT EXISTS ix_{table}_{column}_v020 "
+                                f"ON {table} ({column})"
+                            )
+                        )
+                connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_instances_owner_current_job "
+                        "ON gpu_instances (owner_id, current_job_id)"
+                    )
+                )
+                # DDL alone cannot reconstruct the v0.2 identity graph.
+                # Keep startup safe and local: this helper only repairs
+                # owner/account/instance identity metadata and never calls
+                # OAuth, Colab, or Drive.
+                from .legacy_migration import upgrade_legacy_identity
 
-                    upgrade_legacy_identity(connection)
+                upgrade_legacy_identity(connection)
             return
         except OperationalError:
             if attempt == 5:

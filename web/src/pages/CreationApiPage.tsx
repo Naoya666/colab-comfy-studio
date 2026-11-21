@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { GpuAccount } from '../components/AccountDirectory';
 import { RuntimeSelection, type RuntimeLifecycle } from '../components/RuntimeSelection';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
@@ -39,6 +39,7 @@ const prefix = '/api/gpu/creation-api';
 const write = (method: string, body?: unknown): RequestInit => ({ method, body: body === undefined ? undefined : JSON.stringify(body) });
 const title = (workflow: Pick<Workflow, 'workflow_key' | 'workflow_version'>) => `${workflow.workflow_key} · ${workflow.workflow_version}`;
 const finished = new Set(['completed', 'failed', 'cancelled']);
+const shouldPollWarmup = (job: Warmup) => !finished.has(job.state) || job.ready;
 const stages: Record<string, string> = {
   restore_env: '准备依赖', restore_weights: '下载模型', restore_loras: '下载模型',
   comfy_start: '启动 ComfyUI', warm_reuse: '复用 ComfyUI', creation_warming: '加载模型',
@@ -56,6 +57,8 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
   const [graphText, setGraphText] = useState('');
   const [match, setMatch] = useState<Match>();
   const [warmups, setWarmups] = useState<Warmup[]>([]);
+  const warmupsRef = useRef(warmups);
+  const hasPendingWarmups = warmups.some(shouldPollWarmup);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -73,18 +76,46 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
     return () => { live = false; };
   }, []);
 
+  useEffect(() => { warmupsRef.current = warmups; }, [warmups]);
+
   useEffect(() => {
-    if (!warmups.length) return;
-    let live = true;
-    const timer = window.setInterval(() => {
-      const pending = warmups.filter(job => !finished.has(job.state) || job.ready || job.state === 'completed');
-      if (!pending.length) return;
-      Promise.all(pending.map(job => apiFetch<Warmup>(`${prefix}/warmups/${job.id}`))).then(rows => {
-        if (live) setWarmups(current => current.map(job => rows.find(row => row.id === job.id) || job));
-      }).catch(e => { if (live) setError(String(e.message || e)); });
-    }, 4000);
-    return () => { live = false; window.clearInterval(timer); };
-  }, [warmups]);
+    if (!hasPendingWarmups) return;
+    const controller = new AbortController();
+    let timer: number | undefined;
+    let polling = false;
+
+    function schedule() {
+      window.clearTimeout(timer);
+      if (!polling && !document.hidden && !controller.signal.aborted) {
+        timer = window.setTimeout(() => void poll(), 4000);
+      }
+    }
+
+    async function poll() {
+      polling = true;
+      for (const job of warmupsRef.current.filter(shouldPollWarmup)) {
+        if (document.hidden || controller.signal.aborted) break;
+        try {
+          const row = await apiFetch<Warmup>(`${prefix}/warmups/${job.id}`, { signal: controller.signal });
+          if (!controller.signal.aborted) {
+            setWarmups(current => current.map(item => item === job ? row : item));
+          }
+        } catch (e) {
+          if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
+        }
+      }
+      polling = false;
+      schedule();
+    }
+
+    document.addEventListener('visibilitychange', schedule);
+    schedule();
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', schedule);
+    };
+  }, [hasPendingWarmups]);
 
   async function run(task: () => Promise<void>) {
     setBusy(true);
