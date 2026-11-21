@@ -581,3 +581,24 @@ def test_content_change_between_hash_and_validation_is_rejected(tmp_path, monkey
     monkeypatch.setattr(p, 'file_hash', changed)
     with pytest.raises(RuntimeError, match='changed during scan'):
         p.checked_source(source, p.source_stamp(source))
+
+
+def test_sqlite_transient_sidecar_files_excluded_from_inventory_and_archive(setup):
+    new, _ = setup
+    instance = new('sqlite-wal')
+    node = add(instance, 'weilin-demo')
+    data_dir = node / 'user_data'
+    data_dir.mkdir()
+    (data_dir / 'tags.db').write_bytes(b'sqlite-main')
+    before = p.digest(p.inventory(instance.nodes))
+    (data_dir / 'tags.db-wal').write_bytes(b'wal-bytes-1')
+    (data_dir / 'tags.db-shm').write_bytes(b'shm-bytes-1')
+    (data_dir / 'tags.db-journal').write_bytes(b'journal-bytes')
+    after = p.digest(p.inventory(instance.nodes))
+    assert before == after
+    sync(instance)
+    restored = new('sqlite-wal-restored')
+    restored.restore()
+    assert (restored.nodes / 'weilin-demo/user_data/tags.db').read_bytes() == b'sqlite-main'
+    assert not (restored.nodes / 'weilin-demo/user_data/tags.db-wal').exists()
+    assert not (restored.nodes / 'weilin-demo/user_data/tags.db-shm').exists()

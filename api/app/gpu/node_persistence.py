@@ -140,7 +140,7 @@ def files(folder):
         dirs[:] = sorted(d for d in dirs if d not in EXCLUDE)
         for name in sorted(names):
             path = Path(base) / name
-            if name in EXCLUDE or name.startswith('.env') or name.endswith(('.pem', '.key', '.pyc')):
+            if name in EXCLUDE or name.startswith('.env') or name.endswith(('.pem', '.key', '.pyc', '-wal', '-shm', '-journal')):
                 continue
             if path.is_symlink() or not path.is_file():
                 raise RuntimeError(f'Unsupported plugin file: {path}')

@@ -1396,3 +1396,25 @@ async def test_disconnected_client_does_not_submit_after_model_preparation(proxy
         if middleware._http_client:
             await middleware._http_client.aclose()
     assert seen == ["/studio_native/models/prepare"] and not repo.lease["native_writes"]
+
+
+def test_utf8_content_disposition_header_forwarded_without_latin1_error(proxy, monkeypatch):
+    async def handler(req):
+        return httpx.Response(
+            200,
+            stream=BytesStream(b"\x89PNG\r\n\x1a\n"),
+            headers=[
+                (b"content-type", b"image/png"),
+                (b"content-disposition", 'filename="Anima-放大_00001_.png"'.encode("utf-8")),
+            ],
+        )
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        response = c.get("/view?filename=Anima-%E6%94%BE%E5%A4%A7_00001_.png&type=output",
+                         headers={"Authorization": "Bearer api-test-token"})
+    assert response.status_code == 200
+    assert response.content == b"\x89PNG\r\n\x1a\n"
+    cd = response.headers.get("content-disposition", "")
+    assert "filename*=UTF-8''Anima-%E6%94%BE%E5%A4%A7_00001_.png" in cd

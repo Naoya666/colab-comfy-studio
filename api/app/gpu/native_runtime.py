@@ -525,7 +525,7 @@ def run(root, payload, stages):
         else:
             stages.start("native_environment")
             worker._run(["apt-get", "update", "-qq"], timeout=180)
-            worker._run(["apt-get", "install", "-y", "-qq", "fuse3"], timeout=180)
+            worker._run(["apt-get", "install", "-y", "-qq", "fuse3", "mesa-vulkan-drivers"], timeout=300)
             install_rclone(ROOT, worker)
             if not shutil.which("cloudflared"):
                 binary = ROOT / "cloudflared"

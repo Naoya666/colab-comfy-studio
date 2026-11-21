@@ -436,3 +436,28 @@ async def test_studio_prepare_checks_actual_native_loader_paths(local, monkeypat
     result = await middleware(request("/prompt", prompt, **{"X-Studio-Model-Prepared": ident}), queue)
     assert result.status == (422 if layout == "changed_before_queue" else 200)
     assert resolved and all(path == target for path in resolved)
+
+
+def test_rgthree_lora_loader_stack_dependencies_scanned():
+    from app.gpu import model_dependencies as deps
+
+    prompt = {
+        "1": {
+            "class_type": "Lora Loader Stack (rgthree)",
+            "inputs": {
+                "lora_01": "style_a.safetensors",
+                "strength_01": 0.6,
+                "lora_02": "None",
+                "strength_02": 1.0,
+                "lora_03": "zero_weight.safetensors",
+                "strength_03": 0.0,
+                "lora_04": "style_b.safetensors",
+                "strength_04": 0.35,
+            },
+        }
+    }
+    found = {d["field"]: d for d in deps.scan({"api_graph": prompt})}
+    assert set(found) == {"lora_01", "lora_03", "lora_04"}
+    assert found["lora_01"]["model_type"] == "loras" and found["lora_01"]["required"] is True
+    assert found["lora_03"]["required"] is False
+    assert found["lora_04"]["reference"] == "style_b.safetensors" and found["lora_04"]["required"] is True

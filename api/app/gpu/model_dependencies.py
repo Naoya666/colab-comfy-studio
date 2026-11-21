@@ -18,6 +18,7 @@ RULES = {
     "CheckpointLoaderSimple": {"ckpt_name": "checkpoints"},
     "CheckpointLoader": {"ckpt_name": "checkpoints"},
     "LoraLoader": {"lora_name": "loras"}, "LoraLoaderModelOnly": {"lora_name": "loras"},
+    "Lora Loader Stack (rgthree)": {f"lora_{i:02d}": "loras" for i in range(1, 5)},
     "VAELoader": {"vae_name": "vae"}, "UNETLoader": {"unet_name": "diffusion_models"},
     "DiffusionModelLoader": {"unet_name": "diffusion_models"},
     "UnetLoaderGGUF": {"unet_name": "diffusion_models"},
@@ -93,11 +94,14 @@ def scan(workflow):
         for field, category in rule.items():
             required = not bypassed
             if category == "loras":
-                strengths = [inputs[k] for k in ("strength_model", "strength_clip") if k in inputs]
+                strength_keys = ("strength_model", "strength_clip")
+                if node_type == "Lora Loader Stack (rgthree)" and re.fullmatch(r"lora_\d+", field):
+                    strength_keys = (f"strength_{field.split('_', 1)[1]}",)
+                strengths = [inputs[k] for k in strength_keys if k in inputs]
                 if strengths and all(isinstance(v, (int, float)) and v == 0 for v in strengths):
                     required = False
             append(node_id, node_type, field, inputs.get(field), category, required,
-                   bypassed=bypassed, strengths={k: v for k, v in inputs.items() if k in {"strength_model", "strength_clip"}})
+                   bypassed=bypassed, strengths={k: v for k, v in inputs.items() if k in (strength_keys if category == "loras" else ())})
         if node_type in {"CLIPTextEncode", "CLIPTextEncodeSDXL"}:
             for field in ("text", "text_g", "text_l"):
                 if isinstance(inputs.get(field), str):

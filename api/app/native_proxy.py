@@ -30,6 +30,25 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", 
 PRIVATE = {"authorization", "cookie", "x-api-key", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"}
 
 
+def _header_bytes(name: str, value: str) -> bytes:
+    try:
+        return value.encode("latin1")
+    except UnicodeEncodeError:
+        if name.lower() == "content-disposition":
+            import re
+            match = re.search(r'filename="([^"]+)"', value)
+            if match:
+                raw_name = match.group(1)
+                ascii_fallback = raw_name.encode("ascii", "replace").decode("ascii").replace('"', "_")
+                utf8_star = quote(raw_name, safe="")
+                rewritten = value[:match.start()] + f'filename="{ascii_fallback}"; filename*=UTF-8\'\'{utf8_star}' + value[match.end():]
+                try:
+                    return rewritten.encode("latin1")
+                except UnicodeEncodeError:
+                    pass
+        return value.encode("latin1", "replace")
+
+
 def clean_headers(headers, *, request=False):
     connection = set(headers.get("connection", "").lower().replace(" ", "").split(","))
     return [(k, v) for k, v in headers.multi_items()
@@ -360,7 +379,7 @@ class NativeHostMiddleware:
                                     for k, v in response_headers]
                 response_headers += [("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")]
                 downstream = StreamingResponse(response.aiter_raw(), status_code=response.status_code)
-                downstream.raw_headers = [(k.lower().encode("latin1"), v.encode("latin1")) for k, v in response_headers]
+                downstream.raw_headers = [(k.lower().encode("latin1"), _header_bytes(k, v)) for k, v in response_headers]
                 downstream_started = True
                 await downstream(scope, receive, send)
             finally:
