@@ -60,3 +60,35 @@ def test_png_import_scans_and_preserves_metadata_http(client):
     dep=c.get(f"/api/gpu/workflows/{row['id']}/model-dependencies").json()['data']
     assert dep['dependencies'][0]['reference'] == 'v.safetensors'
     assert not dep['models_ready'] and not dep['runtime_validated']
+
+
+def test_http_hf_dataset_resolve_and_add_roundtrip(client, monkeypatch):
+    import hashlib
+    import httpx
+    from app.gpu.model_sources import SourceHTTP
+
+    c, _repo = client
+    commit = "d" * 40
+    digest = hashlib.sha256(b"dataset-lora").hexdigest()
+
+    def handler(request):
+        assert request.url.raw_path.decode() == "/api/datasets/ACCC1380/Anima_Lora_Collection/revision/main?blobs=true"
+        return httpx.Response(200, json={"sha": commit, "siblings": [
+            {"rfilename": "upload/kazutake-hazano_v2_epoch28.safetensors", "lfs": {"sha256": digest, "size": 23074144}},
+        ]})
+
+    monkeypatch.setattr(
+        "app.gpu.model_library.SourceHTTP",
+        lambda tokens=None: SourceHTTP(tokens, client=httpx.Client(transport=httpx.MockTransport(handler)), resolver=lambda _h: ["8.8.8.8"]),
+    )
+    url = "https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/main/upload/kazutake-hazano_v2_epoch28.safetensors"
+    resolved = c.post("/api/gpu/model-library/resolve", json={"url": url})
+    assert resolved.status_code == 200, resolved.text
+    files = resolved.json()["data"]["files"]
+    assert len(files) == 1
+    assert files[0]["download_url"] == f"https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/{commit}/upload/kazutake-hazano_v2_epoch28.safetensors"
+    added = c.post("/api/gpu/model-library", json={**files[0], "model_type": "loras"})
+    assert added.status_code == 201, added.text
+    row = added.json()["data"]
+    assert row["source_identity"]["repo_type"] == "datasets"
+    assert row["expected_sha256"] == digest and row["expected_size"] == 23074144

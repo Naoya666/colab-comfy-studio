@@ -22,7 +22,18 @@ from app.security import decrypt_secret, encrypt_secret
 
 from . import model_dependencies as deps
 from .drive import _RETRYABLE_STATUSES, DriveError, DriveStorage, _DriveSessionExpired, _DriveTransportError
-from .model_sources import SHA, ModelError, SourceHTTP, Sources, filename, https_url, relative_path
+from .model_sources import (
+    SHA,
+    ModelError,
+    SourceHTTP,
+    Sources,
+    filename,
+    hf_download_url,
+    https_url,
+    normalize_hf_repo_type,
+    normalize_source_url,
+    relative_path,
+)
 
 ACTIVE = {"pending", "downloading", "verifying", "uploading"}
 BUFFER = 1024 ** 2
@@ -133,13 +144,13 @@ class ModelLibrary:
     def resolve(self, body):
         files = Sources(self.http).resolve(body)
         if body.get("url") and not body.get("sha256") and not body.get("repo_id"):
-            return [{**item, "original_source_url": https_url(body["url"])} for item in files]
+            return [{**item, "original_source_url": normalize_source_url(body["url"])} for item in files]
         return files
 
     def bind_external_source(self, row, url):
         if url is None or url == "":
             return None
-        original = https_url(url)
+        original = normalize_source_url(url)
         choices = self.resolve({"url": original, "filename": row["filename"]})
         known_hash = row.get("sha256") or row.get("expected_sha256")
         known_size = row.get("size") or row.get("expected_size")
@@ -190,8 +201,12 @@ class ModelLibrary:
         identity = data.get("source_identity") or {}
         if not isinstance(identity, dict):
             raise ModelError("来源身份格式无效")
-        keys = {"huggingface": ("repo_id", "revision", "filename"), "civitai": ("model_id", "version_id", "file_id")}.get(source, ())
+        keys = {"huggingface": ("repo_type", "repo_id", "revision", "filename"), "civitai": ("model_id", "version_id", "file_id")}.get(source, ())
         row["source_identity"] = {k: identity[k] for k in keys if k in identity}
+        if source == "huggingface" and row["source_identity"].get("repo_type") in {None, "", "model", "models"}:
+            row["source_identity"].pop("repo_type", None)
+        elif source == "huggingface" and "repo_type" in row["source_identity"]:
+            row["source_identity"]["repo_type"] = normalize_hf_repo_type(row["source_identity"]["repo_type"])
         if source in {"drive", "upload", "legacy_cache"}:
             file_id = data.get("drive_file_id")
             if not isinstance(file_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", file_id):
@@ -353,8 +368,12 @@ class ModelLibrary:
                 if weight.get("source") == "drive":
                     data = {"source": "drive", "drive_file_id": weight.get("drive_file_id")}
                 elif all(weight.get(k) for k in ("repo_id", "revision", "filename")):
-                    url = f"https://huggingface.co/{weight['repo_id']}/resolve/{weight['revision']}/{quote(weight['filename'], safe='/')}"
-                    data = {"source": "huggingface", "download_url": url, "source_url": url, "source_identity": weight}
+                    repo_type = normalize_hf_repo_type(weight.get("repo_type"))
+                    url = hf_download_url(weight["repo_id"], weight["revision"], weight["filename"], repo_type)
+                    identity = {"repo_id": weight["repo_id"], "revision": weight["revision"], "filename": weight["filename"]}
+                    if repo_type != "models":
+                        identity["repo_type"] = repo_type
+                    data = {"source": "huggingface", "download_url": url, "source_url": url, "source_identity": identity}
                 else:
                     unresolved.append(dep["id"])
                     continue

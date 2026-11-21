@@ -650,3 +650,186 @@ def test_manual_binding_checks_metadata_and_removes_source_without_upload(repo):
         lib.bind_external_source(after, url)
     assert external_source(lib.update(record["id"], external_source=lib.bind_external_source(after, None))) is None
     assert drive.uploads == 0
+
+
+def test_hf_models_datasets_spaces_urls_metadata_and_download_links():
+    from app.gpu.model_sources import parse_hf_url
+
+    commit = "b" * 40
+    requested_paths = []
+    siblings = [
+        {"rfilename": "upload/kazutake-hazano_v2_epoch28.safetensors", "lfs": {"sha256": HASH, "size": len(DATA)}},
+        {"rfilename": "upload/nested/748cm_TA_EP4 (1).safetensors", "lfs": {"sha256": HASH, "size": len(DATA)}},
+        {"rfilename": "upload/Anima-半写实动漫+style#1.safetensors", "lfs": {"sha256": HASH, "size": len(DATA)}},
+        {"rfilename": "other/top.gguf", "size": 123},
+        {"rfilename": "upload/readme.png", "size": 99},
+    ]
+
+    def handler(request):
+        requested_paths.append(request.url.raw_path.decode())
+        return httpx.Response(200, json={"sha": commit, "siblings": siblings})
+
+    sources = Sources(source_http(handler))
+
+    # 1. Models repo (resolve / blob / tree / fixed revision)
+    m_res = sources.resolve({"url": "https://huggingface.co/org/model-repo/resolve/v1.0/upload/kazutake-hazano_v2_epoch28.safetensors?download=true"})
+    assert requested_paths[-1] == "/api/models/org/model-repo/revision/v1.0?blobs=true"
+    assert len(m_res) == 1
+    assert m_res[0]["download_url"] == f"https://huggingface.co/org/model-repo/resolve/{commit}/upload/kazutake-hazano_v2_epoch28.safetensors"
+    assert m_res[0]["source_identity"] == {
+        "repo_id": "org/model-repo",
+        "revision": commit,
+        "filename": "upload/kazutake-hazano_v2_epoch28.safetensors",
+    }
+
+    m_tree = sources.resolve({"url": f"https://huggingface.co/org/model-repo/tree/{commit}/upload"})
+    assert requested_paths[-1] == f"/api/models/org/model-repo/revision/{commit}?blobs=true"
+    assert len(m_tree) == 3
+
+    # 2. Datasets repo (resolve / blob / tree / repo_id with repo_type)
+    ds_url = "https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/main/upload/kazutake-hazano_v2_epoch28.safetensors"
+    ds_res = sources.resolve({"url": ds_url})
+    assert requested_paths[-1] == "/api/datasets/ACCC1380/Anima_Lora_Collection/revision/main?blobs=true"
+    assert len(ds_res) == 1
+    assert ds_res[0]["filename"] == "kazutake-hazano_v2_epoch28.safetensors"
+    assert ds_res[0]["expected_sha256"] == HASH and ds_res[0]["expected_size"] == len(DATA)
+    assert ds_res[0]["download_url"] == f"https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/{commit}/upload/kazutake-hazano_v2_epoch28.safetensors"
+    assert ds_res[0]["source_identity"] == {
+        "repo_type": "datasets",
+        "repo_id": "ACCC1380/Anima_Lora_Collection",
+        "revision": commit,
+        "filename": "upload/kazutake-hazano_v2_epoch28.safetensors",
+    }
+
+    ds_blob = sources.resolve({"url": "https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/blob/main/upload/kazutake-hazano_v2_epoch28.safetensors"})
+    assert len(ds_blob) == 1 and ds_blob[0]["download_url"] == ds_res[0]["download_url"]
+
+    ds_tree_root = sources.resolve({"url": "https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/tree/main"})
+    assert len(ds_tree_root) == 4
+    ds_tree_dir = sources.resolve({"url": "https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/tree/main/upload/nested"})
+    assert [f["filename"] for f in ds_tree_dir] == ["748cm_TA_EP4 (1).safetensors"]
+
+    ds_by_repo = sources.resolve({
+        "repo_type": "dataset",
+        "repo_id": "ACCC1380/Anima_Lora_Collection",
+        "revision": commit,
+        "filename": "upload/kazutake-hazano_v2_epoch28.safetensors",
+    })
+    assert ds_by_repo[0]["download_url"] == ds_res[0]["download_url"]
+
+    # 3. Spaces repo
+    sp_res = sources.resolve({"url": "https://huggingface.co/spaces/org/demo-space/resolve/main/other/top.gguf"})
+    assert requested_paths[-1] == "/api/spaces/org/demo-space/revision/main?blobs=true"
+    assert len(sp_res) == 1
+    assert sp_res[0]["download_url"] == f"https://huggingface.co/spaces/org/demo-space/resolve/{commit}/other/top.gguf"
+    assert sp_res[0]["source_identity"]["repo_type"] == "spaces"
+
+    # 4. Spaces, parentheses, UTF-8, '+', '#' and URL-encoded vs literal-space inputs
+    encoded_space = sources.resolve({"url": "https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/main/upload/nested/748cm_TA_EP4%20%281%29.safetensors"})
+    literal_space = sources.resolve({"url": "https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/main/upload/nested/748cm_TA_EP4 (1).safetensors"})
+    assert len(encoded_space) == 1 and encoded_space == literal_space
+    assert encoded_space[0]["download_url"] == f"https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/{commit}/upload/nested/748cm_TA_EP4%20%281%29.safetensors"
+
+    special = sources.resolve({"url": "https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/blob/main/upload/Anima-%E5%8D%8A%E5%86%99%E5%AE%9E%E5%8A%A8%E6%BC%AB%2Bstyle%231.safetensors"})
+    assert len(special) == 1
+    assert special[0]["filename"] == "Anima-半写实动漫+style#1.safetensors"
+    assert "%23" in special[0]["download_url"] and "#" not in special[0]["download_url"]
+    assert parse_hf_url(special[0]["download_url"]) == (
+        "datasets",
+        "ACCC1380/Anima_Lora_Collection",
+        commit,
+        "upload/Anima-半写实动漫+style#1.safetensors",
+        False,
+    )
+
+
+@pytest.mark.parametrize("bad_url", [
+    "https://huggingface.co/datasets",
+    "https://huggingface.co/datasets/ACCC1380",
+    "https://huggingface.co/spaces/only-owner",
+    "https://huggingface.co/only-owner",
+    "https://huggingface.co/org/repo/resolve",
+    "https://huggingface.co/org/repo/resolve/main",
+    "https://huggingface.co/datasets/org/repo/blob/main",
+    "https://huggingface.co/datasets/org/repo/tree",
+    "https://huggingface.co/datasets/org/repo/unknown/main/a.safetensors",
+    "https://huggingface.co/datasets/org/repo/resolve/main/upload/../secret.safetensors",
+])
+def test_hf_invalid_urls_rejected(bad_url):
+    from app.gpu.model_sources import parse_hf_url
+
+    with pytest.raises(ModelError):
+        parse_hf_url(bad_url)
+
+
+def test_hf_dataset_and_model_end_to_end_download_and_prepare_dependencies(repo):
+    commit = "c" * 40
+    calls = []
+
+    def handler(request):
+        host = request.headers["host"]
+        path = request.url.raw_path.decode()
+        calls.append((host, path, request.headers.get("authorization")))
+        if path.startswith("/api/datasets/ACCC1380/Anima_Lora_Collection/revision/"):
+            return httpx.Response(200, json={"sha": commit, "siblings": [
+                {"rfilename": "upload/kazutake-hazano_v2_epoch28.safetensors", "lfs": {"sha256": HASH, "size": len(DATA)}},
+            ]})
+        if path.startswith("/api/models/org/model-repo/revision/"):
+            return httpx.Response(200, json={"sha": commit, "siblings": [
+                {"rfilename": "weights/base.safetensors", "lfs": {"sha256": HASH, "size": len(DATA)}},
+            ]})
+        if host == "huggingface.co" and path in {
+            f"/datasets/ACCC1380/Anima_Lora_Collection/resolve/{commit}/upload/kazutake-hazano_v2_epoch28.safetensors",
+            f"/org/model-repo/resolve/{commit}/weights/base.safetensors",
+        }:
+            return httpx.Response(302, headers={"location": "https://cdn.hf.example/blob?signature=signed"})
+        if host == "cdn.hf.example":
+            return httpx.Response(200, content=DATA)
+        return httpx.Response(404)
+
+    drive = FakeDrive()
+    lib = ModelLibrary(repo, "owner", drive=drive, http=source_http(handler, {"huggingface": "hf-secret"}))
+
+    # Datasets end-to-end: resolve -> add -> enqueue -> download -> verify -> Drive upload
+    ds_url = "https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/main/upload/kazutake-hazano_v2_epoch28.safetensors"
+    [candidate] = lib.resolve({"url": ds_url})
+    saved = lib.add({**candidate, "model_type": "loras"})
+    assert saved["source_identity"]["repo_type"] == "datasets"
+    assert saved["download_url"].startswith("https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/")
+    task = lib.enqueue(saved["id"])
+    ModelTransfer(lib, task).run()
+    ready = lib.get(saved["id"])
+    assert ready["state"] == "ready" and ready["sha256"] == HASH and ready["size"] == len(DATA)
+    assert ready["integrity"] == "expected_hash_verified" and drive.uploads == 1
+    # Verify HF token was sent to huggingface.co and stripped on CDN redirect
+    assert any(h == "huggingface.co" and p.startswith("/datasets/") and a == "Bearer hf-secret" for h, p, a in calls)
+    assert all(a is None for h, _, a in calls if h == "cdn.hf.example")
+
+    # prepare_dependencies preserves datasets prefix when weight specifies repo_type
+    other_hash = "e" * 64
+    wf = repo.create("workflows", "owner", {
+        "workflow_key": "ds-dep",
+        "workflow_version": 1,
+        "manifest": {"weight_files": [{
+            "repo_type": "datasets",
+            "repo_id": "ACCC1380/Anima_Lora_Collection",
+            "revision": commit,
+            "filename": "upload/ds_alias.safetensors",
+            "target": "loras/ds_alias.safetensors",
+            "sha256": other_hash,
+            "size": len(DATA),
+        }]},
+        "api_graph": {"1": {"class_type": "LoraLoader", "inputs": {"lora_name": "ds_alias.safetensors", "strength_model": 1, "strength_clip": 1}}},
+        "state": "draft",
+    })
+    prep = lib.prepare_dependencies(wf["id"])
+    assert len(prep["tasks"]) == 1
+    dep_model = lib.get(prep["tasks"][0]["model_id"])
+    assert dep_model["download_url"] == f"https://huggingface.co/datasets/ACCC1380/Anima_Lora_Collection/resolve/{commit}/upload/ds_alias.safetensors"
+    assert dep_model["source_identity"]["repo_type"] == "datasets"
+
+    # Existing models workflow remains unaffected (no /datasets/ prefix, no repo_type key)
+    [m_candidate] = lib.resolve({"url": "https://huggingface.co/org/model-repo/blob/main/weights/base.safetensors"})
+    m_saved = lib.add({**m_candidate, "model_type": "checkpoints"})
+    assert "repo_type" not in m_saved["source_identity"]
+    assert m_saved["download_url"] == f"https://huggingface.co/org/model-repo/resolve/{commit}/weights/base.safetensors"

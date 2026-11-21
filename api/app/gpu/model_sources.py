@@ -14,12 +14,20 @@ import socket
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from pathlib import PurePosixPath
-from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 
 SHA = re.compile(r"^[a-fA-F0-9]{64}$")
 SAFE_EXTENSIONS = {".safetensors", ".gguf", ".onnx"}
+HF_REPO_TYPE_ALIASES = {
+    "model": "models",
+    "models": "models",
+    "dataset": "datasets",
+    "datasets": "datasets",
+    "space": "spaces",
+    "spaces": "spaces",
+}
 
 
 _SOURCE_REQUEST = ContextVar("model_source_request", default=False)
@@ -70,6 +78,81 @@ def https_url(value: str, *, persisted=True) -> str:
     except (ValueError, TypeError) as exc:
         raise ModelError("只允许无凭据的 HTTPS 公网链接") from exc
     return value
+
+
+def normalize_source_url(value: str) -> str:
+    """Percent-encode literal spaces in the URL path before strict HTTPS validation."""
+    if isinstance(value, str) and " " in value and not any(ord(c) < 32 for c in value):
+        p = urlsplit(value)
+        if p.scheme == "https" and p.hostname and " " not in p.netloc and " " not in p.scheme:
+            value = urlunsplit((p.scheme, p.netloc, p.path.replace(" ", "%20"), p.query, p.fragment))
+    return https_url(value)
+
+
+def normalize_hf_repo_type(value: str | None = None) -> str:
+    if value is None or value == "":
+        return "models"
+    if isinstance(value, str):
+        normalized = HF_REPO_TYPE_ALIASES.get(value.strip().lower())
+        if normalized:
+            return normalized
+    raise ModelError("不支持的 Hugging Face 仓库类型")
+
+
+def _validate_hf_repo_and_revision(repo: str, revision: str) -> None:
+    if (not isinstance(repo, str) or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo)
+            or any(seg in {".", ".."} for seg in repo.split("/"))
+            or not isinstance(revision, str) or not revision
+            or any(ord(c) < 33 for c in revision)):
+        raise ModelError("Hugging Face 仓库或 revision 无效")
+
+
+def hf_metadata_url(repo: str, revision: str, repo_type: str = "models") -> str:
+    repo_type = normalize_hf_repo_type(repo_type)
+    _validate_hf_repo_and_revision(repo, revision)
+    return f"https://huggingface.co/api/{repo_type}/{repo}/revision/{quote(revision, safe='')}?blobs=true"
+
+
+def hf_download_url(repo: str, revision: str, path: str, repo_type: str = "models") -> str:
+    repo_type = normalize_hf_repo_type(repo_type)
+    _validate_hf_repo_and_revision(repo, revision)
+    path = relative_path(path)
+    prefix = "" if repo_type == "models" else f"{repo_type}/"
+    return f"https://huggingface.co/{prefix}{repo}/resolve/{quote(revision, safe='')}/{quote(path, safe='/')}"
+
+
+def parse_hf_url(url: str) -> tuple[str, str, str, str | None, bool]:
+    """Parse a Hugging Face URL into (repo_type, repo_id, revision, path, is_tree)."""
+    p = urlsplit(normalize_source_url(url))
+    if p.hostname != "huggingface.co":
+        raise ModelError("不是有效的 Hugging Face 链接")
+    parts = [unquote(seg) for seg in p.path.split("/") if seg != ""]
+    if parts and parts[0] in {"datasets", "spaces"}:
+        repo_type = parts[0]
+        parts = parts[1:]
+    else:
+        repo_type = "models"
+    if len(parts) < 2:
+        raise ModelError("Hugging Face 链接缺少仓库")
+    repo = f"{parts[0]}/{parts[1]}"
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo) or any(seg in {".", ".."} for seg in parts[:2]):
+        raise ModelError("Hugging Face 仓库或 revision 无效")
+    rest = parts[2:]
+    if not rest:
+        return repo_type, repo, "main", None, False
+    action = rest[0]
+    if action not in {"resolve", "blob", "tree"}:
+        raise ModelError("不支持的 Hugging Face 链接路径，请使用仓库、resolve、blob 或 tree 链接")
+    if len(rest) < 2 or not rest[1]:
+        raise ModelError("Hugging Face 链接缺少 revision")
+    revision = rest[1]
+    _validate_hf_repo_and_revision(repo, revision)
+    subpath = "/".join(rest[2:]) if len(rest) > 2 else None
+    if action in {"resolve", "blob"} and not subpath:
+        raise ModelError("Hugging Face 文件链接缺少文件路径")
+    if subpath is not None:
+        subpath = relative_path(subpath)
+    return repo_type, repo, revision, subpath, action == "tree"
 
 
 def public_addresses(host: str) -> list[str]:
@@ -200,10 +283,15 @@ class Sources:
             return [f for f in self.civitai_version(version) if f["expected_sha256"] == value.lower()]
         if body.get("repo_id"):
             repo = body["repo_id"]
-            return self.huggingface(repo, body.get("revision") or "main", body.get("filename"))
-        url = https_url(body.get("url") or "")
+            return self.huggingface(
+                repo,
+                body.get("revision") or "main",
+                body.get("filename"),
+                repo_type=body.get("repo_type") or "models",
+            )
+        url = normalize_source_url(body.get("url") or "")
         p = urlsplit(url)
-        parts = unquote(p.path).strip("/").split("/")
+        parts = [unquote(seg) for seg in p.path.split("/") if seg != ""]
         if p.hostname == "civitai.com":
             query = parse_qs(p.query)
             version_id = (query.get("modelVersionId") or [None])[0]
@@ -219,38 +307,45 @@ class Sources:
                         for f in self.civitai_version({**v, "model": model, "modelId": model["id"]})]
             raise ModelError("请提供 Civitai 模型页面或指定版本链接")
         if p.hostname == "huggingface.co":
-            if len(parts) < 2:
-                raise ModelError("Hugging Face 链接缺少仓库")
-            repo = "/".join(parts[:2])
-            revision = parts[3] if len(parts) >= 4 and parts[2] in {"resolve", "blob", "tree"} else "main"
-            path = "/".join(parts[4:]) if len(parts) > 4 and parts[2] in {"resolve", "blob"} else None
-            return self.huggingface(repo, revision, path)
+            repo_type, repo, revision, path, is_tree = parse_hf_url(url)
+            return self.huggingface(repo, revision, path, repo_type=repo_type, is_tree=is_tree)
         return [{"source": "https", "source_url": url, "download_url": url,
                  "filename": body.get("filename") or unquote(PurePosixPath(p.path).name),
                  "display_name": body.get("display_name"), "model_type": body.get("model_type", "unknown"),
                  "architecture": body.get("architecture") or "unknown", "expected_sha256": body.get("expected_sha256"),
                  "expected_size": body.get("expected_size"), "source_identity": {"url": url}}]
 
-    def huggingface(self, repo, revision, path=None):
-        if not isinstance(repo, str) or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo) or not isinstance(revision, str):
-            raise ModelError("Hugging Face 仓库或 revision 无效")
-        meta = self.http.json(f"https://huggingface.co/api/models/{repo}/revision/{quote(revision, safe='')}?blobs=true")
+    def huggingface(self, repo, revision, path=None, *, repo_type="models", is_tree=False):
+        repo_type = normalize_hf_repo_type(repo_type)
+        _validate_hf_repo_and_revision(repo, revision)
+        if path is not None:
+            path = relative_path(path)
+        meta = self.http.json(hf_metadata_url(repo, revision, repo_type))
         commit = meta.get("sha") or ""
         if not re.fullmatch(r"[a-fA-F0-9]{40}", commit):
             raise ModelError("无法固定 Hugging Face commit，请稍后重试")
         files = []
         for f in meta.get("siblings") or []:
             name = f.get("rfilename") or ""
-            if (path and path != name) or PurePosixPath(name).suffix.lower() not in SAFE_EXTENSIONS:
+            if PurePosixPath(name).suffix.lower() not in SAFE_EXTENSIONS:
                 continue
+            if path:
+                if is_tree:
+                    if name != path and not name.startswith(path + "/"):
+                        continue
+                elif name != path:
+                    continue
             relative_path(name)
             lfs = f.get("lfs") or {}
             digest = lfs.get("sha256")
-            download = f"https://huggingface.co/{repo}/resolve/{commit}/{quote(name, safe='/')}"
+            download = hf_download_url(repo, commit, name, repo_type)
+            identity = {"repo_id": repo, "revision": commit, "filename": name}
+            if repo_type != "models":
+                identity["repo_type"] = repo_type
             files.append({"display_name": name, "filename": PurePosixPath(name).name,
                           "source": "huggingface", "source_url": download, "download_url": download,
                           "architecture": "unknown", "model_type": "unknown",
-                          "source_identity": {"repo_id": repo, "revision": commit, "filename": name},
+                          "source_identity": identity,
                           "expected_sha256": digest.lower() if isinstance(digest, str) and SHA.fullmatch(digest) else None,
                           "expected_size": lfs.get("size") or f.get("size")})
         return files
