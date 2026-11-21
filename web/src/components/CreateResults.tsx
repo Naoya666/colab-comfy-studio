@@ -1,23 +1,28 @@
 import { useState } from 'react';
-import { ArrowUpRight, Film, Image as ImageIcon, Maximize2 } from 'lucide-react';
+import { ArrowUpRight, Download, Film, Image as ImageIcon, ImagePlus, Maximize2, Star, Trash2 } from 'lucide-react';
 import { assetUrl, type GalleryAsset, type GpuJob } from '../lib/gpu-api';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
 import { progressPercent, terminalStates } from '../lib/ui-helpers';
+import { ConfirmDialog } from './Feedback';
 import styles from '../gpu.module.css';
 
 function isMedia(asset: GalleryAsset) {
   return asset.mime.startsWith('image/') || asset.mime.startsWith('video/');
 }
 
-export function CreateResults({ jobs, count, gallery, error, onOpen, onJobs }: {
+export function CreateResults({ jobs, count, gallery, error, onOpen, onJobs, onFavorite, onDelete, onUseAsReference }: {
   jobs: GpuJob[];
   count: number;
   gallery: GalleryAsset[];
   error: string;
   onOpen: (asset: GalleryAsset) => void;
   onJobs: () => void;
+  onFavorite?: (asset: GalleryAsset) => void;
+  onDelete?: (asset: GalleryAsset) => void;
+  onUseAsReference?: (asset: GalleryAsset) => void;
 }) {
   const [selectedId, setSelectedId] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState<GalleryAsset | null>(null);
   const jobIds = new Set(jobs.map(job => job.id));
   const outputIds = new Set(jobs.flatMap(job => job.output_asset_ids || []));
   const outputs = gallery.filter(asset => isMedia(asset) && (
@@ -60,10 +65,35 @@ export function CreateResults({ jobs, count, gallery, error, onOpen, onJobs }: {
           </div>
         )}
       </div>
-      {preview && <div className={styles.resultStatus}>
-        <span>{previous && count > 0 ? '此前的作品' : preview.filename || '生成作品'}</span>
-        <button type="button" className={styles.linkButton} onClick={() => onOpen(preview)}><Maximize2 size={14} aria-hidden />查看作品</button>
-      </div>}
+      {preview && (
+        <>
+          <div className={styles.resultStatus}>
+            <span>{previous && count > 0 ? '此前的作品' : preview.filename || '生成作品'}</span>
+            <button type="button" className={styles.linkButton} onClick={() => onOpen(preview)}><Maximize2 size={14} aria-hidden />查看作品</button>
+          </div>
+          <div className={styles.viewerActions}>
+            {onFavorite && (
+              <button type="button" className="button secondary small" onClick={() => onFavorite(preview)}>
+                <Star size={14} strokeWidth={1.6} fill={preview.favorite ? 'currentColor' : 'none'} aria-hidden />
+                {preview.favorite ? '已收藏' : '收藏'}
+              </button>
+            )}
+            {onUseAsReference && (
+              <button type="button" className="button secondary small" onClick={() => onUseAsReference(preview)}>
+                <ImagePlus size={14} strokeWidth={1.6} aria-hidden />用作参考图
+              </button>
+            )}
+            <a className="button secondary small" href={assetUrl(preview)} download={preview.filename || preview.id} target="_blank" rel="noreferrer">
+              <Download size={14} strokeWidth={1.6} aria-hidden />下载
+            </a>
+            {onDelete && (
+              <button type="button" className="button danger small" onClick={() => setConfirmDelete(preview)}>
+                <Trash2 size={14} strokeWidth={1.6} aria-hidden />删除
+              </button>
+            )}
+          </div>
+        </>
+      )}
       {outputs.length > 1 && <div className={styles.resultStrip} aria-label="本批次作品">
         {outputs.map((asset, index) => (
           <button key={asset.id} type="button" aria-pressed={preview?.id === asset.id}
@@ -72,6 +102,19 @@ export function CreateResults({ jobs, count, gallery, error, onOpen, onJobs }: {
           </button>
         ))}
       </div>}
+
+      <ConfirmDialog
+        open={Boolean(confirmDelete)}
+        title="删除此作品？"
+        description={confirmDelete ? `将永久删除「${confirmDelete.filename || confirmDelete.id}」，删除后无法恢复。` : ''}
+        confirmLabel="确认删除"
+        danger
+        onCancel={() => setConfirmDelete(null)}
+        onConfirm={() => {
+          if (confirmDelete && onDelete) onDelete(confirmDelete);
+          setConfirmDelete(null);
+        }}
+      />
     </section>
   );
 }

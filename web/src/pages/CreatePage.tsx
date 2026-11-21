@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Sparkles, Image as ImageIcon, Film, Layers, Pencil, SlidersHorizontal, Play, Monitor, Cloud,
-  ChevronRight, Minus, Plus, X, Check,
+  ChevronRight, ChevronDown, Minus, Plus, X, Check, Trash2, Save,
 } from 'lucide-react';
 import type {
   GalleryAsset, GpuManifest, GpuModel, GpuPreset, GpuSettings, GpuWorkflow, Provider,
@@ -12,6 +12,7 @@ import { RuntimeSelection } from '../components/RuntimeSelection';
 import type { RuntimeSelectionValue } from '../components/RuntimeSelection';
 import type { GpuAccount, GpuInstance } from '../components/AccountDirectory';
 import { Card, InfoTip, Segmented } from '../components/ui';
+import { ConfirmDialog } from '../components/Feedback';
 import { RUNTIME_HELP } from '../lib/labels';
 import { workflowTitle, workflowUsage } from '../lib/workflow-copy';
 import { parameterList, parameterKey, shown } from '../lib/ui-helpers';
@@ -21,6 +22,12 @@ type Category = 'image' | 'video';
 export type RuntimeChoice = RuntimeSelectionValue;
 
 const isVideoKey = (key: string) => /i2v|video|ref2v|t2v/i.test(key);
+const LIFECYCLE_SHORT: Record<RuntimeChoice['lifecycle'], string> = {
+  save: '节省模式',
+  batch: '批次复用',
+  smart: '智能保留',
+  retain: '保留机器',
+};
 
 /** 常用画幅。图片使用固定尺寸表；视频等小分辨率工作流按工作流默认像素量等比换算。 */
 const RATIOS = [
@@ -54,7 +61,7 @@ export function CreatePanel({
   selectedAssets, setSelectedAssets, uploadProgress, onUpload, setModelId, workflowId, setWorkflowId,
   runtime, setRuntime, maxRuntime, setMaxRuntime, batchCount, setBatchCount, batchMode,
   runtimeChoice, accounts, instances, onRuntimeChoiceChange,
-  gpuSelection, loading, error, onSubmit, onApplyPreset, onSavePreset, children, desktop, draftReady,
+  gpuSelection, loading, error, onSubmit, onApplyPreset, onSavePreset, onUpdatePreset, onDeletePreset, children, desktop, draftReady,
 }: {
   gpuSelection?: ReactNode;
   children?: ReactNode;
@@ -72,7 +79,7 @@ export function CreatePanel({
   selectedAssets: string[];
   setSelectedAssets: (value: string[]) => void;
   uploadProgress: Record<string, number>;
-  onUpload: (file: File) => Promise<void>;
+  onUpload: (file: File) => Promise<GalleryAsset | void>;
   modelId: string;
   setModelId: (value: string) => void;
   workflowId: string;
@@ -94,10 +101,15 @@ export function CreatePanel({
   onSubmit: () => void;
   onApplyPreset: (preset: GpuPreset) => void;
   onSavePreset: (name: string) => void;
+  onUpdatePreset?: (preset: GpuPreset) => void;
+  onDeletePreset?: (preset: GpuPreset) => void;
 }) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [customSize, setCustomSize] = useState(false);
   const [presetName, setPresetName] = useState('');
+  const [selectedPresetId, setSelectedPresetId] = useState('');
+  const [deletingPreset, setDeletingPreset] = useState<GpuPreset | null>(null);
+  const [runtimeExpanded, setRuntimeExpanded] = useState(false);
 
   /* ───── 工作流分组：同一个 workflow_key 的所有版本归为一族 ───── */
   const families = useMemo(() => {
@@ -116,10 +128,13 @@ export function CreatePanel({
   const category: Category = currentFamily?.category || 'image';
   const modelName = (id?: string) => models.find((m) => m.model_id === id)?.display_name || id || '';
   const pickable = (fam: typeof families[number]) => fam.items.some((i) => i.state === 'published') ? fam.items.filter((i) => i.state === 'published') : fam.items;
+  const workflowPresets = useMemo(() => presets.filter((p) => p.workflow_version_id === workflowId), [presets, workflowId]);
+  const selectedPreset = workflowPresets.find((p) => p.id === selectedPresetId) || null;
 
   function chooseWorkflow(wf: GpuWorkflow) {
     setModelId(wf.model_id);
     setWorkflowId(wf.id);
+    setSelectedPresetId('');
   }
   function chooseFamily(fam: typeof families[number]) {
     const list = pickable(fam);
@@ -155,13 +170,39 @@ export function CreatePanel({
   const matched = sizes.find((s) => s.w === curW && s.h === curH);
   const showCustom = customSize || !matched;
 
-  // 换工作流后重新判断是否为自定义尺寸
   useEffect(() => { setCustomSize(false); }, [workflowId]);
 
   const excluded = useMemo(() => [promptKey, ...(hasSize ? ['width', 'height'] : [])], [promptKey, hasSize]);
   const split = useMemo(() => splitParams(manifest, excluded), [manifest, excluded]);
   const promptValue = String(params[promptKey] ?? '');
   const patch = (next: Record<string, unknown>) => setParams({ ...params, ...next });
+
+  const hasDeclaredAssets = Boolean(
+    (manifest?.assets as { required?: unknown[]; optional?: unknown[] } | undefined)?.required?.length
+    || (manifest?.assets as { required?: unknown[]; optional?: unknown[] } | undefined)?.optional?.length,
+  );
+  const showGeneralReferencePicker = Boolean(manifest && supportsReferences(manifest) && (split.assets.length === 0 || hasDeclaredAssets));
+
+  const selectedAccountAlias = accounts.find((a) => a.account_id === runtimeChoice.accountId)?.alias || runtimeChoice.accountId;
+  const selectedInstanceObj = instances.find((item) => (item.id || item.instance_id) === runtimeChoice.instanceId);
+  const runtimeSummary = [
+    runtime === 'mock' ? '离线模拟' : 'Colab GPU',
+    selectedAccountAlias ? `账号 ${selectedAccountAlias}` : '自动账号',
+    selectedInstanceObj ? (selectedInstanceObj.instance_label || selectedInstanceObj.label || '指定机器') : '自动分配',
+    LIFECYCLE_SHORT[runtimeChoice.lifecycle] + (['smart', 'retain'].includes(runtimeChoice.lifecycle) ? ` ${runtimeChoice.retainIdleMinutes}分` : ''),
+  ].join(' · ');
+
+  async function handleFormPaste(e: React.ClipboardEvent) {
+    if (!manifest || !supportsReferences(manifest)) return;
+    const files = Array.from(e.clipboardData?.files || []).filter((f) => /^(image|video|audio)\//.test(f.type));
+    if (!files.length) return;
+    e.preventDefault();
+    const uploaded = await onUpload(files[0]);
+    if (uploaded?.id && split.assets.length > 0) {
+      const targetSlot = split.assets.find((entry) => !params[entry.key]) || split.assets[0];
+      if (targetSlot) setParams({ ...params, [targetSlot.key]: uploaded.id });
+    }
+  }
 
   if (!projectId) {
     return (
@@ -180,10 +221,68 @@ export function CreatePanel({
   const submitError = error && <p className="status error" role="alert">{error}</p>;
 
   return (
-    <div className={styles.createForm}>
+    <div className={styles.createForm} onPaste={(e) => void handleFormPaste(e)}>
       <section className={`${styles.stack} ${styles.createFields}`} aria-label={desktop ? '创作参数' : undefined}>
-        {/* 1 创作类型 */}
-        <Card icon={<Sparkles size={17} strokeWidth={1.6} aria-hidden />} title="创作类型">
+        {/* 1 运行模式紧凑摘要栏（可展开完整运行设置） */}
+        <section className={styles.card} aria-label="运行设置">
+          <div className={styles.runtimeSummaryBar}>
+            <div className={styles.runtimeSummaryText}>
+              <span className={styles.runtimeBadge} data-mode={runtime}>
+                {runtime === 'mock' ? <Monitor size={14} aria-hidden /> : <Cloud size={14} aria-hidden />}
+                {runtime === 'mock' ? '模拟' : 'Colab'}
+              </span>
+              <span className="small muted">{runtimeSummary}</span>
+            </div>
+            <div className={styles.runtimeSummaryActions}>
+              <InfoTip
+                label="运行方式说明"
+                text={<><span className={styles.tipLine}><b>离线模拟</b>：{RUNTIME_HELP.mock}</span><span className={styles.tipLine}><b>Colab GPU</b>：{RUNTIME_HELP.colab}</span></>}
+              />
+              <button
+                type="button"
+                className="button secondary small"
+                aria-expanded={runtimeExpanded}
+                onClick={() => setRuntimeExpanded((open) => !open)}
+              >
+                {runtimeExpanded ? '收起设置' : '运行设置'}
+                <ChevronDown size={14} aria-hidden className={runtimeExpanded ? styles.chevOpen : styles.chev} />
+              </button>
+            </div>
+          </div>
+
+          <div hidden={!runtimeExpanded} className={styles.stack}>
+            <Segmented<Provider>
+              ariaLabel="运行方式"
+              value={runtime}
+              onChange={setRuntime}
+              options={[
+                { value: 'mock', label: '离线模拟', sub: '不扣 CU', icon: <Monitor size={17} strokeWidth={1.6} aria-hidden /> },
+                { value: 'colab', label: 'Colab GPU', sub: settings?.real_enabled ? '真实出图' : '未启用', disabled: !settings?.real_enabled, icon: <Cloud size={17} strokeWidth={1.6} aria-hidden /> },
+              ]}
+            />
+            <RuntimeSelection value={runtimeChoice} accounts={accounts} instances={instances} provider={runtime}
+              onChange={onRuntimeChoiceChange} />
+            {gpuSelection}
+            {batchMode === 'retain' && <p className="muted small">保留机器会继续产生 CU；本站只承诺保留到设定截止，Google 仍可能提前回收。</p>}
+            {runtime === 'colab' && (
+              <div className="field">
+                <label htmlFor="max-runtime">单个任务最长运行（分钟）</label>
+                <input id="max-runtime" type="number" inputMode="numeric" min={5} step={1} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
+                <span className={styles.hint}>超时会被强制关机，已花的 CU 不退。</span>
+              </div>
+            )}
+            <p className="muted small">
+              {runtime === 'mock' ? RUNTIME_HELP.mock : `${RUNTIME_HELP.colab}今日限额 ${shown(settings?.budget?.daily_units)} CU。`}
+            </p>
+          </div>
+        </section>
+
+        {/* 2 创作类型 + 工作流 */}
+        <Card
+          icon={<Layers size={17} strokeWidth={1.6} aria-hidden />}
+          title="工作流"
+          aside={<button type="button" className={styles.linkButton} onClick={() => setPickerOpen(true)}>切换<ChevronRight size={15} strokeWidth={1.6} aria-hidden /></button>}
+        >
           <Segmented<Category>
             ariaLabel="创作类型"
             value={category}
@@ -193,14 +292,6 @@ export function CreatePanel({
               { value: 'video', label: '视频生成', icon: <Film size={17} strokeWidth={1.6} aria-hidden />, disabled: !families.some((f) => f.category === 'video') },
             ]}
           />
-        </Card>
-
-        {/* 2 工作流 */}
-        <Card
-          icon={<Layers size={17} strokeWidth={1.6} aria-hidden />}
-          title="工作流"
-          aside={<button type="button" className={styles.linkButton} onClick={() => setPickerOpen(true)}>切换<ChevronRight size={15} strokeWidth={1.6} aria-hidden /></button>}
-        >
           {activeWorkflow ? (
             <button type="button" className={styles.wfCard} onClick={() => setPickerOpen(true)} aria-label="切换工作流">
               <span className={styles.wfThumb}><Layers size={20} strokeWidth={1.4} aria-hidden /></span>
@@ -214,30 +305,59 @@ export function CreatePanel({
             </button>
           ) : <p className="muted small">{workflows.some(wf => wf.state === 'published')
             ? '请切换到一个已发布的工作流。'
-            : '还没有可用的工作流，请先到「工作流与模型」发布一个。'}</p>}
+            : '还没有可用的工作流，请先到「资产 › 工作流」发布一个。'}</p>}
           <details className={`foldable ${styles.presetBox}`}>
-            <summary>参数预设{presets.filter((p) => p.workflow_version_id === workflowId).length ? `（${presets.filter((p) => p.workflow_version_id === workflowId).length}）` : ''}</summary>
+            <summary>参数预设{workflowPresets.length ? `（${workflowPresets.length}）` : ''}</summary>
             <div className="foldContent">
               <div className="field">
                 <label htmlFor="preset-select">套用已存的参数</label>
-                <select id="preset-select" defaultValue="" disabled={!draftReady} onChange={(e) => {
-                  const preset = presets.find((p) => p.id === e.target.value);
-                  if (preset) onApplyPreset(preset);
-                }}>
-                  <option value="">选择预设…</option>
-                  {presets.filter((p) => p.workflow_version_id === workflowId).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-                </select>
+                <div className={styles.inlineForm}>
+                  <select id="preset-select" value={selectedPresetId} disabled={!draftReady} onChange={(e) => {
+                    const id = e.target.value;
+                    setSelectedPresetId(id);
+                    const preset = workflowPresets.find((p) => p.id === id);
+                    if (preset) onApplyPreset(preset);
+                  }}>
+                    <option value="">选择预设…</option>
+                    {workflowPresets.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  </select>
+                  {selectedPreset && onUpdatePreset && (
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      disabled={!draftReady}
+                      title="用当前参数覆盖此预设"
+                      onClick={() => onUpdatePreset(selectedPreset)}
+                    >
+                      <Save size={14} aria-hidden />更新
+                    </button>
+                  )}
+                  {selectedPreset && onDeletePreset && (
+                    <button
+                      type="button"
+                      className="button danger small"
+                      title="删除此预设"
+                      onClick={() => setDeletingPreset(selectedPreset)}
+                    >
+                      <Trash2 size={14} aria-hidden />
+                    </button>
+                  )}
+                </div>
               </div>
               <div className={styles.inlineForm}>
                 <input aria-label="新预设名称" placeholder="给当前参数起个名字" value={presetName} onChange={(e) => setPresetName(e.target.value)} />
-                <button className="button secondary" type="button" disabled={!presetName.trim() || !draftReady} onClick={() => { onSavePreset(presetName.trim()); setPresetName(''); }}>保存</button>
+                <button className="button secondary" type="button" disabled={!presetName.trim() || !draftReady} onClick={() => { onSavePreset(presetName.trim()); setPresetName(''); }}>另存为</button>
               </div>
             </div>
           </details>
         </Card>
 
         {/* 3 提示词 */}
-        <Card icon={<Pencil size={17} strokeWidth={1.6} aria-hidden />} title="提示词">
+        <Card
+          icon={<Pencil size={17} strokeWidth={1.6} aria-hidden />}
+          title="提示词"
+          aside={<span className="muted small">Ctrl+Enter 生成</span>}
+        >
           <textarea
             aria-label="提示词"
             value={promptValue}
@@ -245,10 +365,27 @@ export function CreatePanel({
             placeholder={loading === 'schema' ? '正在加载工作流参数…' : '描述想要的画面：主体、风格、光线、细节……'}
             rows={3}
             onChange={(e) => setParams({ ...params, [promptKey]: e.target.value })}
+            onKeyDown={(e) => {
+              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && draftReady && loading !== 'submit') {
+                e.preventDefault();
+                onSubmit();
+              }
+            }}
           />
         </Card>
 
-        {/* 4 画面尺寸 —— 全页只有这一套尺寸选择 */}
+        {/* 4 参考素材（有素材槽位时放在前面，方便图生图/图生视频） */}
+        {manifest && (split.assets.length > 0 || showGeneralReferencePicker) && (
+          <Card icon={<ImageIcon size={17} strokeWidth={1.6} aria-hidden />} title="参考素材">
+            <GpuParamForm section="assets" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
+              onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
+            {showGeneralReferencePicker && (
+              <ReferencePicker manifest={manifest} assets={gallery} selected={selectedAssets} onChange={setSelectedAssets} onUpload={async (file) => { await onUpload(file); }} />
+            )}
+          </Card>
+        )}
+
+        {/* 5 画面尺寸 */}
         {hasSize && (
           <Card
             icon={<SlidersHorizontal size={17} strokeWidth={1.6} aria-hidden />}
@@ -297,20 +434,11 @@ export function CreatePanel({
           </Card>
         )}
 
-        {/* 5 常用选项（时长 / 模式）直接展示 */}
+        {/* 6 常用选项（反向提示词 / 时长 / 模式） */}
         {split.options.length > 0 && (
           <Card icon={<SlidersHorizontal size={17} strokeWidth={1.6} aria-hidden />} title="生成选项">
             <GpuParamForm section="options" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
               onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
-          </Card>
-        )}
-
-        {/* 6 素材 */}
-        {manifest && (split.assets.length > 0 || supportsReferences(manifest)) && (
-          <Card icon={<ImageIcon size={17} strokeWidth={1.6} aria-hidden />} title="参考素材">
-            <GpuParamForm section="assets" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
-              onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
-            <ReferencePicker manifest={manifest} assets={gallery} selected={selectedAssets} onChange={setSelectedAssets} onUpload={onUpload} />
           </Card>
         )}
 
@@ -319,7 +447,7 @@ export function CreatePanel({
           <div className={styles.countRow}>
             <div>
               <strong>生成数量</strong>
-              <p className="muted small">一次提交几张/几段，多个会按顺序排队。</p>
+              <p className="muted small">一次提交几张/几段，多个会按顺序排队并自动归为一批。</p>
             </div>
             <div className={styles.stepper}>
               <button type="button" aria-label="减少数量" disabled={batchCount <= 1} onClick={() => setBatchCount(Math.max(1, batchCount - 1))}><Minus size={16} strokeWidth={1.8} aria-hidden /></button>
@@ -344,39 +472,9 @@ export function CreatePanel({
           </details>
         )}
 
-        {/* 9 运行设置 */}
-        <Card
-          icon={<Play size={17} strokeWidth={1.6} aria-hidden />}
-          title="运行设置"
-          aside={<InfoTip label="运行方式说明" text={<><span className={styles.tipLine}><b>离线模拟</b>：{RUNTIME_HELP.mock}</span><span className={styles.tipLine}><b>Colab GPU</b>：{RUNTIME_HELP.colab}</span></>} />}
-        >
-          <Segmented<Provider>
-            ariaLabel="运行方式"
-            value={runtime}
-            onChange={setRuntime}
-            options={[
-              { value: 'mock', label: '离线模拟', sub: '不扣 CU', icon: <Monitor size={17} strokeWidth={1.6} aria-hidden /> },
-              { value: 'colab', label: 'Colab GPU', sub: settings?.real_enabled ? '真实出图' : '未启用', disabled: !settings?.real_enabled, icon: <Cloud size={17} strokeWidth={1.6} aria-hidden /> },
-            ]}
-          />
-          <RuntimeSelection value={runtimeChoice} accounts={accounts} instances={instances} provider={runtime}
-            onChange={onRuntimeChoiceChange} />
-          {gpuSelection}
-          {batchMode === 'retain' && <p className="muted small">保留机器会继续产生 CU；本站只承诺保留到设定截止，Google 仍可能提前回收。</p>}
-          {runtime === 'colab' && (
-            <div className="field">
-              <label htmlFor="max-runtime">单个任务最长运行（分钟）</label>
-              <input id="max-runtime" type="number" inputMode="numeric" min={5} step={1} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
-              <span className={styles.hint}>超时会被强制关机，已花的 CU 不退。</span>
-            </div>
-          )}
-          <p className="muted small">
-            {runtime === 'mock' ? RUNTIME_HELP.mock : `${RUNTIME_HELP.colab}今日限额 ${shown(settings?.budget?.daily_units)} CU。`}
-          </p>
-          {!desktop && <>{submitButton}{submitError}</>}
-        </Card>
-
         {children}
+
+        {!desktop && <Card icon={<Play size={17} strokeWidth={1.6} aria-hidden />} title="开始生成">{submitButton}{submitError}</Card>}
       </section>
       {desktop && <div className={styles.createSubmit}>
         {submitError}
@@ -426,6 +524,22 @@ export function CreatePanel({
           </section>
         </div>
       )}
+
+      <ConfirmDialog
+        open={Boolean(deletingPreset)}
+        title="删除参数预设？"
+        description={deletingPreset ? `将删除预设「${deletingPreset.name}」，不会影响已有任务和作品。` : ''}
+        confirmLabel="确认删除"
+        danger
+        onCancel={() => setDeletingPreset(null)}
+        onConfirm={() => {
+          if (deletingPreset && onDeletePreset) {
+            onDeletePreset(deletingPreset);
+            if (selectedPresetId === deletingPreset.id) setSelectedPresetId('');
+          }
+          setDeletingPreset(null);
+        }}
+      />
     </div>
   );
 }

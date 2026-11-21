@@ -206,19 +206,43 @@ export function InstanceWorkbench({ instance, api, onBack, onQueued }: InstanceW
   </section>;
 }
 
+const HISTORY_COLLAPSED_LIMIT = 5;
+
 function HistoryPanel({ jobs, loading, error, offline }: { jobs: InstanceHistoryJob[]; loading: boolean; error: string; offline: boolean }) {
+  const [showAll, setShowAll] = useState(false);
+  const visibleJobs = showAll ? jobs : jobs.slice(0, HISTORY_COLLAPSED_LIMIT);
+
   return <div className={styles.workbenchPanel} aria-label="历史日志">
     <div className={styles.cardTop}><div><h3>历史日志</h3><p className={styles.muted}>{offline ? '本地持久化记录 · 不连接运行时，不执行远程操作。' : '实例历史记录'}</p></div><span className={styles.stateBadge}>{jobs.length} 个任务</span></div>
     {loading && <p className={styles.status} role="status">正在读取本地历史…</p>}
     {error && <p className={styles.error} role="alert">历史读取失败：{error}</p>}
     {!loading && !error && !jobs.length && <div className={styles.empty}><strong>暂无历史任务</strong><span>实时工作台失败不会影响此处的本地历史查询。</span></div>}
-    <div className={styles.jobList}>{jobs.map((job) => <article className={styles.jobItem} key={job.id}>
+    <div className={styles.jobList}>{visibleJobs.map((job) => <article className={styles.jobItem} key={job.id}>
       <div className={styles.cardTop}><div className={styles.minWidth}><b>{jobLabel(job)}</b><p className={styles.muted}>{job.job_id || job.id}{job.provider ? ` · ${job.provider}` : ''}</p></div><span className={`${styles.stateBadge} ${String(job.state).toLowerCase() === 'failed' ? styles.bad : ''}`}>{jobStateLabel(job.state)}</span></div>
       {job.error && <p className={styles.error} role="alert">{job.error.code ? `[${job.error.code}] ` : ''}{job.error.message || '任务失败'}</p>}
       {!!jobTiming(job).length && <div className={styles.detailGrid}><strong>耗时</strong>{jobTiming(job).map(([name, label, value]) => <span key={name}>{label}：{value}</span>)}</div>}
-      {!!job.logs?.length && <div className={styles.logList}><h4>日志</h4>{job.logs.map((log, index) => <article className={styles.logItem} key={log.id || index}><time>{log.created_at || ''}</time><pre>{log.message || (log.state ? jobStateLabel(log.state) : '')}</pre></article>)}</div>}
-      {!!job.artifacts?.length && <div className={styles.artifactList}><h4>产物</h4>{job.artifacts.map((artifact, index) => { const src = safeAssetUrl(artifact.thumbnail_url); return <article className={styles.artifactItem} key={artifact.id || index}>{src ? <img className={styles.artifactThumb} src={src} alt="" /> : <div className={styles.artifactThumb} aria-hidden="true" />}<div><b>{artifact.name || artifact.filename || artifact.id || '未命名产物'}</b><small className={styles.muted}>{artifact.mime || '类型未确认'} · {artifact.status || '已记录'}</small></div></article>; })}</div>}
+      {!!job.logs?.length && (
+        <details className="foldable">
+          <summary>日志（{job.logs.length} 条）</summary>
+          <div className="foldContent">
+            <div className={styles.logList}>{job.logs.map((log, index) => <article className={styles.logItem} key={log.id || index}><time>{log.created_at || ''}</time><pre>{log.message || (log.state ? jobStateLabel(log.state) : '')}</pre></article>)}</div>
+          </div>
+        </details>
+      )}
+      {!!job.artifacts?.length && (
+        <details className="foldable">
+          <summary>产物（{job.artifacts.length} 件）</summary>
+          <div className="foldContent">
+            <div className={styles.artifactList}>{job.artifacts.map((artifact, index) => { const src = safeAssetUrl(artifact.thumbnail_url); return <article className={styles.artifactItem} key={artifact.id || index}>{src ? <img className={styles.artifactThumb} src={src} alt="" /> : <div className={styles.artifactThumb} aria-hidden="true" />}<div><b>{artifact.name || artifact.filename || artifact.id || '未命名产物'}</b><small className={styles.muted}>{artifact.mime || '类型未确认'} · {artifact.status || '已记录'}</small></div></article>; })}</div>
+          </div>
+        </details>
+      )}
     </article>)}</div>
+    {jobs.length > HISTORY_COLLAPSED_LIMIT && (
+      <button type="button" className={styles.buttonSecondary} onClick={() => setShowAll((v) => !v)}>
+        {showAll ? `收起，仅显示最新 ${HISTORY_COLLAPSED_LIMIT} 条` : `展开其余 ${jobs.length - HISTORY_COLLAPSED_LIMIT} 条历史任务`}
+      </button>
+    )}
   </div>;
 }
 

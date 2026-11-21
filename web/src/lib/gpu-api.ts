@@ -85,7 +85,7 @@ export interface GpuJob {
   [key: string]: unknown;
 }
 export interface GpuEvent { id?: string; state?: string; event_type?: string; message?: string; progress?: number; created_at?: string; payload?: Record<string, unknown>; [key: string]: unknown; }
-export interface GalleryAsset { id: string; project_id: string; mime: string; filename?: string; thumbnail_url?: string; download_url?: string; favorite?: boolean; gpu_job_id?: string; source_job_id?: string; mock?: boolean; metadata?: Record<string, unknown>; [key: string]: unknown; }
+export interface GalleryAsset { id: string; project_id: string; mime: string; filename?: string; thumbnail_url?: string; download_url?: string; favorite?: boolean; gpu_job_id?: string; source_job_id?: string; batch_id?: string; workflow_key?: string; created_at?: string; mock?: boolean; metadata?: Record<string, unknown>; [key: string]: unknown; }
 export interface CcuSnapshot { alias?: string | null; balance?: number | null; rate?: number | null; assignments?: number | null; active_jobs?: number | null; active_leases?: number | null; sampled_at?: number | null; error?: string; }
 export interface CcuBalance {
   total_balance: number | null;
@@ -202,6 +202,8 @@ export async function login(password: string): Promise<string> {
 }
 export const getProjects = () => apiFetch<Project[]>('/api/gpu/projects');
 export const createProject = (title: string) => apiFetch<Project>('/api/gpu/projects', post({ title }));
+export const renameProject = (id: string, title: string) => apiFetch<Project>(`/api/gpu/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ title }) });
+export const deleteProject = (id: string) => apiFetch<{ deleted: boolean; id: string }>(`/api/gpu/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
 export const getGpuModels = () => apiFetch<GpuModel[]>('/api/gpu/models');
 export const getGpuWorkflows = (modelId?: string) => apiFetch<GpuWorkflow[]>(`/api/gpu/workflows${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`);
 export const getGpuWorkflowSchema = (id: string) => apiFetch<GpuManifest>(`/api/gpu/workflows/${encodeURIComponent(id)}/schema`);
@@ -248,6 +250,10 @@ export const realSmokeGpuWorkflow = (
 export const acceptGpuWorkflowSmoke = (id: string, jobId: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/accept-smoke`, post({ confirmed: true, job_id: jobId }));
 export const getGpuPresets = () => apiFetch<GpuPreset[]>('/api/gpu/presets');
 export const saveGpuPreset = (body: { name: string; workflow_version_id: string; overrides: Record<string, unknown> }) => apiFetch<GpuPreset>('/api/gpu/presets', post(body));
+export const updateGpuPreset = (id: string, body: { name?: string; overrides?: Record<string, unknown> }) =>
+  apiFetch<GpuPreset>(`/api/gpu/presets/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) });
+export const deleteGpuPreset = (id: string) =>
+  apiFetch<{ deleted: boolean; id: string }>(`/api/gpu/presets/${encodeURIComponent(id)}`, { method: 'DELETE' });
 
 export async function createGpuJob(body: GpuJobRequest, idempotencyKey: string): Promise<GpuJob> {
   return apiFetch<GpuJob>('/api/gpu/jobs', { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(body) });
@@ -256,6 +262,10 @@ export const getGpuJobs = (projectId: string) => apiFetch<GpuJob[]>(`/api/gpu/jo
 export const getGpuJob = (id: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}`);
 export const cancelGpuJob = (id: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/cancel`, post({}));
 export const retryGpuJob = (id: string, idempotencyKey: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify({}) });
+export const clearGpuJobHistory = (body: { project_id?: string; scope?: 'all_terminal' | 'failed_cancelled' | 'mock'; job_ids?: string[] } = {}) =>
+  apiFetch<{ cleared: number }>('/api/gpu/jobs/history/clear', post(body));
+export const clearCreationWarmups = () =>
+  apiFetch<{ cleared: number }>('/api/gpu/creation-api/warmups/clear', post({}));
 export const getGpuGallery = (projectId: string) => apiFetch<GalleryAsset[]>(`/api/gpu/gallery?project_id=${encodeURIComponent(projectId)}`);
 export const getGpuUsage = () => apiFetch<GpuUsage>('/api/gpu/usage');
 export const queryCcuBalance = () => apiFetch<CcuBalance>('/api/gpu/compute/cu-balance', { cache: 'no-store' }, 60000);
@@ -345,6 +355,7 @@ export async function uploadAsset(projectId: string, file: File, onProgress?: (p
 export const assetUrl = (asset: GalleryAsset, thumbnail = false) => thumbnail ? asset.thumbnail_url || `/api/assets/${asset.id}/thumbnail` : asset.download_url || `/api/assets/${asset.id}/download`;
 export const updateAsset = (id: string, favorite: boolean) => apiFetch<GalleryAsset>(`/api/assets/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ favorite }) });
 export const deleteAsset = (id: string) => apiFetch<void>(`/api/assets/${encodeURIComponent(id)}`, { method: 'DELETE' });
+export const batchDeleteAssets = (assetIds: string[]) => apiFetch<{ deleted: number; ids: string[] }>('/api/assets/batch-delete', post({ asset_ids: assetIds }));
 
 export interface GoogleClientConfig { configured: boolean; client_id?: string; redirect_uri: string; source?: string; }
 export const getGoogleClientConfig = (accountId?: string) => apiFetch<GoogleClientConfig>(`/api/gpu/auth/google/config${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`);

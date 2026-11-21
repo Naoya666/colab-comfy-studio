@@ -321,10 +321,37 @@ def admin_status(request: Request, user=Depends(current_user), store=Depends(get
     admin(user)
     owner = user["id"]
     repo = Repository(store)
+    warmups = []
+    for row in repo.list("jobs", owner):
+        if not row.get("warmup"):
+            continue
+        status = warm_status(repo, row)
+        if row.get("history_cleared_at") is not None and not is_active(row) and not status["ready"]:
+            continue
+        warmups.append(status)
+        if len(warmups) >= 20:
+            break
     return ok({"url": settings.creation_comfy_url, "config": config(store, owner),
                "keys": [public_key(row) for row in store.list(KEYS, owner)],
                "workflows": [public_workflow(row) for row in eligible(repo, owner)],
-               "warmups": [warm_status(repo, row) for row in repo.list("jobs", owner) if row.get("warmup")][:20]}, request)
+               "warmups": warmups}, request)
+
+
+@admin_router.post("/warmups/clear")
+def clear_warmups(request: Request, user=Depends(current_user), store=Depends(get_store)):
+    admin(user)
+    owner = user["id"]
+    repo = Repository(store)
+    now = utcnow().timestamp()
+    cleared = 0
+    for row in repo.list("jobs", owner):
+        if not row.get("warmup") or row.get("history_cleared_at") is not None or is_active(row):
+            continue
+        if warm_status(repo, row)["ready"]:
+            continue
+        repo.update("jobs", row["id"], {"history_cleared_at": now}, owner)
+        cleared += 1
+    return ok({"cleared": cleared}, request)
 
 
 @admin_router.put("/config")

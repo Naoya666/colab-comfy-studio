@@ -265,8 +265,16 @@ def me(user=Depends(current_user)):
 
 
 @router.get("/projects")
-def projects(request: Request, user=Depends(current_user), st=Depends(get_store)):
-    return ok(st.list("projects", user["id"]), request)
+def projects(
+    request: Request,
+    include_archived: bool = False,
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
+    rows = st.list("projects", user["id"])
+    if not include_archived:
+        rows = [row for row in rows if row.get("archived_at") is None]
+    return ok(rows, request)
 
 
 @router.post("/projects")
@@ -294,6 +302,32 @@ def update_project(project_id: str, body: dict, request: Request, user=Depends(c
     if not title:
         raise APIError("PROJECT_INVALID", "项目名不能为空")
     return ok(st.update("projects", project_id, {"title": title, "atelier_project_id": str(body.get("atelier_project_id", ""))[:128]}, user["id"]), request)
+
+
+_TERMINAL_JOB_STATES = {
+    "completed",
+    "succeeded",
+    "failed",
+    "failed_final",
+    "cancelled",
+    "cancelled_local",
+    "blocked",
+}
+_FAILED_JOB_STATES = {"failed", "failed_final", "cancelled", "cancelled_local", "blocked"}
+
+
+@router.delete("/projects/{project_id}")
+def delete_project(project_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    own(st, "projects", project_id, user)
+    active = [
+        job
+        for job in Repository(st).list("jobs", user["id"], project_id)
+        if str(job.get("state") or "").lower() not in _TERMINAL_JOB_STATES
+    ]
+    if active:
+        raise APIError("PROJECT_HAS_ACTIVE_JOBS", "该项目还有正在排队或运行的任务，请先取消后再归档删除", 409)
+    st.update("projects", project_id, {"archived_at": time.time()}, user["id"])
+    return ok({"deleted": True, "id": project_id}, request)
 
 
 @router.get("/models")
@@ -575,6 +609,34 @@ def save_preset(body: dict, request: Request, user=Depends(current_user), st=Dep
     return ok(row, request, 201)
 
 
+@router.patch("/presets/{preset_id}")
+def update_preset(preset_id: str, body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    repo = Repository(st)
+    preset = own(repo, "presets", preset_id, user)
+    patch: dict = {}
+    if "name" in body:
+        name = str(body.get("name") or "").strip()[:100]
+        if not name:
+            raise APIError("VALIDATION_ERROR", "预设名称不能为空")
+        patch["name"] = name
+    if "overrides" in body:
+        workflow = own(repo, "workflows", preset.get("workflow_version_id"), user)
+        overrides = body.get("overrides", {})
+        resolve_parameters(workflow["manifest"], overrides)
+        patch["overrides"] = overrides
+    if not patch:
+        raise APIError("VALIDATION_ERROR", "未提供需要更新的字段")
+    return ok(repo.update("presets", preset_id, patch, user["id"]), request)
+
+
+@router.delete("/presets/{preset_id}")
+def delete_preset(preset_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    repo = Repository(st)
+    own(repo, "presets", preset_id, user)
+    repo.delete("presets", preset_id, user["id"])
+    return ok({"deleted": True, "id": preset_id}, request)
+
+
 
 
 
@@ -614,10 +676,63 @@ def create_job(
 
 
 @router.get("/jobs")
-def jobs(request: Request, project_id: str | None = None, user=Depends(current_user), st=Depends(get_store)):
+def jobs(
+    request: Request,
+    project_id: str | None = None,
+    include_cleared: bool = False,
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
     if project_id:
         own(st, "projects", project_id, user)
-    return ok([public_job(j) for j in Repository(st).list("jobs", user["id"], project_id)], request)
+    rows = Repository(st).list("jobs", user["id"], project_id)
+    if not include_cleared:
+        rows = [
+            j
+            for j in rows
+            if j.get("history_cleared_at") is None or str(j.get("state") or "").lower() not in _TERMINAL_JOB_STATES
+        ]
+    return ok([public_job(j) for j in rows], request)
+
+
+@router.post("/jobs/history/clear")
+def clear_job_history(
+    request: Request,
+    body: dict | None = None,
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
+    payload = body if isinstance(body, dict) else {}
+    project_id = payload.get("project_id")
+    if project_id:
+        own(st, "projects", project_id, user)
+    scope = str(payload.get("scope") or "all_terminal")
+    if scope not in {"all_terminal", "failed_cancelled", "mock"}:
+        raise APIError("VALIDATION_ERROR", "无效的任务清理范围")
+    raw_ids = payload.get("job_ids")
+    target_ids: set[str] | None = None
+    if raw_ids is not None:
+        if not isinstance(raw_ids, list) or len(raw_ids) > 500 or any(not isinstance(item, str) for item in raw_ids):
+            raise APIError("VALIDATION_ERROR", "job_ids 格式无效")
+        target_ids = set(raw_ids)
+    repo = Repository(st)
+    rows = repo.list("jobs", user["id"], project_id)
+    now = time.time()
+    cleared = 0
+    for row in rows:
+        state = str(row.get("state") or "").lower()
+        if state not in _TERMINAL_JOB_STATES or row.get("history_cleared_at") is not None:
+            continue
+        if target_ids is not None:
+            if row["id"] not in target_ids:
+                continue
+        elif scope == "failed_cancelled" and state not in _FAILED_JOB_STATES:
+            continue
+        elif scope == "mock" and row.get("provider") != "mock":
+            continue
+        repo.update("jobs", row["id"], {"history_cleared_at": now}, user["id"])
+        cleared += 1
+    return ok({"cleared": cleared}, request)
 
 
 @router.get("/jobs/{job_id}")
@@ -699,14 +814,23 @@ def gallery(
 ):
     if project_id:
         own(st, "projects", project_id, user)
-    return ok(
-        [
-            public_asset(a)
-            for a in st.list("assets", user["id"], project_id)
-            if a.get("source_job_id") or a.get("gpu_job_id")
-        ],
-        request,
-    )
+    job_map = {job["id"]: job for job in Repository(st).list("jobs", user["id"], project_id)}
+    result = []
+    for a in st.list("assets", user["id"], project_id):
+        source_job_id = a.get("source_job_id") or a.get("gpu_job_id")
+        if not source_job_id:
+            continue
+        item = public_asset(a)
+        job = job_map.get(source_job_id)
+        if job:
+            if job.get("batch_id") and not item.get("batch_id"):
+                item["batch_id"] = job["batch_id"]
+            if job.get("workflow_key") and not item.get("workflow_key"):
+                item["workflow_key"] = job["workflow_key"]
+            if job.get("provider") == "mock" and item.get("mock") is None:
+                item["mock"] = True
+        result.append(item)
+    return ok(result, request)
 
 
 @app.get("/api/assets")
@@ -776,6 +900,21 @@ def delete_asset(asset_id: str, request: Request, user=Depends(current_user), st
     delete_asset_file(asset)
     st.delete("assets", asset_id, user["id"])
     return ok({"deleted": True}, request)
+
+
+@app.post("/api/assets/batch-delete")
+def batch_delete_assets(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    raw_ids = body.get("asset_ids") if isinstance(body, dict) else None
+    if not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 200 or any(not isinstance(item, str) for item in raw_ids):
+        raise APIError("VALIDATION_ERROR", "请提供 1~200 个待删除的素材编号")
+    unique_ids = list(dict.fromkeys(raw_ids))
+    assets = [own(st, "assets", aid, user) for aid in unique_ids]
+    deleted_ids = []
+    for asset in assets:
+        delete_asset_file(asset)
+        st.delete("assets", asset["id"], user["id"])
+        deleted_ids.append(asset["id"])
+    return ok({"deleted": len(deleted_ids), "ids": deleted_ids}, request)
 
 
 @router.get("/usage")

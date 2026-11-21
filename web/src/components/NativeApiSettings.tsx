@@ -42,6 +42,8 @@ export function NativeApiSettings({ accounts }: { accounts: GpuAccount[] }) {
   const [workflow, setWorkflow] = useState('');
   const [canStart, setCanStart] = useState(false);
   const [confirmRevoke, setConfirmRevoke] = useState<string>();
+  const [showRevokedKeys, setShowRevokedKeys] = useState(false);
+  const [showAllStarts, setShowAllStarts] = useState(false);
 
   async function action(run: () => Promise<void>) {
     setPending(true);
@@ -191,28 +193,52 @@ export function NativeApiSettings({ accounts }: { accounts: GpuAccount[] }) {
           <label className="field">接入 Key（仅本次显示）<input readOnly value={token} onFocus={event => event.target.select()} /></label>
           <button type="button" className="button secondary small" onClick={() => void copy(token)}>复制 Key</button>
         </div>}
-        {data.keys.length > 0 && <ul className="nativeApiKeys">
-          {data.keys.map(key => <li key={key.id}>
-            <strong>{key.name}</strong> · {key.mode === 'trusted' ? '信任工作流' : '已批准工作流'}
-            <p className="muted small">{key.revoked_at ? '已撤销' : key.auto_start ? '允许开机' : '仅使用已就绪实例'} · 已提交 {key.submitted} 次
-              {key.last_used_at && <> · 最近使用 {new Date(key.last_used_at).toLocaleString()}</>}</p>
-            {!key.revoked_at && <div className="actions">
-              <button type="button" className="button secondary small" disabled={pending} onClick={() => changeKey(key)}>
-                {key.auto_start ? '移除开机权限' : '允许开机'}
+        {data.keys.length > 0 && (() => {
+          const activeKeys = data.keys.filter(key => !key.revoked_at);
+          const revokedKeys = data.keys.filter(key => Boolean(key.revoked_at));
+          const visibleKeys = showRevokedKeys ? data.keys : activeKeys;
+          return <section>
+            <div className="actions nativeApiHeading">
+              <h3>已创建的接入 Key（{activeKeys.length} 个有效）</h3>
+              {revokedKeys.length > 0 && (
+                <button type="button" className="button ghost small" onClick={() => setShowRevokedKeys(v => !v)}>
+                  {showRevokedKeys ? '隐藏已撤销' : `显示已撤销 (${revokedKeys.length})`}
+                </button>
+              )}
+            </div>
+            {visibleKeys.length > 0 ? <ul className="nativeApiKeys">
+              {visibleKeys.map(key => <li key={key.id}>
+                <strong>{key.name}</strong> · {key.mode === 'trusted' ? '信任工作流' : '已批准工作流'}
+                <p className="muted small">{key.revoked_at ? '已撤销' : key.auto_start ? '允许开机' : '仅使用已就绪实例'} · 已提交 {key.submitted} 次
+                  {key.last_used_at && <> · 最近使用 {new Date(key.last_used_at).toLocaleString()}</>}</p>
+                {!key.revoked_at && <div className="actions">
+                  <button type="button" className="button secondary small" disabled={pending} onClick={() => changeKey(key)}>
+                    {key.auto_start ? '移除开机权限' : '允许开机'}
+                  </button>
+                  {confirmRevoke === key.id ? <>
+                    <button type="button" className="button danger small" disabled={pending} onClick={() => changeKey(key, true)}>确认撤销</button>
+                    <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(undefined)}>取消</button>
+                  </> : <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(key.id)}>撤销 Key</button>}
+                </div>}
+              </li>)}
+            </ul> : <p className="muted small">当前没有有效的接入 Key。</p>}
+          </section>;
+        })()}
+        {data.recent_starts.length > 0 && (() => {
+          const limit = 3;
+          const visibleStarts = showAllStarts ? data.recent_starts : data.recent_starts.slice(0, limit);
+          return <section>
+            <h3>最近的 API 启动记录（{data.recent_starts.length}）</h3>
+            <ul>{visibleStarts.map(start => <li key={start.job_id}>
+              {data.keys.find(key => key.id === start.key_id)?.name || '管理员'} · {new Date(start.created_at).toLocaleString()} · {start.state}
+            </li>)}</ul>
+            {data.recent_starts.length > limit && (
+              <button type="button" className="button ghost small" onClick={() => setShowAllStarts(v => !v)}>
+                {showAllStarts ? `收起，仅看最新 ${limit} 条` : `展开其余 ${data.recent_starts.length - limit} 条记录`}
               </button>
-              {confirmRevoke === key.id ? <>
-                <button type="button" className="button danger small" disabled={pending} onClick={() => changeKey(key, true)}>确认撤销</button>
-                <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(undefined)}>取消</button>
-              </> : <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(key.id)}>撤销 Key</button>}
-            </div>}
-          </li>)}
-        </ul>}
-        {data.recent_starts.length > 0 && <section>
-          <h3>最近的 API 启动记录</h3>
-          <ul>{data.recent_starts.map(start => <li key={start.job_id}>
-            {data.keys.find(key => key.id === start.key_id)?.name || '管理员'} · {new Date(start.created_at).toLocaleString()} · {start.state}
-          </li>)}</ul>
-        </section>}
+            )}
+          </section>;
+        })()}
       </>}
     </dialog>
   </>;

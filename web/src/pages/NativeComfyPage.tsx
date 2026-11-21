@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { ArrowUpRight } from 'lucide-react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
@@ -10,7 +10,10 @@ import { formatInstanceTime } from '../lib/instance-time';
 import { submitNativeHandoff } from '../lib/native-handoff';
 import { jobStateLabel } from '../lib/job-stage-rows';
 import { terminalStates } from '../lib/ui-helpers';
+import { useSmartPoll } from '../lib/smart-poll';
 import styles from '../gpu.module.css';
+
+const EVENTS_COLLAPSED_LIMIT = 5;
 
 type Timeouts = { retain_idle_minutes: number; max_runtime_minutes: number };
 type RestartPhase = 'checking' | 'syncing' | 'rebooting' | 'recovering' | 'succeeded' | 'failed';
@@ -37,6 +40,7 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
   const [submittingRestart, setSubmittingRestart] = useState(false);
   const [pendingRestart, setPendingRestart] = useState<{ id: string; previous?: string }>();
   const [autoOpen, setAutoOpen] = useState(false);
+  const [showAllEvents, setShowAllEvents] = useState(false);
   const [storage, setStorage] = useState<ModelStorage>();
   const [idleMinutes, setIdleMinutes] = useState('');
   const [runtimeMinutes, setRuntimeMinutes] = useState('');
@@ -73,35 +77,32 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
       setEntering(false);
     }
   }
-  useEffect(() => {
-    let live = true;
-    let timer: ReturnType<typeof setTimeout>;
-    async function poll() {
-      try {
-        const data = await apiFetch<NativeStatus>('/api/gpu/native/status');
-        if (!live) return;
-        setStatus(data);
-        setPendingStart(false);
-        setPendingRestart(pending => {
-          const observed = data.restart?.restart_id;
-          return pending && data.instance_id && observed !== pending.id && observed === pending.previous ? pending : undefined;
-        });
-        if (!timeoutsInitialized.current) {
-          setStorage(data.model_storage_defaults);
-          setIdleMinutes(String(data.timeouts.defaults.retain_idle_minutes));
-          setRuntimeMinutes(String(data.timeouts.defaults.max_runtime_minutes));
-          timeoutsInitialized.current = true;
-        }
-        if (data.ready && autoOpen) {
-          setAutoOpen(false);
-          if (!desktop) await enter(false);
-        }
-      } catch (cause) { if (live) setError(apiMessage(cause)); }
-      if (live) timer = setTimeout(() => void poll(), 3000);
-    }
-    void poll();
-    return () => { live = false; clearTimeout(timer); };
-  }, [autoOpen, desktop, pendingStart]);
+  const pollStatus = useCallback(async () => {
+    try {
+      const data = await apiFetch<NativeStatus>('/api/gpu/native/status');
+      setStatus(data);
+      setPendingStart(false);
+      setPendingRestart(pending => {
+        const observed = data.restart?.restart_id;
+        return pending && data.instance_id && observed !== pending.id && observed === pending.previous ? pending : undefined;
+      });
+      if (!timeoutsInitialized.current) {
+        setStorage(data.model_storage_defaults);
+        setIdleMinutes(String(data.timeouts.defaults.retain_idle_minutes));
+        setRuntimeMinutes(String(data.timeouts.defaults.max_runtime_minutes));
+        timeoutsInitialized.current = true;
+      }
+      if (data.ready && autoOpen) {
+        setAutoOpen(false);
+        if (!desktop) await enter(false);
+      }
+    } catch (cause) { setError(apiMessage(cause)); }
+  }, [autoOpen, desktop]);
+
+  const nativeActive = Boolean(
+    pendingStart || pendingRestart || (status && status.state !== 'stopped' && !terminalStates.has(status.state)) || status?.ready,
+  );
+  useSmartPoll(pollStatus, { enabled: true, active: nativeActive, activeMs: 3000, idleMs: 20000 });
   const startupPending = Boolean(pendingStart || (status?.job_id && !status.ready && status.state !== 'stopped' && !terminalStates.has(status.state)));
   const validTimeouts = [idleMinutes, runtimeMinutes].every(value => Number.isInteger(Number(value)) && Number(value) >= 1);
   const validStorage = storage && Number.isInteger(storage.cache_gb) && storage.cache_gb >= 1
@@ -221,8 +222,19 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
           : status.state === 'stopped' ? '当前没有原生会话' : `当前状态：${jobStateLabel(status.state)}`}</p>
         {(error || restartError || status?.error) &&
           <p className="status error" role="alert">{error || restartError || status?.error}</p>}
-        {Boolean(status?.events.length) &&
-          <ol aria-label="启动进度">{status?.events.map((event, i) => <li key={i}>{event.message}</li>)}</ol>}
+        {Boolean(status?.events.length) && (() => {
+          const events = status?.events || [];
+          const hidden = Math.max(0, events.length - EVENTS_COLLAPSED_LIMIT);
+          const shownEvents = showAllEvents || hidden === 0 ? events : events.slice(-EVENTS_COLLAPSED_LIMIT);
+          return <>
+            {hidden > 0 && (
+              <button type="button" className="button ghost small" onClick={() => setShowAllEvents(v => !v)}>
+                {showAllEvents ? `收起早期事件，仅显示最新 ${EVENTS_COLLAPSED_LIMIT} 条` : `展开更早的 ${hidden} 条启动事件`}
+              </button>
+            )}
+            <ol aria-label="启动进度">{shownEvents.map((event, i) => <li key={i}>{event.message}</li>)}</ol>
+          </>;
+        })()}
         {status?.instance_id && <div className="actions">
           <button className="button secondary" onClick={() => { setAutoOpen(false); setStopConfirm(true); }}>停止当前原生实例</button>
           {stopConfirm && <>

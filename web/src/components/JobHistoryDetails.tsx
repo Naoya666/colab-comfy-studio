@@ -1,5 +1,8 @@
+import { useState } from 'react';
 import { timingRows, type TimingDetail } from '../lib/job-history';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
+
+const LOG_PREVIEW_COUNT = 6;
 
 export interface JobHistoryDetailRecord {
   state?: string;
@@ -11,8 +14,12 @@ export interface JobHistoryDetailRecord {
 }
 
 export function JobHistoryDetails({ job }: { job: JobHistoryDetailRecord }) {
+  const [showAllLogs, setShowAllLogs] = useState(false);
   const rows = timingRows(job);
   const logs = job.logs || job.events || [];
+  const hiddenCount = Math.max(0, logs.length - LOG_PREVIEW_COUNT);
+  const visibleLogs = showAllLogs || hiddenCount === 0 ? logs : logs.slice(-LOG_PREVIEW_COUNT);
+
   return (
     <>
       <p className="muted small">
@@ -36,10 +43,19 @@ export function JobHistoryDetails({ job }: { job: JobHistoryDetailRecord }) {
         </details>
       ) : null}
       {logs.length ? (
-        <details className="foldable" open>
-          <summary>持久任务日志</summary>
+        <details className="foldable" open={logs.length <= LOG_PREVIEW_COUNT}>
+          <summary>持久任务日志（{logs.length} 条）</summary>
           <div className="foldContent">
-            {logs.map((log, index) => (
+            {hiddenCount > 0 && (
+              <button
+                type="button"
+                className="button ghost small"
+                onClick={() => setShowAllLogs((v) => !v)}
+              >
+                {showAllLogs ? `收起早期日志，仅看最新 ${LOG_PREVIEW_COUNT} 条` : `展开更早的 ${hiddenCount} 条日志`}
+              </button>
+            )}
+            {visibleLogs.map((log, index) => (
               <p key={log.id || index} className="muted small">
                 {log.created_at ? `${log.created_at} · ` : ''}{log.message || (log.state ? jobStateLabel(log.state) : '状态事件')}
               </p>

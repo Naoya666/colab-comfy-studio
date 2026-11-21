@@ -7,6 +7,7 @@ import type { GpuWorkflow } from '../lib/gpu-api';
 import { Pager } from '../components/ui';
 import { WorkflowActivationPanel } from '../components/WorkflowActivation';
 import { WorkflowGraphPreview, type WorkflowGraphPreviewData } from '../components/WorkflowGraphPreview';
+import { ConfirmDialog } from '../components/Feedback';
 import { readActivationWatch, writeActivationWatch, type ActivationWatch } from '../lib/activation-resume';
 import { workflowSearchText, workflowTitle, workflowUsage } from '../lib/workflow-copy';
 import styles from '../gpu.module.css';
@@ -52,6 +53,7 @@ export function WorkflowsPanel({
   const [page, setPage] = useState(0);
   const [activating, setActivating] = useState<string | null>(null);
   const [previewing, setPreviewing] = useState<GpuWorkflow | null>(null);
+  const [deletingTarget, setDeletingTarget] = useState<GpuWorkflow | null>(null);
   const [openKeys, setOpenKeys] = useState<Set<string>>(new Set());
   const [showAll, setShowAll] = useState<Set<string>>(new Set());
   const [watch, setWatch] = useState<Record<string, ActivationWatch>>(() => readActivationWatch());
@@ -168,9 +170,7 @@ export function WorkflowsPanel({
                             {!published && <button className="button ghost small" type="button" onClick={() => onPublish(wf)} title="发布不会跳过冒烟和模型启用检查">发布</button>}
                             {published && wf.active && onDeactivate ? <button className="button secondary small" type="button" title="不再作为默认版本。已经在跑的任务会继续完成。" onClick={() => onDeactivate(wf)}>停用</button> : null}
                             {published && !wf.active && <button className="button secondary small" type="button" onClick={() => onRollback(wf)}>设为当前</button>}
-                            {onDelete && <button className="button danger small" type="button" disabled={deleting} onClick={() => {
-                              if (window.confirm(`删除「${workflowTitle(wf)}」v${wf.workflow_version}？该版本将无法再用于新任务，已有任务和作品会保留。`)) onDelete(wf);
-                            }}><Trash2 size={14} aria-hidden />删除</button>}
+                            {onDelete && <button className="button danger small" type="button" disabled={deleting} onClick={() => setDeletingTarget(wf)}><Trash2 size={14} aria-hidden />删除</button>}
                           </span>
                         </div>
                         <ModelDependencies workflowId={wf.id} onDraft={onActivated} />
@@ -213,6 +213,19 @@ export function WorkflowsPanel({
 
       <Pager page={safePage} pages={pages} onChange={setPage} />
       {previewing && <WorkflowGraphPreview workflow={previewing} loadPreview={() => fetchWorkflowGraphPreview(previewing)} onClose={() => setPreviewing(null)} />}
+      <ConfirmDialog
+        open={Boolean(deletingTarget)}
+        title="删除工作流版本？"
+        description={deletingTarget ? `将删除「${workflowTitle(deletingTarget)}」v${deletingTarget.workflow_version}。该版本将无法再用于新任务，已有任务和作品会保留。` : ''}
+        confirmLabel="确认删除"
+        danger
+        busy={deleting}
+        onCancel={() => setDeletingTarget(null)}
+        onConfirm={() => {
+          if (deletingTarget && onDelete) onDelete(deletingTarget);
+          setDeletingTarget(null);
+        }}
+      />
     </div>
   );
 }

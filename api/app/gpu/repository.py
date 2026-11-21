@@ -453,6 +453,18 @@ class Repository:
             session.flush()
             return self._row(row)
 
+    def delete(self, kind, id, owner_id=None):
+        model = self._model(kind)
+        with self.store.db_lock(), self.store.Session.begin() as session:
+            stmt = select(model).where(model.id == id)
+            if owner_id is not None:
+                stmt = stmt.where(model.owner_id == owner_id)
+            row = session.scalar(stmt)
+            if row is None:
+                raise KeyError(id)
+            session.delete(row)
+        return True
+
     def create_job(self, owner_id, body, idempotency_key, *, admitted=None):
         raw = copy.deepcopy(dict(body))
         body_hash = digest(raw)

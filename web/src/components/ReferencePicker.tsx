@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Upload, Check } from 'lucide-react';
 import type { GalleryAsset, GpuManifest } from '../lib/gpu-api';
 import styles from '../gpu.module.css';
@@ -18,17 +19,42 @@ export function ReferencePicker({ manifest, assets, selected, onChange, onUpload
   manifest: GpuManifest | null; assets: GalleryAsset[]; selected: string[];
   onChange: (ids: string[]) => void; onUpload: (file: File) => Promise<void>;
 }) {
+  const [dragging, setDragging] = useState(false);
+
   if (!manifest || !supportsReferences(manifest)) return null;
   const available = referenceAssets(assets);
   const toggle = (id: string) => onChange(selected.includes(id) ? selected.filter((item) => item !== id) : [...new Set([...selected, id])]);
+
+  async function handleFiles(files: FileList | null) {
+    if (!files?.length) return;
+    for (const file of Array.from(files)) {
+      if (/^(image|video|audio)\//.test(file.type)) {
+        await onUpload(file);
+      }
+    }
+  }
+
   return (
-    <div role="group" aria-label="参考素材" className={styles.refBox}>
+    <div
+      role="group"
+      aria-label="参考素材"
+      className={`${styles.refBox} ${dragging ? styles.dropActive : ''}`}
+      onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false); }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragging(false);
+        void handleFiles(e.dataTransfer.files);
+      }}
+    >
       <div className={styles.refHead}>
-        <span className="muted small">点选要用的图片或视频</span>
+        <span className="muted small">点选、拖拽或 Ctrl+V 粘贴参考图</span>
         <label className="button secondary small">
           <Upload size={14} strokeWidth={1.6} aria-hidden />上传
-          <input hidden type="file" accept="image/*,video/*,audio/*" onChange={async (event) => {
-            const file = event.target.files?.[0]; event.target.value = ''; if (file) await onUpload(file);
+          <input hidden type="file" multiple accept="image/*,video/*,audio/*" onChange={async (event) => {
+            const files = event.target.files;
+            await handleFiles(files);
+            event.target.value = '';
           }} />
         </label>
       </div>
@@ -47,7 +73,7 @@ export function ReferencePicker({ manifest, assets, selected, onChange, onUpload
             );
           })}
         </div>
-      ) : <p className="muted small">还没有素材，点右上角「上传」添加。</p>}
+      ) : <p className="muted small">还没有素材，拖入文件、Ctrl+V 粘贴，或点右上角「上传」添加。</p>}
     </div>
   );
 }

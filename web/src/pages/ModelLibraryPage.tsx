@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useId, useState } from 'react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
 import { bytesLabel, libraryApi, modelStatus, uploadModel, type Catalog, type LibraryModel, type ModelTask } from '../lib/model-library';
+import { useSmartPoll } from '../lib/smart-poll';
+import { ConfirmDialog } from '../components/Feedback';
 import styles from '../gpu.module.css';
 
 export function ModelSourceSettings() {
@@ -27,7 +29,7 @@ export function ModelStorageSettings() {
   return <details className="foldable"><summary>模型库 Drive 存储账号</summary><div className="foldContent"><label>长期存储账号<select value={account} onChange={e => setAccount(e.target.value)}><option value="">历史默认 Drive 账号</option>{accounts.map(a => <option key={a.id} value={a.account_id || a.id}>{a.alias || a.account_id || a.id}</option>)}</select></label><button className="button secondary small" onClick={async () => {try {await libraryApi('/storage-settings', {account_id:account || null}, 'PUT'); setMessage('存储账号已保存');} catch(e) {setMessage(apiMessage(e));}}}>保存存储账号</button><p className="muted small">所有 GPU 账号共享此模型库。已有模型后禁止直接切换存储账号，防止索引指向另一块 Drive。</p>{message && <p role="status">{message}</p>}</div></details>;
 }
 
-export function ModelLibraryPage() {
+export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => void }) {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [tasks, setTasks] = useState<ModelTask[]>([]);
   const [query, setQuery] = useState('');
@@ -47,11 +49,20 @@ export function ModelLibraryPage() {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState('');
+
   const refresh = useCallback(async () => {
-    const [data, jobs] = await Promise.all([libraryApi<Catalog>(), libraryApi<ModelTask[]>('/tasks')]);
-    setCatalog(data); setTasks(jobs);
+    try {
+      const [data, jobs] = await Promise.all([libraryApi<Catalog>(), libraryApi<ModelTask[]>('/tasks')]);
+      setCatalog(data);
+      setTasks(jobs);
+    } catch (e) {
+      setError(apiMessage(e));
+    }
   }, []);
-  useEffect(() => {void refresh().catch(e => setError(apiMessage(e))); const id = window.setInterval(() => {void refresh().catch(() => {});}, 3000); return () => clearInterval(id);}, [refresh]);
+
+  const hasActiveTasks = tasks.some(t => ['pending', 'downloading', 'verifying', 'uploading'].includes(t.state));
+  useSmartPoll(refresh, { enabled: true, active: hasActiveTasks, activeMs: 3000, idleMs: 30000 });
+
   async function action(fn: () => Promise<unknown>) {setBusy(true); setError(''); try {await fn(); await refresh();} catch(e) {setError(apiMessage(e));} finally {setBusy(false);}}
   async function add(data: Record<string, unknown>) {
     const model = await libraryApi<LibraryModel>('', {...data, relative_path: relativePath.trim() || undefined, model_type: data.model_type === 'unknown' || !data.model_type ? type : data.model_type, architecture: data.architecture === 'unknown' || !data.architecture ? architecture : data.architecture});
@@ -60,10 +71,14 @@ export function ModelLibraryPage() {
   }
   const items = (catalog?.items || []).filter(m => (!query || `${m.display_name} ${m.filename}`.toLowerCase().includes(query.toLowerCase())) && (!category || m.model_type === category) && (!state || m.state === state) && (!architectureFilter || m.architecture === architectureFilter));
   return <div className={styles.stack}>
-    <div className={styles.subHead}><h2>统一模型库</h2><button className="button secondary small" onClick={() => void action(refresh)}>刷新</button></div>
-    <p className="muted">{catalog?.statistics.count || 0} 个模型 · Drive 已索引 {bytesLabel(catalog?.statistics.bytes)}。下载与校验由独立模型进程执行，无需启动 GPU。</p>
-    <ModelStorageSettings />
-    <ModelSourceSettings />
+    <div className={styles.pageTitle}>
+      <h2>统一模型库</h2>
+      <div className={styles.titleActions}>
+        {onOpenSettings && <button className="button ghost small" type="button" onClick={onOpenSettings}>存储与下载源设置</button>}
+        <button className="button secondary small" onClick={() => void action(refresh)}>刷新</button>
+      </div>
+    </div>
+    <p className="muted small">{catalog?.statistics.count || 0} 个模型 · Drive 已索引 {bytesLabel(catalog?.statistics.bytes)}。下载与校验由独立模型进程执行，无需启动 GPU。</p>
     <details className="foldable"><summary>添加模型 / 上传 / 导入 Drive</summary><div className="foldContent">
       <div className={styles.grid2}>
         <label>模型类型<select value={type} onChange={e => setType(e.target.value)}>{Object.keys(catalog?.types || {checkpoints:''}).map(t => <option key={t}>{t}</option>)}</select></label>
@@ -129,6 +144,12 @@ function ModelDetail({modelId, panelId, refresh, onClose, onProgress}: {
   const [externalSource, setExternalSource] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<'remove_index' | 'delete_file' | null>(null);
+  const [registerOpen, setRegisterOpen] = useState(false);
+  const [regKey, setRegKey] = useState('');
+  const [regLicense, setRegLicense] = useState('');
+  const [regVram, setRegVram] = useState('');
+  const [regError, setRegError] = useState('');
 
   useEffect(() => {
     let active = true;
@@ -153,12 +174,31 @@ function ModelDetail({modelId, panelId, refresh, onClose, onProgress}: {
     }
   }
 
+  async function submitRegister() {
+    if (!detail) return;
+    const key = regKey.trim();
+    const license = regLicense.trim();
+    const vram = Number(regVram);
+    if (!key) { setRegError('请输入唯一模型标识（字母、数字、短横线）。'); return; }
+    if (!license) { setRegError('请输入模型的实际许可证名称。'); return; }
+    if (!Number.isFinite(vram) || vram <= 0) { setRegError('请输入有效的显存 GB 正数。'); return; }
+    setRegError('');
+    await action(async () => {
+      await libraryApi(`/${detail.id}/workflow-model`, { model_key: key, license, resource_profile: { vram_gb: vram } });
+      setRegisterOpen(false);
+      setRegKey('');
+      setRegLicense('');
+      setRegVram('');
+      onProgress('已登记为未启用模型，请在工作流配置中关联该标识并完成审核与真实 GPU 验证');
+    });
+  }
+
   return <section id={panelId} className={styles.inlinePanel} aria-label="模型详情">
     {error && <p className="status error" role="alert">{error}</p>}
     {!detail && !error && <p role="status">正在加载模型详情…</p>}
     {detail && <><h3>{detail.display_name}</h3><p>SHA-256：{detail.sha256 || '未计算'}</p><p>来源：{detail.source} · 版本：{detail.version_name || '未知'}</p><p>预期 SHA-256：{detail.expected_sha256 || '未提供；计算 Hash 不代表来源可信'}</p><p>触发词：{detail.trigger_words?.join(', ') || '无'}</p><p>引用工作流：{detail.references?.length || 0}</p>{detail.references?.map(r => <p key={r.workflow_id}>{r.workflow_id}</p>)}
       <label>外部来源链接<input type="url" value={externalSource} onChange={e => setExternalSource(e.target.value)} /></label>
-      <p className="muted small">可填写无凭据的 HTTPS 来源链接，凭据在「模型下载源凭据」中配置。留空并保存可移除绑定。</p>
+      <p className="muted small">可填写无凭据的 HTTPS 来源链接，凭据在「设置 › 模型下载源凭据」中配置。留空并保存可移除绑定。</p>
       <button className="button secondary small" disabled={busy} onClick={() => void action(async () => {
         const updated = await libraryApi<LibraryModel>('/' + detail.id, { external_source_url: externalSource.trim() || null }, 'PATCH');
         setDetail({ ...detail, external_source: updated.external_source }); setExternalSource(updated.external_source?.url || '');
@@ -167,16 +207,71 @@ function ModelDetail({modelId, panelId, refresh, onClose, onProgress}: {
       <label>架构<input value={detail.architecture} onChange={e => setDetail({...detail, architecture:e.target.value})} /></label>
       <label>标签（逗号分隔）<input value={detail.tags?.join(', ') || ''} onChange={e => setDetail({...detail, tags:e.target.value.split(',').map(s => s.trim())})} /></label>
       <div className="actions"><button className="button small" disabled={busy} onClick={() => void action(() => libraryApi('/' + detail.id, {display_name:detail.display_name, architecture:detail.architecture, tags:detail.tags}, 'PATCH'))}>保存信息</button>
-      <button className="button danger small" disabled={busy} onClick={() => {if(window.confirm(`移除模型索引？引用工作流 ${detail.references?.length || 0} 个，相关依赖将失效。`)) void action(async () => {await libraryApi(`/${detail.id}?confirm_references=true`, undefined, 'DELETE'); onClose();});}}>移除索引</button>
-      <button className="button danger small" disabled={busy} onClick={() => {if(window.confirm(`将 Drive 物理文件移至回收站并移除索引？引用工作流 ${detail.references?.length || 0} 个。`)) void action(async () => {await libraryApi(`/${detail.id}?confirm_references=true&delete_file=true`, undefined, 'DELETE'); onClose();});}}>删除 Drive 文件</button>
-      <button className="button secondary small" disabled={busy || detail.state !== 'ready'} onClick={() => {
-        const key=window.prompt('登记到工作流审核流程：请输入唯一模型标识（字母、数字、短横线）'); if(!key) return;
-        const license=window.prompt('请输入模型的实际许可证名称；登记后仍需人工接受许可和真实运行验证'); if(!license) return;
-        const vram=window.prompt('请输入该模型实际需要的显存 GB（用于人工审核，不自动推断）'); if(!vram || !Number.isFinite(Number(vram)) || Number(vram) <= 0) return;
-        void action(async () => {await libraryApi(`/${detail.id}/workflow-model`, {model_key:key, license, resource_profile:{vram_gb:Number(vram)}}); onProgress('已登记为未启用模型，请在工作流配置中关联该标识并完成审核与真实 GPU 验证');});
-      }}>登记为工作流模型</button>
+      <button className="button danger small" disabled={busy} onClick={() => setConfirmAction('remove_index')}>移除索引</button>
+      <button className="button danger small" disabled={busy} onClick={() => setConfirmAction('delete_file')}>删除 Drive 文件</button>
+      <button className="button secondary small" disabled={busy || detail.state !== 'ready'} onClick={() => { setRegError(''); setRegisterOpen(true); }}>登记为工作流模型</button>
       </div>
     </>}
     <div className="actions"><button className="button secondary small" disabled={busy} onClick={onClose}>关闭详情</button></div>
+
+    <ConfirmDialog
+      open={confirmAction === 'remove_index'}
+      title="移除模型索引？"
+      description={`当前有 ${detail?.references?.length || 0} 个工作流引用此模型，移除后相关依赖将失效（不会删除 Drive 物理文件）。`}
+      confirmLabel="确认移除"
+      danger
+      busy={busy}
+      onCancel={() => setConfirmAction(null)}
+      onConfirm={() => {
+        if (!detail) return;
+        setConfirmAction(null);
+        void action(async () => {
+          await libraryApi(`/${detail.id}?confirm_references=true`, undefined, 'DELETE');
+          onClose();
+        });
+      }}
+    />
+
+    <ConfirmDialog
+      open={confirmAction === 'delete_file'}
+      title="删除 Drive 物理文件并移除索引？"
+      description={`将把 Drive 上的模型文件移至回收站并移除索引，当前引用工作流 ${detail?.references?.length || 0} 个。`}
+      confirmLabel="确认删除"
+      danger
+      busy={busy}
+      onCancel={() => setConfirmAction(null)}
+      onConfirm={() => {
+        if (!detail) return;
+        setConfirmAction(null);
+        void action(async () => {
+          await libraryApi(`/${detail.id}?confirm_references=true&delete_file=true`, undefined, 'DELETE');
+          onClose();
+        });
+      }}
+    />
+
+    <ConfirmDialog
+      open={registerOpen}
+      title="登记为工作流模型"
+      description="登记后仍需在工作流配置中关联该标识，并完成人工接受许可与真实 GPU 验证。"
+      confirmLabel="提交登记"
+      busy={busy}
+      error={regError}
+      onCancel={() => setRegisterOpen(false)}
+      onConfirm={() => void submitRegister()}
+    >
+      <div className="field">
+        <label htmlFor="reg-model-key">唯一模型标识（字母、数字、短横线）</label>
+        <input id="reg-model-key" value={regKey} placeholder="例如：flux-dev-fp8" onChange={e => setRegKey(e.target.value)} />
+      </div>
+      <div className="field">
+        <label htmlFor="reg-model-license">模型许可证名称</label>
+        <input id="reg-model-license" value={regLicense} placeholder="例如：Apache-2.0 / Non-Commercial" onChange={e => setRegLicense(e.target.value)} />
+      </div>
+      <div className="field">
+        <label htmlFor="reg-model-vram">所需显存（GB）</label>
+        <input id="reg-model-vram" type="number" min={1} step={0.5} value={regVram} placeholder="例如：16" onChange={e => setRegVram(e.target.value)} />
+      </div>
+    </ConfirmDialog>
   </section>;
 }

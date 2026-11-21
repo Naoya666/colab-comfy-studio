@@ -152,7 +152,7 @@ svg { flex: none; }
 .bottomNav {
   position: fixed; z-index: 30; left: 50%; bottom: 0; transform: translateX(-50%);
   width: 100%; max-width: var(--col);
-  display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px;
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 4px;
   padding: 6px 10px calc(6px + var(--safe-b));
   background: var(--bg); border-top: 1px solid var(--line);
 }

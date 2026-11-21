@@ -1,9 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { Trash2 } from 'lucide-react';
 import type { GpuAccount } from '../components/AccountDirectory';
 import { RuntimeSelection, type RuntimeLifecycle } from '../components/RuntimeSelection';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
+import { ConfirmDialog } from '../components/Feedback';
 import { Card } from '../components/ui';
-import { apiFetch } from '../lib/gpu-api';
+import { apiFetch, clearCreationWarmups } from '../lib/gpu-api';
+import { useSmartPoll } from '../lib/smart-poll';
 
 type Config = {
   auto_start: boolean;
@@ -36,10 +39,10 @@ type Match = {
 };
 
 const prefix = '/api/gpu/creation-api';
+const WARMUP_COLLAPSED_LIMIT = 3;
 const write = (method: string, body?: unknown): RequestInit => ({ method, body: body === undefined ? undefined : JSON.stringify(body) });
 const title = (workflow: Pick<Workflow, 'workflow_key' | 'workflow_version'>) => `${workflow.workflow_key} · ${workflow.workflow_version}`;
 const finished = new Set(['completed', 'failed', 'cancelled']);
-const shouldPollWarmup = (job: Warmup) => !finished.has(job.state) || job.ready;
 const stages: Record<string, string> = {
   restore_env: '准备依赖', restore_weights: '下载模型', restore_loras: '下载模型',
   comfy_start: '启动 ComfyUI', warm_reuse: '复用 ComfyUI', creation_warming: '加载模型',
@@ -57,8 +60,9 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
   const [graphText, setGraphText] = useState('');
   const [match, setMatch] = useState<Match>();
   const [warmups, setWarmups] = useState<Warmup[]>([]);
-  const warmupsRef = useRef(warmups);
-  const hasPendingWarmups = warmups.some(shouldPollWarmup);
+  const [showAllWarmups, setShowAllWarmups] = useState(false);
+  const [confirmRevokeKey, setConfirmRevokeKey] = useState(false);
+  const [confirmClearWarmups, setConfirmClearWarmups] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -76,46 +80,25 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
     return () => { live = false; };
   }, []);
 
-  useEffect(() => { warmupsRef.current = warmups; }, [warmups]);
-
-  useEffect(() => {
-    if (!hasPendingWarmups) return;
-    const controller = new AbortController();
-    let timer: number | undefined;
-    let polling = false;
-
-    function schedule() {
-      window.clearTimeout(timer);
-      if (!polling && !document.hidden && !controller.signal.aborted) {
-        timer = window.setTimeout(() => void poll(), 4000);
-      }
+  const hasPollableWarmups = warmups.some(job => !finished.has(job.state) || job.ready);
+  const pollWarmups = useCallback(async () => {
+    const pending = warmups.filter(job => !finished.has(job.state) || job.ready);
+    if (!pending.length) return;
+    try {
+      const rows = await Promise.all(pending.map(job => apiFetch<Warmup>(`${prefix}/warmups/${job.id}`)));
+      setWarmups(current => current.map(job => rows.find(row => row.id === job.id) || job));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
+  }, [warmups]);
 
-    async function poll() {
-      polling = true;
-      for (const job of warmupsRef.current.filter(shouldPollWarmup)) {
-        if (document.hidden || controller.signal.aborted) break;
-        try {
-          const row = await apiFetch<Warmup>(`${prefix}/warmups/${job.id}`, { signal: controller.signal });
-          if (!controller.signal.aborted) {
-            setWarmups(current => current.map(item => item === job ? row : item));
-          }
-        } catch (e) {
-          if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
-        }
-      }
-      polling = false;
-      schedule();
-    }
-
-    document.addEventListener('visibilitychange', schedule);
-    schedule();
-    return () => {
-      controller.abort();
-      window.clearTimeout(timer);
-      document.removeEventListener('visibilitychange', schedule);
-    };
-  }, [hasPendingWarmups]);
+  useSmartPoll(pollWarmups, {
+    enabled: hasPollableWarmups,
+    active: warmups.some(job => !finished.has(job.state)),
+    activeMs: 4000,
+    idleMs: 15000,
+    immediate: false,
+  });
 
   async function run(task: () => Promise<void>) {
     setBusy(true);
@@ -136,6 +119,8 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
 
   const dirty = status && draft && JSON.stringify(status.config) !== JSON.stringify(draft);
   const liveKeys = keys.filter(key => !key.revoked_at);
+  const clearableWarmupsCount = warmups.filter(job => finished.has(job.state) && !job.ready).length;
+  const visibleWarmups = showAllWarmups ? warmups : warmups.slice(0, WARMUP_COLLAPSED_LIMIT);
 
   async function start(id: string) {
     const job = await apiFetch<Warmup>(`${prefix}/warmups`, write('POST', { workflow_id: id }));
@@ -199,26 +184,20 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
           </label></div>)}
           {!status.workflows.length && <p>暂无已通过真机冒烟、可执行的发布版本。</p>}
         </fieldset>
-        <button type="button" className="button" disabled={busy || !keyName.trim()} onClick={() => void run(async () => {
-          const row = await apiFetch<Key>(keyId ? `${prefix}/keys/${keyId}` : `${prefix}/keys`,
-            write(keyId ? 'PUT' : 'POST', { name: keyName, workflow_ids: allowed }));
-          const { token: plaintext, ...saved } = row;
-          setKeys(current => [...current.filter(key => key.id !== saved.id), saved]);
-          setKeyId(saved.id);
-          setKeyName(saved.name);
-          setToken(plaintext || '');
-          setMatch(undefined);
-          setNotice('Key 权限已保存');
-        })}>{keyId ? '保存授权' : '创建 Key'}</button>
-        {keyId && <button type="button" className="button ghost" disabled={busy} onClick={() => {
-          if (!window.confirm('撤销后此 Key 将不能提交、查询或取图。撤销此 Key？')) return;
-          void run(async () => {
-            await apiFetch(`${prefix}/keys/${keyId}`, write('DELETE'));
-            setKeys(current => current.filter(key => key.id !== keyId));
-            selectKey('');
-            setNotice('Key 已撤销');
-          });
-        }}>撤销 Key</button>}
+        <div className="actions">
+          <button type="button" className="button" disabled={busy || !keyName.trim()} onClick={() => void run(async () => {
+            const row = await apiFetch<Key>(keyId ? `${prefix}/keys/${keyId}` : `${prefix}/keys`,
+              write(keyId ? 'PUT' : 'POST', { name: keyName, workflow_ids: allowed }));
+            const { token: plaintext, ...saved } = row;
+            setKeys(current => [...current.filter(key => key.id !== saved.id), saved]);
+            setKeyId(saved.id);
+            setKeyName(saved.name);
+            setToken(plaintext || '');
+            setMatch(undefined);
+            setNotice('Key 权限已保存');
+          })}>{keyId ? '保存授权' : '创建 Key'}</button>
+          {keyId && <button type="button" className="button danger" disabled={busy} onClick={() => setConfirmRevokeKey(true)}>撤销 Key</button>}
+        </div>
         {token && <div className="field">
           <label htmlFor="creation-key-token">Key 仅显示一次</label>
           <input id="creation-key-token" readOnly value={token} />
@@ -255,7 +234,14 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
           {match.differences.map(({ workflow, reason }) => <p key={workflow.id}>{title(workflow)} · {reason}</p>)}
         </div>}
       </Card>
-      <Card title="启动工作流">
+      <Card
+        title="启动工作流"
+        aside={clearableWarmupsCount > 0 ? (
+          <button type="button" className="button secondary small" disabled={busy} onClick={() => setConfirmClearWarmups(true)}>
+            <Trash2 size={14} aria-hidden />清理历史 ({clearableWarmupsCount})
+          </button>
+        ) : undefined}
+      >
         <div className="field">
           <label htmlFor="creation-warm-workflow">发布版本</label>
           <select id="creation-warm-workflow" value={workflowId} onChange={e => setWorkflowId(e.target.value)}>
@@ -265,7 +251,7 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
         </div>
         <button type="button" className="button" disabled={busy || Boolean(dirty) || !workflowId}
           onClick={() => void run(() => start(workflowId))}>启动工作流</button>
-        {warmups.map(job => <div key={job.id} className="status">
+        {visibleWarmups.map(job => <div key={job.id} className="status">
           <strong>{title(job)} · {job.ready ? '就绪' : job.state === 'completed' ? '预热完成，当前未报告可用实例'
             : job.state === 'failed' ? '启动失败' : job.state === 'cancelled' ? '已取消' : stages[job.stage || ''] || '准备实例'}</strong>
           {job.expires_at && <p>可用至 {new Date(job.expires_at * 1000).toLocaleString()}</p>}
@@ -273,7 +259,49 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
           {job.compute_warnings?.map(warning => <p key={warning}>{warning}</p>)}
           {job.creation_runtime && <p>{job.creation_runtime.devices?.map(device => device.name).join('、') || job.gpu_reported} · 实例 {job.creation_runtime.instance_id} · 进程 {job.creation_runtime.process}</p>}
         </div>)}
+        {warmups.length > WARMUP_COLLAPSED_LIMIT && (
+          <button type="button" className="button secondary small" onClick={() => setShowAllWarmups(v => !v)}>
+            {showAllWarmups ? `收起，仅显示最新 ${WARMUP_COLLAPSED_LIMIT} 条` : `展开其余 ${warmups.length - WARMUP_COLLAPSED_LIMIT} 条预热记录`}
+          </button>
+        )}
       </Card>
     </>}
+
+    <ConfirmDialog
+      open={confirmRevokeKey}
+      title="撤销此 Key？"
+      description="撤销后此 Key 将不能提交、查询或取图，且无法恢复。"
+      confirmLabel="确认撤销"
+      danger
+      busy={busy}
+      onCancel={() => setConfirmRevokeKey(false)}
+      onConfirm={() => {
+        setConfirmRevokeKey(false);
+        void run(async () => {
+          await apiFetch(`${prefix}/keys/${keyId}`, write('DELETE'));
+          setKeys(current => current.filter(key => key.id !== keyId));
+          selectKey('');
+          setNotice('Key 已撤销');
+        });
+      }}
+    />
+
+    <ConfirmDialog
+      open={confirmClearWarmups}
+      title="清理历史预热记录？"
+      description={`将隐藏 ${clearableWarmupsCount} 条已结束且不再就绪的预热记录，正在运行或当前就绪的预热实例不受影响。`}
+      confirmLabel="确认清理"
+      danger
+      busy={busy}
+      onCancel={() => setConfirmClearWarmups(false)}
+      onConfirm={() => {
+        setConfirmClearWarmups(false);
+        void run(async () => {
+          const { cleared } = await clearCreationWarmups();
+          setWarmups(current => current.filter(job => !finished.has(job.state) || job.ready));
+          setNotice(cleared ? `已清理 ${cleared} 条历史预热记录` : '没有可清理的历史预热记录');
+        });
+      }}
+    />
   </div>;
 }

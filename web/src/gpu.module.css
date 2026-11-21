@@ -431,3 +431,201 @@
   .createColumns { grid-template-columns: minmax(340px, min(41%, 450px)) minmax(0, 1fr); }
   .inspector { position: static; max-height: none; }
 }
+
+/* ───── Toast 提示 ───── */
+.toastStack {
+  position: fixed;
+  z-index: 90;
+  right: 16px;
+  bottom: calc(var(--nav-h) + var(--safe-b) + 14px);
+  display: grid;
+  gap: 8px;
+  width: min(360px, calc(100vw - 32px));
+  pointer-events: none;
+}
+@media (min-width: 800px) {
+  .toastStack { bottom: 20px; right: 24px; }
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 10px 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--card-3);
+  color: var(--text);
+  font-size: 0.84rem;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+  animation: rise 0.16s ease;
+}
+.toast span { flex: 1; min-width: 0; }
+.toast[data-tone="error"] { border-color: var(--danger-line); color: var(--danger); }
+
+/* ───── 列表分组 / 堆叠 / 清理栏 ───── */
+.titleActions { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.filterRight { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cleanupBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--card-2);
+}
+
+.bucketSection { display: grid; gap: 8px; }
+.bucketHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-align: left;
+}
+.bucketHead:hover { background: var(--card-2); }
+.bucketHead .chev, .bucketHead .chevCollapsed { margin-left: auto; }
+.chevCollapsed { color: var(--muted); transform: rotate(-90deg); transition: transform 0.15s; }
+.chevOpen { color: var(--muted); transform: rotate(180deg); transition: transform 0.15s; }
+
+/* 任务批次堆叠卡 */
+.batchCard {
+  display: grid;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  background: var(--card);
+  overflow: hidden;
+}
+.batchCard[data-open="true"] .chev { transform: rotate(180deg); }
+.batchHead { display: grid; gap: 10px; padding: 12px; }
+.batchToggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+.batchIcon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  flex: none;
+  border-radius: 10px;
+  background: var(--card-2);
+  color: var(--text-2);
+}
+.batchMeta { display: grid; gap: 2px; flex: 1; min-width: 0; }
+.batchThumbs { display: flex; align-items: center; gap: 6px; overflow-x: auto; }
+.batchThumbs img { width: 46px; height: 46px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); flex: none; }
+.batchMore {
+  display: grid;
+  place-items: center;
+  min-width: 34px;
+  height: 34px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--card-2);
+  color: var(--text-2);
+  font-size: 0.74rem;
+}
+.batchChildren {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+}
+.nestedJobCard { border-radius: var(--r-md); }
+
+/* 作品堆叠 & 预览导航 */
+.tileStacked { box-shadow: 3px 3px 0 -1px var(--card), 3px 3px 0 0 var(--line-strong); }
+.stackBadge {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: var(--r-full);
+  background: rgba(0, 0, 0, 0.76);
+  color: #fff;
+  font-size: 0.7rem;
+  backdrop-filter: blur(6px);
+}
+.expandedStackBar {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--card-2);
+  font-size: 0.84rem;
+}
+.expandedStackBar > span { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.viewerNavGroup { display: inline-flex; align-items: center; gap: 6px; }
+
+/* 创作页紧凑运行栏 / 种子快捷 / 素材预览与拖拽 */
+.runtimeSummaryBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.runtimeSummaryText { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; flex-wrap: wrap; }
+.runtimeSummaryActions { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+.runtimeBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line-strong);
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+.runtimeBadge[data-mode="colab"] { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+
+.seedRow { display: flex; align-items: center; gap: 6px; }
+.seedRow input { flex: 1; min-width: 0; }
+.fileSlot { display: grid; gap: 8px; padding: 6px; border: 1px dashed transparent; border-radius: var(--r-md); transition: border-color 0.15s, background 0.15s; }
+.dropActive { border-color: var(--text) !important; background: var(--card-2) !important; }
+.filePreviewThumb {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  flex: none;
+  overflow: hidden;
+  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  background: var(--card-2);
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.filePreviewThumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* 项目管理行 & 资产二级切换 */
+.projectManageRow { display: flex; align-items: center; gap: 6px; }
+.projectManageRow .projectRow { flex: 1; min-width: 0; }
+.assetsSubBar { max-width: 340px; }
