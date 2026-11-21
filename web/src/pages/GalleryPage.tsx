@@ -18,13 +18,12 @@ function dims(asset: GalleryAsset): string {
 }
 
 export function GalleryPanel({
-  gallery, error, onFavorite, onDelete, onBatchDelete, onOpen, onReuse, onGoCreate, inspectedId,
+  gallery, error, onFavorite, onBatchDelete, onOpen, onReuse, onGoCreate, inspectedId,
 }: {
   gallery: GalleryAsset[];
   error?: string;
   onFavorite: (asset: GalleryAsset) => void;
-  onDelete: (asset: GalleryAsset) => void;
-  onBatchDelete?: (ids: string[]) => Promise<void> | void;
+  onBatchDelete: (ids: string[]) => Promise<{ removedIds: string[]; error?: string }>;
   onOpen: (asset: GalleryAsset, ordered?: GalleryAsset[]) => void;
   onReuse?: (asset: GalleryAsset) => void;
   onGoCreate?: () => void;
@@ -39,7 +38,7 @@ export function GalleryPanel({
   const [batchMode, setBatchMode] = useState(false);
   const [checkedIds, setCheckedIds] = useState<Set<string>>(() => new Set());
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [confirmBatchDelete, setConfirmBatchDelete] = useState<{ ids: string[]; title: string; description: string } | null>(null);
+  const [confirmBatchDelete, setConfirmBatchDelete] = useState<{ ids: string[]; title: string; description: string; error?: string } | null>(null);
   const [deletingBatch, setDeletingBatch] = useState(false);
 
   const diagnosticAssets = useMemo(() => gallery.filter(isDiagnosticAsset), [gallery]);
@@ -92,25 +91,28 @@ export function GalleryPanel({
   }
 
   async function executeBatchDelete() {
-    if (!confirmBatchDelete) return;
+    if (!confirmBatchDelete || deletingBatch) return;
     setDeletingBatch(true);
     try {
-      const ids = confirmBatchDelete.ids;
-      if (onBatchDelete) {
-        await onBatchDelete(ids);
-      } else {
-        for (const id of ids) {
-          const item = gallery.find((a) => a.id === id);
-          if (item) onDelete(item);
-        }
-      }
+      const { removedIds, error } = await onBatchDelete(confirmBatchDelete.ids);
+      const removed = new Set(removedIds);
       setCheckedIds((curr) => {
         const next = new Set(curr);
-        ids.forEach((id) => next.delete(id));
+        removed.forEach((id) => next.delete(id));
         return next;
       });
-      if (selectedId && ids.includes(selectedId)) setSelectedId(null);
-      setConfirmBatchDelete(null);
+      if (selectedId && removed.has(selectedId)) setSelectedId(null);
+      if (error) {
+        const ids = confirmBatchDelete.ids.filter((id) => !removed.has(id));
+        setConfirmBatchDelete({
+          ...confirmBatchDelete,
+          ids,
+          title: removed.size ? `删除剩余的 ${ids.length} 件作品？` : confirmBatchDelete.title,
+          error,
+        });
+      } else {
+        setConfirmBatchDelete(null);
+      }
     } finally {
       setDeletingBatch(false);
     }
@@ -398,6 +400,7 @@ export function GalleryPanel({
         confirmLabel="确认删除"
         danger
         busy={deletingBatch}
+        error={confirmBatchDelete?.error}
         onCancel={() => setConfirmBatchDelete(null)}
         onConfirm={() => void executeBatchDelete()}
       />

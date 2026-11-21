@@ -17,7 +17,7 @@ import {
   ChevronLeft, ChevronRight, Copy, ImagePlus, Pencil, Search,
 } from 'lucide-react';
 import {
-  apiMessage, assetUrl, batchDeleteAssets, cancelGpuJob, clearGpuJobHistory, createGpuJob, createGpuBatch,
+  apiMessage, assetUrl, BATCH_DELETE_ASSET_LIMIT, batchDeleteAssets, cancelGpuJob, clearGpuJobHistory, createGpuJob, createGpuBatch,
   createProject, deleteAsset, deleteGpuPreset, deleteGpuWorkflow, deleteProject,
   apiFetch,
   getGpuComputeSpecs, getGpuGallery, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
@@ -341,6 +341,7 @@ export default function App() {
     () => parseHashRoute(typeof window !== 'undefined' ? window.location.hash : ''),
     [],
   );
+  const lastRouteHash = useRef(formatHashRoute(initialRoute));
   const [loggedIn, setLoggedIn] = useState(isLoggedIn());
   const [tab, setTab] = useState<MainTab>(initialRoute.tab);
   const [assetsSubTab, setAssetsSubTab] = useState<AssetsSubTab>(initialRoute.assetsSubTab);
@@ -390,6 +391,7 @@ export default function App() {
   const [params, setParams] = useState<Record<string, unknown>>({});
   const [gallery, setGallery] = useState<GalleryAsset[]>([]);
   const [galleryError, setGalleryError] = useState('');
+  const [galleryRevision, setGalleryRevision] = useState(0);
   const [referenceImages, setReferenceImages] = useState<GalleryAsset[]>([]);
   const [jobs, setJobs] = useState<GpuJob[]>([]);
   const [selectedAssets, setSelectedAssets] = useState<string[]>([]);
@@ -464,6 +466,7 @@ export default function App() {
   const viewer = viewerSelection?.project_id === projectId
     ? projectGallery.find(asset => asset.id === viewerSelection.id) ?? viewerSelection
     : null;
+  const routeAssetId = tab === '作品' ? pendingRouteAssetId || viewer?.id || '' : '';
   const viewerJobId = viewer?.source_job_id || viewer?.gpu_job_id;
   const inlineViewer = desktop && tab === '作品';
   const detailRevision = projectJobs.find(job => job.id === detailId)?.updated_at;
@@ -488,25 +491,29 @@ export default function App() {
     const nextHash = formatHashRoute({
       tab,
       assetsSubTab,
-      creationApiOpen: adminRole && creationApiOpen,
+      creationApiOpen,
       jobId: tab === '任务' ? detailId : '',
-      assetId: tab === '作品' && viewer ? viewer.id : '',
+      assetId: routeAssetId,
     });
+    if (lastRouteHash.current === nextHash) return;
+    lastRouteHash.current = nextHash;
     if (window.location.hash !== nextHash) {
       window.history.pushState(null, '', nextHash);
     }
-  }, [tab, assetsSubTab, creationApiOpen, adminRole, detailId, viewer]);
+  }, [tab, assetsSubTab, creationApiOpen, detailId, routeAssetId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const onHashChange = () => {
       const parsed = parseHashRoute(window.location.hash);
+      lastRouteHash.current = formatHashRoute(parsed);
       setTab(parsed.tab);
       setAssetsSubTab(parsed.assetsSubTab);
       setCreationApiOpen(parsed.creationApiOpen);
       setDetailId(parsed.jobId);
-      if (parsed.assetId) setPendingRouteAssetId(parsed.assetId);
-      else setViewer(null);
+      setPendingRouteAssetId(parsed.assetId);
+      setViewer(null);
+      setViewerList([]);
     };
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
@@ -700,7 +707,7 @@ export default function App() {
       if (alive) setGalleryError(apiMessage(cause));
     });
     return () => { alive = false; };
-  }, [projectId, loggedIn, tab, galleryOutputs]);
+  }, [projectId, loggedIn, tab, galleryOutputs, galleryRevision]);
 
   useEffect(() => {
     if (tab !== '任务' || !detailId || !projectId || !loggedIn) return;
@@ -746,6 +753,7 @@ export default function App() {
       setDetailId('');
       setDetail(null);
       setViewer(null);
+      setPendingRouteAssetId('');
     }
     setProjectId(id);
     saveProjectId(id);
@@ -794,6 +802,7 @@ export default function App() {
 
   async function handleUpload(file: File): Promise<GalleryAsset | void> {
     const uploadProjectId = projectId;
+    const uploadWorkflowId = workflowId;
     if (!uploadProjectId) return;
     setUploadProgress((curr) => ({ ...curr, [file.name]: 0 }));
     try {
@@ -802,8 +811,9 @@ export default function App() {
       });
       if (currentProjectId.current !== uploadProjectId || asset.project_id !== uploadProjectId) return;
       setReferenceImages((curr) => [asset, ...curr.filter((item) => item.id !== asset.id)]);
-      setSelectedAssets((curr) => [...new Set([...curr, asset.id])]);
       pushToast(`已上传素材「${asset.filename || file.name}」`, 'success');
+      if (workflowIdRef.current !== uploadWorkflowId) return;
+      setSelectedAssets((curr) => [...new Set([...curr, asset.id])]);
       return asset;
     } catch (cause) {
       if (currentProjectId.current === uploadProjectId) setError(`上传 ${file.name}：${apiMessage(cause)}`);
@@ -817,7 +827,10 @@ export default function App() {
   }
 
   function submitSignature() {
-    return JSON.stringify([workflowId, runtime, batchCount, runtimeChoice.accountId, runtimeChoice.instanceId, runtimeChoice.lifecycle, selectedCompute]);
+    return JSON.stringify([
+      workflowId, runtime, batchCount, runtimeChoice.accountId, runtimeChoice.instanceId,
+      runtimeChoice.lifecycle, selectedCompute, maxRuntime, runtimeChoice.retainIdleMinutes,
+    ]);
   }
 
   function requestSubmit() {
@@ -1015,18 +1028,31 @@ export default function App() {
   }
 
   async function batchRemove(ids: string[]) {
-    if (!ids.length) return;
+    const removedIds = new Set<string>();
+    let error = '';
     setGalleryError('');
     try {
-      const { deleted, ids: removedIds } = await batchDeleteAssets(ids);
-      const removedSet = new Set(removedIds);
-      setGallery((curr) => curr.filter((i) => !removedSet.has(i.id)));
-      setViewer((current) => current && removedSet.has(current.id) ? null : current);
-      pushToast(`已批量删除 ${deleted} 件作品`, 'success');
+      for (let offset = 0; offset < ids.length; offset += BATCH_DELETE_ASSET_LIMIT) {
+        const batch = ids.slice(offset, offset + BATCH_DELETE_ASSET_LIMIT);
+        const result = await batchDeleteAssets(batch);
+        result.ids.forEach((id) => removedIds.add(id));
+      }
     } catch (cause) {
-      setGalleryError(`批量删除失败：${apiMessage(cause)}`);
-      pushToast(`批量删除失败：${apiMessage(cause)}`, 'error');
+      // A request can fail after deleting some files. Reconcile before retrying those IDs.
+      const remaining = await getGpuGallery(projectId).catch(() => null);
+      if (remaining) {
+        const existing = new Set(remaining.map((asset) => asset.id));
+        ids.filter((id) => !existing.has(id)).forEach((id) => removedIds.add(id));
+      }
+      if (removedIds.size < ids.length) error = `批量删除失败：${apiMessage(cause)}`;
     }
+    if (removedIds.size > 0) {
+      setGallery((current) => current.filter((asset) => !removedIds.has(asset.id)));
+      setViewer((current) => current && removedIds.has(current.id) ? null : current);
+      if (currentProjectId.current === projectId) setGalleryRevision((revision) => revision + 1);
+    }
+    if (!error) pushToast(`已批量删除 ${removedIds.size} 件作品`, 'success');
+    return { removedIds: [...removedIds], error };
   }
 
   async function savePreset(name: string) {
@@ -1319,6 +1345,7 @@ export default function App() {
   function navigate(next: MainTab) {
     if (next === tab) return;
     setViewer(null);
+    setPendingRouteAssetId('');
     setDetailId('');
     setTab(next);
     window.scrollTo(0, 0);
@@ -1488,15 +1515,16 @@ export default function App() {
         {tab === '作品' && (
           <div className={styles.detailWorkspace} data-gallery>
             <GalleryPanel
+              key={projectId}
               gallery={projectGallery}
               error={viewer ? '' : galleryError}
               inspectedId={desktop ? viewer?.id || '' : undefined}
               onFavorite={(asset) => void favorite(asset)}
-              onDelete={(asset) => void remove(asset)}
               onBatchDelete={batchRemove}
               onOpen={(asset, ordered) => {
                 setViewerList(ordered || projectGallery);
                 setViewer(asset);
+                setPendingRouteAssetId('');
               }}
               onReuse={(asset) => void reuseAsset(asset)}
               onGoCreate={() => navigate('创作')}
@@ -1625,6 +1653,9 @@ export default function App() {
               <dt>机器</dt><dd>{resolveInstanceSubmission(runtimeChoice, instances).machineLabel}</dd>
               <dt>数量</dt><dd>{batchCount}</dd>
               {runtime === 'colab' && <><dt>最长运行</dt><dd>{maxRuntime} 分钟</dd></>}
+              {runtime === 'colab' && (runtimeChoice.lifecycle === 'smart' || runtimeChoice.lifecycle === 'retain') && (
+                <><dt>空闲保留</dt><dd>{runtimeChoice.retainIdleMinutes} 分钟</dd></>
+              )}
             </dl>
             <label className={styles.checkRow}>
               <input

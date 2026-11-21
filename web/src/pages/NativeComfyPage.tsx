@@ -50,8 +50,8 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
   const restartDialog = useRef<HTMLDialogElement>(null);
   const sendingRestart = useRef(false);
   const sendingStart = useRef(false);
-  async function enter(newTab: boolean) {
-    if (opening.current) return;
+  async function enter(newTab: boolean, signal?: AbortSignal) {
+    if (opening.current || signal?.aborted) return;
     const popup = newTab ? window.open('', '_blank') : null;
     if (newTab && !popup) {
       setError('无法打开新标签页，请允许此站点打开弹出窗口后重试。');
@@ -66,20 +66,22 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
         popup.document.title = '原生 ComfyUI';
         popup.document.body.textContent = '正在连接原生 ComfyUI…';
       }
-      const data = await apiFetch<{ url: string; ticket: string }>('/api/gpu/native/ticket', { method: 'POST' });
+      const data = await apiFetch<{ url: string; ticket: string }>('/api/gpu/native/ticket', { method: 'POST', signal });
+      if (signal?.aborted) return;
       if (popup?.closed) throw new Error('新标签页已关闭，请重新打开。');
       submitNativeHandoff(popup?.document ?? document, data);
     } catch (cause) {
       popup?.close();
-      setError(apiMessage(cause));
+      if (!signal?.aborted) setError(apiMessage(cause));
     } finally {
       opening.current = false;
       setEntering(false);
     }
   }
-  const pollStatus = useCallback(async () => {
+  const pollStatus = useCallback(async (signal: AbortSignal) => {
     try {
-      const data = await apiFetch<NativeStatus>('/api/gpu/native/status');
+      const data = await apiFetch<NativeStatus>('/api/gpu/native/status', { signal });
+      if (signal.aborted) return;
       setStatus(data);
       setPendingStart(false);
       setPendingRestart(pending => {
@@ -94,9 +96,9 @@ export function NativeComfyPage({ accounts, instances, desktop }: { accounts: Gp
       }
       if (data.ready && autoOpen) {
         setAutoOpen(false);
-        if (!desktop) await enter(false);
+        if (!desktop) await enter(false, signal);
       }
-    } catch (cause) { setError(apiMessage(cause)); }
+    } catch (cause) { if (!signal.aborted) setError(apiMessage(cause)); }
   }, [autoOpen, desktop]);
 
   const nativeActive = Boolean(

@@ -134,11 +134,12 @@ export function groupJobsByBatch(jobs: GpuJob[]): JobDisplayEntry[] {
 }
 
 /**
- * Split display entries into pinned active entries and date-bucketed history entries.
+ * Pin all active entries and group up to historyLimit history entries by date.
  */
 export function partitionJobEntries(
   entries: JobDisplayEntry[],
   nowMs: number = Date.now(),
+  historyLimit: number = Infinity,
 ): { active: JobDisplayEntry[]; buckets: JobDateBucket[] } {
   const active: JobDisplayEntry[] = [];
   const byBucket: Record<DateBucketKey, JobDisplayEntry[]> = {
@@ -147,11 +148,13 @@ export function partitionJobEntries(
     older: [],
   };
 
+  let historyCount = 0;
   for (const entry of entries) {
     if (!entry.allTerminal) {
       active.push(entry);
-    } else {
+    } else if (historyCount < historyLimit) {
       byBucket[jobDateBucket(entry.latestCreatedAt, nowMs)].push(entry);
+      historyCount += 1;
     }
   }
 

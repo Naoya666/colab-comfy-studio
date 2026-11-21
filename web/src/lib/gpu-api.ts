@@ -355,6 +355,7 @@ export async function uploadAsset(projectId: string, file: File, onProgress?: (p
 export const assetUrl = (asset: GalleryAsset, thumbnail = false) => thumbnail ? asset.thumbnail_url || `/api/assets/${asset.id}/thumbnail` : asset.download_url || `/api/assets/${asset.id}/download`;
 export const updateAsset = (id: string, favorite: boolean) => apiFetch<GalleryAsset>(`/api/assets/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ favorite }) });
 export const deleteAsset = (id: string) => apiFetch<void>(`/api/assets/${encodeURIComponent(id)}`, { method: 'DELETE' });
+export const BATCH_DELETE_ASSET_LIMIT = 200;
 export const batchDeleteAssets = (assetIds: string[]) => apiFetch<{ deleted: number; ids: string[] }>('/api/assets/batch-delete', post({ asset_ids: assetIds }));
 
 export interface GoogleClientConfig { configured: boolean; client_id?: string; redirect_uri: string; source?: string; }

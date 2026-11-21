@@ -70,6 +70,22 @@ def test_project_archive_delete_blocks_when_active_jobs_exist(client):
     assert pid not in remaining
 
 
+def test_project_rename_preserves_atelier_binding(client):
+    project = client.post(
+        "/api/gpu/projects", json={"title": "Before", "atelier_project_id": "atelier-project"}
+    ).json()["data"]
+    path = f"/api/gpu/projects/{project['id']}"
+
+    renamed = client.patch(path, json={"title": "After"})
+    assert renamed.status_code == 200
+    assert renamed.json()["data"]["title"] == "After"
+    assert renamed.json()["data"]["atelier_project_id"] == "atelier-project"
+
+    cleared = client.patch(path, json={"title": "After", "atelier_project_id": ""})
+    assert cleared.status_code == 200
+    assert cleared.json()["data"]["atelier_project_id"] == ""
+
+
 def test_preset_update_and_delete(client):
     repo = Repository(app.state.store)
     wf = repo.create(

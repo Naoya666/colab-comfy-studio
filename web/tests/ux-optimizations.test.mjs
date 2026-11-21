@@ -76,6 +76,11 @@ test('partitionJobEntries pins active items and buckets history by date', () => 
   assert.equal(active.length, 1);
   assert.equal(active[0].job.id, 'run');
   assert.deepEqual(buckets.map((b) => b.key), ['today', 'yesterday', 'older']);
+
+  const running = entries.find((entry) => entry.job.id === 'run');
+  const limited = partitionJobEntries([...entries.filter((entry) => entry !== running), running], now, 1);
+  assert.deepEqual(limited.active.map((entry) => entry.job.id), ['run']);
+  assert.deepEqual(limited.buckets.flatMap((bucket) => bucket.entries.map((entry) => entry.job.id)), ['t1']);
 });
 
 test('groupGalleryAssets stacks same-batch assets and prefers favorited cover', () => {

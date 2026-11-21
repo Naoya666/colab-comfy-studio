@@ -15,15 +15,17 @@ export interface SmartPollOptions {
  * - Pauses completely while the browser tab is hidden.
  * - Refreshes immediately when the tab becomes visible again.
  * - Uses activeMs when work is in flight, and backs off to idleMs when idle.
+ * - Aborts the callback's signal when the polling effect is cleaned up.
  */
-export function useSmartPoll(callback: () => void | Promise<void>, options: SmartPollOptions): void {
+export function useSmartPoll(callback: (signal: AbortSignal) => void | Promise<void>, options: SmartPollOptions): void {
   const { enabled, active, activeMs = 4000, idleMs = 25000, immediate = true } = options;
   const callbackRef = useRef(callback);
   callbackRef.current = callback;
 
   useEffect(() => {
     if (!enabled) return;
-    let alive = true;
+    const controller = new AbortController();
+    let running = false;
     let timer: number | undefined;
 
     const interval = active ? activeMs : idleMs;
@@ -37,7 +39,7 @@ export function useSmartPoll(callback: () => void | Promise<void>, options: Smar
 
     const schedule = () => {
       clearTimer();
-      if (!alive || (typeof document !== 'undefined' && document.hidden)) return;
+      if (controller.signal.aborted || (typeof document !== 'undefined' && document.hidden)) return;
       timer = window.setTimeout(() => {
         void run();
       }, interval);
@@ -45,16 +47,18 @@ export function useSmartPoll(callback: () => void | Promise<void>, options: Smar
 
     const run = async () => {
       clearTimer();
-      if (!alive) return;
+      if (controller.signal.aborted || running) return;
+      running = true;
       try {
-        await callbackRef.current();
+        await callbackRef.current(controller.signal);
       } finally {
-        if (alive) schedule();
+        running = false;
+        schedule();
       }
     };
 
     const onVisibilityChange = () => {
-      if (!alive) return;
+      if (controller.signal.aborted) return;
       if (document.hidden) {
         clearTimer();
       } else {
@@ -75,7 +79,7 @@ export function useSmartPoll(callback: () => void | Promise<void>, options: Smar
     }
 
     return () => {
-      alive = false;
+      controller.abort();
       clearTimer();
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', onVisibilityChange);

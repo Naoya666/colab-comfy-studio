@@ -92,8 +92,7 @@ export function TasksPanel({
     return groupJobsByBatch(filtered);
   }, [filtered, stackBatches]);
 
-  const visibleEntries = entries.slice(0, limit);
-  const { active: activeEntries, buckets } = useMemo(() => partitionJobEntries(visibleEntries), [visibleEntries]);
+  const { active: activeEntries, buckets } = partitionJobEntries(entries, Date.now(), limit);
   const hasMultiBatches = useMemo(() => {
     const seen = new Map<string, number>();
     for (const job of filtered) {
@@ -476,7 +475,7 @@ export function TasksPanel({
         </div>
       )}
 
-      {entries.length > limit && (
+      {entries.length - activeEntries.length > limit && (
         <button className="button secondary block" type="button" onClick={() => setLimit(limit + 30)}>加载更多任务</button>
       )}
 

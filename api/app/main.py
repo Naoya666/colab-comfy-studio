@@ -301,7 +301,10 @@ def update_project(project_id: str, body: dict, request: Request, user=Depends(c
     title = str(body["title"]).strip()[:200]
     if not title:
         raise APIError("PROJECT_INVALID", "项目名不能为空")
-    return ok(st.update("projects", project_id, {"title": title, "atelier_project_id": str(body.get("atelier_project_id", ""))[:128]}, user["id"]), request)
+    patch = {"title": title}
+    if "atelier_project_id" in body:
+        patch["atelier_project_id"] = str(body["atelier_project_id"])[:128]
+    return ok(st.update("projects", project_id, patch, user["id"]), request)
 
 
 _TERMINAL_JOB_STATES = {

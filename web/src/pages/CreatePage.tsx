@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type Dispatch, type ReactNode, type SetStateAction } from 'react';
 import {
   Sparkles, Image as ImageIcon, Film, Layers, Pencil, SlidersHorizontal, Play, Monitor, Cloud,
   ChevronRight, ChevronDown, Minus, Plus, X, Check, Trash2, Save,
@@ -74,7 +74,7 @@ export function CreatePanel({
   settings: GpuSettings | null;
   manifest: GpuManifest | null;
   params: Record<string, unknown>;
-  setParams: (value: Record<string, unknown>) => void;
+  setParams: Dispatch<SetStateAction<Record<string, unknown>>>;
   gallery: GalleryAsset[];
   selectedAssets: string[];
   setSelectedAssets: (value: string[]) => void;
@@ -180,7 +180,7 @@ export function CreatePanel({
   const split = useMemo(() => splitParams(manifest, excluded), [manifest, excluded]);
   const promptValue = String(params[promptKey] ?? '');
   const negativePromptValue = negativePromptKey ? String(params[negativePromptKey] ?? '') : '';
-  const patch = (next: Record<string, unknown>) => setParams({ ...params, ...next });
+  const patch = (next: Record<string, unknown>) => setParams((current) => ({ ...current, ...next }));
 
   const hasDeclaredAssets = Boolean(
     (manifest?.assets as { required?: unknown[]; optional?: unknown[] } | undefined)?.required?.length
@@ -203,9 +203,11 @@ export function CreatePanel({
     if (!files.length) return;
     e.preventDefault();
     const uploaded = await onUpload(files[0]);
-    if (uploaded?.id && split.assets.length > 0) {
-      const targetSlot = split.assets.find((entry) => !params[entry.key]) || split.assets[0];
-      if (targetSlot) setParams({ ...params, [targetSlot.key]: uploaded.id });
+    if (uploaded && split.assets.length > 0) {
+      setParams((current) => {
+        const targetSlot = split.assets.find((entry) => !current[entry.key]) || split.assets[0];
+        return { ...current, [targetSlot.key]: uploaded.id };
+      });
     }
   }
 
@@ -371,7 +373,7 @@ export function CreatePanel({
             disabled={!draftReady}
             placeholder={loading === 'schema' ? '正在加载工作流参数…' : '描述想要的画面：主体、风格、光线、细节……'}
             rows={3}
-            onChange={(e) => setParams({ ...params, [promptKey]: e.target.value })}
+            onChange={(e) => patch({ [promptKey]: e.target.value })}
             onKeyDown={(e) => {
               if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && draftReady && loading !== 'submit') {
                 e.preventDefault();
@@ -389,7 +391,7 @@ export function CreatePanel({
                 disabled={!draftReady}
                 placeholder="不希望画面中出现的元素（选填），例如：lowres, blurry, extra fingers..."
                 rows={2}
-                onChange={(e) => setParams({ ...params, [negativePromptKey]: e.target.value })}
+                onChange={(e) => patch({ [negativePromptKey]: e.target.value })}
                 onKeyDown={(e) => {
                   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && draftReady && loading !== 'submit') {
                     e.preventDefault();
@@ -407,7 +409,7 @@ export function CreatePanel({
         {manifest && (split.assets.length > 0 || showGeneralReferencePicker) && (
           <Card icon={<ImageIcon size={17} strokeWidth={1.6} aria-hidden />} title="参考素材">
             <GpuParamForm section="assets" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
-              onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
+              onChange={(k, v) => patch({ [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
             {showGeneralReferencePicker && (
               <ReferencePicker manifest={manifest} assets={gallery} selected={selectedAssets} onChange={setSelectedAssets} onUpload={async (file) => { await onUpload(file); }} />
             )}
@@ -467,7 +469,7 @@ export function CreatePanel({
         {split.options.length > 0 && (
           <Card icon={<SlidersHorizontal size={17} strokeWidth={1.6} aria-hidden />} title="生成选项">
             <GpuParamForm section="options" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
-              onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
+              onChange={(k, v) => patch({ [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
           </Card>
         )}
 
@@ -496,7 +498,7 @@ export function CreatePanel({
             <div className="foldContent">
               <p className="muted small">一般不用改。不确定时保持默认即可。</p>
               <GpuParamForm section="advanced" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
-                onChange={(k, v) => setParams({ ...params, [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
+                onChange={(k, v) => patch({ [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
             </div>
           </details>
         )}
