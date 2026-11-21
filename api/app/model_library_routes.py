@@ -101,7 +101,10 @@ def add(body: dict, user=Depends(current_user), st=Depends(get_store)):
     with library(st, user) as lib:
         # Source adapters are re-run server-side to avoid trusting user-supplied platform identities.
         if body.get("source") in {"huggingface", "civitai"}:
-            options = lib.resolve({"url": body.get("original_source_url") or body.get("source_url")})
+            options = lib.resolve({
+                "url": body.get("original_source_url") or body.get("source_url"),
+                "model_type": body.get("model_type"),
+            })
             selected = [f for f in options if f.get("source_identity") == body.get("source_identity")]
             if len(selected) != 1:
                 raise ModelError("所选来源文件身份已变化，请重新解析")

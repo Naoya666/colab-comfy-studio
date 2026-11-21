@@ -92,3 +92,56 @@ def test_http_hf_dataset_resolve_and_add_roundtrip(client, monkeypatch):
     row = added.json()["data"]
     assert row["source_identity"]["repo_type"] == "datasets"
     assert row["expected_sha256"] == digest and row["expected_size"] == 23074144
+
+
+def test_http_upscale_pt_and_pth_controlled_import(client, monkeypatch):
+    import httpx
+    from app.gpu.model_sources import SourceHTTP
+
+    c, _repo = client
+    commit = "d2db793b0909d31d651019f7aa17891616cc3327"
+    ultra_sha = "a5812231fc936b42af08a5edba784195495d303d5b3248c24489ef0c4021fe01"
+
+    def handler(request):
+        path = request.url.raw_path.decode()
+        if path == "/api/models/MochaPixel/4XUltrasharpV10/revision/main?blobs=true":
+            return httpx.Response(200, json={"sha": commit, "siblings": [
+                {"rfilename": "4xUltrasharp_4xUltrasharpV10.pt", "lfs": {"sha256": ultra_sha, "size": 66961958}},
+            ]})
+        if path == "/repos/xinntao/Real-ESRGAN/releases/tags/v0.2.2.4":
+            return httpx.Response(200, json={"assets": [
+                {"name": "RealESRGAN_x4plus_anime_6B.pth", "size": 17938799, "digest": None},
+            ]})
+        return httpx.Response(404)
+
+    monkeypatch.setattr(
+        "app.gpu.model_library.SourceHTTP",
+        lambda tokens=None: SourceHTTP(tokens, client=httpx.Client(transport=httpx.MockTransport(handler)), resolver=lambda _h: ["8.8.8.8"]),
+    )
+
+    ultra_url = "https://huggingface.co/MochaPixel/4XUltrasharpV10/blob/main/4xUltrasharp_4xUltrasharpV10.pt"
+    # Rejected under checkpoints
+    denied = c.post("/api/gpu/model-library/resolve", json={"url": ultra_url, "model_type": "checkpoints"})
+    assert denied.status_code == 422
+
+    # Allowed under upscale_models and round-trips through POST /api/gpu/model-library
+    ok_res = c.post("/api/gpu/model-library/resolve", json={"url": ultra_url, "model_type": "upscale_models"})
+    assert ok_res.status_code == 200, ok_res.text
+    file_item = ok_res.json()["data"]["files"][0]
+    assert file_item["model_type"] == "upscale_models"
+    added = c.post("/api/gpu/model-library", json={**file_item, "model_type": "upscale_models"})
+    assert added.status_code == 201, added.text
+    assert added.json()["data"]["expected_sha256"] == ultra_sha
+
+    # Rejected if client tampers model_type back to checkpoints on POST /api/gpu/model-library
+    tampered = c.post("/api/gpu/model-library", json={**file_item, "model_type": "checkpoints"})
+    assert tampered.status_code == 422
+
+    # Trusted GitHub Release .pth resolves with size under upscale_models
+    gh_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
+    gh_res = c.post("/api/gpu/model-library/resolve", json={"url": gh_url, "model_type": "upscale_models"})
+    assert gh_res.status_code == 200, gh_res.text
+    gh_item = gh_res.json()["data"]["files"][0]
+    assert gh_item["expected_size"] == 17938799
+    gh_added = c.post("/api/gpu/model-library", json={**gh_item, "model_type": "upscale_models"})
+    assert gh_added.status_code == 201, gh_added.text

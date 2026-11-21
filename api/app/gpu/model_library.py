@@ -30,9 +30,12 @@ from .model_sources import (
     filename,
     hf_download_url,
     https_url,
+    is_controlled_upscale_extension,
     normalize_hf_repo_type,
     normalize_source_url,
     relative_path,
+    validate_controlled_upscale_source,
+    validate_weight_file,
 )
 
 ACTIVE = {"pending", "downloading", "verifying", "uploading"}
@@ -151,7 +154,7 @@ class ModelLibrary:
         if url is None or url == "":
             return None
         original = normalize_source_url(url)
-        choices = self.resolve({"url": original, "filename": row["filename"]})
+        choices = self.resolve({"url": original, "filename": row["filename"], "model_type": row.get("model_type")})
         known_hash = row.get("sha256") or row.get("expected_sha256")
         known_size = row.get("size") or row.get("expected_size")
         compatible = [
@@ -163,18 +166,20 @@ class ModelLibrary:
         selected = exact or [item for item in compatible if item["filename"] == row["filename"]]
         if len(selected) != 1:
             raise ModelError("来源文件不匹配或版本有歧义，请提供具体文件链接并核对 SHA-256 和大小")
+        if is_controlled_upscale_extension(row["filename"]):
+            validate_controlled_upscale_source(selected[0]["download_url"], source=selected[0].get("source"))
         return {"url": original, "download_url": selected[0]["download_url"],
                 "status": "verified" if exact and row.get("state") == "ready" and row.get("sha256") else "unverified"}
 
     def add(self, data):
-        name = filename(data.get("filename"))
+        category = data.get("model_type")
+        if category not in deps.directories():
+            raise ModelError("请选择模型类型（可通过 MODEL_LIBRARY_DIRECTORIES 扩展）")
+        name = filename(data.get("filename"), model_type=category)
         legacy_target = relative_path(data["legacy_target"]) if data.get("legacy_target") else None
         model_path = relative_path(data.get("relative_path") or (legacy_target.split("/", 1)[-1] if legacy_target else name))
         if PurePosixPath(model_path).name != name:
             raise ModelError("模型相对路径必须以所登记的文件名结尾")
-        category = data.get("model_type")
-        if category not in deps.directories():
-            raise ModelError("请选择模型类型（可通过 MODEL_LIBRARY_DIRECTORIES 扩展）")
         expected = data.get("expected_sha256")
         if expected is not None and (not isinstance(expected, str) or not SHA.fullmatch(expected)):
             raise ModelError("预期 SHA-256 必须为完整 64 位十六进制值")
@@ -208,6 +213,8 @@ class ModelLibrary:
         elif source == "huggingface" and "repo_type" in row["source_identity"]:
             row["source_identity"]["repo_type"] = normalize_hf_repo_type(row["source_identity"]["repo_type"])
         if source in {"drive", "upload", "legacy_cache"}:
+            if is_controlled_upscale_extension(name):
+                raise ModelError("受控 .pt/.pth 超分模型仅允许通过受信任下载来源导入，禁止直接上传或导入未经验证的文件")
             file_id = data.get("drive_file_id")
             if not isinstance(file_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", file_id):
                 raise ModelError("Drive 文件 ID 无效；drive.file 授权只能访问当前应用可见文件")
@@ -215,6 +222,8 @@ class ModelLibrary:
             row["state"] = "unverified"
         elif not row["download_url"]:
             raise ModelError("缺少下载来源，请先解析并选择文件")
+        elif is_controlled_upscale_extension(name):
+            validate_controlled_upscale_source(row["download_url"], source=source)
         identity_key = None
         if expected:
             identity_key = f"sha256:{expected.lower()}"
@@ -927,6 +936,12 @@ class ModelTransfer:
                 path.unlink(missing_ok=True)
                 path.with_suffix(".json").unlink(missing_ok=True)
                 raise ModelError("模型 SHA-256 或文件大小不匹配，未提交 ready；请核对来源和预期值")
+            try:
+                validate_weight_file(path, self.model["filename"], size, model_type=self.model.get("model_type"))
+            except ModelError:
+                path.unlink(missing_ok=True)
+                path.with_suffix(".json").unlink(missing_ok=True)
+                raise
             if imported and meta.get("md5Checksum") and md5 != meta["md5Checksum"]:
                 raise ModelError("Drive 文件传输校验失败，请重试")
             if not imported:

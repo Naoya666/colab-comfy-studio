@@ -23,11 +23,31 @@ import httpx
 try:
     from . import model_dependencies as deps
     from . import runtime_worker as studio_worker
-    from .model_sources import SHA, ModelError, SourceHTTP, filename, https_url, relative_path
+    from .model_sources import (
+        SHA,
+        ModelError,
+        SourceHTTP,
+        filename,
+        https_url,
+        is_controlled_upscale_extension,
+        relative_path,
+        validate_controlled_upscale_source,
+        validate_weight_file,
+    )
 except ImportError:  # The bootstrap ships standalone modules to Colab.
     import model_dependencies as deps
     import runtime_worker as studio_worker
-    from model_sources import SHA, ModelError, SourceHTTP, filename, https_url, relative_path
+    from model_sources import (
+        SHA,
+        ModelError,
+        SourceHTTP,
+        filename,
+        https_url,
+        is_controlled_upscale_extension,
+        relative_path,
+        validate_controlled_upscale_source,
+        validate_weight_file,
+    )
 
 RESERVE = 5 * 1024**3
 CHUNK = 1024**2
@@ -450,7 +470,10 @@ class LocalModels:
             digest, md5 = self.file_hashes(scratch)
             if plan["sha256"] and digest != plan["sha256"]:
                 raise ModelError("下载文件 SHA-256 不匹配，请核对版本和来源")
-            if not plan["sha256"] and not plan["md5"]:
+            target_category = category_for(target.relative_to(self.model_dir).parts[0])
+            if is_controlled_upscale_extension(target.name):
+                validate_weight_file(scratch, target.name, written, model_type=target_category)
+            elif not plan["sha256"] and not plan["md5"]:
                 self.check_unpinned_format(scratch, target.suffix.lower(), written)
             if plan["md5"] and md5 != plan["md5"]:
                 raise ModelError("Drive 模型 MD5 不匹配，请检查文件是否已变更")
@@ -523,9 +546,12 @@ class LocalModels:
             url, drive = plan["url"], plan["drive"]
             token = None
             account = self.config.get("drive_account")
+            target_category = category_for(target.relative_to(self.model_dir).parts[0])
             if url or drive:
-                filename(target.name)
+                filename(target.name, model_type=target_category)
             if url:
+                if is_controlled_upscale_extension(target.name):
+                    validate_controlled_upscale_source(url)
                 update(state="downloading", source="external", host=urlsplit(url).hostname)
                 try:
                     self.transfer(https_url(url), target, plan, update)
@@ -550,7 +576,7 @@ class LocalModels:
                 drive = self.legacy_copy(target, plan, token=token)
             if not drive:
                 raise ModelError("找不到明确来源或 Drive 副本，请在模型库登记准确类别和相对路径")
-            filename(target.name)
+            filename(target.name, model_type=target_category)
             file_id = drive["drive_file_id"]
             if not isinstance(file_id, str) or not FILE_ID.fullmatch(file_id):
                 raise ModelError("Drive 文件 ID 无效")

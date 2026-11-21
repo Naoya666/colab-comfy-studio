@@ -833,3 +833,239 @@ def test_hf_dataset_and_model_end_to_end_download_and_prepare_dependencies(repo)
     m_saved = lib.add({**m_candidate, "model_type": "checkpoints"})
     assert "repo_type" not in m_saved["source_identity"]
     assert m_saved["download_url"] == f"https://huggingface.co/org/model-repo/resolve/{commit}/weights/base.safetensors"
+
+
+def _make_safe_pytorch_zip() -> bytes:
+    """Build a minimal valid PyTorch ZIP archive with safe pure-tensor pickle opcodes."""
+    import io
+    import zipfile
+
+    # Protocol 2 pickle calling collections.OrderedDict and torch._utils._rebuild_tensor_v2 + torch.FloatStorage
+    pkl = (
+        b"\x80\x02"
+        b"ccollections\nOrderedDict\n)\x81"
+        b"ctorch._utils\n_rebuild_tensor_v2\n"
+        b"ctorch\nFloatStorage\n"
+        b"K\x00\x86R."
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("archive/data.pkl", pkl)
+        zf.writestr("archive/data/0", b"\x00" * 16)
+    return buf.getvalue()
+
+
+def _make_safe_pytorch_legacy() -> bytes:
+    """Build a minimal legacy PyTorch checkpoint (magic + protocol + sys_info + state_dict)."""
+    import pickle
+    from app.gpu.model_sources import PYTORCH_LEGACY_MAGIC
+
+    s0 = pickle.dumps(PYTORCH_LEGACY_MAGIC, protocol=2)
+    s1 = pickle.dumps(1001, protocol=2)
+    s2 = pickle.dumps({"little_endian": True, "type_sizes": {"short": 2, "int": 4, "long": 4}}, protocol=2)
+    s3 = (
+        b"\x80\x02"
+        b"ccollections\nOrderedDict\n)\x81"
+        b"ctorch._utils\n_rebuild_tensor_v2\n"
+        b"ctorch\nFloatStorage\n"
+        b"K\x00\x86R."
+    )
+    return s0 + s1 + s2 + s3
+
+
+def _make_malicious_pytorch_zip(use_stack_global: bool = False) -> bytes:
+    import io
+    import zipfile
+
+    if use_stack_global:
+        # Protocol 4 STACK_GLOBAL subprocess.Popen
+        pkl = b"\x80\x04\x8c\nsubprocess\x8c\x05Popen\x93)\x81."
+    else:
+        # Protocol 2 GLOBAL os.system
+        pkl = b"\x80\x02cos\nsystem\n(X\x02\x00\x00\x00idtR."
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("archive/data.pkl", pkl)
+    return buf.getvalue()
+
+
+def test_hf_ultrasharp_slash_revision_query_params_and_errors():
+    commit = "d2db793b0909d31d651019f7aa17891616cc3327"
+    ultra_sha = "a5812231fc936b42af08a5edba784195495d303d5b3248c24489ef0c4021fe01"
+    requested = []
+
+    def handler(request):
+        path = request.url.raw_path.decode()
+        requested.append(path)
+        if path == "/api/models/MochaPixel/4XUltrasharpV10/revision/main?blobs=true":
+            return httpx.Response(200, json={"sha": commit, "siblings": [
+                {"rfilename": "4xUltrasharp_4xUltrasharpV10.pt", "lfs": {"sha256": ultra_sha, "size": 66961958}},
+                {"rfilename": "README.md", "size": 42},
+            ]})
+        if path == "/api/models/org/slash-branch/refs":
+            return httpx.Response(200, json={"branches": [{"name": "release/v1.0"}], "tags": [], "converts": []})
+        if path == "/api/models/org/slash-branch/revision/release%2Fv1.0?blobs=true":
+            return httpx.Response(200, json={"sha": commit, "siblings": [
+                {"rfilename": "sub/model.safetensors", "lfs": {"sha256": HASH, "size": len(DATA)}},
+            ]})
+        if path == "/api/models/org/gated-repo/revision/main?blobs=true":
+            return httpx.Response(403, text="gated")
+        if path == "/api/models/org/empty-tree/revision/main?blobs=true":
+            return httpx.Response(200, json={"sha": commit, "siblings": [{"rfilename": "docs/readme.md", "size": 10}]})
+        return httpx.Response(404)
+
+    sources = Sources(source_http(handler))
+
+    # UltraSharp blob + resolve + tracking query params under upscale_models
+    for url in (
+        "https://huggingface.co/MochaPixel/4XUltrasharpV10/blob/main/4xUltrasharp_4xUltrasharpV10.pt",
+        "https://huggingface.co/MochaPixel/4XUltrasharpV10/resolve/main/4xUltrasharp_4xUltrasharpV10.pt?download=true&utm_source=test",
+    ):
+        files = sources.resolve({"url": url, "model_type": "upscale_models"})
+        assert len(files) == 1
+        assert files[0]["filename"] == "4xUltrasharp_4xUltrasharpV10.pt"
+        assert files[0]["model_type"] == "upscale_models"
+        assert files[0]["expected_size"] == 66961958
+        assert files[0]["expected_sha256"] == ultra_sha
+        assert files[0]["download_url"] == f"https://huggingface.co/MochaPixel/4XUltrasharpV10/resolve/{commit}/4xUltrasharp_4xUltrasharpV10.pt"
+        assert "repo_type" not in files[0]["source_identity"]
+
+    # Reject .pt when non-upscale category is selected
+    with pytest.raises(ModelError, match="upscale_models"):
+        sources.resolve({
+            "url": "https://huggingface.co/MochaPixel/4XUltrasharpV10/blob/main/4xUltrasharp_4xUltrasharpV10.pt",
+            "model_type": "checkpoints",
+        })
+
+    # Branch containing '/' disambiguated via /refs
+    slash_files = sources.resolve({"url": "https://huggingface.co/org/slash-branch/blob/release/v1.0/sub/model.safetensors"})
+    assert len(slash_files) == 1 and slash_files[0]["filename"] == "model.safetensors"
+
+    # Missing file inside existing repo -> clear 404
+    with pytest.raises(ModelError, match="404"):
+        sources.resolve({"url": "https://huggingface.co/MochaPixel/4XUltrasharpV10/blob/main/does_not_exist.safetensors"})
+
+    # Missing repo -> 404
+    with pytest.raises(ModelError, match="404"):
+        sources.resolve({"url": "https://huggingface.co/org/nonexistent-repo"})
+
+    # Gated repo -> 403 permission error
+    with pytest.raises(ModelError, match="403"):
+        sources.resolve({"url": "https://huggingface.co/org/gated-repo"})
+
+    # Tree directory with no supported weights -> explicit directory error
+    with pytest.raises(ModelError, match="目录"):
+        sources.resolve({"url": "https://huggingface.co/org/empty-tree/tree/main/docs"})
+
+
+def test_controlled_upscale_pt_pth_security_and_downloads(repo):
+    commit = "d2db793b0909d31d651019f7aa17891616cc3327"
+    legacy_pt = _make_safe_pytorch_legacy()
+    legacy_sha = hashlib.sha256(legacy_pt).hexdigest()
+    zip_pth = _make_safe_pytorch_zip()
+    zip_sha = hashlib.sha256(zip_pth).hexdigest()
+    gguf_bytes = b"GGUF\x03\x00\x00\x00" + b"\x00" * 32
+    gguf_sha = hashlib.sha256(gguf_bytes).hexdigest()
+    onnx_bytes = b"\x08\x07\x12\x04test" + b"\x00" * 32
+    onnx_sha = hashlib.sha256(onnx_bytes).hexdigest()
+
+    def handler(request):
+        host = request.headers["host"]
+        path = request.url.raw_path.decode()
+        if path == "/api/models/MochaPixel/4XUltrasharpV10/revision/main?blobs=true":
+            return httpx.Response(200, json={"sha": commit, "siblings": [
+                {"rfilename": "4xUltrasharp_4xUltrasharpV10.pt", "lfs": {"sha256": legacy_sha, "size": len(legacy_pt)}},
+            ]})
+        if host == "huggingface.co" and path.endswith("/4xUltrasharp_4xUltrasharpV10.pt"):
+            return httpx.Response(200, content=legacy_pt)
+        if host == "api.github.com" and path == "/repos/xinntao/Real-ESRGAN/releases/tags/v0.2.2.4":
+            return httpx.Response(200, json={"assets": [
+                {"name": "RealESRGAN_x4plus_anime_6B.pth", "size": len(zip_pth), "digest": f"sha256:{zip_sha}"},
+            ]})
+        if host == "github.com" and path.endswith("/RealESRGAN_x4plus_anime_6B.pth"):
+            return httpx.Response(200, content=zip_pth)
+        if host == "example.com" and path == "/model.gguf":
+            return httpx.Response(200, content=gguf_bytes)
+        if host == "example.com" and path == "/model.onnx":
+            return httpx.Response(200, content=onnx_bytes)
+        return httpx.Response(404)
+
+    drive = FakeDrive()
+    lib = ModelLibrary(repo, "owner", drive=drive, http=source_http(handler, {"huggingface": "hf-tok"}))
+
+    # 1. Valid legacy .pt upscale model from Hugging Face
+    [pt_cand] = lib.resolve({
+        "url": "https://huggingface.co/MochaPixel/4XUltrasharpV10/blob/main/4xUltrasharp_4xUltrasharpV10.pt",
+        "model_type": "upscale_models",
+    })
+    pt_row = lib.add(pt_cand)
+    ModelTransfer(lib, lib.enqueue(pt_row["id"])).run()
+    pt_ready = lib.get(pt_row["id"])
+    assert pt_ready["state"] == "ready" and pt_ready["sha256"] == legacy_sha and pt_ready["model_type"] == "upscale_models"
+
+    # 2. Valid modern ZIP .pth upscale model from trusted GitHub Release (xinntao)
+    [pth_cand] = lib.resolve({
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+        "model_type": "upscale_models",
+    })
+    assert pth_cand["expected_size"] == len(zip_pth) and pth_cand["expected_sha256"] == zip_sha
+    pth_row = lib.add(pth_cand)
+    ModelTransfer(lib, lib.enqueue(pth_row["id"])).run()
+    pth_ready = lib.get(pth_row["id"])
+    assert pth_ready["state"] == "ready" and pth_ready["sha256"] == zip_sha and pth_ready["integrity"] == "expected_hash_verified"
+
+    # 3. Regression: GGUF & ONNX downloads still work
+    gguf_row = lib.add({"filename": "m.gguf", "model_type": "diffusion_models", "source": "https",
+                        "download_url": "https://example.com/model.gguf", "expected_sha256": gguf_sha})
+    ModelTransfer(lib, lib.enqueue(gguf_row["id"])).run()
+    assert lib.get(gguf_row["id"])["state"] == "ready"
+
+    onnx_row = lib.add({"filename": "m.onnx", "model_type": "upscale_models", "source": "https",
+                        "download_url": "https://example.com/model.onnx", "expected_sha256": onnx_sha})
+    ModelTransfer(lib, lib.enqueue(onnx_row["id"])).run()
+    assert lib.get(onnx_row["id"])["state"] == "ready"
+
+    # 4. Non-upscale categories still block .pt / .pth
+    for bad_cat in ("checkpoints", "loras", "vae"):
+        with pytest.raises(ModelError):
+            lib.add({**pth_cand, "model_type": bad_cat})
+
+    # 5. Unauthorized .pt/.pth sources blocked (arbitrary host, untrusted GitHub owner, upload/drive)
+    for bad_url in (
+        "https://evil.example/upscaler.pt",
+        "https://github.com/random-attacker/fake/releases/download/v1/upscaler.pth",
+        "https://github.com/xinntao/Real-ESRGAN/raw/master/RealESRGAN_x4plus_anime_6B.pth",
+    ):
+        with pytest.raises(ModelError, match="未授权"):
+            lib.resolve({"url": bad_url, "model_type": "upscale_models"})
+        with pytest.raises(ModelError, match="未授权"):
+            lib.add({"filename": "bad.pth", "model_type": "upscale_models", "source": "https", "download_url": bad_url})
+
+    with pytest.raises(ModelError, match="受控"):
+        lib.add({"filename": "local.pth", "model_type": "upscale_models", "source": "upload", "drive_file_id": "file-123"})
+
+
+@pytest.mark.parametrize("filename_val,model_type,payload", [
+    ("spoofed.safetensors", "checkpoints", _make_safe_pytorch_zip()),
+    ("spoofed_legacy.safetensors", "checkpoints", _make_safe_pytorch_legacy()),
+    ("spoofed.gguf", "diffusion_models", b"not-a-gguf-payload-at-all"),
+    ("spoofed.onnx", "upscale_models", _make_safe_pytorch_zip()),
+    ("html_page.safetensors", "checkpoints", b"<!DOCTYPE html><html>404</html>"),
+    ("malicious_os.pth", "upscale_models", _make_malicious_pytorch_zip(use_stack_global=False)),
+    ("malicious_stack.pth", "upscale_models", _make_malicious_pytorch_zip(use_stack_global=True)),
+    ("corrupt.pt", "upscale_models", b"\x80\x02\x99\xfftruncated-corrupt-bytes"),
+    ("fake_pt.pt", "upscale_models", b"<html>not a torch model</html>"),
+])
+def test_weight_file_validation_blocks_spoofing_malicious_pickle_and_corruption(repo, filename_val, model_type, payload):
+    drive = FakeDrive()
+    url = (
+        f"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/{filename_val}"
+        if filename_val.endswith((".pt", ".pth"))
+        else f"https://example.com/{filename_val}"
+    )
+    lib = ModelLibrary(repo, "owner", drive=drive, http=source_http(lambda r: httpx.Response(200, content=payload)))
+    row = lib.add({"filename": filename_val, "model_type": model_type, "source": "https", "download_url": url})
+    ModelTransfer(lib, lib.enqueue(row["id"])).run()
+    failed = lib.get(row["id"])
+    assert failed["state"] == "failed" and drive.uploads == 0
+    assert failed["error"]
