@@ -155,6 +155,7 @@ export function CreatePanel({
   const plist = useMemo(() => parameterList(manifest), [manifest]);
   const keys = useMemo(() => plist.map((p, i) => parameterKey(p, i)), [plist]);
   const promptKey = keys.find((k) => k === 'prompt') || keys.find((k) => /prompt|caption/i.test(k) && !/negative/i.test(k)) || 'prompt';
+  const negativePromptKey = keys.find((k) => /(^|_)negative(_prompt)?$/i.test(k)) || '';
   const hasSize = keys.includes('width') && keys.includes('height');
   const wParam = plist.find((p, i) => parameterKey(p, i) === 'width');
   const hParam = plist.find((p, i) => parameterKey(p, i) === 'height');
@@ -172,9 +173,13 @@ export function CreatePanel({
 
   useEffect(() => { setCustomSize(false); }, [workflowId]);
 
-  const excluded = useMemo(() => [promptKey, ...(hasSize ? ['width', 'height'] : [])], [promptKey, hasSize]);
+  const excluded = useMemo(
+    () => [promptKey, ...(negativePromptKey ? [negativePromptKey] : []), ...(hasSize ? ['width', 'height'] : [])],
+    [promptKey, negativePromptKey, hasSize],
+  );
   const split = useMemo(() => splitParams(manifest, excluded), [manifest, excluded]);
   const promptValue = String(params[promptKey] ?? '');
+  const negativePromptValue = negativePromptKey ? String(params[negativePromptKey] ?? '') : '';
   const patch = (next: Record<string, unknown>) => setParams({ ...params, ...next });
 
   const hasDeclaredAssets = Boolean(
@@ -250,31 +255,33 @@ export function CreatePanel({
             </div>
           </div>
 
-          <div hidden={!runtimeExpanded} className={styles.stack}>
-            <Segmented<Provider>
-              ariaLabel="运行方式"
-              value={runtime}
-              onChange={setRuntime}
-              options={[
-                { value: 'mock', label: '离线模拟', sub: '不扣 CU', icon: <Monitor size={17} strokeWidth={1.6} aria-hidden /> },
-                { value: 'colab', label: 'Colab GPU', sub: settings?.real_enabled ? '真实出图' : '未启用', disabled: !settings?.real_enabled, icon: <Cloud size={17} strokeWidth={1.6} aria-hidden /> },
-              ]}
-            />
-            <RuntimeSelection value={runtimeChoice} accounts={accounts} instances={instances} provider={runtime}
-              onChange={onRuntimeChoiceChange} />
-            {gpuSelection}
-            {batchMode === 'retain' && <p className="muted small">保留机器会继续产生 CU；本站只承诺保留到设定截止，Google 仍可能提前回收。</p>}
-            {runtime === 'colab' && (
-              <div className="field">
-                <label htmlFor="max-runtime">单个任务最长运行（分钟）</label>
-                <input id="max-runtime" type="number" inputMode="numeric" min={5} step={1} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
-                <span className={styles.hint}>超时会被强制关机，已花的 CU 不退。</span>
-              </div>
-            )}
-            <p className="muted small">
-              {runtime === 'mock' ? RUNTIME_HELP.mock : `${RUNTIME_HELP.colab}今日限额 ${shown(settings?.budget?.daily_units)} CU。`}
-            </p>
-          </div>
+          {runtimeExpanded && (
+            <div className={styles.stack}>
+              <Segmented<Provider>
+                ariaLabel="运行方式"
+                value={runtime}
+                onChange={setRuntime}
+                options={[
+                  { value: 'mock', label: '离线模拟', sub: '不扣 CU', icon: <Monitor size={17} strokeWidth={1.6} aria-hidden /> },
+                  { value: 'colab', label: 'Colab GPU', sub: settings?.real_enabled ? '真实出图' : '未启用', disabled: !settings?.real_enabled, icon: <Cloud size={17} strokeWidth={1.6} aria-hidden /> },
+                ]}
+              />
+              <RuntimeSelection value={runtimeChoice} accounts={accounts} instances={instances} provider={runtime}
+                onChange={onRuntimeChoiceChange} />
+              {gpuSelection}
+              {batchMode === 'retain' && <p className="muted small">保留机器会继续产生 CU；本站只承诺保留到设定截止，Google 仍可能提前回收。</p>}
+              {runtime === 'colab' && (
+                <div className="field">
+                  <label htmlFor="max-runtime">单个任务最长运行（分钟）</label>
+                  <input id="max-runtime" type="number" inputMode="numeric" min={5} step={1} value={maxRuntime} onChange={(e) => setMaxRuntime(Number(e.target.value))} />
+                  <span className={styles.hint}>超时会被强制关机，已花的 CU 不退。</span>
+                </div>
+              )}
+              <p className="muted small">
+                {runtime === 'mock' ? RUNTIME_HELP.mock : `${RUNTIME_HELP.colab}今日限额 ${shown(settings?.budget?.daily_units)} CU。`}
+              </p>
+            </div>
+          )}
         </section>
 
         {/* 2 创作类型 + 工作流 */}
@@ -352,7 +359,7 @@ export function CreatePanel({
           </details>
         </Card>
 
-        {/* 3 提示词 */}
+        {/* 3 提示词（含负面提示词） */}
         <Card
           icon={<Pencil size={17} strokeWidth={1.6} aria-hidden />}
           title="提示词"
@@ -372,6 +379,28 @@ export function CreatePanel({
               }
             }}
           />
+          {negativePromptKey ? (
+            <div className="field">
+              <label htmlFor={`gpu-${negativePromptKey}`}>负面提示词</label>
+              <textarea
+                id={`gpu-${negativePromptKey}`}
+                aria-label="负面提示词"
+                value={negativePromptValue}
+                disabled={!draftReady}
+                placeholder="不希望画面中出现的元素（选填），例如：lowres, blurry, extra fingers..."
+                rows={2}
+                onChange={(e) => setParams({ ...params, [negativePromptKey]: e.target.value })}
+                onKeyDown={(e) => {
+                  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && draftReady && loading !== 'submit') {
+                    e.preventDefault();
+                    onSubmit();
+                  }
+                }}
+              />
+            </div>
+          ) : draftReady && manifest ? (
+            <p className="muted small">当前工作流未提供单独的负面提示词参数。</p>
+          ) : null}
         </Card>
 
         {/* 4 参考素材（有素材槽位时放在前面，方便图生图/图生视频） */}

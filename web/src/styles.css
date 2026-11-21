@@ -16,6 +16,9 @@
   --primary-hover: #e6e6e6;
   --danger: #ff6b6b;
   --danger-line: rgba(255, 107, 107, 0.45);
+  --warning: #ffd27d;
+  --warning-bg: rgba(255, 210, 125, 0.08);
+  --warning-line: rgba(255, 210, 125, 0.38);
   --overlay: rgba(0, 0, 0, 0.7);
 
   --r-sm: 8px;
@@ -47,6 +50,9 @@
   --primary-hover: #262626;
   --danger: #d93030;
   --danger-line: rgba(217, 48, 48, 0.45);
+  --warning: #8a5200;
+  --warning-bg: #fff8e6;
+  --warning-line: rgba(154, 92, 0, 0.35);
   --overlay: rgba(0, 0, 0, 0.45);
   color-scheme: light;
 }
@@ -67,12 +73,16 @@
     --primary-hover: #262626;
     --danger: #d93030;
     --danger-line: rgba(217, 48, 48, 0.45);
+    --warning: #8a5200;
+    --warning-bg: #fff8e6;
+    --warning-line: rgba(154, 92, 0, 0.35);
     --overlay: rgba(0, 0, 0, 0.45);
     color-scheme: light;
   }
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+[hidden] { display: none !important; }
 
 html, body, #root {
   margin: 0;

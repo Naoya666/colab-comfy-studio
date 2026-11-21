@@ -83,13 +83,14 @@
 }
 
 .warning {
-  color: #ffe1a8;
-  border-color: rgba(255, 225, 168, 0.45);
+  color: var(--warning, #ffd27d);
+  background: var(--warning-bg, rgba(255, 210, 125, 0.08));
+  border-color: var(--warning-line, rgba(255, 210, 125, 0.38));
 }
 
 .warningInline {
   flex: 1 1 100%;
-  color: #ffe1a8;
+  color: var(--warning, #ffd27d);
   font-size: 0.76rem;
   line-height: 1.4;
 }
@@ -500,12 +501,13 @@
 }
 
 .cuHint {
-  border: 1px solid rgba(255, 225, 168, 0.35);
+  border: 1px solid var(--warning-line, rgba(255, 210, 125, 0.38));
   border-radius: var(--r-sm, 8px);
-  color: #ffe1a8;
+  background: var(--warning-bg, rgba(255, 210, 125, 0.08));
+  color: var(--warning, #ffd27d);
   padding: 8px 10px;
   font-size: 0.78rem;
-  line-height: 1.45;
+  line-height: 1.5;
 }
 
 /* Controlled workbench */
@@ -595,13 +597,14 @@
   margin: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  color: #ddd;
+  color: var(--v-text-2);
   font: 0.76rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .readOnlyNotice {
-  color: #ffe1a8;
-  border: 1px solid rgba(255, 225, 168, 0.45);
+  color: var(--warning, #ffd27d);
+  background: var(--warning-bg, rgba(255, 210, 125, 0.08));
+  border: 1px solid var(--warning-line, rgba(255, 210, 125, 0.38));
   border-radius: var(--r-sm, 8px);
   padding: 8px 10px;
   font-size: 0.78rem;
