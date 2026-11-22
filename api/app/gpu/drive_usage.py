@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from typing import Any
 
 from .accounts import AccountService
@@ -14,9 +14,7 @@ from .model_library import ModelLibrary
 
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 CACHE_TTL_SECONDS = 300.0
-MAX_FILES = 6000
-MAX_FOLDERS = 500
-MAX_PAGES = 80
+MAX_BULK_PAGES = 25
 
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
@@ -158,6 +156,40 @@ def _find_owner_folder_readonly(drive: DriveStorage, owner_id: str) -> str | Non
     return drive._find_folder(owner_id, root_id)
 
 
+def _bulk_list_app_entries(drive: DriveStorage) -> tuple[dict[str, list[dict[str, Any]]], bool]:
+    """Fetch all app-visible Drive entries in bulk (drive.file scope keeps this tiny and fast)."""
+    children: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    page_token: str | None = None
+    pages = 0
+    truncated = False
+    while True:
+        if pages >= MAX_BULK_PAGES:
+            truncated = True
+            break
+        params: dict[str, str] = {
+            "q": "trashed = false",
+            "pageSize": "1000",
+            "fields": "nextPageToken,files(id,name,mimeType,size,parents)",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        response = drive._request("GET", drive.base_url + "/files", params=params)
+        payload = drive._ensure_ok(response, "空间统计批量读取")
+        pages += 1
+        for item in payload.get("files") or []:
+            if not isinstance(item, dict):
+                continue
+            parents = item.get("parents")
+            if isinstance(parents, list):
+                for parent_id in parents:
+                    if isinstance(parent_id, str) and parent_id:
+                        children[parent_id].append(item)
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            break
+    return children, truncated
+
+
 def collect_drive_usage(
     repo,
     owner_id: str,
@@ -221,65 +253,37 @@ def collect_drive_usage(
             key: {"bytes": 0, "count": 0} for key, _, _ in _CATEGORY_META
         }
         seen_files: set[str] = set()
+        seen_folders: set[str] = set()
         truncated = False
 
         if owner_folder:
+            children_map, truncated = _bulk_list_app_entries(storage)
             queue: deque[tuple[str, tuple[str, ...]]] = deque([(owner_folder, ())])
-            visited_folders = 0
-            pages = 0
-            files_scanned = 0
-
             while queue:
-                if visited_folders >= MAX_FOLDERS or pages >= MAX_PAGES or files_scanned >= MAX_FILES:
-                    truncated = True
-                    break
                 folder_id, prefix = queue.popleft()
-                visited_folders += 1
-                page_token: str | None = None
-                while True:
-                    if pages >= MAX_PAGES or files_scanned >= MAX_FILES:
-                        truncated = True
-                        break
-                    params: dict[str, str] = {
-                        "q": f"'{storage._q(folder_id)}' in parents and trashed = false",
-                        "pageSize": "200",
-                        "fields": "nextPageToken,files(id,name,mimeType,size)",
-                    }
-                    if page_token:
-                        params["pageToken"] = page_token
-                    response = storage._request("GET", storage.base_url + "/files", params=params)
-                    payload = storage._ensure_ok(response, "空间统计目录读取")
-                    pages += 1
-                    for item in payload.get("files") or []:
-                        if not isinstance(item, dict):
+                if folder_id in seen_folders:
+                    continue
+                seen_folders.add(folder_id)
+                for item in children_map.get(folder_id, ()):
+                    fid = str(item.get("id") or "")
+                    name = str(item.get("name") or "")
+                    mime = str(item.get("mimeType") or "")
+                    if not fid:
+                        continue
+                    if mime == FOLDER_MIME:
+                        if prefix == ("models",) and name == "native-index":
                             continue
-                        fid = str(item.get("id") or "")
-                        name = str(item.get("name") or "")
-                        mime = str(item.get("mimeType") or "")
-                        if not fid:
-                            continue
-                        if mime == FOLDER_MIME:
-                            # Skip models/native-index shortcut directory to avoid pointless traversal
-                            if prefix == ("models",) and name == "native-index":
-                                continue
-                            queue.append((fid, (*prefix, name)))
-                            continue
-                        if mime == SHORTCUT_MIME or mime.startswith("application/vnd.google-apps."):
-                            continue
-                        if fid in seen_files:
-                            continue
-                        seen_files.add(fid)
-                        files_scanned += 1
-                        size = _int_or_none(item.get("size")) or 0
-                        bucket = _classify_path((*prefix, name), fid, indexed_ids)
-                        totals[bucket]["bytes"] += size
-                        totals[bucket]["count"] += 1
-                        if files_scanned >= MAX_FILES:
-                            truncated = True
-                            break
-                    page_token = payload.get("nextPageToken")
-                    if not page_token or truncated:
-                        break
+                        queue.append((fid, (*prefix, name)))
+                        continue
+                    if mime == SHORTCUT_MIME or mime.startswith("application/vnd.google-apps."):
+                        continue
+                    if fid in seen_files:
+                        continue
+                    seen_files.add(fid)
+                    size = _int_or_none(item.get("size")) or 0
+                    bucket = _classify_path((*prefix, name), fid, indexed_ids)
+                    totals[bucket]["bytes"] += size
+                    totals[bucket]["count"] += 1
 
         categories = [
             {

@@ -167,6 +167,14 @@ def _build_mock_drive(repo, tree_folders: dict[str, list[dict]], file_bytes: dic
             return httpx.Response(200, json={"storageQuota": quota})
         if path.endswith("/files") and request.method == "GET":
             q = request.url.params.get("q", "")
+            if q.strip() == "trashed = false":
+                all_entries = [
+                    {**e, "parents": [parent_id]}
+                    for parent_id, entries in tree_folders.items()
+                    for e in entries
+                    if e["id"] not in trashed_out
+                ]
+                return httpx.Response(200, json={"files": all_entries})
             # Match folder lookup by name & parent
             for parent_id, entries in tree_folders.items():
                 if f"'{parent_id}' in parents" in q:
