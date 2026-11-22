@@ -92,7 +92,7 @@ def _widget_fields(node_type, node_types):
     return fields
 
 
-def _visual_node_inputs(node, node_types, *, link_values=None):
+def _visual_node_inputs(node, node_types, *, link_values=None, passthrough_links=frozenset()):
     node_type = node.get("type")
     values = node.get("widgets_values")
     if isinstance(values, dict):
@@ -118,48 +118,92 @@ def _visual_node_inputs(node, node_types, *, link_values=None):
         sname = slot.get("name")
         if link_values and lid in link_values and isinstance(sname, str):
             inputs[sname] = link_values[lid]
+        elif lid in passthrough_links:
+            # Unlinked subgraph parameter without an outer widget slot retains the inner node's default.
+            continue
         elif sname in inputs:
             inputs.pop(sname, None)
     return inputs
 
 
-def _subgraph_link_values(outer_node, subgraph, parent_link_values):
+def _subgraph_link_values(outer_node, subgraph, parent_link_values, parent_passthrough_links=frozenset()):
     values = outer_node.get("widgets_values")
     slots = [s for s in (outer_node.get("inputs") or ()) if isinstance(s, dict)]
+    slots_by_name = {s["name"]: s for s in slots if isinstance(s.get("name"), str)}
+    explicit_widget_slots = [s for s in slots if isinstance(s.get("widget"), dict)]
     slot_values = {}
-    widget_idx = 0
-    for slot in slots:
-        name = slot.get("name")
-        is_widget = isinstance(slot.get("widget"), dict)
-        widget_val = None
-        has_widget_val = False
-        if is_widget and isinstance(values, list):
-            if widget_idx < len(values):
-                widget_val = values[widget_idx]
+    externally_linked = set()
+
+    if explicit_widget_slots or isinstance(values, dict):
+        widget_idx = 0
+        for slot in slots:
+            name = slot.get("name")
+            is_widget = isinstance(slot.get("widget"), dict)
+            widget_val = None
+            has_widget_val = False
+            if is_widget and isinstance(values, list):
+                if widget_idx < len(values):
+                    widget_val = values[widget_idx]
+                    has_widget_val = True
+                widget_idx += 1
+            elif isinstance(values, dict) and isinstance(name, str) and name in values:
+                widget_val = values[name]
                 has_widget_val = True
-            widget_idx += 1
-        elif isinstance(values, dict) and isinstance(name, str) and name in values:
-            widget_val = values[name]
-            has_widget_val = True
-        link_id = slot.get("link")
-        if link_id is not None:
-            if parent_link_values and link_id in parent_link_values and isinstance(name, str):
-                slot_values[name] = parent_link_values[link_id]
-        elif has_widget_val and isinstance(name, str):
-            slot_values[name] = widget_val
+            link_id = slot.get("link")
+            if link_id is not None:
+                if parent_link_values and link_id in parent_link_values and isinstance(name, str):
+                    slot_values[name] = parent_link_values[link_id]
+                elif link_id not in parent_passthrough_links and isinstance(name, str):
+                    externally_linked.add(name)
+            elif has_widget_val and isinstance(name, str):
+                slot_values[name] = widget_val
+    else:
+        for slot in slots:
+            name = slot.get("name")
+            link_id = slot.get("link")
+            if link_id is not None and isinstance(name, str):
+                if parent_link_values and link_id in parent_link_values:
+                    slot_values[name] = parent_link_values[link_id]
+                elif link_id not in parent_passthrough_links:
+                    externally_linked.add(name)
+        if isinstance(values, list):
+            widget_idx = 0
+            for sg_in in subgraph.get("inputs") or ():
+                if not isinstance(sg_in, dict):
+                    continue
+                in_name = sg_in.get("name")
+                if not isinstance(in_name, str) or in_name in slots_by_name:
+                    continue
+                if sg_in.get("type") in _WIDGET_PRIMITIVES and widget_idx < len(values):
+                    slot_values[in_name] = values[widget_idx]
+                    widget_idx += 1
 
     inner_links = {}
+    passthrough_links = set()
     for sg_in in subgraph.get("inputs") or ():
         if not isinstance(sg_in, dict):
             continue
         in_name = sg_in.get("name")
+        lids = sg_in.get("linkIds") or ()
         if in_name in slot_values:
-            for lid in sg_in.get("linkIds") or ():
+            for lid in lids:
                 inner_links[lid] = slot_values[in_name]
-    return inner_links
+        elif in_name not in externally_linked:
+            passthrough_links.update(lids)
+    return inner_links, frozenset(passthrough_links)
 
 
-def _expand_visual_nodes(container, subgraphs, node_types, *, prefix="", parent_bypassed=False, link_values=None, stack=frozenset()):
+def _expand_visual_nodes(
+    container,
+    subgraphs,
+    node_types,
+    *,
+    prefix="",
+    parent_bypassed=False,
+    link_values=None,
+    passthrough_links=frozenset(),
+    stack=frozenset(),
+):
     for n in container.get("nodes") or ():
         if not isinstance(n, dict) or "id" not in n:
             continue
@@ -168,7 +212,7 @@ def _expand_visual_nodes(container, subgraphs, node_types, *, prefix="", parent_
         node_type = n.get("type")
         if isinstance(node_type, str) and node_type in subgraphs and node_type not in stack and len(stack) < 8:
             sg = subgraphs[node_type]
-            inner_links = _subgraph_link_values(n, sg, link_values)
+            inner_links, inner_passthrough = _subgraph_link_values(n, sg, link_values, passthrough_links)
             yield from _expand_visual_nodes(
                 sg,
                 subgraphs,
@@ -176,10 +220,11 @@ def _expand_visual_nodes(container, subgraphs, node_types, *, prefix="", parent_
                 prefix=f"{node_id}:",
                 parent_bypassed=bypassed,
                 link_values=inner_links,
+                passthrough_links=inner_passthrough,
                 stack=stack | {node_type},
             )
         else:
-            inputs = _visual_node_inputs(n, node_types, link_values=link_values)
+            inputs = _visual_node_inputs(n, node_types, link_values=link_values, passthrough_links=passthrough_links)
             yield node_id, node_type, inputs, bypassed, n
 DIRECTORIES = {x: x for x in ("checkpoints", "loras", "vae", "diffusion_models", "text_encoders",
                               "clip_vision", "controlnet", "upscale_models", "embeddings", "latent_upscale_models")}

@@ -675,6 +675,30 @@ def test_visual_ui_workflow_expands_comfy_v1_subgraphs_and_outer_widget_override
         ("upscale_models", "4xUltrasharp_4xUltrasharpV10.pt"),
     ]
 
+    # Also support older subgraph nodes where outer_node["inputs"] omits unlinked widget slots.
+    legacy_outer = {
+        "nodes": [
+            {
+                "id": 167,
+                "type": sg_base,
+                "mode": 0,
+                "inputs": [],
+                "widgets_values": [
+                    "krea2_turbo_int8_convrot.safetensors",
+                    "qwen3vl_4b_fp8_scaled.safetensors",
+                    "qwen_image_vae.safetensors",
+                ],
+            }
+        ],
+        "definitions": visual["definitions"],
+    }
+    legacy_found = list(native_models.dependencies({"workflow": legacy_outer}, [], visual=True))
+    assert [(d["category"], d["name"]) for d in legacy_found] == [
+        ("diffusion_models", "krea2_turbo_int8_convrot.safetensors"),
+        ("text_encoders", "qwen3vl_4b_fp8_scaled.safetensors"),
+        ("vae", "qwen_image_vae.safetensors"),
+    ]
+
 
 @pytest.mark.asyncio
 async def test_drive_workflows_list_save_delete_and_prepare_by_ref(local, monkeypatch, tmp_path):
