@@ -82,7 +82,7 @@ def creation_optimization_flags() -> dict[str, str]:
     defaults = {
         "CREATION_USE_UV": "1",
         "CREATION_PARALLEL_BOOTSTRAP": "1",
-        "CREATION_MULTI_STREAM_DRIVE": "1",
+        "CREATION_MULTI_STREAM_DRIVE": "0",
         "CREATION_DRIVE_STREAMS": "4",
         "CREATION_LOCAL_HASH_CACHE": "1",
         "CREATION_FAST_CONTROL_PLANE": "1",
@@ -1730,7 +1730,7 @@ class DriveCache:
         except ValueError:
             streams = 4
         use_multi = (
-            _creation_flag("CREATION_MULTI_STREAM_DRIVE", True)
+            _creation_flag("CREATION_MULTI_STREAM_DRIVE", False)
             and streams > 1
             and size >= self._min_multistream_bytes
         )
@@ -2071,7 +2071,9 @@ def _restore_weights(
         record["seconds"] = round(time.time() - started, 1)
         return record
 
-    items = list(by_target.values())
+    # Schedule largest weights (e.g. UNet/DiT/CLIP) first so they start at t=0
+    # and are never tail-delayed behind small LoRAs in the 4-worker pool.
+    items = sorted(by_target.values(), key=lambda x: -(int(x.get("size") or 0)))
     with ThreadPoolExecutor(max_workers=4) as pool:
         records = list(pool.map(local, items))
         if not prep and any(not record.get("source") for record in records):

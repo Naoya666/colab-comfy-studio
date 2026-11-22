@@ -548,3 +548,57 @@ def test_tunnel_artifact_streaming_reuses_single_ws_with_4mib_chunks(tmp_path, m
     verified = objects.verify(item["artifact_id"], "owner", eid)
     assert verified["sha256"] == sha
 
+
+def test_default_drive_mode_and_largest_first_weight_scheduling(tmp_path, monkeypatch):
+    monkeypatch.delenv("CREATION_MULTI_STREAM_DRIVE", raising=False)
+    assert worker.creation_optimization_flags()["CREATION_MULTI_STREAM_DRIVE"] == "0"
+
+    small_bytes = b"s" * 16
+    big_bytes = b"b" * 1024
+    mid_bytes = b"m" * 128
+    weights = [
+        {"source": "drive", "drive_file_id": "1" * 32, "target": "loras/small.safetensors",
+         "size": len(small_bytes), "sha256": hashlib.sha256(small_bytes).hexdigest()},
+        {"source": "drive", "drive_file_id": "2" * 32, "target": "diffusion_models/big.safetensors",
+         "size": len(big_bytes), "sha256": hashlib.sha256(big_bytes).hexdigest()},
+        {"source": "drive", "drive_file_id": "3" * 32, "target": "vae/mid.safetensors",
+         "size": len(mid_bytes), "sha256": hashlib.sha256(mid_bytes).hexdigest()},
+    ]
+    by_id = {
+        "1" * 32: small_bytes,
+        "2" * 32: big_bytes,
+        "3" * 32: mid_bytes,
+    }
+    cache = worker.DriveCache("t" * 32, "f" * 32)
+    monkeypatch.setattr(
+        cache,
+        "_json",
+        lambda method, url: {
+            "id": (fid := url.split("/files/")[1].split("?")[0]),
+            "size": str(len(by_id[fid])),
+            "md5Checksum": hashlib.md5(by_id[fid], usedforsecurity=False).hexdigest(),
+            "mimeType": "application/octet-stream",
+            "trashed": False,
+        },
+    )
+    order: list[str] = []
+
+    def fake_fetch(entry, dest, *, expected_sha256=None, label=None):
+        order.append(label or "")
+        data = by_id[entry["id"]]
+        dest.write_bytes(data)
+        return hashlib.sha256(data).hexdigest(), entry["md5Checksum"]
+
+    monkeypatch.setattr(cache, "fetch", fake_fetch)
+    # Run with max_workers=1 to deterministically assert largest-first submission order.
+    orig_tpe = worker.ThreadPoolExecutor
+    monkeypatch.setattr(worker, "ThreadPoolExecutor", lambda max_workers=None: orig_tpe(max_workers=1))
+    comfy = tmp_path / "ComfyUI"
+    comfy.mkdir()
+    worker._restore_weights(comfy, {"weight_files": weights}, 60, cache, prep=False)
+    assert order == [
+        "diffusion_models/big.safetensors",
+        "vae/mid.safetensors",
+        "loras/small.safetensors",
+    ]
+

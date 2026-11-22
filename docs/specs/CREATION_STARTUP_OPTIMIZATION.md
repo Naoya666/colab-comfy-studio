@@ -35,9 +35,9 @@
   - 保留 `REVIEWED_CUSTOM_NODES` 并发 shallow clone 能力，并将 `_pack_env`/`_unpack_env` 升级为基于 `.dist-info/RECORD` 语义差集 + `pigz` + 同挂载点原子回滚的 v2 引擎（由 `CREATION_ENV_CACHE=auto|1|0` 控制，无额外依赖时默认跳过 tar 缓存直接走 `uv`）。
 - **全流水线并发启动**（[runtime_worker.py](../../api/app/gpu/runtime_worker.py)）：
   - 在 `CREATION_PARALLEL_BOOTSTRAP=1` 下，完成 ~2–3s 的 ComfyUI checkout 后，后台并发执行 `uv` 依赖安装，同时前台并发拉取主权重与用户 LoRA（HF 兜底仅在缺少 `huggingface_hub` 时等待 `uv` 完成），把 Python 依赖安装从关键路径隐藏。
-- **纯 Python 多流 Range Drive 下载 + 有界滑窗单遍双哈希 + 本地 Stamp 缓存**（[runtime_worker.py](../../api/app/gpu/runtime_worker.py)）：
-  - 对 ≥32 MiB 的 Drive 权重启用纯 Python 多流分片下载（默认 6 路、16 MiB 分片、进程级 12 流并发信号量、严格 `(streams + 2)` 有界内存滑窗 ≤ ~128 MiB 峰值内存防 T4 OOM），严格校验 `206` + `Content-Range` 与单分片指数退避重试，遇到 HTTP `200` 或非校验错误自动无损回退单流；
-  - 多流与单流均在写盘同时单遍计算 **SHA-256 + MD5**，彻底消除下载后的二次全盘重读；
+- **单遍双哈希 Drive 权重下载 + 大文件优先调度 + 本地 Stamp 缓存 + 可选多流 Range 加速**（[runtime_worker.py](../../api/app/gpu/runtime_worker.py)）：
+  - 默认（`CREATION_MULTI_STREAM_DRIVE=0`）采用 4 文件并发的纯 C OpenSSL `urllib` 连续全量拉取，边写盘边单遍计算 **SHA-256 + MD5**，彻底消除下载后的二次全盘重读，并按文件大小**从大到小排序提交**确保大体积 UNet/DiT 在 `t=0` 立即起跑（实测在 Colab→Drive 链路下显著快于 HTTP Range 拆分）；
+  - 保留纯 Python 大段连续 Range 多流引擎作为按需开关（`CREATION_MULTI_STREAM_DRIVE=1`，≥128 MiB、默认 4 路连续流 `os.pwrite` + 断流续传，遇到 HTTP `200` 或非校验错误自动无损回退单流）；
   - 持久化 VM 本地 `.model-hash-cache.json`（按 `(dev, ino, size, mtime_ns, ctime_ns)` 索引）+ C 级 `hashlib.file_digest`，同机复验权重降至毫秒级。
 
 ### 2.2 同机切工作流与换用户 LoRA（P1）
@@ -66,9 +66,29 @@
 | --- | --- | --- |
 | `CREATION_USE_UV` | `1` | 合并基础依赖安装并优先使用 `uv` + `gpu-constraints.txt`（失败自动回退 `pip`） |
 | `CREATION_PARALLEL_BOOTSTRAP` | `1` | `uv` 依赖安装、用户 LoRA 与模型权重并发准备 |
-| `CREATION_MULTI_STREAM_DRIVE` | `1` | Drive 大权重（≥32 MiB）纯 Python 多流 Range 并发下载与单遍双哈希 |
-| `CREATION_DRIVE_STREAMS` | `6` | 单文件并发 Range 流数（1–12，进程总并发上限 12） |
+| `CREATION_MULTI_STREAM_DRIVE` | `0` | 按需开启 Drive 大权重（≥128 MiB）纯 Python 4 路连续 Range 多流下载；默认 `0`（纯 C SSL 单流全量 GET + 4 文件并发 + 单遍双哈希，Colab→Drive 实测显著更快） |
+| `CREATION_DRIVE_STREAMS` | `4` | 开启 `CREATION_MULTI_STREAM_DRIVE=1` 时单文件并发 Range 流数（1–8） |
 | `CREATION_LOCAL_HASH_CACHE` | `1` | 同 VM 本地 Stamp 哈希缓存（`.model-hash-cache.json`） |
 | `CREATION_SKIP_DRIVE_PREP` | `1` | 全 Drive 绑定权重工作流跳过自动 CPU Prep |
 | `CREATION_FAST_CONTROL_PLANE` | `1` | Drive 子目录缓存、并发预检、精简 bootstrap、单 WS 4 MiB 产物拉取与快轮询 |
 | `CREATION_ENV_CACHE` | `auto` | 创作模式环境归档缓存策略（`auto`=仅自定义节点含额外依赖时启用，`1`=强制，`0`=关闭） |
+
+---
+
+## 4. 真实生产环境（`bero` + Colab L4）端到端验收对比
+
+验证对象：`anima-aesthetic-t2i`（12 个 Drive 绑定权重，总计 6.10 GiB，最大单文件 UNet 3988.5 MiB）与 `anima-aesthetic-hires`（13 个 Drive 绑定权重，6.16 GiB，含 12 个共享权重 + 1 个 63.9 MiB 放大模型），均在生产服务器 `bero` 上使用真实 Colab L4 实例完成，每轮验收后均通过 `POST /api/gpu/instances/{id}/stop`（`{"confirmed": true}`）确认释放（`active_instances=[]`、`active_leases=[]`）。
+
+| 场景 / 版本 | Job ID | CPU Prep | `restore_env` | `restore_weights` | `comfy_start` | `sampling` | 端到端总耗时 | 关键观察 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 优化前冷启（含 CPU Prep） | `cd802596` | **220.6s** | 32.3s | 45.8s | 27.0s | 22.0s | **~370s+** | CPU VM 无效打包 GPU 不可用 env 并重复下载全部 Drive 权重 |
+| 优化前冷启（无 Prep） | `5cdba060` | — | 31.0s | 67.0s | 29.0s | 22.0s | **~160s** | 串行两轮 `pip` 阻塞下载，下完再二次全盘重读算 SHA-256 |
+| 优化后 R1（`14337ed4`，16 MiB 分片 6 路 Range） | `2000b718` | **跳过（0s）** | **2.8s** | 90.3s | 27.7s | 21.0s | 187.8s | `uv` 9.1s 完全被权重下载掩盖；定位到 250 次 16 MiB Range 302 跳转导致 UNet 仅 44.6 MiB/s |
+| 优化后 R1b（`649dea09`，4 路大段连续 Range） | `89478e9e` | **跳过（0s）** | **2.2s** | 77.4s | 26.5s | 20.5s | 169.6s | 较 R1 缩短 18.2s（UNet 52.2 MiB/s），产物单 WS 1 块拉回仅 `2.9s` |
+| **优化后 R1c（默认单流 `urllib` + 单遍双哈希）** | `b24dab53` | **跳过（0s）** | **2.3s** | **57.4s** | 28.9s | 21.1s | **135.3s** | **全量 GET 聚合 108.8 MiB/s（UNet 70.0 / CLIP 75.2 / VAE 85.6 MiB/s），较 R1b 快 34.3s、较含 Prep 基线省 ~235s（-63%）** |
+| **优化后 R2（同机热复用 `t2i`）** | `13bf6cd2` | — | 0s | 0s | 0s（`warm_reuse=0.0s`） | 8.1s | **26.7s** | 准入 `1.3s`，热复用零重建，产物单 WS 1 块回传 `3.8s` |
+| 优化前同机切工作流（`t2i`→`hires`） | `49649e60` | — | 7.2s | 17.3s | 14.0s | 42.0s | — | 切换开销合计 **38.5s**（删旧权重 + 重检环境 + 重算 SHA-256） |
+| **优化后 R3（同机切工作流 `t2i`→`hires`）** | `64d0de7a` | — | **0s（跳过）** | **5.6s** | **10.9s** | 41.8s | **78.1s** | `in_place_restart` 原地保留 `ComfyUI/` 与环境，12 个共享权重（6.10 GiB）毫秒命中 Stamp 缓存，仅下载 63.9 MiB 放大模型（4.7s），**切换开销 38.5s → 16.5s（-57%）** |
+
+### 实测调优结论
+- Google Colab（GCE 内网）拉取 Google Drive 时，HTTP `Range` 多流会触发 Google Drive 的 Range 限速及 Python `httpx`/`h11` GIL 开销（实测单文件仅 20–52 MiB/s）；而纯 C OpenSSL `urllib` 完整 GET 配合 4 文件并发、大文件优先调度与写盘同时单遍 SHA-256 + MD5 校验，单文件可达 60–86 MiB/s、聚合超 108 MiB/s，因此将 `CREATION_MULTI_STREAM_DRIVE` 默认值定型为 `0`，同时完整保留多流大段 Range 引擎作为受限网络环境的按需开关（`CREATION_MULTI_STREAM_DRIVE=1`）。
