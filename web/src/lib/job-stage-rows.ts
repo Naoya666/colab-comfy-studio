@@ -6,9 +6,12 @@ const stages: Array<[string, string]> = [
   ['native_env_cache', '恢复环境缓存'], ['native_python', '安装基础依赖'],
   ['native_plugins_deps', '安装节点依赖'], ['native_environment', '准备原生环境'],
   ['restore_env', '恢复运行环境'],
-  ['restore_weights', '恢复模型权重'], ['warm_reuse', '复用已就绪环境'],
+  ['creation_python', '安装基础依赖'],
+  ['restore_weights', '恢复模型权重'], ['restore_loras', '恢复用户 LoRA'],
+  ['warm_reuse', '复用已就绪环境'],
   ['start_comfy', '启动 ComfyUI'], ['comfy_start', '启动 ComfyUI'],
   ['native_tunnel', '建立代理连接'],
+  ['creation_warming', '预热加载模型'],
   ['sampling', '采样生成'], ['upload', '保存产物'], ['cleanup', '释放算力'], ['delete', '释放算力'],
   ['prep_env', '准备运行环境'], ['prep_weights', '准备模型权重'],
 ];

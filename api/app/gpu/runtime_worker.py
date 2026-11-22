@@ -12,10 +12,13 @@ import contextlib
 import csv
 import errno
 import hashlib
+import importlib
 import importlib.metadata
 import io
 import json
+import math
 import os
+import random
 import re
 import shutil
 import signal
@@ -25,6 +28,7 @@ import sys
 import sysconfig
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -45,6 +49,55 @@ DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
 DRIVE_TOKEN = re.compile(r"^[A-Za-z0-9._~+/=-]{20,4096}$")
 FOLDER_MIME = "application/vnd.google-apps.folder"
 UPLOAD_CHUNK = 64 * 1024 * 1024  # must be a multiple of 256 KiB
+_MULTI_STREAM_MIN_BYTES = 32 * 1024 * 1024
+_MULTI_STREAM_PART_BYTES = 16 * 1024 * 1024
+_DRIVE_STREAM_SEM = threading.Semaphore(12)
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
+_LRU_RESERVE_BYTES = 5 * 1024**3
+_PROTECTED_DIST_NAMES = frozenset({"torch", "torchvision", "torchaudio", "triton"})
+_PROTECTED_TOP_DIRS = frozenset({"torch", "torchvision", "torchaudio", "triton", "torchgen", "functorch"})
+CREATION_FLAG_NAMES = (
+    "CREATION_USE_UV",
+    "CREATION_PARALLEL_BOOTSTRAP",
+    "CREATION_MULTI_STREAM_DRIVE",
+    "CREATION_DRIVE_STREAMS",
+    "CREATION_LOCAL_HASH_CACHE",
+    "CREATION_FAST_CONTROL_PLANE",
+    "CREATION_ENV_CACHE",
+)
+_LOCAL_HASH_LOCK = threading.Lock()
+_LOCAL_HASH_CACHE: dict[str, dict[str, Any]] = {}
+_LOCAL_HASH_LOADED_PATH: Path | None = None
+_RETRYABLE_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def _creation_flag(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def creation_optimization_flags() -> dict[str, str]:
+    defaults = {
+        "CREATION_USE_UV": "1",
+        "CREATION_PARALLEL_BOOTSTRAP": "1",
+        "CREATION_MULTI_STREAM_DRIVE": "1",
+        "CREATION_DRIVE_STREAMS": "6",
+        "CREATION_LOCAL_HASH_CACHE": "1",
+        "CREATION_FAST_CONTROL_PLANE": "1",
+        "CREATION_ENV_CACHE": "auto",
+    }
+    return {name: (os.getenv(name) or default).strip() or default for name, default in defaults.items()}
+
+
+def _env_cache_mode() -> str:
+    raw = (os.getenv("CREATION_ENV_CACHE") or "auto").strip().lower()
+    if raw in {"0", "false", "off", "no"}:
+        return "off"
+    if raw in {"1", "true", "on", "yes", "force"}:
+        return "force"
+    return "auto"
 # Third-party ComfyUI nodes that were read line by line and pinned. Nothing else may be installed;
 # no pip step runs for them (their only dependency, einops, is already in ComfyUI's requirements).
 REVIEWED_CUSTOM_NODES = {
@@ -313,6 +366,7 @@ def _start_comfy_service(service_dir: Path, fingerprint: str, cache_reason: str,
         if deadline is None:
             _http_json(_service_api_url("/system_stats"), timeout=5)
         else:
+            poll_interval = 0.3 if _creation_flag("CREATION_FAST_CONTROL_PLANE", True) else 1.0
             while time.time() < deadline:
                 try:
                     _http_json(_service_api_url("/system_stats"), timeout=5)
@@ -320,7 +374,7 @@ def _start_comfy_service(service_dir: Path, fingerprint: str, cache_reason: str,
                 except WorkerError:
                     if process.poll() is not None:
                         raise WorkerError("Comfy worker exited during startup")
-                    time.sleep(1)
+                    time.sleep(poll_interval)
             else:
                 raise WorkerError("Comfy worker startup timed out")
         return {**state, "system_stats": True, "service_dir": str(service_dir)}
@@ -436,13 +490,13 @@ def _main_workbench_action(path: str) -> int:
 
 
 def _run(
-    args: list[str], *, cwd: Path | None = None, timeout: float, capture: bool = True
+    args: list[str], *, cwd: Path | None = None, timeout: float, capture: bool = True, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess:
     if not isinstance(args, list) or not args or any(not isinstance(item, str) for item in args):
         raise WorkerError("internal command must be an argument list")
     try:
         return subprocess.run(
-            args, cwd=cwd, timeout=timeout, check=True, shell=False, capture_output=capture, text=True
+            args, cwd=cwd, timeout=timeout, check=True, shell=False, capture_output=capture, text=True, env=env
         )
     except subprocess.TimeoutExpired as exc:
         raise WorkerError("controlled command timed out") from exc
@@ -485,14 +539,31 @@ def _reviewed_custom_nodes(items: Any) -> list[dict]:
 
 
 def _install_custom_nodes(comfy: Path, items: list[dict], timeout: float) -> None:
-    for item in items:
+    if not items:
+        return
+
+    def _clone_one(item: dict) -> None:
         folder = comfy / "custom_nodes" / item["dir"]
         shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(mode=0o700, parents=True)
         _run(["git", "init", "-q"], cwd=folder, timeout=30)
         _run(["git", "fetch", "-q", "--depth", "1", item["repo"], item["commit"]], cwd=folder, timeout=timeout)
         _run(["git", "checkout", "-q", "--detach", "FETCH_HEAD"], cwd=folder, timeout=timeout)
+
+    if len(items) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(items))) as pool:
+            list(pool.map(_clone_one, items))
+    else:
+        _clone_one(items[0])
     _verify_custom_nodes(comfy, items)
+
+
+def _nodes_need_pip(comfy: Path, items: list[dict]) -> bool:
+    for item in items or ():
+        folder = comfy / "custom_nodes" / item["dir"]
+        if (folder / "requirements.txt").is_file() or (folder / "install.py").is_file():
+            return True
+    return False
 
 
 def _verify_custom_nodes(comfy: Path, items: list[dict]) -> None:
@@ -549,11 +620,97 @@ def _validate_weights(manifest: dict) -> list[dict]:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _file_stamp(st: os.stat_result) -> list[int]:
+    return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+
+
+def _hash_cache_file() -> Path | None:
+    try:
+        root = COMFY_SERVICE_ROOT.expanduser()
+        if root.exists() and root.is_symlink():
+            return None
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return root / ".model-hash-cache.json"
+    except OSError:
+        return None
+
+
+def _load_local_hash_cache_locked() -> None:
+    global _LOCAL_HASH_LOADED_PATH
+    cache_file = _hash_cache_file()
+    if cache_file is None or _LOCAL_HASH_LOADED_PATH == cache_file:
+        return
+    _LOCAL_HASH_CACHE.clear()
+    try:
+        if cache_file.is_file() and not cache_file.is_symlink():
+            raw = json.loads(cache_file.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for key, entry in raw.items():
+                    if isinstance(key, str) and isinstance(entry, dict) and isinstance(entry.get("stamp"), list):
+                        _LOCAL_HASH_CACHE[key] = entry
+    except (OSError, ValueError, TypeError):
+        pass
+    _LOCAL_HASH_LOADED_PATH = cache_file
+
+
+def _save_local_hash_cache_locked() -> None:
+    cache_file = _hash_cache_file()
+    if cache_file is None:
+        return
+    if len(_LOCAL_HASH_CACHE) > 2048:
+        for key in list(_LOCAL_HASH_CACHE.keys())[:-1024]:
+            _LOCAL_HASH_CACHE.pop(key, None)
+    try:
+        _atomic_json(cache_file, _LOCAL_HASH_CACHE)
+    except OSError:
+        pass
+
+
+def _record_local_hash(path: Path, sha256: str | None = None, md5: str | None = None) -> None:
+    if not _creation_flag("CREATION_LOCAL_HASH_CACHE", True) or (not sha256 and not md5):
+        return
+    try:
+        resolved = path.resolve()
+        st = resolved.stat()
+    except OSError:
+        return
+    stamp = _file_stamp(st)
+    key = str(resolved)
+    with _LOCAL_HASH_LOCK:
+        _load_local_hash_cache_locked()
+        existing = _LOCAL_HASH_CACHE.get(key)
+        entry: dict[str, Any] = {"stamp": stamp}
+        if isinstance(existing, dict) and existing.get("stamp") == stamp:
+            if existing.get("sha256"):
+                entry["sha256"] = existing["sha256"]
+            if existing.get("md5"):
+                entry["md5"] = existing["md5"]
+        if sha256:
+            entry["sha256"] = sha256.lower()
+        if md5:
+            entry["md5"] = md5.lower()
+        _LOCAL_HASH_CACHE[key] = entry
+        _save_local_hash_cache_locked()
+
+
+def _lookup_local_hash(path: Path, stamp: list[int], *, md5: bool = False) -> str | None:
+    if not _creation_flag("CREATION_LOCAL_HASH_CACHE", True):
+        return None
+    try:
+        key = str(path.resolve())
+    except OSError:
+        return None
+    with _LOCAL_HASH_LOCK:
+        _load_local_hash_cache_locked()
+        entry = _LOCAL_HASH_CACHE.get(key)
+        if not isinstance(entry, dict) or entry.get("stamp") != stamp:
+            return None
+        value = entry.get("md5" if md5 else "sha256")
+        return value if isinstance(value, str) and value else None
 
 
 def _check_local_tree(models: Path) -> None:
@@ -597,9 +754,22 @@ def _local_model_hit(path: Path, size: int | None, digest: str, *, md5: bool = F
     before = path.stat()
     if before.st_size <= 0 or (size is not None and before.st_size != size):
         return False
-    actual = _hash_file(path)[1] if md5 else _sha256(path)
+    stamp = _file_stamp(before)
+    cached = _lookup_local_hash(path, stamp, md5=md5)
+    if cached is not None:
+        after = path.stat()
+        return cached == digest and (before.st_ino, before.st_ctime_ns) == (after.st_ino, after.st_ctime_ns)
+    if md5:
+        actual_sha, actual_md5 = _hash_file(path)
+        actual = actual_md5
+    else:
+        actual_sha, actual_md5 = _sha256(path), None
+        actual = actual_sha
     after = path.stat()
-    return actual == digest and (before.st_ino, before.st_ctime_ns) == (after.st_ino, after.st_ctime_ns)
+    matched = actual == digest and (before.st_ino, before.st_ctime_ns) == (after.st_ino, after.st_ctime_ns)
+    if matched:
+        _record_local_hash(path, sha256=actual_sha, md5=actual_md5)
+    return matched
 
 
 def _check_model_space(directory: Path, needed: int) -> None:
@@ -748,41 +918,309 @@ def _env_key(commit: str, timeout: float, custom_nodes: list[dict] | None = None
     return key
 
 
-def _pip_install(comfy: Path, timeout: float) -> None:
-    base = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q"]
-    _run([*base, "-r", str(comfy / "requirements.txt")], cwd=comfy, timeout=timeout)
-    _run([*base, "huggingface_hub"], cwd=comfy, timeout=timeout)
+def _has_nvidia_gpu() -> bool:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        return bool(result.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
-def _pack_env(comfy: Path, site: Path, before: dict[str, int], key: str, out: Path) -> dict:
-    """Tar the ComfyUI checkout plus every site-packages entry the install added or changed."""
-    after = _site_state(site)
-    added = sorted(name for name, mtime in after.items() if before.get(name) != mtime)
-    removed = sorted(name for name in before if name not in after)
-    with tarfile.open(out, "w:gz", compresslevel=1) as tar:
-        tar.add(comfy, arcname="ComfyUI")
+def _norm_dist_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def _is_protected_dist(name: str) -> bool:
+    norm = _norm_dist_name(name)
+    return norm in _PROTECTED_DIST_NAMES or norm.startswith("nvidia-")
+
+
+def _is_protected_site_entry(name: str, site: Path | None = None) -> bool:
+    if name in _PROTECTED_TOP_DIRS:
+        return True
+    if name.endswith((".dist-info", ".egg-info")):
+        base = name.rsplit(".", 1)[0]
+        prefix = base.split("-", 1)[0]
+        if _is_protected_dist(prefix):
+            return True
+        if site is not None:
+            meta = site / name / "METADATA"
+            if meta.is_file():
+                try:
+                    for line in meta.read_text(errors="replace").splitlines():
+                        if line.lower().startswith("name:"):
+                            return _is_protected_dist(line.split(":", 1)[1])
+                        if not line.strip():
+                            break
+                except OSError:
+                    pass
+    return False
+
+
+def _protect_creation_environment(root: Path) -> tuple[dict[str, str], Path]:
+    """Pin preinstalled PyTorch/CUDA distributions in gpu-constraints.txt."""
+    protected: dict[str, str] = {}
+    for dist in importlib.metadata.distributions():
+        raw_name = dist.metadata.get("Name")
+        if not raw_name or not dist.version:
+            continue
+        norm = _norm_dist_name(raw_name)
+        if _is_protected_dist(norm):
+            protected[norm] = dist.version
+    constraints = root / "gpu-constraints.txt"
+    constraints.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lines = [f"{name}=={ver}" for name, ver in sorted(protected.items())]
+    constraints.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return protected, constraints
+
+
+def _cuda_build_env(constraints: Path, comfy: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env["PIP_CONSTRAINT"] = str(constraints)
+    env["UV_CONSTRAINT"] = str(constraints)
+    env["COMFYUI_PATH"] = str(comfy)
+    if "TORCH_CUDA_ARCH_LIST" not in env:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                capture_output=True, text=True, check=True, timeout=5,
+            ).stdout
+            caps = sorted({line.strip() for line in out.splitlines() if re.fullmatch(r"\d+\.\d+", line.strip())})
+            if caps:
+                env["TORCH_CUDA_ARCH_LIST"] = ";".join(caps)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    env.setdefault("MAX_JOBS", str(min(8, max(2, os.cpu_count() or 4))))
+    return env
+
+
+def _pip_install(
+    comfy: Path,
+    timeout: float,
+    *,
+    root: Path | None = None,
+    custom_nodes: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Install ComfyUI base requirements + huggingface_hub (+ optional custom node deps) via uv with pip fallback."""
+    t0 = time.monotonic()
+    constraint_root = root or comfy.parent
+    before_protected, constraints = _protect_creation_environment(constraint_root)
+    build_env = _cuda_build_env(constraints, comfy)
+    req_args = ["-r", str(comfy / "requirements.txt")]
+    node_install_scripts: list[Path] = []
+    for item in custom_nodes or ():
+        folder = comfy / "custom_nodes" / item["dir"]
+        node_req = folder / "requirements.txt"
+        if node_req.is_file():
+            req_args.extend(["-r", str(node_req)])
+        node_install = folder / "install.py"
+        if node_install.is_file():
+            node_install_scripts.append(node_install)
+
+    installer = "pip"
+    uv_bin = shutil.which("uv") if _creation_flag("CREATION_USE_UV", True) else None
+    installed_via_uv = False
+    if uv_bin:
+        cmd = [
+            uv_bin, "pip", "install", "--system", "--python", sys.executable,
+            "--constraint", str(constraints), "-q", "huggingface_hub", *req_args,
+        ]
+        try:
+            _run(cmd, cwd=comfy, timeout=timeout, env=build_env)
+            installed_via_uv = True
+            installer = "uv"
+        except WorkerError as exc:
+            print(f"[studio-creation] uv pip install failed ({exc}); falling back to pip", flush=True)
+    if not installed_via_uv:
+        base = [
+            sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q",
+            "-c", str(constraints),
+        ]
+        _run([*base, "huggingface_hub", *req_args], cwd=comfy, timeout=timeout, env=build_env)
+
+    for script in node_install_scripts:
+        _run([sys.executable, str(script)], cwd=script.parent, timeout=timeout, env=build_env)
+
+    importlib.invalidate_caches()
+    after_protected, _ = _protect_creation_environment(constraint_root)
+    if before_protected and after_protected != before_protected:
+        raise WorkerError("Python 依赖安装修改了受保护的 PyTorch/CUDA 基础包，已中止运行")
+    elapsed = round(time.monotonic() - t0, 2)
+    print(f"[studio-creation] Python deps ready via {installer} in {elapsed:.1f}s", flush=True)
+    return {"installer": installer, "python_seconds": elapsed}
+
+
+def _env_tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    parts = Path(tarinfo.name).parts
+    if "__pycache__" in parts or tarinfo.name.endswith((".pyc", ".pyo")):
+        return None
+    return tarinfo
+
+
+def _dist_record_top_names(dist_entry: Path) -> set[str]:
+    names: set[str] = set()
+    record = dist_entry / "RECORD"
+    if record.is_file():
+        try:
+            with record.open("r", encoding="utf-8", errors="replace", newline="") as stream:
+                for row in csv.reader(stream):
+                    if not row or not row[0].strip():
+                        continue
+                    raw = row[0].strip().replace("\\", "/")
+                    if raw.startswith("/") or raw.startswith("../"):
+                        continue
+                    top = raw.split("/", 1)[0]
+                    if top and top not in {".", "..", "__pycache__"}:
+                        names.add(top)
+        except (OSError, csv.Error):
+            pass
+    return names
+
+
+def _site_dist_state(site: Path) -> dict[str, Any]:
+    if not site.is_dir():
+        return {"entries": set(), "dists": {}}
+    entries: set[str] = set()
+    dists: dict[str, str] = {}
+    for entry in site.iterdir():
+        if entry.name == "__pycache__" or entry.name.startswith(".studio-creation-"):
+            continue
+        entries.add(entry.name)
+        if entry.name.endswith((".dist-info", ".egg-info")):
+            meta = entry / "METADATA"
+            try:
+                fp = _sha256(meta) if meta.is_file() else str(entry.stat().st_mtime_ns)
+            except OSError:
+                fp = ""
+            dists[entry.name] = fp
+    return {"entries": entries, "dists": dists}
+
+
+def _pack_env(comfy: Path, site: Path, before: dict[str, Any], key: str, out: Path) -> dict:
+    """Tar ComfyUI plus semantic site-packages delta (excluding __pycache__ and protected PyTorch/CUDA dirs)."""
+    if isinstance(before, dict) and "entries" in before and "dists" in before:
+        after = _site_dist_state(site)
+        before_entries: set[str] = before["entries"]
+        before_dists: dict[str, str] = before["dists"]
+        added_set = set(after["entries"] - before_entries)
+        removed = sorted(name for name in (before_entries - after["entries"]) if not _is_protected_site_entry(name, site))
+        for dist_name, fp in after["dists"].items():
+            if before_dists.get(dist_name) != fp and not _is_protected_site_entry(dist_name, site):
+                added_set.add(dist_name)
+                added_set.update(_dist_record_top_names(site / dist_name))
+        added = sorted(
+            name for name in added_set
+            if (site / name).exists() and not _is_protected_site_entry(name, site)
+        )
+    else:
+        after_legacy = _site_state(site)
+        added = sorted(
+            name for name, mtime in after_legacy.items()
+            if before.get(name) != mtime and not _is_protected_site_entry(name, site)
+        )
+        removed = sorted(
+            name for name in before
+            if name not in after_legacy and not _is_protected_site_entry(name, site)
+        )
+
+    def _write_members(tar: tarfile.TarFile) -> None:
+        tar.add(comfy, arcname="ComfyUI", filter=_env_tar_filter)
         for name in added:
-            tar.add(site / name, arcname=f"site/{name}")
-        meta = json.dumps({"key": key, "removed": removed}).encode()
+            tar.add(site / name, arcname=f"site/{name}", filter=_env_tar_filter)
+        meta = json.dumps({"schema": 2, "key": key, "removed": removed}).encode()
         info = tarfile.TarInfo("env.json")
         info.size = len(meta)
         tar.addfile(info, io.BytesIO(meta))
+
+    if shutil.which("pigz"):
+        with out.open("wb") as out_stream:
+            pigz = subprocess.Popen(["pigz", "-1", "-c"], stdin=subprocess.PIPE, stdout=out_stream, stderr=subprocess.PIPE)
+            try:
+                assert pigz.stdin is not None
+                with tarfile.open(fileobj=pigz.stdin, mode="w|") as tar:
+                    _write_members(tar)
+                pigz.stdin.close()
+                pigz.stdin = None
+                _, err = pigz.communicate(timeout=600)
+                if pigz.returncode != 0:
+                    raise WorkerError("pigz pack failed: " + err.decode(errors="replace")[-200:])
+            finally:
+                if pigz.poll() is None:
+                    pigz.kill()
+                    pigz.wait(timeout=5)
+    else:
+        with tarfile.open(out, "w:gz", compresslevel=1) as tar:
+            _write_members(tar)
     return {"site_entries_added": len(added), "site_entries_removed": len(removed)}
 
 
 def _unpack_env(archive: Path, root: Path, site: Path) -> None:
-    stage = root / ".env-stage"
+    same_fs = site.is_dir() and site.parent.is_dir()
+    stage = (site.parent / f".studio-creation-env-stage-{os.getpid()}") if same_fs else (root / ".env-stage")
+    rollback = (site.parent / f".studio-creation-env-rollback-{os.getpid()}") if same_fs else (root / ".env-rollback")
     shutil.rmtree(stage, ignore_errors=True)
-    with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(stage, filter="data")
-    removed = json.loads((stage / "env.json").read_text())["removed"]
-    for name in removed:
-        _remove(site / name)
-    for entry in (stage / "site").iterdir():
-        _remove(site / entry.name)
-        shutil.move(str(entry), str(site / entry.name))
-    shutil.move(str(stage / "ComfyUI"), str(root / "ComfyUI"))
-    shutil.rmtree(stage, ignore_errors=True)
+    shutil.rmtree(rollback, ignore_errors=True)
+    stage.mkdir(mode=0o700, parents=True, exist_ok=True)
+    before_protected, _ = _protect_creation_environment(root)
+    moved: list[str] = []
+    installed: list[str] = []
+    try:
+        if shutil.which("pigz"):
+            proc = subprocess.Popen(["pigz", "-dc", str(archive)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                assert proc.stdout is not None
+                with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+                    tar.extractall(stage, filter="data")
+                _, err = proc.communicate(timeout=300)
+                if proc.returncode != 0:
+                    raise WorkerError("pigz unpack failed: " + err.decode(errors="replace")[-200:])
+            except BaseException:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                raise
+        else:
+            with tarfile.open(archive, "r:gz") as tar:
+                tar.extractall(stage, filter="data")
+        removed = [
+            x for x in json.loads((stage / "env.json").read_text())["removed"]
+            if isinstance(x, str) and "/" not in x and x not in {"", ".", ".."}
+        ]
+        staged_site = stage / "site"
+        incoming = sorted(e.name for e in staged_site.iterdir()) if staged_site.is_dir() else []
+        for name in set(removed) | set(incoming):
+            if _is_protected_site_entry(name, site):
+                raise WorkerError(f"env cache attempted to modify protected package: {name}")
+        rollback.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for name in sorted(set(removed) | set(incoming)):
+            target = site / name
+            if target.exists() or target.is_symlink():
+                shutil.move(str(target), str(rollback / name))
+                moved.append(name)
+        for name in incoming:
+            shutil.move(str(staged_site / name), str(site / name))
+            installed.append(name)
+        importlib.invalidate_caches()
+        after_protected, _ = _protect_creation_environment(root)
+        if before_protected and after_protected != before_protected:
+            raise WorkerError("env cache altered protected PyTorch/CUDA packages")
+        shutil.move(str(stage / "ComfyUI"), str(root / "ComfyUI"))
+    except Exception:
+        for name in reversed(installed):
+            _remove(site / name)
+        for name in reversed(moved):
+            src = rollback / name
+            if src.exists() or src.is_symlink():
+                _remove(site / name)
+                shutil.move(str(src), str(site / name))
+        importlib.invalidate_caches()
+        raise
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(rollback, ignore_errors=True)
 
 
 def _remove(path: Path) -> None:
@@ -866,26 +1304,33 @@ def _warm_put(root: Path, fingerprint: str) -> None:
 def _restore_env(
     root: Path, commit: str, timeout: float, cache: "DriveCache | None", build: bool, custom_nodes: list[dict] | None = None
 ) -> dict:
-    """ComfyUI + pip deps: from the Drive env cache when possible, otherwise installed fresh.
-
-    ``build`` (CPU prep jobs only) packs a fresh install and uploads it; GPU jobs never upload,
-    so the GPU is never kept alive for cache work.
-    """
+    """ComfyUI + Python deps: fast uv direct install by default; fixed v2 Drive env-cache when explicitly needed."""
     comfy = root / "ComfyUI"
     site = _site_dir()
     started = time.time()
     record: dict[str, Any] = {}
     key = target = None
-    if cache is not None:
+    cache_mode = _env_cache_mode()
+    # By default ("auto"), skip Drive env tarballs when no custom nodes are present because
+    # uv installs base ComfyUI deps in ~5-8s in parallel with weights; only use Drive env-cache
+    # when explicitly forced or when custom nodes may carry heavy/compiled pip dependencies
+    # on a real GPU runtime (CPU VMs never produce GPU-compatible env keys).
+    try_env_cache = (
+        cache is not None
+        and cache_mode != "off"
+        and (cache_mode == "force" or bool(custom_nodes))
+        and _has_nvidia_gpu()
+    )
+    if try_env_cache:
         try:
-            key = _env_key(commit, timeout, custom_nodes)
+            key = "v2-" + _env_key(commit, timeout, custom_nodes)
             target = f"env/{key}.tar.gz"
             record["key"] = key
             entry = cache.lookup(target, None, None)
             if entry:
                 archive = root / "env.tar.gz"
-                cache.fetch(entry, archive)
-                if _hash_file(archive)[0] != entry["appProperties"]["sha256"]:
+                sha_actual, _ = cache.fetch(entry, archive, expected_sha256=entry["appProperties"]["sha256"])
+                if sha_actual != entry["appProperties"]["sha256"]:
                     raise WorkerError("env cache sha256 mismatch")
                 _unpack_env(archive, root, site)
                 archive.unlink(missing_ok=True)
@@ -896,13 +1341,26 @@ def _restore_env(
         except Exception as exc:  # noqa: BLE001 - a broken cache falls back to a normal install
             record["cache_error"] = _safe_error(exc)[:200]
             shutil.rmtree(comfy, ignore_errors=True)
-    before = _site_state(site)
+    before = _site_dist_state(site) if (build and try_env_cache) else None
+    t_co = time.monotonic()
     _checkout_comfy(comfy, commit, timeout)
     _verify_checkout(comfy, commit)
-    _pip_install(comfy, timeout)
+    record["checkout_seconds"] = round(time.monotonic() - t_co, 2)
+    t_nodes = time.monotonic()
     _install_custom_nodes(comfy, custom_nodes or [], timeout)
+    record["nodes_seconds"] = round(time.monotonic() - t_nodes, 2)
+    pip_info = _pip_install(comfy, timeout, root=root, custom_nodes=custom_nodes)
+    record.update(pip_info)
     record.update(source="install", seconds=round(time.time() - started, 1))
-    if build and cache is not None and key:
+    should_build_cache = (
+        build
+        and try_env_cache
+        and cache is not None
+        and key
+        and before is not None
+        and (cache_mode == "force" or _nodes_need_pip(comfy, custom_nodes or []))
+    )
+    if should_build_cache:
         try:
             archive = root / "env.tar.gz"
             record.update(_pack_env(comfy, site, before, key, archive))
@@ -925,6 +1383,10 @@ def _hash_file(path: Path) -> tuple[str, str]:
     return sha.hexdigest(), md5.hexdigest()
 
 
+class _RangeUnsupported(RuntimeError):
+    """Raised when an upstream response ignores Range (HTTP 200) so fetch falls back cleanly."""
+
+
 class DriveCache:
     """Model cache in the user's Drive, reached with a short-lived drive.file token.
 
@@ -943,6 +1405,46 @@ class DriveCache:
         self._token = token
         self.folder_id = folder_id
         self._folders: dict[tuple[str, str], str] = {}
+        self._lock = threading.Lock()
+        self._http_client: Any = None
+        self._part_size = _MULTI_STREAM_PART_BYTES
+        self._min_multistream_bytes = _MULTI_STREAM_MIN_BYTES
+
+    def _is_open_overridden(self) -> bool:
+        return type(self)._open is not DriveCache._open or "_open" in self.__dict__
+
+    def _get_http_client(self):
+        if self._is_open_overridden():
+            return None
+        with self._lock:
+            if self._http_client is not None:
+                return self._http_client
+            try:
+                import httpx
+            except ImportError:
+                return None
+            self._http_client = httpx.Client(
+                timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=60.0),
+                limits=httpx.Limits(max_connections=16, max_keepalive_connections=16),
+                follow_redirects=False,
+                trust_env=True,
+            )
+            return self._http_client
+
+    @staticmethod
+    def _check_google_url(url: str) -> None:
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        if parsed.scheme != "https" or not (
+            host == "www.googleapis.com" or host.endswith(".googleusercontent.com")
+        ):
+            raise WorkerError("drive cache refuses a non-Google URL")
+
+    @staticmethod
+    def _retry_sleep(attempt: int) -> None:
+        if os.getenv("STUDIO_OFFLINE_TEST") == "1":
+            return
+        time.sleep(min(8.0, (0.5 * (2**attempt)) + random.uniform(0.0, 0.4)))
 
     def _open(
         self, method: str, url: str, *, body: bytes | None = None, headers: dict | None = None, timeout=120
@@ -950,11 +1452,7 @@ class DriveCache:
         merged = {"Authorization": "Bearer " + self._token}
         merged.update(headers or {})
         for _ in range(4):
-            host = urlsplit(url).hostname or ""
-            if urlsplit(url).scheme != "https" or not (
-                host == "www.googleapis.com" or host.endswith(".googleusercontent.com")
-            ):
-                raise WorkerError("drive cache refuses a non-Google URL")
+            self._check_google_url(url)
             try:
                 return _NO_REDIRECT.open(
                     Request(url, data=body, method=method, headers=merged), timeout=timeout
@@ -987,7 +1485,8 @@ class DriveCache:
         return self._json("GET", f"{DRIVE_API}/files?{params}").get("files") or []
 
     def _folder(self, name: str, parent: str, create: bool) -> str | None:
-        cached = self._folders.get((parent, name))
+        with self._lock:
+            cached = self._folders.get((parent, name))
         if cached:
             return cached
         found = self._list(name, parent, True)
@@ -1004,7 +1503,8 @@ class DriveCache:
                 raise WorkerError("drive cache folder creation failed")
         else:
             return None
-        self._folders[(parent, name)] = folder_id
+        with self._lock:
+            self._folders[(parent, name)] = folder_id
         return folder_id
 
     def _parent(self, target: str, create: bool) -> tuple[str | None, str]:
@@ -1033,29 +1533,280 @@ class DriveCache:
             return entry
         return None
 
-    def fetch(self, entry: dict, destination: Path) -> None:
-        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        digest = hashlib.md5(usedforsecurity=False)
+    def _fetch_range_part(self, url: str, start: int, end: int, total_size: int) -> bytes:
+        expected_len = end - start + 1
+        range_header = f"bytes={start}-{end}"
+        client = self._get_http_client()
+        for attempt in range(4):
+            try:
+                if client is not None:
+                    cur = url
+                    headers = {"Authorization": "Bearer " + self._token, "Range": range_header}
+                    resp = None
+                    for _ in range(4):
+                        self._check_google_url(cur)
+                        resp = client.get(cur, headers=headers)
+                        if resp.status_code in {301, 302, 303, 307} and resp.headers.get("location"):
+                            cur = resp.headers["location"]
+                            continue
+                        break
+                    assert resp is not None
+                    status = resp.status_code
+                    if status == 200:
+                        raise _RangeUnsupported("upstream ignored Range header")
+                    if status in _RETRYABLE_HTTP_CODES:
+                        if attempt == 3:
+                            raise WorkerError(f"drive range request failed (HTTP {status})")
+                        self._retry_sleep(attempt)
+                        continue
+                    if status != 206:
+                        raise WorkerError(f"drive range request returned HTTP {status}")
+                    cr = (resp.headers.get("content-range") or "").strip()
+                    match = _CONTENT_RANGE_RE.fullmatch(cr)
+                    if (
+                        not match
+                        or int(match[1]) != start
+                        or int(match[2]) != end
+                        or int(match[3]) != total_size
+                    ):
+                        raise _RangeUnsupported(f"unexpected Content-Range: {cr}")
+                    data = resp.content
+                else:
+                    with self._open("GET", url, headers={"Range": range_header}, timeout=60) as response:
+                        status = getattr(response, "status", None)
+                        if status is None and hasattr(response, "getcode"):
+                            status = response.getcode()
+                        if status == 200 or status is None:
+                            raise _RangeUnsupported("upstream ignored Range header")
+                        if status != 206:
+                            raise WorkerError(f"drive range request returned HTTP {status}")
+                        resp_headers = getattr(response, "headers", None) or {}
+                        cr = str(resp_headers.get("Content-Range") or resp_headers.get("content-range") or "").strip()
+                        match = _CONTENT_RANGE_RE.fullmatch(cr)
+                        if (
+                            not match
+                            or int(match[1]) != start
+                            or int(match[2]) != end
+                            or int(match[3]) != total_size
+                        ):
+                            raise _RangeUnsupported(f"unexpected Content-Range: {cr}")
+                        chunks = []
+                        while block := response.read(4 * 1024 * 1024):
+                            chunks.append(block)
+                        data = b"".join(chunks)
+                if len(data) != expected_len:
+                    if attempt == 3:
+                        raise WorkerError(f"drive range part short read ({len(data)} != {expected_len})")
+                    self._retry_sleep(attempt)
+                    continue
+                return data
+            except _RangeUnsupported:
+                raise
+            except HTTPError as exc:
+                if exc.code in _RETRYABLE_HTTP_CODES and attempt < 3:
+                    self._retry_sleep(attempt)
+                    continue
+                raise
+            except WorkerError:
+                raise
+            except Exception:
+                if attempt == 3:
+                    raise
+                self._retry_sleep(attempt)
+        raise WorkerError("drive range part failed after retries")
+
+    def _fetch_multistream(
+        self, entry: dict, destination: Path, *, expected_sha256: str | None, streams: int
+    ) -> tuple[str, str]:
         size = int(entry["size"])
-        written = 0
         url = f"{DRIVE_API}/files/{quote(entry['id'])}?alt=media"
+        part_size = max(1024 * 1024, int(self._part_size))
+        total_parts = math.ceil(size / part_size)
+        effective_streams = max(2, min(streams, total_parts))
+        window_sem = threading.Semaphore(effective_streams + 2)
+        ready: dict[int, bytes] = {}
+        cond = threading.Condition()
+        error_box: list[BaseException] = []
+        stop_event = threading.Event()
+
+        def worker_fetch(part_idx: int) -> None:
+            acquired_global = False
+            try:
+                if stop_event.is_set():
+                    return
+                _DRIVE_STREAM_SEM.acquire()
+                acquired_global = True
+                if stop_event.is_set():
+                    return
+                start = part_idx * part_size
+                end = min(size, start + part_size) - 1
+                data = self._fetch_range_part(url, start, end, size)
+                with cond:
+                    ready[part_idx] = data
+                    cond.notify_all()
+            except BaseException as exc:  # noqa: BLE001
+                stop_event.set()
+                with cond:
+                    if not error_box:
+                        error_box.append(exc)
+                    cond.notify_all()
+                window_sem.release()
+            finally:
+                if acquired_global:
+                    _DRIVE_STREAM_SEM.release()
+
+        sha = hashlib.sha256()
+        md5 = hashlib.md5(usedforsecurity=False)
+        written = 0
         temporary = None
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".part", delete=False) as out:
                 temporary = Path(out.name)
-                with self._open("GET", url, timeout=300) as response:
-                    for block in iter(lambda: response.read(8 * 1024 * 1024), b""):
-                        written += len(block)
+                with ThreadPoolExecutor(max_workers=effective_streams) as pool:
+                    def submitter() -> None:
+                        for idx in range(total_parts):
+                            window_sem.acquire()
+                            if stop_event.is_set():
+                                window_sem.release()
+                                return
+                            pool.submit(worker_fetch, idx)
+
+                    sub_thread = threading.Thread(target=submitter, daemon=True)
+                    sub_thread.start()
+                    next_idx = 0
+                    while next_idx < total_parts:
+                        with cond:
+                            while next_idx not in ready and not error_box:
+                                cond.wait(timeout=1.0)
+                            if error_box:
+                                raise error_box[0]
+                            chunk = ready.pop(next_idx)
+                        written += len(chunk)
                         if written > size:
+                            stop_event.set()
                             raise WorkerError("drive cached file exceeds expected size")
-                        out.write(block)
-                        digest.update(block)
-            if written != size or digest.hexdigest() != entry.get("md5Checksum"):
+                        out.write(chunk)
+                        sha.update(chunk)
+                        md5.update(chunk)
+                        del chunk
+                        window_sem.release()
+                        next_idx += 1
+                    sub_thread.join(timeout=5)
+            actual_sha = sha.hexdigest()
+            actual_md5 = md5.hexdigest()
+            if written != size or actual_md5 != entry.get("md5Checksum"):
                 raise WorkerError("drive cached file failed size/md5 check")
+            if expected_sha256 and actual_sha != expected_sha256.lower():
+                raise WorkerError("Drive weight sha256 or size mismatch")
             os.replace(temporary, destination)
+            temporary = None
+            _record_local_hash(destination, sha256=actual_sha, md5=actual_md5)
+            return actual_sha, actual_md5
+        except BaseException:
+            stop_event.set()
+            raise
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+
+    def _fetch_single(self, entry: dict, destination: Path, *, expected_sha256: str | None) -> tuple[str, str]:
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        size = int(entry["size"])
+        url = f"{DRIVE_API}/files/{quote(entry['id'])}?alt=media"
+        for attempt in range(3):
+            sha = hashlib.sha256()
+            md5 = hashlib.md5(usedforsecurity=False)
+            written = 0
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".part", delete=False) as out:
+                    temporary = Path(out.name)
+                    with self._open("GET", url, timeout=300) as response:
+                        for block in iter(lambda: response.read(8 * 1024 * 1024), b""):
+                            written += len(block)
+                            if written > size:
+                                raise WorkerError("drive cached file exceeds expected size")
+                            out.write(block)
+                            sha.update(block)
+                            md5.update(block)
+                actual_sha = sha.hexdigest()
+                actual_md5 = md5.hexdigest()
+                if written != size or actual_md5 != entry.get("md5Checksum"):
+                    raise WorkerError("drive cached file failed size/md5 check")
+                if expected_sha256 and actual_sha != expected_sha256.lower():
+                    raise WorkerError("Drive weight sha256 or size mismatch")
+                os.replace(temporary, destination)
+                temporary = None
+                _record_local_hash(destination, sha256=actual_sha, md5=actual_md5)
+                return actual_sha, actual_md5
+            except HTTPError as exc:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+                    temporary = None
+                if exc.code in _RETRYABLE_HTTP_CODES and attempt < 2:
+                    self._retry_sleep(attempt)
+                    continue
+                raise
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        raise WorkerError("drive cached file download failed")
+
+    def fetch(self, entry: dict, destination: Path, *, expected_sha256: str | None = None) -> tuple[str, str]:
+        started = time.monotonic()
+        size = int(entry["size"])
+        try:
+            streams = max(1, min(int(os.getenv("CREATION_DRIVE_STREAMS", "6")), 12))
+        except ValueError:
+            streams = 6
+        use_multi = (
+            _creation_flag("CREATION_MULTI_STREAM_DRIVE", True)
+            and streams > 1
+            and size >= self._min_multistream_bytes
+        )
+        used_streams = 1
+        if use_multi:
+            try:
+                hashes = self._fetch_multistream(
+                    entry, destination, expected_sha256=expected_sha256, streams=streams
+                )
+                used_streams = streams
+            except _RangeUnsupported:
+                hashes = self._fetch_single(entry, destination, expected_sha256=expected_sha256)
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC:
+                    raise
+                print(
+                    f"[studio-creation] multi-stream drive fetch fallback to single stream ({type(exc).__name__})",
+                    flush=True,
+                )
+                hashes = self._fetch_single(entry, destination, expected_sha256=expected_sha256)
+            except WorkerError as exc:
+                if "sha256" in str(exc).lower() or "md5" in str(exc).lower():
+                    raise
+                print(
+                    f"[studio-creation] multi-stream drive fetch fallback to single stream ({exc})",
+                    flush=True,
+                )
+                hashes = self._fetch_single(entry, destination, expected_sha256=expected_sha256)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[studio-creation] multi-stream drive fetch fallback to single stream ({type(exc).__name__})",
+                    flush=True,
+                )
+                hashes = self._fetch_single(entry, destination, expected_sha256=expected_sha256)
+        else:
+            hashes = self._fetch_single(entry, destination, expected_sha256=expected_sha256)
+        elapsed = max(0.001, time.monotonic() - started)
+        if size >= 1024 * 1024:
+            mib = size / (1024**2)
+            print(
+                f"[studio-creation] drive fetch {destination.name}: {mib:.1f} MiB in {elapsed:.1f}s "
+                f"({mib / elapsed:.1f} MiB/s, streams={used_streams})",
+                flush=True,
+            )
+        return hashes
 
     def store(self, target: str, source: Path, sha256: str, md5: str, size: int) -> None:
         parent, name = self._parent(target, create=True)
@@ -1190,23 +1941,35 @@ def _restore_user_loras(comfy: Path, files: list[dict], cache: DriveCache | None
         raise WorkerError("自定义 LoRA 需要 Drive 存储授权")
     _check_model_space(comfy, sum(item["size"] for item in pending.values()))
     with tempfile.TemporaryDirectory(prefix=".studio-loras-", dir=comfy) as scratch:
-        for target, item in pending.items():
+        def _download_one(pair: tuple[Path, dict]) -> dict:
+            target, item = pair
             started = time.time()
             try:
-                source = Path(scratch) / target.name
-                cache.fetch(item, source)
+                source = Path(scratch) / f"{uuid.uuid4().hex}-{target.name}"
+                sha, md5 = cache.fetch(item, source)
                 _publish_model(source, target, preserve_existing=preserve_existing)
-                records.append({"target": "loras/" + item["target"], "source": "drive",
-                                "seconds": round(time.time() - started, 1)})
+                _record_local_hash(target, sha256=sha, md5=md5)
+                return {
+                    "target": "loras/" + item["target"],
+                    "source": "drive",
+                    "seconds": round(time.time() - started, 1),
+                }
             except Exception as exc:
                 raise WorkerError(f"用户 LoRA 恢复失败：{_model_download_error(exc)}") from exc
+
+        pairs = list(pending.items())
+        if len(pairs) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(pairs))) as pool:
+                records.extend(pool.map(_download_one, pairs))
+        else:
+            records.append(_download_one(pairs[0]))
     return records
 
 
 def _restore_weights(
     comfy: Path, manifest: dict, timeout: float, cache: DriveCache | None, prep: bool,
     *, preserve_existing: bool = False, warm_models: Path | None = None, use_drive_cache: bool = True,
-    paths: dict[str, Path] | None = None,
+    paths: dict[str, Path] | None = None, env_future: Any = None,
 ) -> list[dict]:
     """Bring every reviewed weight file in, four at a time, on the destination filesystem."""
     checked = _validate_weights(manifest)
@@ -1258,6 +2021,7 @@ def _restore_weights(
                 candidate = warm_models / item["target"]
                 if _local_model_hit(candidate, item["size"], item["sha256"]):
                     _publish_model(candidate, target, preserve_existing=True)
+                    _record_local_hash(target, sha256=item["sha256"])
                     return {**record, "source": "local", "seconds": round(time.time() - started, 1)}
         return record
 
@@ -1270,15 +2034,26 @@ def _restore_weights(
 
         def fetch(entry: dict, source: Path) -> None:
             _check_model_space(scratch, int(entry["size"]))
-            cache.fetch(entry, source)
-            if not _local_model_hit(source, item["size"], item["sha256"]):
-                raise WorkerError("Drive weight sha256 or size mismatch")
+            fetched = cache.fetch(entry, source, expected_sha256=item["sha256"])
+            if isinstance(fetched, tuple) and len(fetched) == 2:
+                actual_sha, actual_md5 = fetched
+                if actual_sha != item["sha256"]:
+                    raise WorkerError("Drive weight sha256 or size mismatch")
+                if item["size"] is not None and source.stat().st_size != item["size"]:
+                    raise WorkerError("Drive weight sha256 or size mismatch")
+            else:
+                if not _local_model_hit(source, item["size"], item["sha256"]):
+                    raise WorkerError("Drive weight sha256 or size mismatch")
+                actual_sha, actual_md5 = item["sha256"], None
             if not prep:
                 _publish_model(source, target, preserve_existing=preserve_existing)
+                _record_local_hash(target, sha256=actual_sha, md5=actual_md5)
 
         try:
             if item.get("source") == "drive":
-                fetch(drive_entry(item), scratch / "drive")
+                entry = drive_entry(item)
+                if not prep:
+                    fetch(entry, scratch / "drive")
                 record.update(source="drive")
                 if prep:
                     record["cache_stored"] = True  # The library file is already in Drive.
@@ -1295,7 +2070,13 @@ def _restore_weights(
                     record.update(source="drive")
                 else:
                     _check_model_space(scratch, item["size"] or 0)
-                    from huggingface_hub import hf_hub_download
+                    try:
+                        from huggingface_hub import hf_hub_download
+                    except ImportError:
+                        if env_future is not None:
+                            env_future.result()
+                            importlib.invalidate_caches()
+                        from huggingface_hub import hf_hub_download
 
                     source = Path(hf_hub_download(
                         item["repo_id"], item["filename"], revision=item["revision"], local_dir=str(scratch)
@@ -1315,6 +2096,7 @@ def _restore_weights(
                             record.update(cache_stored=False, cache_error=_model_download_error(exc))
                     elif not prep:
                         _publish_model(source, target, preserve_existing=preserve_existing)
+                        _record_local_hash(target, sha256=sha256, md5=md5)
         except Exception as exc:
             raise WorkerError(f"模型 {item['target']} 恢复失败：{_model_download_error(exc)}") from exc
         record["seconds"] = round(time.time() - started, 1)
@@ -1393,6 +2175,140 @@ def _stream_output(response, target: Path, limit: int) -> int:
         partial.unlink(missing_ok=True)
 
 
+_ENV_STATE_FILE = "env-state.json"
+_MODEL_LRU_FILE = ".model-lru.json"
+
+
+def _code_env_fingerprint(commit: str, custom_nodes: list[dict], manifest: dict | None = None) -> str:
+    """Fingerprint only ComfyUI code + Python/custom-node env, decoupled from weights & user LoRAs."""
+    manifest = manifest or {}
+    declared = manifest.get("dependency_signature", manifest.get("dependencies_signature"))
+    if declared is None:
+        raw_deps = manifest.get("dependencies")
+        if isinstance(raw_deps, dict):
+            declared = {k: v for k, v in raw_deps.items() if k not in {"weight_files", "weights"}}
+        else:
+            declared = manifest.get("requirements_sha256")
+    body = {
+        "version": 1,
+        "comfy_commit": commit,
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "custom_nodes": sorted(f"{n.get('repo')}@{n.get('commit')}" for n in custom_nodes),
+        "dependencies": declared,
+    }
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _read_env_state(service_dir: Path) -> dict | None:
+    try:
+        value = json.loads((service_dir / _ENV_STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _write_env_state(service_dir: Path, code_fp: str, commit: str) -> None:
+    _atomic_json(
+        service_dir / _ENV_STATE_FILE,
+        {"code_env_fingerprint": code_fp, "commit": commit, "updated_at": time.time()},
+    )
+
+
+def _prune_user_loras(comfy: Path, user_loras: list[dict]) -> None:
+    """Strictly keep only user LoRAs admitted for the current job."""
+    selected = {Path(item["target"]).name for item in user_loras}
+    loras = comfy / "models" / "loras" / "user"
+    if loras.is_dir():
+        for entry in loras.iterdir():
+            if entry.name not in selected:
+                _remove(entry)
+
+
+def _read_model_lru(service_dir: Path) -> dict[str, float]:
+    try:
+        raw = json.loads((service_dir / _MODEL_LRU_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): float(v) for k, v in raw.items() if isinstance(k, str) and isinstance(v, (int, float))}
+
+
+def _touch_model_lru(service_dir: Path, targets: list[str]) -> None:
+    if not targets:
+        return
+    lru = _read_model_lru(service_dir)
+    now = time.time()
+    for target in targets:
+        lru[str(target)] = now
+    with contextlib.suppress(OSError):
+        _atomic_json(service_dir / _MODEL_LRU_FILE, lru)
+
+
+def _evict_unused_weights_if_needed(
+    service_dir: Path,
+    models: Path,
+    keep_targets: set[str],
+    needed_bytes: int,
+    *,
+    reserve_bytes: int = _LRU_RESERVE_BYTES,
+) -> list[str]:
+    """Keep cached base weights on disk while free space suffices; evict oldest unused ones if tight."""
+    if not models.is_dir() or needed_bytes <= 0:
+        return []
+    free = shutil.disk_usage(models).free
+    if free >= needed_bytes + reserve_bytes:
+        return []
+    lru = _read_model_lru(service_dir)
+    candidates: list[tuple[float, int, str, Path]] = []
+    for parent, _dirs, files in os.walk(models):
+        for name in files:
+            path = Path(parent) / name
+            if path.is_symlink():
+                continue
+            rel = str(path.relative_to(models)).replace("\\", "/")
+            if rel in keep_targets or rel.startswith("loras/user/"):
+                continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            last_used = lru.get(rel, st.st_mtime)
+            candidates.append((last_used, st.st_size, rel, path))
+    candidates.sort(key=lambda item: item[0])
+    evicted: list[str] = []
+    for _ts, file_size, rel, path in candidates:
+        if free >= needed_bytes + reserve_bytes:
+            break
+        try:
+            path.unlink()
+            free += file_size
+            lru.pop(rel, None)
+            evicted.append(rel)
+        except OSError:
+            continue
+    if evicted:
+        with contextlib.suppress(OSError):
+            _atomic_json(service_dir / _MODEL_LRU_FILE, lru)
+        print(f"[studio-creation] Evicted {len(evicted)} LRU cached weight(s) to free disk space", flush=True)
+    return evicted
+
+
+def _can_reuse_in_place_env(service_dir: Path, code_fp: str, commit: str, nodes: list[dict]) -> bool:
+    env_state = _read_env_state(service_dir)
+    if not isinstance(env_state, dict) or env_state.get("code_env_fingerprint") != code_fp:
+        return False
+    comfy = service_dir / "ComfyUI"
+    if not (comfy / "main.py").is_file():
+        return False
+    try:
+        _verify_checkout(comfy, commit)
+        _verify_custom_nodes(comfy, nodes)
+    except WorkerError:
+        return False
+    return True
+
+
 def _creation_service(service_dir, payload, manifest, commit, nodes, checked, user_loras, stages, deadline):
     def environment_fingerprint():
         environment = _service_fingerprint(commit, nodes, checked, manifest)
@@ -1400,6 +2316,7 @@ def _creation_service(service_dir, payload, manifest, commit, nodes, checked, us
         return hashlib.sha256(encoded.encode()).hexdigest()
 
     fingerprint = environment_fingerprint()
+    code_fp = _code_env_fingerprint(commit, nodes, manifest)
     state = _read_service_state(service_dir)
     if state:
         # An absent PID or different start time is a stale marker. Never signal that PID.
@@ -1419,6 +2336,7 @@ def _creation_service(service_dir, payload, manifest, commit, nodes, checked, us
             pass
         else:
             stages.start("warm_reuse")
+            _touch_model_lru(service_dir, [w["target"] for w in checked])
             return {**state, "cache_reason": "hot_reuse"}, {"source": "hot_reuse"}, []
     if state:
         pid = state["pid"]
@@ -1435,24 +2353,121 @@ def _creation_service(service_dir, payload, manifest, commit, nodes, checked, us
             time.sleep(0.2)
         else:
             raise WorkerError("上一个 ComfyUI 进程尚未退出")
+
     comfy = service_dir / "ComfyUI"
+    timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
+    use_drive_cache = payload.get("use_drive_cache", True)
+    service_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    in_place_reuse = _can_reuse_in_place_env(service_dir, code_fp, commit, nodes)
+
+    if in_place_reuse:
+        # Same ComfyUI commit & custom nodes (e.g. switched user LoRA or another workflow on same commit):
+        # keep ComfyUI/ tree and Python packages intact, strictly prune unselected user LoRAs, and LRU-cache base weights.
+        for leftover in ("input", "output", "temp"):
+            shutil.rmtree(comfy / leftover, ignore_errors=True)
+        _prune_user_loras(comfy, user_loras)
+        models_dir = _local_models(comfy)
+        keep_targets = {w["target"] for w in checked}
+        missing_bytes = sum(
+            int(w.get("size") or 0)
+            for w in checked
+            if not (models_dir / w["target"]).is_file()
+        ) + sum(
+            int(u.get("size") or 0)
+            for u in user_loras
+            if not (models_dir / "loras" / u["target"]).is_file()
+        )
+        _evict_unused_weights_if_needed(service_dir, models_dir, keep_targets, missing_bytes)
+        env = {"source": "in_place_reuse", "seconds": 0.0}
+        stages.start("restore_weights")
+        if user_loras and _creation_flag("CREATION_PARALLEL_BOOTSTRAP", True):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                weights_future = pool.submit(
+                    _restore_weights,
+                    comfy, manifest, timeout, _drive_cache(payload), False,
+                    use_drive_cache=use_drive_cache,
+                )
+                loras_future = pool.submit(
+                    _restore_user_loras,
+                    comfy, user_loras, _lora_drive_cache(payload),
+                )
+                weights = weights_future.result()
+                loras_future.result()
+        else:
+            weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False,
+                                       use_drive_cache=use_drive_cache)
+            if user_loras:
+                stages.start("restore_loras")
+                _restore_user_loras(comfy, user_loras, _lora_drive_cache(payload))
+        _touch_model_lru(service_dir, [w["target"] for w in checked])
+        stages.start("comfy_start")
+        service = _start_comfy_service(service_dir, environment_fingerprint(), "in_place_restart", deadline=deadline)
+        return service, env, weights
+
     parked = service_dir / "previous"
-    if comfy.exists() and state and state["env_fingerprint"] != fingerprint:
+    if comfy.exists():
         shutil.rmtree(parked, ignore_errors=True)
         comfy.rename(parked)
-    service_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    stages.start("restore_env")
-    timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
-    env_cache = _drive_cache(payload, "runtime_folder_id") if payload.get("use_drive_cache", True) else None
-    env = _restore_env(service_dir, commit, timeout, env_cache, build=False, custom_nodes=nodes)
-    stages.start("restore_weights")
-    weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False,
-                               warm_models=_local_models(parked) if parked.is_dir() else None,
-                               use_drive_cache=payload.get("use_drive_cache", True))
+    warm_models = _local_models(parked) if parked.is_dir() else None
+    env_cache = _drive_cache(payload, "runtime_folder_id") if use_drive_cache else None
+    parallel_boot = (
+        _creation_flag("CREATION_PARALLEL_BOOTSTRAP", True)
+        and _env_cache_mode() != "force"
+        and _restore_env.__name__ == "_restore_env"
+    )
+
+    if parallel_boot:
+        stages.start("restore_env")
+        t_env0 = time.monotonic()
+        _checkout_comfy(comfy, commit, timeout)
+        _verify_checkout(comfy, commit)
+        checkout_s = round(time.monotonic() - t_env0, 2)
+        t_nodes = time.monotonic()
+        _install_custom_nodes(comfy, nodes, timeout)
+        nodes_s = round(time.monotonic() - t_nodes, 2)
+
+        def _finish_python() -> dict[str, Any]:
+            pip_info = _pip_install(comfy, timeout, root=service_dir, custom_nodes=nodes)
+            return {
+                **pip_info,
+                "checkout_seconds": checkout_s,
+                "nodes_seconds": nodes_s,
+                "source": "install",
+                "seconds": round(time.monotonic() - t_env0, 1),
+            }
+
+        with ThreadPoolExecutor(max_workers=3) as boot_pool:
+            env_future = boot_pool.submit(_finish_python)
+            stages.start("restore_weights")
+            loras_future = (
+                boot_pool.submit(_restore_user_loras, comfy, user_loras, _lora_drive_cache(payload))
+                if user_loras
+                else None
+            )
+            weights = _restore_weights(
+                comfy, manifest, timeout, _drive_cache(payload), prep=False,
+                warm_models=warm_models, use_drive_cache=use_drive_cache, env_future=env_future,
+            )
+            if loras_future is not None:
+                if not loras_future.done():
+                    stages.start("restore_loras")
+                loras_future.result()
+            if not env_future.done():
+                stages.start("creation_python")
+            env = env_future.result()
+    else:
+        stages.start("restore_env")
+        env = _restore_env(service_dir, commit, timeout, env_cache, build=False, custom_nodes=nodes)
+        stages.start("restore_weights")
+        weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False,
+                                   warm_models=warm_models, use_drive_cache=use_drive_cache)
+        if user_loras:
+            stages.start("restore_loras")
+            _restore_user_loras(comfy, user_loras, _lora_drive_cache(payload))
+
+    _write_env_state(service_dir, code_fp, commit)
+    _touch_model_lru(service_dir, [w["target"] for w in checked])
     shutil.rmtree(parked, ignore_errors=True)
-    if user_loras:
-        stages.start("restore_loras")
-        _restore_user_loras(comfy, user_loras, _lora_drive_cache(payload))
     stages.start("comfy_start")
     service = _start_comfy_service(service_dir, environment_fingerprint(), "cold_start", deadline=deadline)
     return service, env, weights
@@ -1551,6 +2566,9 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
             if not service and not payload.get("generation_timeouts"):
                 deadline = time.time() + runtime_seconds
             api = f"http://{COMFY_SERVICE_HOST}:{port}"
+            fast_poll = _creation_flag("CREATION_FAST_CONTROL_PLANE", True)
+            ready_poll_sleep = 0.3 if fast_poll else 1.0
+            history_poll_sleep = 0.5 if fast_poll else 2.0
             while time.time() < deadline:
                 try:
                     _http_json(api + "/system_stats", timeout=5)
@@ -1558,7 +2576,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                 except WorkerError:
                     if process is not None and process.poll() is not None:
                         raise WorkerError("Comfy worker exited during startup")
-                    time.sleep(1)
+                    time.sleep(ready_poll_sleep)
             else:
                 raise WorkerError("Comfy worker startup timed out")
             if process is not None and process.poll() is not None:
@@ -1580,7 +2598,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                 history = _http_json(api + "/history/" + prompt_id, timeout=30)
                 item = history.get(prompt_id)
                 if not isinstance(item, dict):
-                    time.sleep(2)
+                    time.sleep(history_poll_sleep)
                     continue
                 status = item.get("status") or {}
                 if status.get("status_str") in {"error", "failed"}:
@@ -1591,7 +2609,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                             detail = f"{data.get('node_type')}: {data.get('exception_message')}"
                     raise WorkerError(f"Comfy workflow failed: {detail}"[:500])
                 if status.get("completed") is not True and (service or not item.get("outputs")):
-                    time.sleep(2)
+                    time.sleep(history_poll_sleep)
                     continue
                 stages.end()
                 if service:
@@ -1658,21 +2676,34 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
 
 
 def _run_prep(root: Path, payload: dict, manifest: dict, stages: _Stages) -> list[dict]:
-    """CPU-only cache fill: build the env archive and put every missing weight into Drive. No sampling."""
+    """CPU-only cache fill: put every missing Hugging Face weight into Drive. No sampling."""
     commit = manifest.get("comfy_commit", manifest.get("comfy_version"))
     if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
         raise WorkerError("Comfy workflow must lock a 40-character commit")
     if _drive_cache(payload) is None:
         raise WorkerError("prep needs the Drive cache")
     timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
-    stages.start("prep_env")
-    env = _restore_env(root, commit, timeout, _drive_cache(payload, "runtime_folder_id"), build=True,
-                       custom_nodes=_reviewed_custom_nodes(manifest.get("custom_nodes")))
+    if _env_cache_mode() == "force" and _has_nvidia_gpu():
+        stages.start("prep_env")
+        env = _restore_env(root, commit, timeout, _drive_cache(payload, "runtime_folder_id"), build=True,
+                           custom_nodes=_reviewed_custom_nodes(manifest.get("custom_nodes")))
+    else:
+        # CPU VMs cannot build GPU-compatible env caches and base deps use fast parallel uv on GPU boot.
+        (root / "ComfyUI").mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            import huggingface_hub  # noqa: F401
+        except ImportError:
+            uv_bin = shutil.which("uv") if _creation_flag("CREATION_USE_UV", True) else None
+            if uv_bin:
+                _run([uv_bin, "pip", "install", "--system", "--python", sys.executable, "-q", "huggingface_hub"], timeout=timeout)
+            else:
+                _run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", "huggingface_hub"], timeout=timeout)
+        env = {"source": "uv_direct", "skipped_env_archive": True, "seconds": 0.0}
     stages.start("prep_weights")
     weights = _restore_weights(root / "ComfyUI", manifest, timeout, _drive_cache(payload), prep=True)
     stages.end()
     failed = [item["target"] for item in weights if item.get("cache_stored") is False]
-    if env.get("source") != "drive" and env.get("cache_stored") is not True:
+    if not env.get("skipped_env_archive") and env.get("source") != "drive" and env.get("cache_stored") is not True:
         failed.append("env")
     if failed:
         raise WorkerError("cache fill incomplete: " + ", ".join(failed))
@@ -1697,6 +2728,9 @@ def _run_prep(root: Path, payload: dict, manifest: dict, stages: _Stages) -> lis
 
 
 def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
+    for flag_name, flag_val in (payload.get("creation_flags") or {}).items():
+        if flag_name in CREATION_FLAG_NAMES:
+            os.environ[flag_name] = str(flag_val)
     stages = _Stages(root)
     try:
         _status(root, "running")

@@ -33,5 +33,8 @@ test('history labels translate known states and stages while preserving unknown 
   assert.equal(jobStageLabel('sampling'), '采样生成');
   assert.equal(jobStageLabel('native_env_cache'), '恢复环境缓存');
   assert.equal(jobStageLabel('native_plugins_restore'), '恢复节点归档');
+  assert.equal(jobStageLabel('creation_python'), '安装基础依赖');
+  assert.equal(jobStageLabel('restore_loras'), '恢复用户 LoRA');
+  assert.equal(jobStageLabel('creation_warming'), '预热加载模型');
   assert.equal(jobStageLabel('future_stage'), 'future_stage');
 });

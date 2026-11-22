@@ -258,11 +258,65 @@ class DriveStorage:
             raise DriveError("Drive key路径过长")
         return normalized
 
+    def _remember_folder(self, folder_key: str, name: str, parent: str, remote_id: str) -> None:
+        rows = [
+            row
+            for row in self._repo_files()
+            if row.get("kind") == "drive_folder"
+            and row.get("folder_key") == folder_key
+            and row.get("parent_id") == parent
+            and self._account_matches(row)
+        ]
+        data = {
+            "kind": "drive_folder",
+            "folder_key": folder_key,
+            "name": name,
+            "parent_id": parent,
+            "remote_id": remote_id,
+            "state": "verified",
+        }
+        if self.account_id is not None:
+            data["account_id"] = self.account_id
+        if rows:
+            if rows[0].get("remote_id") != remote_id:
+                self.store.update("files", rows[0]["id"], data, self.owner_id)
+            return
+        scope = "legacy" if self._is_legacy_account() else self.account_id
+        record_id = hashlib.sha256(
+            f"drive-folder:{self.owner_id}:{scope}:{folder_key}:{parent}".encode()
+        ).hexdigest()
+        try:
+            self.store.create("files", self.owner_id, data, record_id=record_id)
+        except ValueError:
+            pass  # recorded by a concurrent request
+
+    def _cached_folder(self, folder_key: str, name: str, parent: str) -> str:
+        from .node_persistence import env_flag
+
+        if not env_flag("CREATION_FAST_CONTROL_PLANE", True):
+            return self._folder(name, parent)
+        for row in self._repo_files():
+            if (
+                row.get("kind") == "drive_folder"
+                and row.get("folder_key") == folder_key
+                and row.get("parent_id") == parent
+                and self._account_matches(row)
+            ):
+                remote_id = row.get("remote_id")
+                if isinstance(remote_id, str) and remote_id:
+                    return remote_id
+        folder_id = self._folder(name, parent)
+        self._remember_folder(folder_key, name, parent, folder_id)
+        return folder_id
+
+    def _owner_folder(self) -> str:
+        if self._owner_folder_id is None:
+            self._owner_folder_id = self._cached_folder("owner", self.owner_id, self._root_folder())
+        return self._owner_folder_id
+
     def _job_parent(self, key: str) -> str:
         normalized = self._normalize_key(key)
-        if self._owner_folder_id is None:
-            self._owner_folder_id = self._folder(self.owner_id, self._root_folder())
-        parent = self._owner_folder_id
+        parent = self._owner_folder()
         for part in normalized.split("/")[:-1]:
             parent = self._folder(part, parent)
         return parent
@@ -273,19 +327,18 @@ class DriveStorage:
         The cache lives at ``AI-Studio/<owner>/models`` in the user's Drive.  The
         token is handed to the trusted worker only, never stored or logged.
         """
-        if self._owner_folder_id is None:
-            self._owner_folder_id = self._folder(self.owner_id, self._root_folder())
+        owner_folder = self._owner_folder()
         return {
-            "folder_id": self._folder("models", self._owner_folder_id),
-            "runtime_folder_id": self._folder("runtime-cache", self._owner_folder_id),
+            "folder_id": self._cached_folder("models", "models", owner_folder),
+            "runtime_folder_id": self._cached_folder("runtime-cache", "runtime-cache", owner_folder),
             "access_token": self.google.access_token("drive"),
         }
 
     def lora_folder(self) -> str:
         """``AI-Studio/<owner>/loras/h3``; created on first use."""
-        if self._owner_folder_id is None:
-            self._owner_folder_id = self._folder(self.owner_id, self._root_folder())
-        return self._folder("h3", self._folder("loras", self._owner_folder_id))
+        owner_folder = self._owner_folder()
+        loras_folder = self._cached_folder("loras", "loras", owner_folder)
+        return self._cached_folder("loras/h3", "h3", loras_folder)
 
     def list_loras(self) -> list[dict]:
         """.safetensors files in the LoRA folder (only files this app uploaded are visible under drive.file)."""

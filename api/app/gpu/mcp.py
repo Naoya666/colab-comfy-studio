@@ -26,7 +26,13 @@ from app.security import decrypt_secret
 
 from .google import GoogleService
 from .node_persistence import env_flag
-from .runtime_worker import COMFY_SERVICE_ROOT, MAX_OUTPUT_BYTES, _instance_service_name, _service_api_url
+from .runtime_worker import (
+    COMFY_SERVICE_ROOT,
+    MAX_OUTPUT_BYTES,
+    _instance_service_name,
+    _service_api_url,
+    creation_optimization_flags,
+)
 
 log = logging.getLogger("studio.mcp")
 MCP_ENDPOINT = "https://colaboratory.googleapis.com/mcp"
@@ -37,6 +43,9 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _NETWORK_ATTEMPTS = 3
 _INLINE_ARTIFACT_MAX_BYTES = 64 * 1024
 _INLINE_ARTIFACT_TOTAL_MAX_BYTES = 256 * 1024
+_DEFAULT_CHUNK_BYTES = 1024 * 1024
+_TUNNEL_CHUNK_BYTES = 4 * 1024 * 1024
+_MAX_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 def _prefer_ipv4_direct() -> bool:
@@ -141,12 +150,21 @@ def build_bootstrap_code(execution_id: str, payload: dict, worker_source: str | 
         worker_source = Path(__file__).with_name("runtime_worker.py").read_text(encoding="utf-8")
     if not isinstance(worker_source, str) or not worker_source:
         raise MCPError("trusted worker source is unavailable")
-    plugins_b64 = base64.b64encode(Path(__file__).with_name("node_persistence.py").read_bytes()).decode("ascii")
-    native_b64 = base64.b64encode(Path(__file__).with_name("native_runtime.py").read_bytes()).decode("ascii")
-    local_modules = {}
+    is_native = bool((payload.get("snapshot") or {}).get("native_comfy"))
+    lean_bootstrap = env_flag("CREATION_FAST_CONTROL_PLANE", True)
+    extra_modules: dict[str, str] = {}
+    if is_native or not lean_bootstrap:
+        extra_modules["node_persistence.py"] = base64.b64encode(
+            Path(__file__).with_name("node_persistence.py").read_bytes()
+        ).decode("ascii")
+        extra_modules["native_runtime.py"] = base64.b64encode(
+            Path(__file__).with_name("native_runtime.py").read_bytes()
+        ).decode("ascii")
     if (payload.get("native_secrets") or {}).get("model_storage_mode") == "local":
-        local_modules = {name: base64.b64encode(Path(__file__).with_name(name).read_bytes()).decode("ascii")
-                         for name in ("native_models.py", "model_dependencies.py", "model_sources.py")}
+        for name in ("native_models.py", "model_dependencies.py", "model_sources.py"):
+            extra_modules[name] = base64.b64encode(
+                Path(__file__).with_name(name).read_bytes()
+            ).decode("ascii")
     source_b64 = base64.b64encode(worker_source.encode("utf-8")).decode("ascii")
     payload_b64 = _b64_json(payload)
     execution_literal = repr(execution_id)
@@ -180,9 +198,7 @@ else:
     except FileExistsError:
         _result["existing"] = True
     else:
-        (_dir / "node_persistence.py").write_bytes(_base64.b64decode({plugins_b64!r}))
-        (_dir / "native_runtime.py").write_bytes(_base64.b64decode({native_b64!r}))
-        for _filename, _content in {local_modules!r}.items():
+        for _filename, _content in {extra_modules!r}.items():
             (_dir / _filename).write_bytes(_base64.b64decode(_content))
         _worker.write_bytes(_base64.b64decode({source_b64!r}))
         _payload.touch(mode=0o600)
@@ -296,9 +312,16 @@ print(_json.dumps(_result, separators=(",", ":")))
 """
 
 
-def build_chunk_code(execution_id: str, index: int, offset: int) -> str:
+def build_chunk_code(execution_id: str, index: int, offset: int, chunk_bytes: int = _DEFAULT_CHUNK_BYTES) -> str:
     execution_id = _uuid4(execution_id)
-    if type(index) is not int or not 0 <= index < 100 or type(offset) is not int or not 0 <= offset <= 2*1024**3:
+    if (
+        type(index) is not int
+        or not 0 <= index < 100
+        or type(offset) is not int
+        or not 0 <= offset <= 2 * 1024**3
+        or type(chunk_bytes) is not int
+        or not 1 <= chunk_bytes <= _MAX_CHUNK_BYTES
+    ):
         raise MCPError('invalid chunk request')
     return f"""# Trusted bounded artifact reader; no caller paths.
 import base64 as _b
@@ -315,7 +338,7 @@ if _root.resolve() not in _path.parents or not _path.is_file():
     raise ValueError('artifact path escaped')
 with _path.open('rb') as _f:
     _f.seek({offset})
-    _chunk = _f.read(1024*1024)
+    _chunk = _f.read({chunk_bytes})
 print(_j.dumps({{'execution_id': _e, 'offset': {offset}, 'content': _b.b64encode(_chunk).decode()}}))
 """
 
@@ -912,6 +935,8 @@ print(json.dumps({{"interrupted": interrupted}}))
             payload["native_secrets"] = runtime_secrets(self.store, job)
             payload["native_plugin_generation"] = job["snapshot"].get("native_plugin_generation")
             payload["native_flags"] = native_optimization_flags()
+        else:
+            payload["creation_flags"] = creation_optimization_flags()
         code = build_bootstrap_code(execution_id, payload)
         result = self._exec_code_on_handle(handle, session, execution_id, code)
         return {
@@ -920,6 +945,156 @@ print(json.dumps({{"interrupted": interrupted}}))
             "idempotent": bool(isinstance(result, dict) and result.get("existing")),
             "remote": result if isinstance(result, dict) else {},
         }
+
+    def _stream_tunnel_artifact_chunks(
+        self,
+        lease: dict,
+        execution_id: str,
+        index: int,
+        size_bytes: int,
+        objects: Any,
+        key: str,
+        offset: int,
+        *,
+        chunk_bytes: int = _TUNNEL_CHUNK_BYTES,
+    ) -> tuple[int, int]:
+        """Stream remaining artifact chunks over a single persistent Jupyter WebSocket."""
+        from websockets.exceptions import InvalidStatus
+        from websockets.sync.client import connect as ws_connect
+
+        base_timeout = float(getattr(self, "timeout", 30.0))
+        ws_open_timeout = min(6.0, base_timeout)
+        per_chunk_timeout = max(20.0, base_timeout)
+        proxy_url, proxy_token = self._refresh_tunnel_proxy(lease)
+        auth_params = {"colab-runtime-proxy-token": proxy_token, "authuser": "0"}
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Colab-Client-Agent": "colab-cli",
+            "X-Colab-Runtime-Proxy-Token": proxy_token,
+        }
+        kernel_id = lease.get("kernel_id")
+        if not kernel_id:
+            # Ensure a kernel exists before opening the streaming WS.
+            self._execute_tunnel_code(lease, "print('{\"ok\":true}')", exec_timeout=10.0)
+            kernel_id = lease.get("kernel_id")
+            if not kernel_id:
+                raise MCPTransient("Colab 隧道 Kernel 尚未就绪")
+        ws_base = re.sub(r"^http", "ws", proxy_url, count=1)
+        reads = 0
+
+        for ws_pass in range(2):
+            session_id = uuid.uuid4().hex
+            query = urlencode({**auth_params, "session_id": session_id})
+            ws_url = f"{ws_base}/api/kernels/{kernel_id}/channels?{query}"
+            ws_kwargs: dict[str, Any] = {
+                "additional_headers": {
+                    "X-Colab-Client-Agent": headers["X-Colab-Client-Agent"],
+                    "X-Colab-Runtime-Proxy-Token": proxy_token,
+                },
+                "open_timeout": ws_open_timeout,
+                "close_timeout": 3.0,
+                "max_size": 32 * 1024 * 1024,
+            }
+            sock = _connect_ipv4_socket(ws_url, ws_open_timeout)
+            if sock is not None:
+                ws_kwargs["sock"] = sock
+            try:
+                with ws_connect(ws_url, **ws_kwargs) as ws:
+                    while offset < size_bytes:
+                        reads += 1
+                        code = build_chunk_code(execution_id, index, offset, chunk_bytes=chunk_bytes)
+                        msg_id = uuid.uuid4().hex
+                        req_msg = {
+                            "header": {
+                                "msg_id": msg_id,
+                                "username": "studio",
+                                "session": session_id,
+                                "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "msg_type": "execute_request",
+                                "version": "5.3",
+                            },
+                            "parent_header": {},
+                            "metadata": {},
+                            "content": {
+                                "code": code,
+                                "silent": False,
+                                "store_history": False,
+                                "user_expressions": {},
+                                "allow_stdin": False,
+                                "stop_on_error": True,
+                            },
+                            "channel": "shell",
+                        }
+                        ws.send(self._ws_pack_default(req_msg))
+                        stdout_parts: list[str] = []
+                        error_info: dict | None = None
+                        reply_seen = False
+                        idle_seen = False
+                        deadline = time.monotonic() + per_chunk_timeout
+                        while time.monotonic() < deadline:
+                            remaining = max(0.5, deadline - time.monotonic())
+                            raw = ws.recv(timeout=remaining)
+                            msg = self._ws_unpack_default(raw)
+                            if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
+                                continue
+                            mtype = (msg.get("header") or {}).get("msg_type") or msg.get("msg_type")
+                            content = msg.get("content") or {}
+                            if mtype == "stream":
+                                if content.get("name") == "stdout":
+                                    stdout_parts.append(str(content.get("text") or ""))
+                            elif mtype in ("execute_result", "display_data"):
+                                plain = (content.get("data") or {}).get("text/plain")
+                                if isinstance(plain, str):
+                                    stdout_parts.append(plain + "\n")
+                            elif mtype == "error":
+                                error_info = {
+                                    "name": content.get("ename") or "ExecutionError",
+                                    "value": content.get("evalue") or "",
+                                }
+                            elif mtype == "execute_reply":
+                                reply_seen = True
+                                if content.get("status") == "error" and error_info is None:
+                                    error_info = {
+                                        "name": content.get("ename") or "ExecutionError",
+                                        "value": content.get("evalue") or "",
+                                    }
+                            elif mtype == "status" and content.get("execution_state") == "idle":
+                                idle_seen = True
+                            if reply_seen and idle_seen:
+                                break
+                        if error_info is not None:
+                            reply = self._tool_value(
+                                {"isError": True, "executionError": error_info, "stdout": "".join(stdout_parts)}
+                            )
+                        else:
+                            reply = self._tool_value({"stdout": "".join(stdout_parts)})
+                        if not isinstance(reply, dict) or reply.get("execution_id") != execution_id or reply.get("offset") != offset:
+                            raise MCPError("artifact chunk identity mismatch")
+                        try:
+                            chunk = base64.b64decode(reply["content"], validate=True)
+                        except (KeyError, ValueError, TypeError) as exc:
+                            raise MCPError("artifact chunk encoding invalid") from exc
+                        if not chunk or len(chunk) > chunk_bytes:
+                            raise MCPError("artifact chunk size invalid")
+                        offset = objects.append(key, self.owner_id, execution_id, offset, chunk)
+                return offset, reads
+            except InvalidStatus as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code in {404, 410} and ws_pass == 0:
+                    lease["kernel_id"] = None
+                    self._execute_tunnel_code(lease, "print('{\"ok\":true}')", exec_timeout=10.0)
+                    kernel_id = lease.get("kernel_id")
+                    if kernel_id:
+                        continue
+                raise MCPTransient(f"Colab 隧道产物 WebSocket HTTP {status_code or 'error'}") from exc
+            except TimeoutError as exc:
+                raise MCPTransient("Colab 隧道产物流式拉取超时") from exc
+            except (MCPError, MCPTransient):
+                raise
+            except Exception as exc:
+                raise MCPTransient(f"Colab 隧道产物流式拉取异常（{type(exc).__name__}）") from exc
+        return offset, reads
 
     def poll(self, handle: dict, job: dict) -> dict:
         if not isinstance(job, dict) or not isinstance(job.get("id"), str):
@@ -1006,6 +1181,22 @@ print(json.dumps({{"interrupted": interrupted}}))
                         if len(inline_chunk) == item['size_bytes']:
                             offset = objects.append(key, self.owner_id, execution_id, 0, inline_chunk)
                             inline_reads += 1
+                    tunnel_lease = (
+                        self._tunnel_lease(handle)
+                        if hasattr(self, "store") and env_flag("CREATION_FAST_CONTROL_PLANE", True)
+                        else None
+                    )
+                    if offset < item['size_bytes'] and tunnel_lease is not None:
+                        offset, streamed_reads = self._stream_tunnel_artifact_chunks(
+                            tunnel_lease,
+                            execution_id,
+                            index,
+                            item['size_bytes'],
+                            objects,
+                            key,
+                            offset,
+                        )
+                        chunk_reads += streamed_reads
                     while offset < item['size_bytes']:
                         chunk_reads += 1
                         reply = self._exec_code_on_handle(

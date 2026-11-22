@@ -48,7 +48,9 @@ _STAGE_TEXT = {
     "native_plugins_deps": "安装与校验自定义节点依赖",
     "native_tunnel": "建立原生 ComfyUI 代理连接",
     "restore_env": "正在恢复运行环境",
+    "creation_python": "安装基础 Python 依赖",
     "restore_weights": "正在恢复模型文件",
+    "restore_loras": "正在恢复用户 LoRA",
     "creation_warming": "加载模型并运行内部预热",
     "warm_reuse": "同一台机器已有模型，直接复用",
     "comfy_start": "正在启动 ComfyUI",
@@ -267,17 +269,27 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         One failed or cancelled prep stops the waiting (the job then runs uncached); it is never retried here.
         """
         from .instances import POOL_CREATION, instance_pool_of
+        from .node_persistence import env_flag
 
         snapshot = job.get("snapshot") or {}
         sha = snapshot.get("workflow_sha256")
+        weights = (snapshot.get("manifest") or {}).get("weight_files") or []
         if (
             self._provider_name(job) != "colab"
             or snapshot.get("prep")
             or snapshot.get("creation_api")
             or snapshot.get("system_smoke")
             or not sha
-            or not (snapshot.get("manifest") or {}).get("weight_files")
+            or not weights
             or os.getenv("GPU_PREP", "on").strip().lower() == "off"
+        ):
+            return False
+        # When every reviewed weight is already bound to Google Drive (Model Library) and
+        # base Python dependencies are installed via fast parallel uv, CPU Prep has nothing
+        # to cache for the GPU runtime.
+        if (
+            env_flag("CREATION_SKIP_DRIVE_PREP", True)
+            and all(isinstance(w, dict) and w.get("source") == "drive" for w in weights)
         ):
             return False
         # If a live creation-pool instance already has this exact workflow warm in VRAM/disk

@@ -278,11 +278,21 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
             binding = {**binding, "dependencies": dependencies}
         if binding:
             bound_models = []
-            for ident in {d.get("model_id") for d in binding["dependencies"] if d.get("model_id")}:
-                if policy["provider"] == "colab" and not creation:
-                    bound_models.append(library.check_remote(ident))
+            model_ids = sorted({d.get("model_id") for d in binding["dependencies"] if d.get("model_id")})
+            if policy["provider"] == "colab" and not creation:
+                from concurrent.futures import ThreadPoolExecutor
+
+                from .gpu.node_persistence import env_flag
+
+                if len(model_ids) > 1 and env_flag("CREATION_FAST_CONTROL_PLANE", True):
+                    # Prime lazy DriveStorage on the main thread before concurrent metadata checks.
+                    _ = library.drive
+                    with ThreadPoolExecutor(max_workers=min(6, len(model_ids))) as pool:
+                        bound_models = list(pool.map(library.check_remote, model_ids))
                 else:
-                    bound_models.append(library.get(ident))
+                    bound_models = [library.check_remote(ident) for ident in model_ids]
+            else:
+                bound_models = [library.get(ident) for ident in model_ids]
             drive_accounts = {m.get("drive_account_id") for m in bound_models if m.get("drive_account_id")}
             if len(drive_accounts) > 1:
                 raise ModelError("本次模型来自不同 Drive 账号，请先统一存储账号")
