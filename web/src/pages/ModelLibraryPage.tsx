@@ -3,6 +3,7 @@ import { apiFetch, apiMessage } from '../lib/gpu-api';
 import { bytesLabel, libraryApi, modelStatus, uploadModel, type Catalog, type LibraryModel, type ModelTask } from '../lib/model-library';
 import { useSmartPoll } from '../lib/smart-poll';
 import { ConfirmDialog } from '../components/Feedback';
+import { ModelStorageBreakdown } from '../components/ModelStorageBreakdown';
 import styles from '../gpu.module.css';
 
 export function ModelSourceSettings() {
@@ -79,6 +80,11 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
       </div>
     </div>
     <p className="muted small">{catalog?.statistics.count || 0} 个模型 · Drive 已索引 {bytesLabel(catalog?.statistics.bytes)}。下载与校验由独立模型进程执行，无需启动 GPU。</p>
+    <ModelStorageBreakdown
+      catalog={catalog}
+      selectedCategory={category}
+      onSelectCategory={setCategory}
+    />
     <details className="foldable"><summary>添加模型 / 上传 / 导入 Drive</summary><div className="foldContent">
       <div className={styles.grid2}>
         <label>模型类型<select value={type} onChange={e => setType(e.target.value)}>{Object.keys(catalog?.types || {checkpoints:''}).map(t => <option key={t}>{t}</option>)}</select></label>

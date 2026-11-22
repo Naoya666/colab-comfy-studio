@@ -54,6 +54,13 @@ def search(q: str, user=Depends(current_user), st=Depends(get_store)):
         return ok({"candidates": Sources(lib.http).search(q), "requires_confirmation": True})
 
 
+@router.get("/model-library/drive-usage")
+def drive_usage(refresh: bool = False, user=Depends(current_user), st=Depends(get_store)):
+    from .gpu.drive_usage import collect_drive_usage
+
+    return ok(collect_drive_usage(Repository(st), user["id"], force_refresh=refresh))
+
+
 @router.get("/model-library/storage-settings")
 def storage_settings(user=Depends(current_user), st=Depends(get_store)):
     with library(st, user) as lib:

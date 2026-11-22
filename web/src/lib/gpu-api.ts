@@ -463,3 +463,129 @@ export function createGpuBatch(jobs: GpuJobRequest[], mode: 'save'|'smart'|'batc
 }
 
 export const retryGpuAttempt = (id: string, key: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/attempts`, { method: "POST", headers: { "Idempotency-Key": key }, body: JSON.stringify({}) });
+
+export interface NativeTelemetry {
+  sampled_at: number;
+  instance_id?: string | null;
+  account_id?: string | null;
+  gpu_name?: string | null;
+  vram_total_bytes?: number | null;
+  vram_free_bytes?: number | null;
+  vram_used_bytes?: number | null;
+  torch_vram_total_bytes?: number | null;
+  torch_vram_free_bytes?: number | null;
+  torch_vram_used_bytes?: number | null;
+  ram_total_bytes?: number | null;
+  ram_free_bytes?: number | null;
+  ram_used_bytes?: number | null;
+  queue_running?: number | null;
+  queue_pending?: number | null;
+  busy?: boolean;
+  busy_reason?: string | null;
+  disk_free_bytes?: number | null;
+  vfs_cache_bytes?: number | null;
+  model_storage_mode?: 'local' | 'drive_mount' | string | null;
+  cache_gb?: number | null;
+  comfyui_version?: string | null;
+  pytorch_version?: string | null;
+}
+
+export interface NativeTelemetryResponse {
+  active: boolean;
+  ready: boolean;
+  restarting: boolean;
+  instance_id?: string | null;
+  telemetry: NativeTelemetry | null;
+}
+
+export const getNativeTelemetry = (refresh = false, signal?: AbortSignal) =>
+  apiFetch<NativeTelemetryResponse>(`/api/gpu/native/telemetry${refresh ? '?refresh=true' : ''}`, { cache: 'no-store', signal });
+
+export interface NativeOutputAsset {
+  id: string;
+  filename: string;
+  subfolder: string;
+  path: string;
+  mime: string;
+  size: number;
+  width?: number | null;
+  height?: number | null;
+  md5?: string | null;
+  modified_at?: string | null;
+  created_at?: string | null;
+  favorite: boolean;
+  thumbnail_url: string;
+  content_url: string;
+  account_id?: string | null;
+  account_alias?: string | null;
+}
+
+export interface NativeOutputsPage {
+  connected: boolean;
+  account_id?: string | null;
+  account_alias?: string | null;
+  items: NativeOutputAsset[];
+  total: number;
+  total_all: number;
+  subfolders: string[];
+  has_more: boolean;
+  cached_at?: number;
+  message?: string;
+}
+
+export function getNativeOutputs({
+  refresh = false,
+  limit = 48,
+  offset = 0,
+  mediaType = 'all',
+  favorite = 'all',
+  q = '',
+  subfolder = '',
+}: {
+  refresh?: boolean;
+  limit?: number;
+  offset?: number;
+  mediaType?: 'all' | 'image' | 'video';
+  favorite?: 'all' | 'only' | 'unfavorited';
+  q?: string;
+  subfolder?: string;
+} = {}, signal?: AbortSignal) {
+  const query = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+    media_type: mediaType,
+    favorite,
+  });
+  if (refresh) query.set('refresh', 'true');
+  if (q.trim()) query.set('q', q.trim());
+  if (subfolder) query.set('subfolder', subfolder);
+  return apiFetch<NativeOutputsPage>(`/api/gpu/native/outputs?${query}`, { cache: 'no-store', signal }, 30000);
+}
+
+export const favoriteNativeOutput = (fileId: string, favorite: boolean) =>
+  apiFetch<NativeOutputAsset>(`/api/gpu/native/outputs/${encodeURIComponent(fileId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ favorite }),
+  });
+
+export const importNativeOutputAsReference = (fileId: string, projectId: string) =>
+  apiFetch<GalleryAsset>(`/api/gpu/native/outputs/${encodeURIComponent(fileId)}/import-reference`, {
+    method: 'POST',
+    body: JSON.stringify({ project_id: projectId }),
+  }, 60000);
+
+export const deleteNativeOutput = (fileId: string) =>
+  apiFetch<{ deleted: boolean; id: string; filename?: string }>(`/api/gpu/native/outputs/${encodeURIComponent(fileId)}`, {
+    method: 'DELETE',
+  });
+
+export async function fetchNativeOutputBytes(contentUrl: string, signal?: AbortSignal): Promise<Uint8Array> {
+  const headers = new Headers();
+  const token = sessionToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const response = await fetch(`${API_BASE}${contentUrl}`, { headers, credentials: 'include', signal });
+  if (!response.ok) {
+    throw new ApiError(`读取原生图片失败（HTTP ${response.status}）`, response.status, 'HTTP_ERROR');
+  }
+  return new Uint8Array(await response.arrayBuffer());
+}

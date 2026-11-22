@@ -1,7 +1,9 @@
 """Studio control plane for native ComfyUI. Data plane lives on its own host, subpath, or port."""
 import asyncio
 import re
+import threading
 import time
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -17,6 +19,140 @@ from .port_listeners import probe_port_available
 from .security import sign_session
 
 router = APIRouter(prefix="/api/gpu/native")
+
+_TELEMETRY_CACHE_TTL = 4.0
+_TELEMETRY_LOCK = threading.Lock()
+_TELEMETRY_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_telemetry(
+    lease: dict,
+    storage_cfg: dict,
+    stats_payload: dict | None,
+    queue_payload: dict | None,
+    state_payload: dict | None,
+) -> dict[str, Any] | None:
+    if not isinstance(stats_payload, dict) or not isinstance(stats_payload.get("system"), dict):
+        return None
+    system = stats_payload["system"]
+    devices = stats_payload.get("devices")
+    device = None
+    if isinstance(devices, list) and devices:
+        device = next(
+            (d for d in devices if isinstance(d, dict) and str(d.get("type") or "").lower() in {"cuda", "mps", "xpu"}),
+            devices[0] if isinstance(devices[0], dict) else None,
+        )
+
+    vram_total = _int_or_none(device.get("vram_total")) if device else None
+    vram_free = _int_or_none(device.get("vram_free")) if device else None
+    vram_used = max(0, vram_total - vram_free) if vram_total is not None and vram_free is not None else None
+    torch_vram_total = _int_or_none(device.get("torch_vram_total")) if device else None
+    torch_vram_free = _int_or_none(device.get("torch_vram_free")) if device else None
+    torch_vram_used = (
+        max(0, torch_vram_total - torch_vram_free)
+        if torch_vram_total is not None and torch_vram_free is not None
+        else None
+    )
+
+    ram_total = _int_or_none(system.get("ram_total"))
+    ram_free = _int_or_none(system.get("ram_free"))
+    ram_used = max(0, ram_total - ram_free) if ram_total is not None and ram_free is not None else None
+
+    queue_running = None
+    queue_pending = None
+    if isinstance(queue_payload, dict):
+        running = queue_payload.get("queue_running")
+        pending = queue_payload.get("queue_pending")
+        if isinstance(running, list):
+            queue_running = len(running)
+        if isinstance(pending, list):
+            queue_pending = len(pending)
+
+    disk_free = _int_or_none(state_payload.get("disk_free_bytes")) if isinstance(state_payload, dict) else None
+    vfs_cache = _int_or_none(state_payload.get("vfs_cache_bytes")) if isinstance(state_payload, dict) else None
+    state_busy = state_payload.get("busy") if isinstance(state_payload, dict) else None
+    busy_reason = state_payload.get("busy_reason") if isinstance(state_payload, dict) else None
+    if not busy_reason and ((queue_running or 0) > 0 or (queue_pending or 0) > 0):
+        busy_reason = "queue"
+        state_busy = True
+
+    return {
+        "sampled_at": time.time(),
+        "instance_id": lease.get("instance_id"),
+        "account_id": lease.get("account_id"),
+        "gpu_name": str(device.get("name")) if device and device.get("name") else None,
+        "vram_total_bytes": vram_total,
+        "vram_free_bytes": vram_free,
+        "vram_used_bytes": vram_used,
+        "torch_vram_total_bytes": torch_vram_total,
+        "torch_vram_free_bytes": torch_vram_free,
+        "torch_vram_used_bytes": torch_vram_used,
+        "ram_total_bytes": ram_total,
+        "ram_free_bytes": ram_free,
+        "ram_used_bytes": ram_used,
+        "queue_running": queue_running,
+        "queue_pending": queue_pending,
+        "busy": bool(state_busy) if state_busy is not None else bool((queue_running or 0) or (queue_pending or 0)),
+        "busy_reason": busy_reason,
+        "disk_free_bytes": disk_free,
+        "vfs_cache_bytes": vfs_cache,
+        "model_storage_mode": storage_cfg.get("model_storage_mode"),
+        "cache_gb": storage_cfg.get("cache_gb"),
+        "comfyui_version": system.get("comfyui_version"),
+        "pytorch_version": system.get("pytorch_version"),
+    }
+
+
+async def _fetch_native_telemetry(repo, owner_id: str, lease: dict, *, force_refresh: bool = False) -> dict[str, Any] | None:
+    cache_key = (owner_id, str(lease.get("instance_id") or lease.get("id") or ""))
+    now = time.monotonic()
+    if not force_refresh:
+        with _TELEMETRY_LOCK:
+            cached = _TELEMETRY_CACHE.get(cache_key)
+            if cached and now - cached[0] < _TELEMETRY_CACHE_TTL:
+                return cached[1]
+
+    try:
+        url, headers = native.backend_for(repo, owner_id)
+    except APIError:
+        return None
+
+    async def _get_json(client: httpx.AsyncClient, path: str) -> dict | None:
+        try:
+            resp = await client.get(url + path, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data if isinstance(data, dict) else None
+        except (httpx.HTTPError, ValueError):
+            pass
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            stats_data, queue_data, state_data = await asyncio.gather(
+                _get_json(client, "/system_stats"),
+                _get_json(client, "/queue"),
+                _get_json(client, "/studio_native/state"),
+            )
+    except httpx.HTTPError:
+        return None
+
+    storage_cfg = native.lease_storage(repo, lease)
+    telemetry = _parse_telemetry(lease, storage_cfg, stats_data, queue_data, state_data)
+    if telemetry is not None:
+        with _TELEMETRY_LOCK:
+            _TELEMETRY_CACHE[cache_key] = (time.monotonic(), telemetry)
+    return telemetry
 
 
 def _listener_status(app):
@@ -158,6 +294,37 @@ def update_api_key(key_id: str, body: dict, request: Request, user=Depends(curre
 def revoke_api_key(key_id: str, request: Request, user=Depends(current_user)):
     admin(user)
     return ok(native_api.revoke_key(request.app.state.repo.store, user["id"], key_id), request)
+
+
+@router.get("/telemetry")
+async def telemetry(request: Request, refresh: bool = False, user=Depends(current_user)):
+    repo = request.app.state.repo
+    lease = native.active_lease(repo, user["id"])
+    if not lease:
+        return ok({"active": False, "ready": False, "restarting": False, "instance_id": None, "telemetry": None}, request)
+    restarting = native.restart_active(lease)
+    if not lease.get("native_ready") or restarting:
+        return ok(
+            {
+                "active": True,
+                "ready": False,
+                "restarting": restarting,
+                "instance_id": lease.get("instance_id"),
+                "telemetry": None,
+            },
+            request,
+        )
+    data = await _fetch_native_telemetry(repo, user["id"], lease, force_refresh=refresh)
+    return ok(
+        {
+            "active": True,
+            "ready": data is not None,
+            "restarting": False,
+            "instance_id": lease.get("instance_id"),
+            "telemetry": data,
+        },
+        request,
+    )
 
 
 @router.get("/status")

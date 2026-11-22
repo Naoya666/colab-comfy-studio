@@ -16,8 +16,35 @@ export interface Dependency {
 }
 export interface DependencyRecord { dependencies: Dependency[]; models_ready: boolean; workflow_state: string; runtime_validated: boolean; }
 export interface Catalog { items: LibraryModel[]; types: Record<string, string>; statistics: { count: number; bytes: number; by_type: Record<string, {count: number; bytes: number}> }; }
+export interface DriveUsageCategory {
+  key: string;
+  label: string;
+  description: string;
+  bytes: number;
+  count: number;
+}
+export interface DriveStorageQuota {
+  limit?: number | null;
+  usage?: number | null;
+  usage_in_drive?: number | null;
+  usage_in_drive_trash?: number | null;
+}
+export interface DriveUsageReport {
+  connected: boolean;
+  account_id?: string | null;
+  account_alias?: string | null;
+  cached_at?: number;
+  quota?: DriveStorageQuota | null;
+  studio_total_bytes: number;
+  studio_file_count: number;
+  truncated: boolean;
+  categories: DriveUsageCategory[];
+  message?: string;
+}
 export const libraryApi = <T,>(path = '', body?: unknown, method = body === undefined ? 'GET' : 'POST') =>
   apiFetch<T>(`/api/gpu/model-library${path}`, { method, ...(body === undefined ? {} : {body: JSON.stringify(body)}) });
+export const getDriveUsage = (refresh = false, signal?: AbortSignal) =>
+  apiFetch<DriveUsageReport>(`/api/gpu/model-library/drive-usage${refresh ? '?refresh=true' : ''}`, { cache: 'no-store', signal }, 45000);
 export const dependencyApi = <T,>(workflow: string, action = '', body?: unknown) =>
   apiFetch<T>(`/api/gpu/workflows/${encodeURIComponent(workflow)}/model-dependencies${action ? '/' + action : ''}`, body === undefined && !action ? {} : {method: 'POST', body: JSON.stringify(body || {})});
 export const bytesLabel = (value?: number) => {

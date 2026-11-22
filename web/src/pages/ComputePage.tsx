@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { Cpu, Monitor, HardDrive, Info, Square, Search } from 'lucide-react';
+import { Cpu, HardDrive, Info, Square, Search } from 'lucide-react';
 import { apiMessage, queryCcuBalance, type ComputeSpec, type GpuSettings, type GpuUsage } from '../lib/gpu-api';
 import { CuGuardSettings } from '../components/CuGuardSettings';
 import { CuSessionDetails } from '../components/CuSessionDetails';
 import { ComputeSpecs } from '../components/ComputeSpecs';
 import { InstanceCenter } from '../components/InstanceCenter';
+import { RuntimeTelemetryCard } from '../components/RuntimeTelemetryCard';
 import type { GpuInstance } from '../components/AccountDirectory';
 import { Card } from '../components/ui';
 import styles from '../gpu.module.css';
@@ -70,7 +71,6 @@ export function ComputePage({
   error?: string;
 }) {
   const realEnabled = Boolean(settings?.real_enabled) && settings?.offline_mode !== true;
-  const activeCount = Number(usage?.active_runtimes ?? 0);
   const actual = usage?.today_actual_cu;
   const limit = usage?.guard?.daily_limit_cu;
   const unresolved = (usage?.ccu?.anomalies || []).filter((item) => !item.resolved_at);
@@ -82,21 +82,7 @@ export function ComputePage({
         <p className="muted small">任务在后台运行，关闭页面后仍可回来查看进度。</p>
       </div>
 
-      <Card
-        className={styles.workspaceWide}
-        icon={<Monitor size={17} strokeWidth={1.6} aria-hidden />}
-        title="当前环境"
-        aside={<span className={`pill ${realEnabled ? 'solid' : ''}`}>{realEnabled ? '真实 GPU' : '模拟模式'}</span>}
-      >
-        <div className={styles.envBanner}>
-          <p className="muted small">{realEnabled ? '任务会在 Google Colab 的 GPU 上真实运行。' : '现在是本地模拟，不会连接 Colab，也不会扣 CU。'}</p>
-          <div className={styles.triple}>
-            <div><small className="muted">真实 GPU</small><strong>{realEnabled ? '已启用' : '未启用'}</strong></div>
-            <div><small className="muted">在线机器</small><strong>{activeCount}</strong></div>
-            <div><small className="muted">文件存放</small><strong>{settings?.storage === 'drive' ? 'Google 云盘' : '本站服务器'}</strong></div>
-          </div>
-        </div>
-      </Card>
+      <RuntimeTelemetryCard settings={settings} usage={usage} instances={instances} />
 
       <Card icon={<HardDrive size={17} strokeWidth={1.6} aria-hidden />} title="CU 用量">
         <div className={styles.grid2}>

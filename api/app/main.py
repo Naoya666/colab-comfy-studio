@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import io
 import json
 import os
 import secrets
@@ -12,16 +11,18 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, Request, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image
 from pydantic import BaseModel, Field
 
 from . import __version__
 from .account_routes import router as account_router
 from .admission import _drive, admit_job, repo_registry
+from .agent_routes import AGENT_TOOLS
+from .agent_routes import router as agent_router
+from .asset_routes import assets_router, gallery_router
 from .atelier_routes import router as atelier_router
 from .batch_routes import build_batch_router
 from .common import APIError, admin, current_user, envelope, get_store, ok, own
@@ -45,13 +46,14 @@ from .instance_routes import router as instance_router
 from .job_history import job_timing_details, job_timings
 from .job_schemas import JobInput
 from .model_library_routes import router as model_library_router
+from .native_outputs_routes import router as native_outputs_router
 from .native_proxy import NativeHostMiddleware
 from .native_routes import router as native_router
 from .oauth_config_routes import router as oauth_config_router
 from .presenters import public_asset, public_job
+from .project_routes import router as project_router
 from .review_routes import router as review_router
 from .security import sign_session
-from .storage import asset_path, delete_asset_file, save_asset
 
 
 def usage(st, owner):
@@ -204,49 +206,6 @@ def me(user=Depends(current_user)):
     return user
 
 
-@router.get("/projects")
-def projects(
-    request: Request,
-    include_archived: bool = False,
-    user=Depends(current_user),
-    st=Depends(get_store),
-):
-    rows = st.list("projects", user["id"])
-    if not include_archived:
-        rows = [row for row in rows if row.get("archived_at") is None]
-    return ok(rows, request)
-
-
-@router.post("/projects")
-def create_project(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
-    title = str(body.get("title", "")).strip()[:200]
-    if not title:
-        raise APIError("VALIDATION_ERROR", "项目名称不能为空")
-    return ok(
-        st.create(
-            "projects",
-            user["id"],
-            {"title": title, "atelier_project_id": str(body.get("atelier_project_id", ""))[:128]},
-        ),
-        request,
-        201,
-    )
-
-
-@router.patch("/projects/{project_id}")
-def update_project(project_id: str, body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
-    own(st, "projects", project_id, user)
-    if "title" not in body:
-        raise APIError("PROJECT_INVALID", "仅支持修改本地项目名称")
-    title = str(body["title"]).strip()[:200]
-    if not title:
-        raise APIError("PROJECT_INVALID", "项目名不能为空")
-    patch = {"title": title}
-    if "atelier_project_id" in body:
-        patch["atelier_project_id"] = str(body["atelier_project_id"])[:128]
-    return ok(st.update("projects", project_id, patch, user["id"]), request)
-
-
 _TERMINAL_JOB_STATES = {
     "completed",
     "succeeded",
@@ -257,20 +216,6 @@ _TERMINAL_JOB_STATES = {
     "blocked",
 }
 _FAILED_JOB_STATES = {"failed", "failed_final", "cancelled", "cancelled_local", "blocked"}
-
-
-@router.delete("/projects/{project_id}")
-def delete_project(project_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
-    own(st, "projects", project_id, user)
-    active = [
-        job
-        for job in Repository(st).list("jobs", user["id"], project_id)
-        if str(job.get("state") or "").lower() not in _TERMINAL_JOB_STATES
-    ]
-    if active:
-        raise APIError("PROJECT_HAS_ACTIVE_JOBS", "该项目还有正在排队或运行的任务，请先取消后再归档删除", 409)
-    st.update("projects", project_id, {"archived_at": time.time()}, user["id"])
-    return ok({"deleted": True, "id": project_id}, request)
 
 
 @router.get("/models")
@@ -759,115 +704,6 @@ def outputs(job_id: str, request: Request, user=Depends(current_user), st=Depend
     return ok([public_asset(a) for a in rows], request)
 
 
-@router.get("/gallery")
-def gallery(
-    request: Request, project_id: str | None = None, user=Depends(current_user), st=Depends(get_store)
-):
-    if project_id:
-        own(st, "projects", project_id, user)
-    job_map = {job["id"]: job for job in Repository(st).list("jobs", user["id"], project_id)}
-    result = []
-    for a in st.list("assets", user["id"], project_id):
-        source_job_id = a.get("source_job_id") or a.get("gpu_job_id")
-        if not source_job_id:
-            continue
-        item = public_asset(a)
-        job = job_map.get(source_job_id)
-        if job:
-            if job.get("batch_id") and not item.get("batch_id"):
-                item["batch_id"] = job["batch_id"]
-            if job.get("workflow_key") and not item.get("workflow_key"):
-                item["workflow_key"] = job["workflow_key"]
-            if job.get("provider") == "mock" and item.get("mock") is None:
-                item["mock"] = True
-        result.append(item)
-    return ok(result, request)
-
-
-@app.get("/api/assets")
-def reference_assets(request: Request, project_id: str, user=Depends(current_user), st=Depends(get_store)):
-    own(st, "projects", project_id, user)
-    rows = [
-        public_asset(a)
-        for a in st.list("assets", user["id"], project_id)
-        if not a.get("mock")
-        and not (a.get("metadata") or {}).get("mock")
-        and str(a.get("mime", "")).startswith(("image/", "video/", "audio/"))
-    ]
-    return ok(rows, request)
-
-
-@app.post("/api/assets")
-async def upload_asset(
-    request: Request,
-    project_id: str = Form(...),
-    file: UploadFile = File(...),
-    user=Depends(current_user),
-    st=Depends(get_store),
-):
-    own(st, "projects", project_id, user)
-    content = await file.read(settings.max_upload_bytes + 1)
-    return ok(
-        public_asset(save_asset(st, user["id"], project_id, content, file.filename or "upload.bin")),
-        request,
-        201,
-    )
-
-
-@app.get("/api/assets/{asset_id}/download")
-@app.get("/api/assets/{asset_id}/preview")
-def download_asset(asset_id: str, user=Depends(current_user), st=Depends(get_store)):
-    asset = own(st, "assets", asset_id, user)
-    return FileResponse(asset_path(asset), media_type=asset["mime"], filename=asset["filename"])
-
-
-@app.get("/api/assets/{asset_id}/thumbnail")
-def thumbnail(asset_id: str, user=Depends(current_user), st=Depends(get_store)):
-    asset = own(st, "assets", asset_id, user)
-    if not asset["mime"].startswith("image/"):
-        raise APIError("THUMBNAIL_UNAVAILABLE", "非图片素材不提供图片缩略图", 404)
-    with Image.open(asset_path(asset)) as image:
-        image.thumbnail((480, 480))
-        target = io.BytesIO()
-        image.convert("RGB").save(target, "WEBP", quality=80)
-    return Response(target.getvalue(), media_type="image/webp")
-
-
-@app.patch("/api/assets/{asset_id}")
-def favorite_asset(
-    asset_id: str, body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)
-):
-    own(st, "assets", asset_id, user)
-    if not isinstance(body.get("favorite"), bool):
-        raise APIError("VALIDATION_ERROR", "favorite必须为布尔值")
-    return ok(
-        public_asset(st.update("assets", asset_id, {"favorite": body["favorite"]}, user["id"])), request
-    )
-
-
-@app.delete("/api/assets/{asset_id}")
-def delete_asset(asset_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
-    asset = own(st, "assets", asset_id, user)
-    delete_asset_file(asset)
-    st.delete("assets", asset_id, user["id"])
-    return ok({"deleted": True}, request)
-
-
-@app.post("/api/assets/batch-delete")
-def batch_delete_assets(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
-    raw_ids = body.get("asset_ids") if isinstance(body, dict) else None
-    if not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 200 or any(not isinstance(item, str) for item in raw_ids):
-        raise APIError("VALIDATION_ERROR", "请提供 1~200 个待删除的素材编号")
-    unique_ids = list(dict.fromkeys(raw_ids))
-    assets = [own(st, "assets", aid, user) for aid in unique_ids]
-    deleted_ids = []
-    for asset in assets:
-        delete_asset_file(asset)
-        st.delete("assets", asset["id"], user["id"])
-        deleted_ids.append(asset["id"])
-    return ok({"deleted": len(deleted_ids), "ids": deleted_ids}, request)
-
-
 @router.get("/usage")
 def get_usage(request: Request, user=Depends(current_user), st=Depends(get_store)):
     return ok(usage(st, user["id"]), request)
@@ -968,92 +804,11 @@ def google_disconnect(body: dict, request: Request, user=Depends(current_user), 
     return ok(GoogleService(Repository(st), user["id"]).disconnect(body.get("purpose")), request)
 
 
-# White-listed Agent API: it is not a shell and has no budget or compute-create tool.
-AGENT_TOOLS = {
-    "workflow.list",
-    "workflow.import_draft",
-    "workflow.validate",
-    "model.list",
-    "model.inspect",
-    "model.register_draft",
-    "job.create",
-    "job.get",
-    "job.cancel",
-    "job.list_logs_redacted",
-    "storage.list_project_files",
-    "usage.inspect",
-}
-
-
-def agent_user(request):
-    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
-    expected = os.getenv("GPU_AGENT_TOKEN", "")
-    owner = os.getenv("GPU_AGENT_OWNER_ID", "")
-    if expected and owner and supplied and secrets.compare_digest(supplied, expected):
-        return {"id": owner, "role": "agent"}
-    return current_user(request)
-
-
-@router.get("/agent/tools")
-def agent_tools(request: Request):
-    agent_user(request)
-    return ok(sorted(AGENT_TOOLS), request)
-
-
-@router.post("/agent/invoke")
-def agent_invoke(body: dict, request: Request, st=Depends(get_store)):
-    user = agent_user(request)
-    tool, args = body.get("tool"), body.get("arguments", {})
-    if tool not in AGENT_TOOLS or not isinstance(args, dict):
-        raise APIError("TOOL_FORBIDDEN", "Agent 不具备该工具权限；预算、发布与直接开机不可绕过", 403)
-    repo, registry = repo_registry(st, user)
-    if tool == "usage.inspect":
-        result = usage(st, user["id"])
-    elif tool in {"workflow.list", "model.list"}:
-        result = registry.workflows(user["id"]) if tool == "workflow.list" else registry.models(user["id"])
-    elif tool == "model.inspect":
-        result = next((m for m in registry.models(user["id"]) if m["model_id"] == args.get("model_id")), None)
-    elif tool == "model.register_draft":
-        if not args.get("model_id"):
-            raise APIError("MODEL_INVALID", "缺少模型 ID")
-        result = repo.create(
-            "models",
-            user["id"],
-            {
-                k: v
-                for k, v in args.items()
-                if k in {"model_id", "display_name", "source", "revision", "license", "resource_profile"}
-            }
-            | {"enabled": False, "is_mock": False, "disabled_reason": "待管理员审查"},
-        )
-    elif tool == "workflow.import_draft":
-        result = registry.import_workflow(user["id"], args)
-    elif tool == "workflow.validate":
-        result = registry.validate(user["id"], args.get("id"))
-    elif tool == "job.create":
-        key = args.pop("idempotency_key", None)
-        result = public_job(admit_job(st, user, JobInput(**args).model_dump(), key))
-    elif tool in {"job.get", "job.cancel", "job.list_logs_redacted"}:
-        job = own(repo, "jobs", args.get("id"), user)
-        if tool == "job.cancel":
-            job = Scheduler(st).cancel(user["id"], job["id"])
-        result = (
-            [e for e in repo.list("events", user["id"]) if e.get("job_id") == job["id"]]
-            if tool.endswith("redacted")
-            else public_job(job)
-        )
-    elif tool == "storage.list_project_files":
-        own(st, "projects", args.get("project_id"), user)
-        result = [public_asset(a) for a in st.list("assets", user["id"], args["project_id"])]
-    else:
-        raise APIError("TOOL_FORBIDDEN", "工具不可用", 403)
-    return ok(result, request)
-
-
 if os.getenv("STUDIO_ATELIER_ENABLED", "0").strip().lower() in {"1", "true"}:
     app.include_router(atelier_router)
 app.include_router(account_router)
 app.include_router(instance_router)
+app.include_router(native_outputs_router)
 app.include_router(native_router)
 app.include_router(creation_api_router)
 app.add_middleware(CreationHostMiddleware, studio_app=app)
@@ -1063,6 +818,7 @@ app.include_router(compute_router)
 app.include_router(review_router)
 app.include_router(oauth_config_router)
 app.include_router(model_library_router)
+app.include_router(assets_router)
 
 
 @app.exception_handler(GoogleError)
@@ -1070,6 +826,9 @@ async def google_error(request, exc):
     return error_response(request, APIError("GOOGLE_REQUEST_FAILED", str(exc)[:250], 422))
 
 
+router.include_router(project_router)
+router.include_router(gallery_router)
+router.include_router(agent_router)
 router.include_router(build_batch_router(JobInput, admit_job, public_job))
 app.include_router(router, prefix="/api/gpu")
 # Canonical task-book endpoints are available too; provider switches keep /api/jobs unchanged.
@@ -1090,5 +849,9 @@ if _static_root.exists():
             raise APIError("NOT_FOUND", "接口不存在", 404)
         target = (_static_root / path).resolve()
         if path and target.is_relative_to(_static_root.resolve()) and target.is_file():
+            if target.suffix == ".webmanifest":
+                return FileResponse(target, media_type="application/manifest+json")
             return FileResponse(target)
         return FileResponse(_static_root / "index.html")
+
+__all__ = ["AGENT_TOOLS", "app", "security_context"]

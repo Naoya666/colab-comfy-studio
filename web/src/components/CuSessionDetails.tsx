@@ -9,6 +9,7 @@ import {
   type GpuUsage,
 } from '../lib/gpu-api';
 import { cuNumber, formatDateTime } from '../lib/ui-helpers';
+import { CuDailyChart } from './CuDailyChart';
 import { Card, Segmented } from './ui';
 import styles from '../gpu.module.css';
 
@@ -234,6 +235,38 @@ export function CuSessionDetails({ usage }: { usage: GpuUsage | null }) {
   );
   const dailyError = dailyRangeInvalid ? '起始日期不能晚于终止日期' : dailyRequestError;
 
+  // Separate unpaginated daily fetch for the SVG trend chart when filtered.
+  const [chartState, setChartState] = useState<{ key: string; days: CuDailyEntry[]; loading: boolean }>({
+    key: '',
+    days: [],
+    loading: false,
+  });
+  const chartQueryKey = `${dailyStartDate}:${dailyEndDate}:${usageRefreshKey}`;
+  const chartNeedsFetch = tab === 'daily' && !dailyRangeInvalid && hasDailyFilter;
+  useEffect(() => {
+    if (!chartNeedsFetch) return;
+    const controller = new AbortController();
+    setChartState((prev) => ({ key: chartQueryKey, days: prev.key === chartQueryKey ? prev.days : [], loading: true }));
+    void getCuDaily({ startDate: dailyStartDate, endDate: dailyEndDate, limit: 90, offset: 0 }, controller.signal).then(
+      (page) => {
+        if (!controller.signal.aborted) {
+          setChartState({ key: chartQueryKey, days: page.days, loading: false });
+        }
+      },
+      () => {
+        if (!controller.signal.aborted) {
+          setChartState((prev) => ({ ...prev, loading: false }));
+        }
+      },
+    );
+    return () => controller.abort();
+  }, [chartNeedsFetch, chartQueryKey, dailyStartDate, dailyEndDate]);
+
+  const chartDays: CuDailyEntry[] = !hasDailyFilter
+    ? (usage?.daily_history || [])
+    : (chartState.key === chartQueryKey && chartState.days.length ? chartState.days : (dailyPage?.days || []));
+  const chartLoading = chartNeedsFetch && chartState.loading;
+
   const defaultDailySummary = useMemo(() => {
     const history = usage?.daily_history;
     if (!history) return null;
@@ -315,6 +348,24 @@ export function CuSessionDetails({ usage }: { usage: GpuUsage | null }) {
             {dailyLoading && <span className="muted">更新中…</span>}
           </span>
         </div>
+      )}
+
+      {!dailyRangeInvalid && (
+        <CuDailyChart
+          days={chartDays}
+          today={today}
+          startDate={dailyStartDate}
+          endDate={dailyEndDate}
+          dailyLimitCu={usage?.guard?.daily_limit_cu}
+          loading={chartLoading}
+          onSelectDate={(selectedDate) => {
+            setStartDate(selectedDate);
+            setEndDate(selectedDate);
+            setKind('all');
+            setOffset(0);
+            setTab('sessions');
+          }}
+        />
       )}
 
       {!dailyRangeInvalid && dailyRows?.map(day => <div className={styles.inlinePanel} key={day.date}>
