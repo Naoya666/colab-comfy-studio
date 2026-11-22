@@ -11,18 +11,21 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import re
+import socket
 import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
 from app.security import decrypt_secret
 
 from .google import GoogleService
+from .node_persistence import env_flag
 from .runtime_worker import COMFY_SERVICE_ROOT, MAX_OUTPUT_BYTES, _instance_service_name, _service_api_url
 
 log = logging.getLogger("studio.mcp")
@@ -32,6 +35,61 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 _NETWORK_ATTEMPTS = 3
+_INLINE_ARTIFACT_MAX_BYTES = 64 * 1024
+_INLINE_ARTIFACT_TOTAL_MAX_BYTES = 256 * 1024
+
+
+def _prefer_ipv4_direct() -> bool:
+    """Use IPv4 directly for Colab endpoints when no outbound proxy is configured.
+
+    Avoids dual-stack read/open stalls observed on IPv4-only Docker bridges.
+    """
+    if os.getenv("COLAB_TUNNEL_FORCE_IPV4", "1").strip().lower() in {"0", "false", "off", "no"}:
+        return False
+    return not any(
+        os.getenv(k) for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+    )
+
+
+def _make_colab_http_client(timeout: float) -> httpx.Client:
+    http_timeout = httpx.Timeout(timeout, connect=min(8.0, timeout))
+    if _prefer_ipv4_direct():
+        try:
+            return httpx.Client(
+                timeout=http_timeout,
+                follow_redirects=False,
+                transport=httpx.HTTPTransport(local_address="0.0.0.0"),
+            )
+        except OSError:
+            pass
+    return httpx.Client(timeout=http_timeout, follow_redirects=False)
+
+
+def _connect_ipv4_socket(ws_url: str, timeout: float) -> socket.socket | None:
+    if not _prefer_ipv4_direct():
+        return None
+    parsed = urlsplit(ws_url)
+    host = parsed.hostname
+    if not host:
+        return None
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    last_err: OSError | None = None
+    for af, socktype, proto, _, sa in infos:
+        sock = socket.socket(af, socktype, proto)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(sa)
+            return sock
+        except OSError as exc:
+            last_err = exc
+            sock.close()
+    if last_err is not None:
+        raise last_err
+    return None
 
 
 class MCPError(RuntimeError):
@@ -142,10 +200,12 @@ print(_json.dumps(_result, separators=(",", ":")))
 """
 
 
-def build_poll_code(execution_id: str) -> str:
+def build_poll_code(execution_id: str, *, inline_small_artifacts: bool = False) -> str:
     """Return a read-only status reader with a hard 100MB output bound."""
     execution_id = _uuid4(execution_id)
     encoded = base64.b64encode(execution_id.encode()).decode("ascii")
+    inline_max = _INLINE_ARTIFACT_MAX_BYTES if inline_small_artifacts else 0
+    inline_total_max = _INLINE_ARTIFACT_TOTAL_MAX_BYTES if inline_small_artifacts else 0
     return f"""# Colab GPU Studio fixed read-only recovery probe.
 import base64 as _base64
 import json as _json
@@ -156,6 +216,8 @@ _dir = _Path("/content/ai-studio") / _execution_id
 _status_path = _dir / "status.json"
 _meta_path = _dir / "meta.json"
 _limit = 100 * 1024 * 1024
+_inline_max = {inline_max}
+_inline_total_max = {inline_total_max}
 _result = {{"execution_id": _execution_id, "state": "running", "outputs": []}}
 if not _status_path.exists():
     _result["marker"] = (_dir / "marker.json").exists()
@@ -170,6 +232,30 @@ else:
             if len(_artifacts) > 100 or len(_json.dumps(_artifacts)) > 1048576:
                 raise ValueError("artifact metadata exceeds limit")
             _result["artifacts"] = _artifacts
+            if _inline_max > 0:
+                _inline = {{}}
+                _inline_total = 0
+                _root_res = _dir.resolve()
+                for _idx, _a in enumerate(_artifacts):
+                    if not isinstance(_a, dict) or "storage" in _a:
+                        continue
+                    _rel = _a.get("path")
+                    _sz = _a.get("size_bytes")
+                    if not isinstance(_rel, str) or type(_sz) is not int or not (0 < _sz <= _inline_max):
+                        continue
+                    if _inline_total + _sz > _inline_total_max:
+                        continue
+                    _fp = (_dir / _rel).resolve()
+                    if _root_res not in _fp.parents or not _fp.is_file():
+                        continue
+                    if _fp.stat().st_size != _sz:
+                        continue
+                    _raw = _fp.read_bytes()
+                    if len(_raw) == _sz:
+                        _inline[str(_idx)] = _base64.b64encode(_raw).decode("ascii")
+                        _inline_total += _sz
+                if _inline:
+                    _result["inline_artifacts"] = _inline
         _total = 0
         for _item in (_meta.get("outputs", []) if isinstance(_meta, dict) and _artifacts is None else []):
             if not isinstance(_item, dict):
@@ -264,7 +350,7 @@ class MCPGPUExecutor:
         self.artifact_store = artifact_store
         self.store = store
         self.owner_id, self.account_id = owner_id, account_id
-        self.client = client or httpx.Client(timeout=httpx.Timeout(timeout), follow_redirects=False)
+        self.client = client or _make_colab_http_client(timeout)
         self._owns_client = client is None
         self.google = google or GoogleService(store, owner_id, account_id=account_id, client=self.client)
         self.endpoint = endpoint.rstrip("/")
@@ -476,8 +562,16 @@ class MCPGPUExecutor:
             raise MCPError("Colab 隧道代理凭据缺失")
         return str(url).rstrip("/"), decrypt_secret(enc_tok)
 
-    def _execute_tunnel_code(self, lease: dict, code: str) -> dict:
+    def _execute_tunnel_code(self, lease: dict, code: str, *, exec_timeout: float | None = None) -> dict:
+        from websockets.exceptions import InvalidStatus
         from websockets.sync.client import connect as ws_connect
+
+        fast_cp = env_flag("NATIVE_FAST_CONTROL_PLANE", True)
+        base_timeout = float(getattr(self, "timeout", 30.0))
+        override_timeout = getattr(self, "_exec_timeout_override", None)
+        effective_timeout = float(exec_timeout if exec_timeout is not None else (override_timeout if override_timeout is not None else base_timeout))
+        ws_open_timeout = min(6.0, effective_timeout) if fast_cp else min(15.0, effective_timeout)
+        http_timeout = min(8.0, effective_timeout) if fast_cp else effective_timeout
 
         t_start = time.monotonic()
         proxy_url, proxy_token = self._refresh_tunnel_proxy(lease)
@@ -489,125 +583,171 @@ class MCPGPUExecutor:
             "X-Colab-Client-Agent": "colab-cli",
             "X-Colab-Runtime-Proxy-Token": proxy_token,
         }
-        kernel_id = lease.get("kernel_id")
-        t_kernel = time.monotonic()
-        try:
-            if kernel_id:
-                r = self.client.get(f"{proxy_url}/api/kernels/{kernel_id}", headers=headers, params=auth_params)
-                if r.status_code == 404:
-                    kernel_id = None
-                elif r.status_code >= 400:
-                    raise MCPTransient(f"Colab kernel inspect HTTP {r.status_code}")
-            if not kernel_id:
-                rk = self.client.get(f"{proxy_url}/api/kernels", headers=headers, params=auth_params)
-                existing = rk.json() if rk.status_code == 200 else None
-                if isinstance(existing, list) and existing:
-                    kernel_id = existing[0].get("id")
-                else:
-                    rc = self.client.post(
-                        f"{proxy_url}/api/kernels", json={"name": "python3"}, headers=headers, params=auth_params
+
+        def _ensure_kernel(current_id: str | None, *, verify_existing: bool) -> str:
+            kid = current_id
+            try:
+                if kid and verify_existing:
+                    r = self.client.get(
+                        f"{proxy_url}/api/kernels/{kid}",
+                        headers=headers,
+                        params=auth_params,
+                        timeout=http_timeout,
                     )
-                    if rc.status_code >= 400:
-                        raise MCPTransient(f"Colab kernel start HTTP {rc.status_code}")
-                    kernel_id = rc.json().get("id")
-                if not isinstance(kernel_id, str) or not kernel_id:
-                    raise MCPError("Colab 隧道未能创建 Jupyter Kernel")
-                self.store.update("leases", lease["id"], {"kernel_id": kernel_id}, self.owner_id)
-        except httpx.HTTPError as exc:
-            raise MCPTransient(f"Colab kernel HTTP error ({type(exc).__name__})") from exc
+                    if r.status_code == 404:
+                        kid = None
+                    elif r.status_code >= 400:
+                        raise MCPTransient(f"Colab kernel inspect HTTP {r.status_code}")
+                if not kid:
+                    rk = self.client.get(
+                        f"{proxy_url}/api/kernels",
+                        headers=headers,
+                        params=auth_params,
+                        timeout=http_timeout,
+                    )
+                    existing = rk.json() if rk.status_code == 200 else None
+                    if isinstance(existing, list) and existing:
+                        kid = existing[0].get("id")
+                    else:
+                        rc = self.client.post(
+                            f"{proxy_url}/api/kernels",
+                            json={"name": "python3"},
+                            headers=headers,
+                            params=auth_params,
+                            timeout=http_timeout,
+                        )
+                        if rc.status_code >= 400:
+                            raise MCPTransient(f"Colab kernel start HTTP {rc.status_code}")
+                        kid = rc.json().get("id")
+                    if not isinstance(kid, str) or not kid:
+                        raise MCPError("Colab 隧道未能创建 Jupyter Kernel")
+                    self.store.update("leases", lease["id"], {"kernel_id": kid}, self.owner_id)
+                    lease["kernel_id"] = kid
+                return kid
+            except httpx.HTTPError as exc:
+                raise MCPTransient(f"Colab kernel HTTP error ({type(exc).__name__})") from exc
+
+        kernel_id = lease.get("kernel_id")
+        skipped_kernel_verify = bool(kernel_id and fast_cp)
+        t_kernel = time.monotonic()
+        if not skipped_kernel_verify:
+            kernel_id = _ensure_kernel(kernel_id, verify_existing=True)
         kernel_http_s = time.monotonic() - t_kernel
 
         ws_base = re.sub(r"^http", "ws", proxy_url, count=1)
-        session_id = uuid.uuid4().hex
-        msg_id = uuid.uuid4().hex
-        query = urlencode({**auth_params, "session_id": session_id})
-        ws_url = f"{ws_base}/api/kernels/{kernel_id}/channels?{query}"
-        req_msg = {
-            "header": {
-                "msg_id": msg_id,
-                "username": "studio",
-                "session": session_id,
-                "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "msg_type": "execute_request",
-                "version": "5.3",
-            },
-            "parent_header": {},
-            "metadata": {},
-            "content": {
-                "code": code,
-                "silent": False,
-                "store_history": False,
-                "user_expressions": {},
-                "allow_stdin": False,
-                "stop_on_error": True,
-            },
-            "channel": "shell",
-        }
         stdout_parts: list[str] = []
         error_info: dict | None = None
-        reply_seen = False
-        idle_seen = False
-        deadline = time.monotonic() + self.timeout
-        t_ws = time.monotonic()
         ws_open_s = 0.0
-        try:
-            with ws_connect(
-                ws_url,
-                additional_headers={
-                    "X-Colab-Client-Agent": "colab-cli",
-                    "X-Colab-Runtime-Proxy-Token": proxy_token,
+
+        for ws_pass in range(2):
+            session_id = uuid.uuid4().hex
+            msg_id = uuid.uuid4().hex
+            query = urlencode({**auth_params, "session_id": session_id})
+            ws_url = f"{ws_base}/api/kernels/{kernel_id}/channels?{query}"
+            req_msg = {
+                "header": {
+                    "msg_id": msg_id,
+                    "username": "studio",
+                    "session": session_id,
+                    "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "msg_type": "execute_request",
+                    "version": "5.3",
                 },
-                open_timeout=min(15.0, self.timeout),
-                close_timeout=5.0,
-                max_size=32 * 1024 * 1024,
-            ) as ws:
-                ws_open_s = time.monotonic() - t_ws
-                ws.send(self._ws_pack_default(req_msg))
-                while time.monotonic() < deadline:
-                    remaining = max(0.5, deadline - time.monotonic())
-                    raw = ws.recv(timeout=remaining)
-                    msg = self._ws_unpack_default(raw)
-                    if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
-                        continue
-                    mtype = (msg.get("header") or {}).get("msg_type") or msg.get("msg_type")
-                    content = msg.get("content") or {}
-                    if mtype == "stream":
-                        if content.get("name") == "stdout":
-                            stdout_parts.append(str(content.get("text") or ""))
-                    elif mtype in ("execute_result", "display_data"):
-                        plain = (content.get("data") or {}).get("text/plain")
-                        if isinstance(plain, str):
-                            stdout_parts.append(plain + "\n")
-                    elif mtype == "error":
-                        error_info = {
-                            "name": content.get("ename") or "ExecutionError",
-                            "value": content.get("evalue") or "",
-                        }
-                    elif mtype == "execute_reply":
-                        reply_seen = True
-                        if content.get("status") == "error" and error_info is None:
+                "parent_header": {},
+                "metadata": {},
+                "content": {
+                    "code": code,
+                    "silent": False,
+                    "store_history": False,
+                    "user_expressions": {},
+                    "allow_stdin": False,
+                    "stop_on_error": True,
+                },
+                "channel": "shell",
+            }
+            stdout_parts = []
+            error_info = None
+            reply_seen = False
+            idle_seen = False
+            deadline = time.monotonic() + effective_timeout
+            t_ws = time.monotonic()
+            ws_open_s = 0.0
+            try:
+                ws_kwargs: dict[str, Any] = {
+                    "additional_headers": {
+                        "X-Colab-Client-Agent": "colab-cli",
+                        "X-Colab-Runtime-Proxy-Token": proxy_token,
+                    },
+                    "open_timeout": ws_open_timeout,
+                    "close_timeout": 3.0 if fast_cp else 5.0,
+                    "max_size": 32 * 1024 * 1024,
+                }
+                sock = _connect_ipv4_socket(ws_url, ws_open_timeout)
+                if sock is not None:
+                    ws_kwargs["sock"] = sock
+                with ws_connect(ws_url, **ws_kwargs) as ws:
+                    ws_open_s = time.monotonic() - t_ws
+                    ws.send(self._ws_pack_default(req_msg))
+                    while time.monotonic() < deadline:
+                        remaining = max(0.5, deadline - time.monotonic())
+                        raw = ws.recv(timeout=remaining)
+                        msg = self._ws_unpack_default(raw)
+                        if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
+                            continue
+                        mtype = (msg.get("header") or {}).get("msg_type") or msg.get("msg_type")
+                        content = msg.get("content") or {}
+                        if mtype == "stream":
+                            if content.get("name") == "stdout":
+                                stdout_parts.append(str(content.get("text") or ""))
+                        elif mtype in ("execute_result", "display_data"):
+                            plain = (content.get("data") or {}).get("text/plain")
+                            if isinstance(plain, str):
+                                stdout_parts.append(plain + "\n")
+                        elif mtype == "error":
                             error_info = {
                                 "name": content.get("ename") or "ExecutionError",
                                 "value": content.get("evalue") or "",
                             }
-                    elif mtype == "status" and content.get("execution_state") == "idle":
-                        idle_seen = True
-                    if reply_seen and idle_seen:
-                        break
-        except TimeoutError as exc:
-            log.warning(
-                "tunnel_exec timeout total_s=%.3f refresh_s=%.3f kernel_http_s=%.3f ws_open_s=%.3f",
-                time.monotonic() - t_start, refresh_s, kernel_http_s, ws_open_s,
-            )
-            raise MCPTransient("Colab 隧道 Kernel 执行超时") from exc
-        except Exception as exc:
-            if isinstance(exc, (MCPError, MCPTransient)):
-                raise
-            log.warning(
-                "tunnel_exec ws_error=%s total_s=%.3f refresh_s=%.3f kernel_http_s=%.3f ws_open_s=%.3f",
-                type(exc).__name__, time.monotonic() - t_start, refresh_s, kernel_http_s, ws_open_s,
-            )
-            raise MCPTransient(f"Colab 隧道 WebSocket 异常（{type(exc).__name__}）") from exc
+                        elif mtype == "execute_reply":
+                            reply_seen = True
+                            if content.get("status") == "error" and error_info is None:
+                                error_info = {
+                                    "name": content.get("ename") or "ExecutionError",
+                                    "value": content.get("evalue") or "",
+                                }
+                        elif mtype == "status" and content.get("execution_state") == "idle":
+                            idle_seen = True
+                        if reply_seen and idle_seen:
+                            break
+                break
+            except InvalidStatus as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code in {404, 410} and skipped_kernel_verify and ws_pass == 0:
+                    log.info("tunnel_exec kernel_id stale (HTTP %s); recreating kernel", status_code)
+                    t_recreate = time.monotonic()
+                    kernel_id = _ensure_kernel(None, verify_existing=False)
+                    kernel_http_s += time.monotonic() - t_recreate
+                    skipped_kernel_verify = False
+                    continue
+                log.warning(
+                    "tunnel_exec ws_status=%s total_s=%.3f refresh_s=%.3f kernel_http_s=%.3f ws_open_s=%.3f",
+                    status_code, time.monotonic() - t_start, refresh_s, kernel_http_s, ws_open_s,
+                )
+                raise MCPTransient(f"Colab 隧道 WebSocket HTTP {status_code or 'error'}") from exc
+            except TimeoutError as exc:
+                log.warning(
+                    "tunnel_exec timeout total_s=%.3f refresh_s=%.3f kernel_http_s=%.3f ws_open_s=%.3f",
+                    time.monotonic() - t_start, refresh_s, kernel_http_s, ws_open_s,
+                )
+                raise MCPTransient("Colab 隧道 Kernel 执行超时") from exc
+            except Exception as exc:
+                if isinstance(exc, (MCPError, MCPTransient)):
+                    raise
+                log.warning(
+                    "tunnel_exec ws_error=%s total_s=%.3f refresh_s=%.3f kernel_http_s=%.3f ws_open_s=%.3f",
+                    type(exc).__name__, time.monotonic() - t_start, refresh_s, kernel_http_s, ws_open_s,
+                )
+                raise MCPTransient(f"Colab 隧道 WebSocket 异常（{type(exc).__name__}）") from exc
         total_s = time.monotonic() - t_start
         ws_exec_s = max(0.0, total_s - refresh_s - kernel_http_s - ws_open_s)
         if total_s >= 2.0:
@@ -696,14 +836,15 @@ class MCPGPUExecutor:
     def _exec_code_on_handle(self, handle: dict, session: str, execution_id: str, code: str) -> Any:
         tunnel_lease = self._tunnel_lease(handle)
         if tunnel_lease is not None:
+            fast_cp = env_flag("NATIVE_FAST_CONTROL_PLANE", True)
             for attempt in range(_NETWORK_ATTEMPTS):
                 try:
                     return self._tool_value(self._execute_tunnel_code(tunnel_lease, code))
                 except MCPTransient as exc:
                     if attempt == _NETWORK_ATTEMPTS - 1:
                         raise
-                    delay = 2 * (attempt + 1)
-                    log.warning("tunnel_exec retry attempt=%d/%d delay_s=%d err=%s", attempt + 1, _NETWORK_ATTEMPTS, delay, type(exc).__name__)
+                    delay = 0.5 * (attempt + 1) if fast_cp else 2 * (attempt + 1)
+                    log.warning("tunnel_exec retry attempt=%d/%d delay_s=%.1f err=%s", attempt + 1, _NETWORK_ATTEMPTS, delay, type(exc).__name__)
                     time.sleep(delay)
         return self._tool("execute_code", {"session": session, "executionId": execution_id, "code": code})
 
@@ -783,12 +924,20 @@ print(json.dumps({{"interrupted": interrupted}}))
     def poll(self, handle: dict, job: dict) -> dict:
         if not isinstance(job, dict) or not isinstance(job.get("id"), str):
             raise MCPError("job无效")
+        fast_cp = env_flag("NATIVE_FAST_CONTROL_PLANE", True)
+        base_timeout = float(getattr(self, "timeout", 30.0))
+        poll_timeout = min(12.0, base_timeout) if fast_cp else None
         t_poll0 = time.monotonic()
         execution_id = _uuid4(job.get("execution_id"))
         session = self._session(handle, job["id"])
         probe_id = str(uuid.uuid4())
-        code = build_poll_code(execution_id)
-        result = self._exec_code_on_handle(handle, session, probe_id, code)
+        code = build_poll_code(execution_id, inline_small_artifacts=fast_cp)
+        prev_override = getattr(self, "_exec_timeout_override", None)
+        self._exec_timeout_override = poll_timeout
+        try:
+            result = self._exec_code_on_handle(handle, session, probe_id, code)
+        finally:
+            self._exec_timeout_override = prev_override
         status_poll_s = time.monotonic() - t_poll0
         if not isinstance(result, dict):
             raise MCPError("Colab状态响应无效")
@@ -835,6 +984,8 @@ print(json.dumps({{"interrupted": interrupted}}))
                 raise MCPError('invalid artifact manifest')
             t_art0 = time.monotonic()
             chunk_reads = 0
+            inline_reads = 0
+            inline_map = result.get('inline_artifacts') if isinstance(result.get('inline_artifacts'), dict) else {}
             if any('storage' not in item for item in artifacts):
                 from app.config import settings
 
@@ -846,6 +997,15 @@ print(json.dumps({{"interrupted": interrupted}}))
                         item['size_bytes'], item['sha256'])
                     key = value['artifact_id']
                     offset = objects.offset(key, self.owner_id, execution_id)
+                    inline_b64 = inline_map.get(str(index)) if offset == 0 else None
+                    if isinstance(inline_b64, str) and 0 < item['size_bytes'] <= _INLINE_ARTIFACT_MAX_BYTES:
+                        try:
+                            inline_chunk = base64.b64decode(inline_b64, validate=True)
+                        except (ValueError, TypeError):
+                            inline_chunk = b""
+                        if len(inline_chunk) == item['size_bytes']:
+                            offset = objects.append(key, self.owner_id, execution_id, 0, inline_chunk)
+                            inline_reads += 1
                     while offset < item['size_bytes']:
                         chunk_reads += 1
                         reply = self._exec_code_on_handle(
@@ -869,8 +1029,8 @@ print(json.dumps({{"interrupted": interrupted}}))
                     local.append(verified)
                 artifacts = local
             log.info(
-                "mcp_poll job=%s state=completed status_poll_s=%.3f artifact_s=%.3f chunks=%d total_s=%.3f",
-                job["id"], status_poll_s, time.monotonic() - t_art0, chunk_reads, time.monotonic() - t_poll0,
+                "mcp_poll job=%s state=completed status_poll_s=%.3f artifact_s=%.3f chunks=%d inlined=%d total_s=%.3f",
+                job["id"], status_poll_s, time.monotonic() - t_art0, chunk_reads, inline_reads, time.monotonic() - t_poll0,
             )
             return {**evidence, 'state':'completed','artifacts':artifacts,
                     'timings':result.get('timings') or {}}

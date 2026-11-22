@@ -1780,8 +1780,8 @@ def test_native_env_cache_v2_namespace_overlay_pycache_filter_and_v1_prune(monke
 
     cache_key = partial(np.compute_env_cache_key, base_packages=runtime._base_python_packages(local=False))
     key_info = cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, np.inventory(nodes))
-    assert key_info["key"].startswith("native-env-v2-")
-    assert key_info["spec"]["schema"] == 2
+    assert key_info["key"].startswith("native-env-v3-")
+    assert key_info["spec"]["schema"] == 3
 
     def seed_base(site):
         # Preinstalled protected torch
@@ -1956,7 +1956,7 @@ def test_native_env_cache_v2_namespace_overlay_pycache_filter_and_v1_prune(monke
     (site_norec / "mystery-1.0.dist-info" / "METADATA").write_text("Name: mystery\nVersion: 1.0\n")
     assert np.prepare_env_cache_plan(root, site_norec, before_norec, key_info) is None
 
-    # prune_env_cache deletes all native-env-v1-* files and keeps latest keep v2 entries
+    # prune_env_cache deletes all native-env-v1-* and native-env-v2-* files and keeps latest keep v3 entries
     deleted = []
     remote_real = np.Remote(tmp_path / "rclone_root")
     (tmp_path / "rclone_root").mkdir()
@@ -1967,12 +1967,14 @@ def test_native_env_cache_v2_namespace_overlay_pycache_filter_and_v1_prune(monke
         if args[0] == "lsf":
             return SimpleNamespace(
                 stdout=(
-                    "2026-11-22 10:00:00\tnative-env-v1-old1.meta.json\n"
-                    "2026-11-22 10:00:00\tnative-env-v1-old1.tar.gz\n"
-                    "2026-11-22 11:00:00\tnative-env-v2-a.meta.json\n"
-                    "2026-11-22 12:00:00\tnative-env-v2-b.meta.json\n"
-                    "2026-11-22 13:00:00\tnative-env-v2-c.meta.json\n"
-                    "2026-11-22 14:00:00\tnative-env-v2-d.meta.json\n"
+                    "2026-11-22 09:00:00\tnative-env-v1-old1.meta.json\n"
+                    "2026-11-22 09:00:00\tnative-env-v1-old1.tar.gz\n"
+                    "2026-11-22 10:00:00\tnative-env-v2-old2.meta.json\n"
+                    "2026-11-22 10:00:00\tnative-env-v2-old2.tar.gz\n"
+                    "2026-11-22 11:00:00\tnative-env-v3-a.meta.json\n"
+                    "2026-11-22 12:00:00\tnative-env-v3-b.meta.json\n"
+                    "2026-11-22 13:00:00\tnative-env-v3-c.meta.json\n"
+                    "2026-11-22 14:00:00\tnative-env-v3-d.meta.json\n"
                 )
             )
         if args[0] == "deletefile":
@@ -1984,9 +1986,11 @@ def test_native_env_cache_v2_namespace_overlay_pycache_filter_and_v1_prune(monke
     remote_real.prune_env_cache(keep=3)
     assert "native-env-v1-old1.meta.json" in deleted
     assert "native-env-v1-old1.tar.gz" in deleted
-    assert "native-env-v2-a.meta.json" in deleted
-    assert "native-env-v2-a.tar.gz" in deleted
-    assert "native-env-v2-b.meta.json" not in deleted
+    assert "native-env-v2-old2.meta.json" in deleted
+    assert "native-env-v2-old2.tar.gz" in deleted
+    assert "native-env-v3-a.meta.json" in deleted
+    assert "native-env-v3-a.tar.gz" in deleted
+    assert "native-env-v3-b.meta.json" not in deleted
 
 
 def test_scheduler_native_wait_event_emitted_even_when_stage_already_native_tunnel(monkeypatch, tmp_path):
@@ -2113,4 +2117,150 @@ async def test_native_state_route_fails_closed_fast_during_boot_scan_without_dup
     assert probe_calls == [False]
     assert status_calls == [1]
     assert resp3.data["busy"] is False
+
+
+def test_mcp_poll_inlines_small_artifacts_without_second_chunk_roundtrip(monkeypatch, tmp_path):
+    import contextlib
+    import hashlib
+    import io
+    import json
+    import uuid
+
+    from app.gpu import mcp
+    from app.gpu.artifacts import LocalArtifactStore
+
+    execution = str(uuid.uuid4())
+    remote = tmp_path / "remote"
+    exec_dir = remote / execution
+    (exec_dir / "outputs").mkdir(parents=True)
+    report_bytes = json.dumps({"native_comfy": True, "stage_seconds": {"comfy_start": 50.0}}).encode()
+    (exec_dir / "outputs" / "native-ready.json").write_bytes(report_bytes)
+    large_bytes = b"L" * (70 * 1024)  # > 64 KiB -> must NOT be inlined
+    (exec_dir / "outputs" / "big.mp4").write_bytes(large_bytes)
+    artifacts = [
+        {
+            "filename": "native-ready.json", "path": "outputs/native-ready.json", "mime": "application/json",
+            "size_bytes": len(report_bytes), "sha256": hashlib.sha256(report_bytes).hexdigest(),
+        },
+        {
+            "filename": "big.mp4", "path": "outputs/big.mp4", "mime": "video/mp4",
+            "size_bytes": len(large_bytes), "sha256": hashlib.sha256(large_bytes).hexdigest(),
+        },
+    ]
+    (exec_dir / "status.json").write_text(json.dumps({"state": "completed", "updated_at": 1234.5}))
+    (exec_dir / "meta.json").write_text(json.dumps({"execution_id": execution, "artifacts": artifacts}))
+
+    objects = LocalArtifactStore(tmp_path / "artifacts")
+    ex = object.__new__(mcp.MCPGPUExecutor)
+    ex.owner_id = "owner"
+    ex.artifact_store = objects
+    ex._session = lambda *a: "session"
+    tool_calls = []
+
+    def fake_tool(name, args):
+        tool_calls.append(args["code"])
+        out = io.StringIO()
+        code = args["code"].replace("/content/ai-studio", str(remote))
+        with contextlib.redirect_stdout(out):
+            exec(compile(code, "poll_inline_test", "exec"), {})
+        return json.loads(out.getvalue())
+
+    ex._tool = fake_tool
+    res = ex.poll({}, {"id": "job-inline", "execution_id": execution, "snapshot": {"native_comfy": True}})
+    assert res["state"] == "completed"
+    assert res["status_updated_at"] == 1234.5
+    assert len(res["artifacts"]) == 2
+    # 1 poll call (which inlined native-ready.json) + 1 chunk call ONLY for big.bin (not for native-ready.json!)
+    assert len(tool_calls) == 2
+    assert "native-ready.json" in res["artifacts"][0]["filename"]
+    _, p0 = objects.verify_manifest(res["artifacts"][0], "owner", execution)
+    _, p1 = objects.verify_manifest(res["artifacts"][1], "owner", execution)
+    assert p0.read_bytes() == report_bytes
+    assert p1.read_bytes() == large_bytes
+
+
+def test_mcp_tunnel_skips_kernel_get_when_known_and_recreates_on_ws_404(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+    from websockets.exceptions import InvalidStatus
+    import websockets.sync.client as ws_client
+
+    from app.db import Store
+    from app.gpu import mcp
+    from app.gpu.repository import Repository
+
+    store = Store(f"sqlite:///{tmp_path / 'tunnel_fast.db'}")
+    repo = Repository(store)
+    lease = repo.create("leases", "owner", {
+        "provider": "colab", "state": "active", "kernel_id": "k-old",
+        "proxy_url": "https://proxy.example", "tunnel_endpoint": "ep1",
+    })
+
+    http_calls = []
+
+    def http_handler(req):
+        http_calls.append((req.method, req.url.path))
+        if req.method == "GET" and req.url.path == "/api/kernels":
+            return httpx.Response(200, json=[])
+        if req.method == "POST" and req.url.path == "/api/kernels":
+            return httpx.Response(201, json={"id": "k-new"})
+        raise AssertionError(f"unexpected http call: {req.method} {req.url.path}")
+
+    ws_urls = []
+    ws_fail_old = [False]
+
+    class FakeWS:
+        def __init__(self, url):
+            self.url = url
+            self.sent_msg_id = None
+            self.replies = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def send(self, frame):
+            msg = mcp.MCPGPUExecutor._ws_unpack_default(frame)
+            mid = msg["header"]["msg_id"]
+            self.replies = [
+                json.dumps({"parent_header": {"msg_id": mid}, "header": {"msg_type": "stream"}, "content": {"name": "stdout", "text": '{"ok":true}\n'}}),
+                json.dumps({"parent_header": {"msg_id": mid}, "header": {"msg_type": "execute_reply"}, "content": {"status": "ok"}}),
+                json.dumps({"parent_header": {"msg_id": mid}, "header": {"msg_type": "status"}, "content": {"execution_state": "idle"}}),
+            ]
+
+        def recv(self, timeout=None):
+            return self.replies.pop(0)
+
+    def fake_ws_connect(url, **kwargs):
+        ws_urls.append(url)
+        if ws_fail_old[0] and "/api/kernels/k-old/" in url:
+            raise InvalidStatus(SimpleNamespace(status_code=404))
+        return FakeWS(url)
+
+    monkeypatch.setattr(ws_client, "connect", fake_ws_connect)
+    monkeypatch.setattr(mcp, "_connect_ipv4_socket", lambda *a, **kw: None)
+
+    with httpx.Client(transport=httpx.MockTransport(http_handler)) as client:
+        ex = mcp.MCPGPUExecutor(repo, "owner", google=object(), client=client)
+        monkeypatch.setattr(ex, "_refresh_tunnel_proxy", lambda l: ("https://proxy.example", "tok"))
+
+        # Case 1: kernel_id already known -> ZERO HTTP GET /api/kernels/{id} calls!
+        out1 = ex._execute_tunnel_code(dict(lease), "print(1)")
+        assert json.loads(out1["stdout"]) == {"ok": True}
+        assert http_calls == []
+        assert len(ws_urls) == 1 and "/api/kernels/k-old/" in ws_urls[0]
+
+        # Case 2: kernel_id stale (WS handshake 404) -> recreates kernel & succeeds!
+        ws_fail_old[0] = True
+        ws_urls.clear()
+        lease_copy = dict(lease)
+        out2 = ex._execute_tunnel_code(lease_copy, "print(2)")
+        assert json.loads(out2["stdout"]) == {"ok": True}
+        assert ("POST", "/api/kernels") in http_calls
+        assert lease_copy["kernel_id"] == "k-new"
+        assert repo.get("leases", lease["id"], "owner")["kernel_id"] == "k-new"
+        assert len(ws_urls) == 2 and "/api/kernels/k-new/" in ws_urls[1]
+
 

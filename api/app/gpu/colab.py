@@ -81,7 +81,12 @@ class GoogleColabProvider:
         timeout=10.0,
     ):
         self.store, self.owner_id, self.account_id = store, owner_id, account_id
-        self.client = client or httpx.Client(timeout=httpx.Timeout(timeout), follow_redirects=False)
+        if client is not None:
+            self.client = client
+        else:
+            from .mcp import _make_colab_http_client
+
+            self.client = _make_colab_http_client(timeout)
         self._owns_client = client is None
         self.google = google or GoogleService(store, owner_id, account_id=account_id, client=self.client)
         self.base_url = base_url.rstrip("/")
@@ -733,8 +738,9 @@ class GoogleColabProvider:
 
         if run_kernel_exec and proxy_status == "ok" and kernel_id and proxy_url and proxy_token:
             try:
-                from .mcp import MCPGPUExecutor
+                from .mcp import MCPGPUExecutor, _connect_ipv4_socket
 
+                custom_ws = ws_connect_fn is not None
                 if ws_connect_fn is None:
                     from websockets.sync.client import connect as ws_connect_fn
                 ws_base = re.sub(r"^http", "ws", proxy_url, count=1)
@@ -771,16 +777,20 @@ class GoogleColabProvider:
                 idle_seen = False
                 has_error = False
                 deadline = time.monotonic() + 8.0
-                with ws_connect_fn(
-                    ws_url,
-                    additional_headers={
+                ws_kwargs = {
+                    "additional_headers": {
                         "X-Colab-Client-Agent": "colab-cli",
                         "X-Colab-Runtime-Proxy-Token": proxy_token,
                     },
-                    open_timeout=6.0,
-                    close_timeout=3.0,
-                    max_size=4 * 1024 * 1024,
-                ) as ws:
+                    "open_timeout": 6.0,
+                    "close_timeout": 3.0,
+                    "max_size": 4 * 1024 * 1024,
+                }
+                if not custom_ws:
+                    sock = _connect_ipv4_socket(ws_url, 6.0)
+                    if sock is not None:
+                        ws_kwargs["sock"] = sock
+                with ws_connect_fn(ws_url, **ws_kwargs) as ws:
                     ws.send(MCPGPUExecutor._ws_pack_default(req_msg))
                     while time.monotonic() < deadline:
                         remaining = max(0.3, deadline - time.monotonic())

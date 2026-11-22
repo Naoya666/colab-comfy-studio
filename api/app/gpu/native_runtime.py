@@ -6,6 +6,7 @@ never copies the whole Drive or preloads VRAM.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -711,21 +712,44 @@ def run(root, payload, stages):
                     local_config.unlink(missing_ok=True)
                     extra.write_text(json.dumps(model_paths(mount)))
 
-                stages.start("native_plugins_restore")
                 shutil.copyfile(Path(__file__).with_name("node_persistence.py"), ROOT / "node_persistence.py")
                 persistence = Persistence(ROOT, comfy, data / "user")
-                restored_plugins = persistence.restore(payload.get("native_plugin_generation"))
-
                 baseline_protected = protect_environment(ROOT)
                 site = worker._site_dir()
                 use_env_cache = _flag("NATIVE_ENV_CACHE", True) and site.is_dir() and persistence.remote.available()
+
+                stages.start("native_plugins_restore")
+                base_python_future = None
+                if boot_pool is not None:
+                    def _run_base_python() -> float:
+                        t_py = time.monotonic()
+                        _install_base_python(worker, ROOT, comfy, manager, local=local)
+                        return time.monotonic() - t_py
+                    base_python_future = boot_pool.submit(_run_base_python)
+                restored_plugins = persistence.restore(payload.get("native_plugin_generation"))
+                if base_python_future is not None:
+                    if not base_python_future.done():
+                        stages.start("native_python")
+                    base_py_s = base_python_future.result()
+                    print(
+                        f"[studio-native] Base Python dependencies ready in {base_py_s:.1f}s (parallel with plugin restore)",
+                        flush=True,
+                    )
+                else:
+                    stages.start("native_python")
+                    _install_base_python(worker, ROOT, comfy, manager, local=local)
+                importlib.invalidate_caches()
+                after_base = protect_environment(ROOT)
+                if after_base != baseline_protected:
+                    raise RuntimeError("Base dependency install changed protected PyTorch/CUDA packages; recreate runtime")
+
                 key_info = None
                 before_site = {}
                 env_cache_hit = False
                 env_cache_plan = None
+                current_plugins = restored_plugins if restored_plugins is not None else inventory(comfy / "custom_nodes")
 
-                if use_env_cache:
-                    current_plugins = restored_plugins if restored_plugins is not None else inventory(comfy / "custom_nodes")
+                if use_env_cache and current_plugins:
                     key_info = compute_env_cache_key(
                         comfy, commit, worker._gpu_cache_tag(), comfy / "custom_nodes", current_plugins,
                         base_packages=_base_python_packages(local=local),
@@ -740,12 +764,6 @@ def run(root, payload, stages):
                 if not env_cache_hit:
                     if use_env_cache and key_info is not None:
                         before_site = site_snapshot(site)
-                    stages.start("native_python")
-                    _install_base_python(worker, ROOT, comfy, manager, local=local)
-                    after_base = protect_environment(ROOT)
-                    if after_base != baseline_protected:
-                        raise RuntimeError("Base dependency install changed protected PyTorch/CUDA packages; recreate runtime")
-
                     stages.start("native_plugins_deps")
                     dep_key = persistence.dependencies(plugins=restored_plugins)
                     if dep_key:

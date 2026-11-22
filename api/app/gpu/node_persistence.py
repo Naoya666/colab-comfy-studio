@@ -602,9 +602,9 @@ class Remote:
             if len(parts) != 2:
                 continue
             ts, fname = parts[0], parts[1].strip()
-            if fname.startswith('native-env-v1-') and fname.endswith(('.meta.json', '.tar.gz')):
+            if fname.startswith(('native-env-v1-', 'native-env-v2-')) and fname.endswith(('.meta.json', '.tar.gz')):
                 legacy_files.append(fname)
-            elif fname.startswith('native-env-v2-') and fname.endswith('.meta.json'):
+            elif fname.startswith('native-env-v3-') and fname.endswith('.meta.json'):
                 metas.append((ts, fname[:-len('.meta.json')]))
         for fname in sorted(set(legacy_files)):
             try:
@@ -1132,9 +1132,9 @@ class Persistence:
                 'error': error}
 
 
-# --- Phase 2: Incremental Native Environment Cache (site-packages delta v2) ---
+# --- Phase 2: Incremental Native Environment Cache (plugin site-packages delta v3) ---
 
-_ENV_CACHE_SCHEMA = 2
+_ENV_CACHE_SCHEMA = 3
 _PROTECTED_TOP_DIRS = frozenset({'torch', 'torchvision', 'torchaudio', 'triton', 'torchgen', 'functorch'})
 
 
@@ -1333,7 +1333,7 @@ def compute_env_cache_key(
     }
     spec_sha = digest(spec)
     py_tag = f'py{sys.version_info.major}{sys.version_info.minor}'
-    key = f'native-env-v2-{commit[:12]}-{py_tag}-img{base_pkg_sha[:12]}-gpu{gpu_tag[:12]}-deps{spec_sha[:16]}'
+    key = f'native-env-v3-{commit[:12]}-{py_tag}-img{base_pkg_sha[:12]}-gpu{gpu_tag[:12]}-deps{spec_sha[:16]}'
     return {'key': key, 'spec': spec}
 
 
@@ -1710,7 +1710,7 @@ def prepare_env_cache_plan(root: Path, site: Path, before_site: dict, key_info: 
         'external_ignored': external_ignored,
     })
     print(
-        f'[studio-native] Prepared env-cache plan v2: added={len(added_top)}, '
+        f'[studio-native] Prepared env-cache plan v{_ENV_CACHE_SCHEMA}: added={len(added_top)}, '
         f'overlay_files={len(overlay_files)}, removed={len(removed_top)}, '
         f'removed_files={len(removed_files)}, external_ignored={external_ignored}',
         flush=True,
