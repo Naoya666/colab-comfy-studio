@@ -357,9 +357,13 @@ class NativeGateway:
             if file:
                 url += "?" + urlencode(dict(zip(("filename", "subfolder", "type"), file)))
         headers = clean_headers(httpx.Headers(scope["headers"]), request=True)
-        # Strip client Origin and Referer before adding upstream Origin so ComfyUI's aiohttp
-        # origin guard never receives duplicate/comma-joined Origin values on browser POSTs.
-        headers = [(k, v) for k, v in headers if k.lower() not in {"origin", "referer"}]
+        # Strip client Origin/Referer before adding upstream Origin, and rewrite Python-urllib
+        # User-Agent which Cloudflare Browser Integrity Check blocks with 403 error code 1010.
+        headers = [
+            (k, "colab-gpu-studio-proxy/1.0" if k.lower() == "user-agent" and "python-urllib" in v.lower() else v)
+            for k, v in headers
+            if k.lower() not in {"origin", "referer"}
+        ]
         headers += list(auth.items()) + [("Origin", base)]
         path = path or scope["path"].removeprefix("/api").rstrip("/")
         mutating = request.method not in {"GET", "HEAD", "OPTIONS"} or (
