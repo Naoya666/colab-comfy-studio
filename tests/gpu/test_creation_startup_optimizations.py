@@ -134,23 +134,36 @@ def test_drive_cache_multistream_range_single_pass_dual_hash_and_retry(tmp_path,
     expected_md5 = hashlib.md5(payload, usedforsecurity=False).hexdigest()
 
     cache = worker.DriveCache("t" * 32, "f" * 32)
-    cache._part_size = 1024 * 1024  # 1 MiB parts -> 5 parts
     cache._min_multistream_bytes = 2 * 1024 * 1024
 
     lock = threading.Lock()
     seen_ranges: list[str] = []
-    failed_once = {"part2": False}
+    failed_once = {"seg2": False}
 
     def fake_open(method, url, *, body=None, headers=None, timeout=120):
         rng = (headers or {}).get("Range", "")
-        with lock:
-            seen_ranges.append(rng)
-            if rng.startswith("bytes=2097152-") and not failed_once["part2"]:
-                failed_once["part2"] = True
-                raise ConnectionResetError("transient reset on part 2")
         assert rng.startswith("bytes=")
         s_str, e_str = rng[6:].split("-", 1)
         start, end = int(s_str), int(e_str)
+        with lock:
+            seen_ranges.append(rng)
+            if start > 0 and not failed_once["seg2"]:
+                failed_once["seg2"] = True
+                # Simulate mid-segment disconnect after delivering first 128 KiB -> must resume from start+128KiB!
+                partial = payload[start : start + 128 * 1024]
+
+                class _DropStream(_FakeRangeResponse):
+                    def read(self, n: int = -1) -> bytes:
+                        out = super().read(n)
+                        if not out:
+                            raise ConnectionResetError("mid-segment reset")
+                        return out
+
+                return _DropStream(
+                    206,
+                    partial,
+                    headers={"Content-Range": f"bytes {start}-{end}/{len(payload)}"},
+                )
         chunk = payload[start : end + 1]
         return _FakeRangeResponse(
             206,
@@ -166,7 +179,7 @@ def test_drive_cache_multistream_range_single_pass_dual_hash_and_retry(tmp_path,
     assert sha == expected_sha
     assert md5 == expected_md5
     assert dest.read_bytes() == payload
-    assert len(seen_ranges) == 6  # 5 parts + 1 retry on part 2
+    assert len(seen_ranges) == 5  # 4 big segments + 1 mid-segment resume!
 
     # Local stamp hash cache must now hit without calling _sha256 again!
     monkeypatch.setattr(worker, "_sha256", lambda _: pytest.fail("should hit stamp hash cache"))
@@ -183,7 +196,6 @@ def test_drive_cache_multistream_falls_back_to_single_on_http_200(tmp_path, monk
     expected_md5 = hashlib.md5(payload, usedforsecurity=False).hexdigest()
 
     cache = worker.DriveCache("t" * 32, "f" * 32)
-    cache._part_size = 1024 * 1024
     cache._min_multistream_bytes = 2 * 1024 * 1024
 
     def fake_open(method, url, *, body=None, headers=None, timeout=120):

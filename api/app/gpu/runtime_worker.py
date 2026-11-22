@@ -49,8 +49,8 @@ DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
 DRIVE_TOKEN = re.compile(r"^[A-Za-z0-9._~+/=-]{20,4096}$")
 FOLDER_MIME = "application/vnd.google-apps.folder"
 UPLOAD_CHUNK = 64 * 1024 * 1024  # must be a multiple of 256 KiB
-_MULTI_STREAM_MIN_BYTES = 32 * 1024 * 1024
-_MULTI_STREAM_PART_BYTES = 16 * 1024 * 1024
+_MULTI_STREAM_MIN_BYTES = 128 * 1024 * 1024
+_MULTI_STREAM_STREAM_CHUNK = 4 * 1024 * 1024
 _DRIVE_STREAM_SEM = threading.Semaphore(12)
 _CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
 _LRU_RESERVE_BYTES = 5 * 1024**3
@@ -83,7 +83,7 @@ def creation_optimization_flags() -> dict[str, str]:
         "CREATION_USE_UV": "1",
         "CREATION_PARALLEL_BOOTSTRAP": "1",
         "CREATION_MULTI_STREAM_DRIVE": "1",
-        "CREATION_DRIVE_STREAMS": "6",
+        "CREATION_DRIVE_STREAMS": "4",
         "CREATION_LOCAL_HASH_CACHE": "1",
         "CREATION_FAST_CONTROL_PLANE": "1",
         "CREATION_ENV_CACHE": "auto",
@@ -1407,7 +1407,6 @@ class DriveCache:
         self._folders: dict[tuple[str, str], str] = {}
         self._lock = threading.Lock()
         self._http_client: Any = None
-        self._part_size = _MULTI_STREAM_PART_BYTES
         self._min_multistream_bytes = _MULTI_STREAM_MIN_BYTES
 
     def _is_open_overridden(self) -> bool:
@@ -1533,46 +1532,55 @@ class DriveCache:
             return entry
         return None
 
-    def _fetch_range_part(self, url: str, start: int, end: int, total_size: int) -> bytes:
-        expected_len = end - start + 1
-        range_header = f"bytes={start}-{end}"
+    def _stream_range_segment(self, url: str, fd: int, start: int, end: int, total_size: int) -> None:
+        """Stream one large contiguous Range segment directly via os.pwrite, resuming on drop."""
+        pos = start
         client = self._get_http_client()
         for attempt in range(4):
+            if pos > end:
+                return
+            range_header = f"bytes={pos}-{end}"
             try:
                 if client is not None:
                     cur = url
                     headers = {"Authorization": "Bearer " + self._token, "Range": range_header}
-                    resp = None
-                    for _ in range(4):
+                    # Resolve Google 302 redirect hop(s) once before opening the continuous stream.
+                    for hop in range(4):
                         self._check_google_url(cur)
-                        resp = client.get(cur, headers=headers)
-                        if resp.status_code in {301, 302, 303, 307} and resp.headers.get("location"):
-                            cur = resp.headers["location"]
-                            continue
-                        break
-                    assert resp is not None
-                    status = resp.status_code
-                    if status == 200:
-                        raise _RangeUnsupported("upstream ignored Range header")
-                    if status in _RETRYABLE_HTTP_CODES:
-                        if attempt == 3:
-                            raise WorkerError(f"drive range request failed (HTTP {status})")
-                        self._retry_sleep(attempt)
-                        continue
-                    if status != 206:
-                        raise WorkerError(f"drive range request returned HTTP {status}")
-                    cr = (resp.headers.get("content-range") or "").strip()
-                    match = _CONTENT_RANGE_RE.fullmatch(cr)
-                    if (
-                        not match
-                        or int(match[1]) != start
-                        or int(match[2]) != end
-                        or int(match[3]) != total_size
-                    ):
-                        raise _RangeUnsupported(f"unexpected Content-Range: {cr}")
-                    data = resp.content
+                        with client.stream("GET", cur, headers=headers) as resp:
+                            status = resp.status_code
+                            if status in {301, 302, 303, 307} and resp.headers.get("location"):
+                                cur = resp.headers["location"]
+                                if hop == 3:
+                                    raise WorkerError("drive cache redirected too many times")
+                                continue
+                            if status == 200:
+                                raise _RangeUnsupported("upstream ignored Range header")
+                            if status in _RETRYABLE_HTTP_CODES:
+                                raise HTTPError(cur, status, f"HTTP {status}", resp.headers, None)
+                            if status != 206:
+                                raise WorkerError(f"drive range request returned HTTP {status}")
+                            cr = (resp.headers.get("content-range") or "").strip()
+                            match = _CONTENT_RANGE_RE.fullmatch(cr)
+                            if (
+                                not match
+                                or int(match[1]) != pos
+                                or int(match[2]) != end
+                                or int(match[3]) != total_size
+                            ):
+                                raise _RangeUnsupported(f"unexpected Content-Range: {cr}")
+                            for chunk in resp.iter_bytes(chunk_size=_MULTI_STREAM_STREAM_CHUNK):
+                                if not chunk:
+                                    continue
+                                if pos + len(chunk) > end + 1:
+                                    raise WorkerError("drive range segment exceeded expected end")
+                                written = os.pwrite(fd, chunk, pos)
+                                while written < len(chunk):
+                                    written += os.pwrite(fd, chunk[written:], pos + written)
+                                pos += len(chunk)
+                            break
                 else:
-                    with self._open("GET", url, headers={"Range": range_header}, timeout=60) as response:
+                    with self._open("GET", url, headers={"Range": range_header}, timeout=120) as response:
                         status = getattr(response, "status", None)
                         if status is None and hasattr(response, "getcode"):
                             status = response.getcode()
@@ -1585,21 +1593,23 @@ class DriveCache:
                         match = _CONTENT_RANGE_RE.fullmatch(cr)
                         if (
                             not match
-                            or int(match[1]) != start
+                            or int(match[1]) != pos
                             or int(match[2]) != end
                             or int(match[3]) != total_size
                         ):
                             raise _RangeUnsupported(f"unexpected Content-Range: {cr}")
-                        chunks = []
-                        while block := response.read(4 * 1024 * 1024):
-                            chunks.append(block)
-                        data = b"".join(chunks)
-                if len(data) != expected_len:
-                    if attempt == 3:
-                        raise WorkerError(f"drive range part short read ({len(data)} != {expected_len})")
-                    self._retry_sleep(attempt)
-                    continue
-                return data
+                        while chunk := response.read(_MULTI_STREAM_STREAM_CHUNK):
+                            if pos + len(chunk) > end + 1:
+                                raise WorkerError("drive range segment exceeded expected end")
+                            written = os.pwrite(fd, chunk, pos)
+                            while written < len(chunk):
+                                written += os.pwrite(fd, chunk[written:], pos + written)
+                            pos += len(chunk)
+                if pos > end:
+                    return
+                if attempt == 3:
+                    raise WorkerError(f"drive range segment incomplete ({pos} <= {end})")
+                self._retry_sleep(attempt)
             except _RangeUnsupported:
                 raise
             except HTTPError as exc:
@@ -1609,93 +1619,48 @@ class DriveCache:
                 raise
             except WorkerError:
                 raise
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC or attempt == 3:
+                    raise
+                self._retry_sleep(attempt)
             except Exception:
                 if attempt == 3:
                     raise
                 self._retry_sleep(attempt)
-        raise WorkerError("drive range part failed after retries")
+        raise WorkerError("drive range segment failed after retries")
 
     def _fetch_multistream(
         self, entry: dict, destination: Path, *, expected_sha256: str | None, streams: int
     ) -> tuple[str, str]:
         size = int(entry["size"])
         url = f"{DRIVE_API}/files/{quote(entry['id'])}?alt=media"
-        part_size = max(1024 * 1024, int(self._part_size))
-        total_parts = math.ceil(size / part_size)
-        effective_streams = max(2, min(streams, total_parts))
-        window_sem = threading.Semaphore(effective_streams + 2)
-        ready: dict[int, bytes] = {}
-        cond = threading.Condition()
-        error_box: list[BaseException] = []
-        stop_event = threading.Event()
-
-        def worker_fetch(part_idx: int) -> None:
-            acquired_global = False
-            try:
-                if stop_event.is_set():
-                    return
-                _DRIVE_STREAM_SEM.acquire()
-                acquired_global = True
-                if stop_event.is_set():
-                    return
-                start = part_idx * part_size
-                end = min(size, start + part_size) - 1
-                data = self._fetch_range_part(url, start, end, size)
-                with cond:
-                    ready[part_idx] = data
-                    cond.notify_all()
-            except BaseException as exc:  # noqa: BLE001
-                stop_event.set()
-                with cond:
-                    if not error_box:
-                        error_box.append(exc)
-                    cond.notify_all()
-                window_sem.release()
-            finally:
-                if acquired_global:
-                    _DRIVE_STREAM_SEM.release()
-
-        sha = hashlib.sha256()
-        md5 = hashlib.md5(usedforsecurity=False)
-        written = 0
+        effective_streams = max(2, min(streams, 8))
+        seg_size = math.ceil(size / effective_streams)
+        segments = [
+            (idx * seg_size, min(size, (idx + 1) * seg_size) - 1)
+            for idx in range(effective_streams)
+            if idx * seg_size < size
+        ]
         temporary = None
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".part", delete=False) as out:
                 temporary = Path(out.name)
-                with ThreadPoolExecutor(max_workers=effective_streams) as pool:
-                    def submitter() -> None:
-                        for idx in range(total_parts):
-                            window_sem.acquire()
-                            if stop_event.is_set():
-                                window_sem.release()
-                                return
-                            pool.submit(worker_fetch, idx)
+                os.ftruncate(out.fileno(), size)
+                fd = out.fileno()
 
-                    sub_thread = threading.Thread(target=submitter, daemon=True)
-                    sub_thread.start()
-                    next_idx = 0
-                    while next_idx < total_parts:
-                        with cond:
-                            while next_idx not in ready and not error_box:
-                                cond.wait(timeout=1.0)
-                            if error_box:
-                                raise error_box[0]
-                            chunk = ready.pop(next_idx)
-                        written += len(chunk)
-                        if written > size:
-                            stop_event.set()
-                            raise WorkerError("drive cached file exceeds expected size")
-                        out.write(chunk)
-                        sha.update(chunk)
-                        md5.update(chunk)
-                        del chunk
-                        window_sem.release()
-                        next_idx += 1
-                    sub_thread.join(timeout=5)
-            actual_sha = sha.hexdigest()
-            actual_md5 = md5.hexdigest()
-            if written != size or actual_md5 != entry.get("md5Checksum"):
+                def run_seg(bounds: tuple[int, int]) -> None:
+                    with _DRIVE_STREAM_SEM:
+                        self._stream_range_segment(url, fd, bounds[0], bounds[1], size)
+
+                with ThreadPoolExecutor(max_workers=len(segments)) as pool:
+                    futures = [pool.submit(run_seg, bounds) for bounds in segments]
+                    for fut in futures:
+                        fut.result()
+            if temporary.stat().st_size != size:
+                raise WorkerError("drive cached file failed size/md5 check")
+            actual_sha, actual_md5 = _hash_file(temporary)
+            if actual_md5 != entry.get("md5Checksum"):
                 raise WorkerError("drive cached file failed size/md5 check")
             if expected_sha256 and actual_sha != expected_sha256.lower():
                 raise WorkerError("Drive weight sha256 or size mismatch")
@@ -1703,9 +1668,6 @@ class DriveCache:
             temporary = None
             _record_local_hash(destination, sha256=actual_sha, md5=actual_md5)
             return actual_sha, actual_md5
-        except BaseException:
-            stop_event.set()
-            raise
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
@@ -1753,13 +1715,20 @@ class DriveCache:
                     temporary.unlink(missing_ok=True)
         raise WorkerError("drive cached file download failed")
 
-    def fetch(self, entry: dict, destination: Path, *, expected_sha256: str | None = None) -> tuple[str, str]:
+    def fetch(
+        self,
+        entry: dict,
+        destination: Path,
+        *,
+        expected_sha256: str | None = None,
+        label: str | None = None,
+    ) -> tuple[str, str]:
         started = time.monotonic()
         size = int(entry["size"])
         try:
-            streams = max(1, min(int(os.getenv("CREATION_DRIVE_STREAMS", "6")), 12))
+            streams = max(1, min(int(os.getenv("CREATION_DRIVE_STREAMS", "4")), 8))
         except ValueError:
-            streams = 6
+            streams = 4
         use_multi = (
             _creation_flag("CREATION_MULTI_STREAM_DRIVE", True)
             and streams > 1
@@ -1802,7 +1771,7 @@ class DriveCache:
         if size >= 1024 * 1024:
             mib = size / (1024**2)
             print(
-                f"[studio-creation] drive fetch {destination.name}: {mib:.1f} MiB in {elapsed:.1f}s "
+                f"[studio-creation] drive fetch {label or destination.name}: {mib:.1f} MiB in {elapsed:.1f}s "
                 f"({mib / elapsed:.1f} MiB/s, streams={used_streams})",
                 flush=True,
             )
@@ -1946,7 +1915,7 @@ def _restore_user_loras(comfy: Path, files: list[dict], cache: DriveCache | None
             started = time.time()
             try:
                 source = Path(scratch) / f"{uuid.uuid4().hex}-{target.name}"
-                sha, md5 = cache.fetch(item, source)
+                sha, md5 = cache.fetch(item, source, label="loras/" + item["target"])
                 _publish_model(source, target, preserve_existing=preserve_existing)
                 _record_local_hash(target, sha256=sha, md5=md5)
                 return {
@@ -2034,7 +2003,7 @@ def _restore_weights(
 
         def fetch(entry: dict, source: Path) -> None:
             _check_model_space(scratch, int(entry["size"]))
-            fetched = cache.fetch(entry, source, expected_sha256=item["sha256"])
+            fetched = cache.fetch(entry, source, expected_sha256=item["sha256"], label=item["target"])
             if isinstance(fetched, tuple) and len(fetched) == 2:
                 actual_sha, actual_md5 = fetched
                 if actual_sha != item["sha256"]:
