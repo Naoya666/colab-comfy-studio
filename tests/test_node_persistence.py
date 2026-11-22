@@ -614,3 +614,120 @@ def test_plugin_backup_captures_committed_wal_data_without_archiving_sidecars(se
         assert sync(restored)['manifest']['generation'] == latest
         with closing(sqlite3.connect(restored_db)) as reader:
             assert reader.execute('SELECT name FROM tags').fetchall() == [('committed',)]
+
+
+def test_binary_magic_skips_regex_while_spoofed_png_secret_is_blocked(tmp_path):
+    node = tmp_path / 'media-node'
+    node.mkdir()
+    genuine_png = node / 'preview.png'
+    genuine_png.write_bytes(b'\x89PNG\r\n\x1a\n' + b'\x00' * 128 + b'api_key="not_a_text_file_123456"')
+    genuine_ttf = node / 'font.ttf'
+    genuine_ttf.write_bytes(b'\x00\x01\x00\x00' + b'\x00' * 128)
+    assert p.is_verified_binary(genuine_png, genuine_png.read_bytes()[:64]) is True
+    assert p.is_verified_binary(genuine_ttf, genuine_ttf.read_bytes()[:64]) is True
+    entries = dict(p.files(node))
+    assert genuine_png in entries and genuine_ttf in entries
+
+    # Spoofed extension: plain text secret renamed to .png lacks PNG magic header and MUST be blocked!
+    spoofed = node / 'spoofed.png'
+    spoofed.write_bytes(b'api_key = "secret123456789"\n')
+    assert p.is_verified_binary(spoofed, spoofed.read_bytes()[:64]) is False
+    with pytest.raises(RuntimeError, match='credential'):
+        list(p.files(node))
+
+
+def test_restore_dependencies_prestartup_deduplicates_scans_and_rechecks_on_reboot(setup, monkeypatch):
+    new, _ = setup
+    first = new('first')
+    add(first, 'node-a')
+    add(first, 'node-b')
+    sync(first)
+
+    second = new('second')
+    log = second.root / 'comfy.log'
+    log.write_text('boot\n')
+    p.atomic(second.root / 'plugins-config.json', {
+        'comfy': str(second.comfy), 'user': str(second.user), 'log': str(log), 'log_offset': 0,
+    })
+
+    monkeypatch.setattr(p, 'manager_cli', lambda comfy: Path('/fake/cm-cli.py'))
+    monkeypatch.setattr(p, 'protect_environment', lambda root: {'torch': '2.8'})
+    monkeypatch.setattr(p.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0, stdout='', stderr=''))
+
+    scan_calls = []
+    orig_inventory = p.inventory
+
+    def counting_inventory(*a, **kw):
+        scan_calls.append((Path(a[0]).name, kw))
+        return orig_inventory(*a, **kw)
+
+    monkeypatch.setattr(p, 'inventory', counting_inventory)
+
+    restored = second.restore()
+    assert restored is not None and len(restored) == 2
+    assert len(scan_calls) == 1  # Only stage hash verification in restore()
+
+    dep_key = second.dependencies(plugins=restored)
+    assert dep_key is not None
+    assert len(scan_calls) == 1  # Zero redundant scan in dependencies()!
+
+    p.mark_prestartup_verified(second.root, second.nodes, dep_key)
+    p.prestartup(second.root)
+    assert len(scan_calls) == 1  # Zero redundant scan on initial ComfyUI prestartup()!
+
+    # Second prestartup() (e.g. Manager reboot) consumes the one-shot token and verifies again!
+    p.prestartup(second.root)
+    assert len(scan_calls) == 2
+
+
+def test_parallel_restore_uses_rclone_files_from_and_verifies_sha256(setup, tmp_path, monkeypatch):
+    new, drive = setup
+    first = new('first')
+    add(first, 'alpha', version=1)
+    add(first, 'beta', version=2)
+    manifest = sync(first)['manifest']
+    assert len(manifest['plugins']) == 2
+
+    target_vm = tmp_path / 'vm-rclone'
+    comfy = target_vm / 'ComfyUI'
+    (comfy / 'custom_nodes').mkdir(parents=True)
+    (target_vm / 'rclone').write_text('#!/bin/sh\n')
+    (target_vm / 'rclone.conf').write_text('[studio]\n')
+
+    rclone_calls = []
+
+    class BatchRemote(p.Remote):
+        def get(self, key, target):
+            return drive.get(key, target)
+
+        def command(self, *args, timeout=600):
+            rclone_calls.append(args)
+            assert args[0] == 'copy' and '--files-from-raw' in args
+            list_file = Path(args[args.index('--files-from-raw') + 1])
+            dest_dir = Path(args[-1])
+            for name in list_file.read_text().splitlines():
+                if name.strip():
+                    shutil.copyfile(drive.path / 'objects' / name.strip(), dest_dir / name.strip())
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    pers = p.Persistence(target_vm, comfy, target_vm / 'user', BatchRemote(target_vm))
+    restored = pers.restore()
+    assert len(rclone_calls) == 1  # Single batch rclone copy for both plugins!
+    assert [x['path'] for x in restored] == ['alpha', 'beta']
+
+    # Corrupt remote archive still rejected even when returned by batch rclone copy
+    bad_vm = tmp_path / 'vm-corrupt'
+    (bad_vm / 'ComfyUI' / 'custom_nodes').mkdir(parents=True)
+    (bad_vm / 'rclone').write_text('#!/bin/sh\n')
+    (bad_vm / 'rclone.conf').write_text('[studio]\n')
+
+    class CorruptBatchRemote(BatchRemote):
+        def command(self, *args, timeout=600):
+            res = super().command(*args, timeout=timeout)
+            dest_dir = Path(args[-1])
+            next(dest_dir.glob('*.tar.gz')).write_bytes(b'corrupted-bytes')
+            return res
+
+    bad_pers = p.Persistence(bad_vm, bad_vm / 'ComfyUI', bad_vm / 'user', CorruptBatchRemote(bad_vm))
+    with pytest.raises(RuntimeError, match='Corrupt plugin cache'):
+        bad_pers.restore()

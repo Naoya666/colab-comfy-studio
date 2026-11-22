@@ -51,8 +51,13 @@ MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 # Stage markers written by runtime_worker.py into status.json while a job is running.
 _STAGE_TEXT = {
     "native_environment": "初始化原生 ComfyUI 和节点依赖",
+    "native_system": "安装系统依赖与传输组件",
     "native_drive": "挂载 Google Drive 持久化目录",
-    "native_models": "准备按需模型缓存及模型目录",
+    "native_models": "准备 ComfyUI 源码及模型目录",
+    "native_plugins_restore": "并发恢复自定义节点归档",
+    "native_env_cache": "恢复 Drive Python 环境缓存",
+    "native_python": "安装 ComfyUI 与 Manager 基础依赖",
+    "native_plugins_deps": "安装与校验自定义节点依赖",
     "native_tunnel": "建立原生 ComfyUI 代理连接",
     "restore_env": "正在恢复运行环境",
     "restore_weights": "正在恢复模型文件",
@@ -1275,14 +1280,20 @@ class Scheduler:
         }
 
     def _upload(self, job: dict) -> dict:
+        from .node_persistence import env_flag
+
         outputs, assets = job.get("outputs") or [], []
         report = None
+        native_boot = bool((job.get("snapshot") or {}).get("native_comfy"))
+        skip_native_drive = native_boot and env_flag("NATIVE_FAST_CONTROL_PLANE", True)
+        owns_storage = False
         if self.storage_factory:
             storage = self._factory(self.storage_factory, job)
-        elif os.getenv("GPU_STORAGE", "local").strip().lower() == "drive":
+        elif not skip_native_drive and os.getenv("GPU_STORAGE", "local").strip().lower() == "drive":
             from .drive import DriveStorage
 
             storage = DriveStorage(job, self.store)
+            owns_storage = True
         else:
             storage = None
         result_metadata = self._result_metadata(job)
@@ -1356,6 +1367,9 @@ class Scheduler:
             if attempts >= 3:
                 return self._begin_failure(job, "gpu_upload_failed", self._safe_error(exc))
             return self._update("jobs", job["id"], {"upload_attempts": attempts}, job.get("owner_id"))
+        finally:
+            if owns_storage and hasattr(storage, "close"):
+                storage.close()
         # Drive metadata file IDs are not authenticated application asset IDs.
         output_asset_ids = [a.get("id") for a in assets if a.get("id")]
         if metadata_record:

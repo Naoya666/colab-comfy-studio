@@ -713,9 +713,10 @@ print(json.dumps({{"healthy": healthy}}))
         root = "/content/ai-studio/" + execution_id
         payload = self._payload(job, execution_id, root)
         if (job.get("snapshot") or {}).get("native_comfy"):
-            from .native import runtime_secrets
+            from .native import native_optimization_flags, runtime_secrets
             payload["native_secrets"] = runtime_secrets(self.store, job)
             payload["native_plugin_generation"] = job["snapshot"].get("native_plugin_generation")
+            payload["native_flags"] = native_optimization_flags()
         code = build_bootstrap_code(execution_id, payload)
         result = self._exec_code_on_handle(handle, session, execution_id, code)
         return {

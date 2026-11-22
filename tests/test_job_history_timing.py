@@ -104,6 +104,28 @@ def test_timing_details_preserve_zero_only_when_worker_explicitly_persisted_it()
     }
 
 
+def test_native_split_worker_stages_are_preserved_in_job_timings():
+    timings = job_timings(
+        {
+            "state": "completed",
+            "worker_timings": {
+                "native_system": 14.2,
+                "native_drive": 0.6,
+                "native_models": 3.1,
+                "native_plugins_restore": 9.4,
+                "native_env_cache": 11.2,
+                "comfy_start": 51.0,
+                "native_tunnel": 1.1,
+            },
+        },
+        [],
+    )
+    assert timings["native_system"] == 14.2
+    assert timings["native_plugins_restore"] == 9.4
+    assert timings["native_env_cache"] == 11.2
+    assert timings["native_tunnel"] == 1.1
+
+
 def test_safe_history_value_drops_credentials_inside_nested_metadata():
     value = safe_history_value({
         "api_key": "api-secret",

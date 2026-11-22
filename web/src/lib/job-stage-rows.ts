@@ -1,8 +1,14 @@
 const stages: Array<[string, string]> = [
   ['queued', '排队等待'], ['queue', '排队等待'], ['prep_cache', '准备共享缓存'],
-  ['allocate', '分配算力'], ['restore_env', '恢复运行环境'],
+  ['allocate', '分配算力'],
+  ['native_system', '安装系统依赖'], ['native_drive', '挂载 Drive 目录'],
+  ['native_models', '准备源码与模型目录'], ['native_plugins_restore', '恢复节点归档'],
+  ['native_env_cache', '恢复环境缓存'], ['native_python', '安装基础依赖'],
+  ['native_plugins_deps', '安装节点依赖'], ['native_environment', '准备原生环境'],
+  ['restore_env', '恢复运行环境'],
   ['restore_weights', '恢复模型权重'], ['warm_reuse', '复用已就绪环境'],
   ['start_comfy', '启动 ComfyUI'], ['comfy_start', '启动 ComfyUI'],
+  ['native_tunnel', '建立代理连接'],
   ['sampling', '采样生成'], ['upload', '保存产物'], ['cleanup', '释放算力'], ['delete', '释放算力'],
   ['prep_env', '准备运行环境'], ['prep_weights', '准备模型权重'],
 ];

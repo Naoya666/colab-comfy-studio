@@ -115,6 +115,9 @@ def sample_account_balance(repo, owner_id: str, account_id: str | None, *, timeo
                 pass
 
 
+_DEFAULT_SAMPLE_ACCOUNT_BALANCE = sample_account_balance
+
+
 def active_lease_count(repo, owner_id: str, account_id: str | None, *, exclude_lease_id: str | None = None) -> int:
     if not account_id:
         return 0
@@ -395,6 +398,27 @@ def _sample_lock(repo, owner, account, source):
 def sample_and_record(repo, owner, account, source, *, sampler=None, now=None):
     if not account or (sampler is None and not sampling_enabled()):
         return None
+    if (
+        source == "tick"
+        and sampler is None
+        and sample_account_balance is _DEFAULT_SAMPLE_ACCOUNT_BALANCE
+        and os.getenv("NATIVE_FAST_CONTROL_PLANE", "1").strip().lower() not in {"0", "false", "off", "no"}
+    ):
+        from .google import GoogleService
+
+        # Skip Drive-only or unlinked accounts during periodic background ticks to avoid OAuth log spam.
+        if GoogleService(repo, owner, account_id=account)._credential("colab", account_id=account) is None:
+            return None
+        check_now = time.time() if now is None else float(now)
+        with repo.store.db_lock(), repo.store.Session() as session:
+            prev = setting(session, _snapshot_key(owner, account))
+        if (
+            prev.get("error") == "sample_failed"
+            and check_now - float(prev.get("attempted_at") or 0) < 300
+            and active_job_count(repo, owner, account) == 0
+            and active_lease_count(repo, owner, account) == 0
+        ):
+            return None
     with _sample_lock(repo, owner, account, source) as acquired:
         if not acquired:
             return None

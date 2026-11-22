@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -18,8 +19,21 @@ from app.security import decrypt_secret
 
 from .compute import GpuConfig
 from .manifest import digest
+from .node_persistence import NATIVE_FLAG_NAMES, env_flag
 
 TERMINAL = {"completed", "failed", "cancelled", "rejected"}
+UNAUTHENTICATED_TUNNEL_PROBES = (
+    "/system_stats",
+    "/v2/manager/queue/status",
+    "/manager/queue/status",
+    "/v2/manager/queue/install_model",
+    "/customnode/install",
+)
+
+
+def native_optimization_flags() -> dict[str, str]:
+    """Snapshot independent startup optimization switches from server environment."""
+    return {name: ("1" if env_flag(name, True) else "0") for name in NATIVE_FLAG_NAMES}
 
 
 def timeout_options():
@@ -629,14 +643,24 @@ def ready(client=None):
             # Service-token protection of the internal tunnel is mandatory.
             # Probe installation paths with GET only: never submit an installation.
             # Access must protect Manager too, including deployments with path-based rules.
-            for path in ("/system_stats", "/v2/manager/queue/status", "/manager/queue/status",
-                         "/v2/manager/queue/install_model", "/customnode/install"):
-                unauthenticated = c.get(url + path)
-                if unauthenticated.status_code not in {401, 403, 302}:
-                    return False
-            response = c.get(url + "/system_stats", headers=headers)
+            if env_flag("NATIVE_FAST_CONTROL_PLANE", True):
+                with ThreadPoolExecutor(max_workers=7) as pool:
+                    unauth_futures = [pool.submit(c.get, url + path) for path in UNAUTHENTICATED_TUNNEL_PROBES]
+                    stats_future = pool.submit(c.get, url + "/system_stats", headers=headers)
+                    state_future = pool.submit(c.get, url + "/studio_native/state", headers=headers)
+                    for fut in unauth_futures:
+                        if fut.result().status_code not in {401, 403, 302}:
+                            return False
+                    response = stats_future.result()
+                    state = state_future.result()
+            else:
+                for path in UNAUTHENTICATED_TUNNEL_PROBES:
+                    unauthenticated = c.get(url + path)
+                    if unauthenticated.status_code not in {401, 403, 302}:
+                        return False
+                response = c.get(url + "/system_stats", headers=headers)
+                state = c.get(url + "/studio_native/state", headers=headers)
             response.raise_for_status()
-            state = c.get(url + "/studio_native/state", headers=headers)
             state.raise_for_status()
             return isinstance(response.json().get("system"), dict) and isinstance(state.json().get("busy"), bool)
     except Exception:

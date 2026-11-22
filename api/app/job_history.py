@@ -19,6 +19,15 @@ _EVENT_STAGES = {
     "cleanup": frozenset({"cleaning_up", "cleanup_pending"}),
 }
 _WORKER_KEYS = frozenset({
+    "native_environment",
+    "native_system",
+    "native_drive",
+    "native_models",
+    "native_plugins_restore",
+    "native_env_cache",
+    "native_python",
+    "native_plugins_deps",
+    "native_tunnel",
     "restore_env",
     "restore_weights",
     "warm_reuse",

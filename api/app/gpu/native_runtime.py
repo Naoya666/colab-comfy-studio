@@ -1,7 +1,7 @@
 """Colab native service bootstrap. Shipped beside the existing trusted worker.
 
 Uses native ComfyUI directories and rclone's bounded on-demand VFS cache; it
-never copies the whole Drive, restores a Python environment, or preloads VRAM.
+never copies the whole Drive or preloads VRAM.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -21,6 +22,7 @@ from urllib.request import urlopen
 ROOT = Path("/content/ai-studio/native")
 RCLONE_VERSION = "v1.70.3"
 RCLONE_SHA256 = "7d69057e69385f6514a9684c7eaa424d972096b130284bb34dd967c4ed4f9dad"
+TUNNEL_METRICS_ADDR = "127.0.0.1:20241"
 CATEGORIES = ("checkpoints", "diffusion_models", "unet", "text_encoders", "clip", "vae", "loras", "controlnet",
               "embeddings", "upscale_models", "clip_vision", "style_models", "vae_approx", "diffusers",
               "gligen", "hypernetworks", "model_patches", "audio_encoders")
@@ -80,7 +82,7 @@ def manager_busy():
                 raise
     return True
 
-def probe():
+def probe(check_plugins=True):
     try:
         import fcntl
         import shutil
@@ -97,7 +99,7 @@ def probe():
         if manager_busy():
             return {**metrics, "busy": True, "busy_reason": "manager"}
         config = Path("/content/ai-studio/native/plugins-config.json")
-        if config.exists():
+        if check_plugins and config.exists():
             import sys
             sys.path.insert(0, "/content/ai-studio/native")
             from node_persistence import inventory, digest, read
@@ -153,8 +155,8 @@ def index_status(models, refresh):
 @PromptServer.instance.routes.get("/studio_native/state")
 async def state(request):
     Path("/content/ai-studio/native/heartbeat").write_text(str(time.time()))
-    result = await asyncio.to_thread(probe)
     status_file = Path("/content/ai-studio/native/plugins-status.json")
+    result = await asyncio.to_thread(probe, not status_file.exists())
     if LOCAL_MODELS and LOCAL_MODELS.handoffs:
         result.update(busy=True, busy_reason="model_preparation")
     if status_file.exists():
@@ -244,7 +246,7 @@ while True:
         if not alive:
             binary = state["tunnel_binary"]
             with (root / "tunnel.log").open("ab") as log:
-                tunnel = subprocess.Popen([binary, "tunnel", "--no-autoupdate", "--protocol", "http2", "run", "--token-file", str(root / "tunnel.token")], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                tunnel = subprocess.Popen([binary, "tunnel", "--no-autoupdate", "--protocol", "http2", "--metrics", "127.0.0.1:20241", "run", "--token-file", str(root / "tunnel.token")], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             state["tunnel_pid"] = tunnel.pid
             state["tunnel_start_id"] = (Path("/proc") / str(tunnel.pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
             temp = root / "state.tmp"
@@ -275,6 +277,13 @@ while True:
         # Unknown state must not interrupt generation or lose pending Drive writes.
         continue
 """
+
+
+def _flag(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "off", "no"}
 
 
 def model_paths(mount):
@@ -319,6 +328,24 @@ def install_rclone(root, worker):
     finally:
         archive.unlink(missing_ok=True)
         (root / "rclone.partial").unlink(missing_ok=True)
+
+
+def install_cloudflared(root, worker):
+    existing = shutil.which("cloudflared")
+    if existing:
+        return existing
+    binary = root / "cloudflared"
+    if binary.is_file():
+        return str(binary)
+    partial = root / "cloudflared.partial"
+    try:
+        with urlopen("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", timeout=60) as response:
+            worker._stream_output(response, partial, 100 * 1024**2)
+        partial.chmod(0o700)
+        partial.replace(binary)
+        return str(binary)
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def _mount_error(log, secret):
@@ -503,8 +530,94 @@ def wait_for_comfy(worker, process, timeout=2100):
             time.sleep(1)
 
 
+def wait_for_tunnel(tunnel, timeout=10.0):
+    """Wait briefly for cloudflared's local readiness probe so the VPS sees a live edge tunnel."""
+    if not _flag("NATIVE_FAST_CONTROL_PLANE", True):
+        return
+    if os.getenv("STUDIO_OFFLINE_TEST") == "1" or not callable(getattr(tunnel, "poll", None)):
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if tunnel.poll() is not None:
+            raise RuntimeError("Native cloudflared tunnel exited during startup; inspect tunnel.log")
+        try:
+            with urlopen(f"http://{TUNNEL_METRICS_ADDR}/ready", timeout=1) as response:
+                if response.status == 200:
+                    return
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+
+def _install_base_python(worker, root: Path, comfy: Path, manager: Path, *, local: bool) -> None:
+    print(f"[studio-native] Installing Manager requirements: {manager}; Python: {sys.executable}", flush=True)
+    constraints = root / "gpu-constraints.txt"
+    packages = ["jedi>=0.16,<0.20", *(["httpx>=0.27,<1"] if local else [])]
+    req_args = ["-r", str(comfy / "requirements.txt"), "-r", str(manager)]
+    uv_bin = shutil.which("uv") if _flag("NATIVE_USE_UV", True) else None
+    if uv_bin:
+        cmd = [
+            uv_bin, "pip", "install", "--system", "--python", sys.executable,
+            "--constraint", str(constraints), "-q", *packages, *req_args,
+        ]
+        try:
+            worker._run(cmd, timeout=900)
+            return
+        except worker.WorkerError as exc:
+            print(f"[studio-native] uv pip install failed ({exc}); falling back to pip", flush=True)
+    worker._run(
+        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", "-c", str(constraints), *packages, *req_args],
+        timeout=900,
+    )
+
+
+def _install_system_apt(worker) -> None:
+    worker._run(["apt-get", "update", "-qq"], timeout=180)
+    worker._run(["apt-get", "install", "-y", "-qq", "--no-install-recommends", "fuse3", "mesa-vulkan-drivers"], timeout=300)
+
+
+def _ensure_comfy_checkout(comfy: Path, commit: str, worker) -> None:
+    if not comfy.exists():
+        comfy.mkdir()
+        worker._checkout_comfy(comfy, commit, 180)
+    worker._verify_checkout(comfy, commit)
+
+
 def run(root, payload, stages):
     import runtime_worker as worker
+    try:
+        from node_persistence import (
+            NATIVE_FLAG_NAMES,
+            Persistence,
+            compute_env_cache_key,
+            inventory,
+            mark_prestartup_verified,
+            prepare_env_cache_plan,
+            protect_environment,
+            site_snapshot,
+            try_restore_env_cache,
+        )
+    except ImportError:
+        from .node_persistence import (
+            NATIVE_FLAG_NAMES,
+            Persistence,
+            compute_env_cache_key,
+            inventory,
+            mark_prestartup_verified,
+            prepare_env_cache_plan,
+            protect_environment,
+            site_snapshot,
+            try_restore_env_cache,
+        )
+
+    applied_flags = {}
+    for flag_name, flag_val in (payload.get("native_flags") or {}).items():
+        if flag_name in NATIVE_FLAG_NAMES:
+            os.environ[flag_name] = str(flag_val)
+    for flag_name in NATIVE_FLAG_NAMES:
+        if flag_name in os.environ:
+            applied_flags[flag_name] = os.environ[flag_name]
+
     secret = payload["native_secrets"]
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     with worker._file_lock(ROOT / ".bootstrap.lock"):
@@ -523,129 +636,183 @@ def run(root, payload, stages):
                 raise RuntimeError("Native Manager verification metadata missing; stop the old session first")
             verify_manager(worker, Path(state["comfy_log"]), state.get("comfy_log_offset", 0))
         else:
-            stages.start("native_environment")
-            worker._run(["apt-get", "update", "-qq"], timeout=180)
-            worker._run(["apt-get", "install", "-y", "-qq", "fuse3", "mesa-vulkan-drivers"], timeout=300)
-            install_rclone(ROOT, worker)
-            if not shutil.which("cloudflared"):
-                binary = ROOT / "cloudflared"
-                with urlopen("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", timeout=60) as response:
-                    worker._stream_output(response, binary, 100 * 1024**2)
-                binary.chmod(0o700)
-            stages.start("native_drive")
-            if not local:
-                _index_models(secret, worker)
-            mount = mount_drive(ROOT, secret)
-            stages.start("native_models")
             comfy = ROOT / "ComfyUI"
-            if not comfy.exists():
-                comfy.mkdir()
-                worker._checkout_comfy(comfy, commit, 180)
-            worker._verify_checkout(comfy, commit)
-            data = prepare_paths(comfy, mount, local=True) if local else prepare_paths(comfy, mount)
-            extra = ROOT / "extra_model_paths.yaml"
-            local_config = ROOT / "local-model-config.json"
-            if local:
-                extra.unlink(missing_ok=True)
-                # Comfy auto-loads the checkout-local file independently of CLI flags.
-                if (comfy / "extra_model_paths.yaml").exists() or (comfy / "extra_model_paths.yaml").is_symlink():
-                    raise RuntimeError("Remove the ComfyUI checkout extra_model_paths.yaml before starting local mode")
-                for module in ("native_models.py", "model_dependencies.py", "model_sources.py"):
-                    shutil.copyfile(Path(__file__).with_name(module), ROOT / module)
-                shutil.copyfile(Path(__file__).with_name("runtime_worker.py"), ROOT / "runtime_worker.py")
-                _write_secret(local_config, json.dumps({"catalog": secret["catalog"], "channel": secret["model_channel"],
-                                                        "drive_auth": secret["drive_auth"], "tokens": secret.get("source_tokens", {}),
-                                                        "drive_account": secret["drive_account"],
-                                                        "models_folder": secret["models_folder_id"],
-                                                        "directories": secret["directories"], "rules": secret["rules"]}))
-            else:
-                local_config.unlink(missing_ok=True)
-                extra.write_text(json.dumps(model_paths(mount)))
-            stages.start("native_environment")
+            parallel_boot = _flag("NATIVE_PARALLEL_BOOTSTRAP", True)
+            boot_pool = ThreadPoolExecutor(max_workers=5) if parallel_boot else None
+            cloudflared_future = None
+            comfy_future = None
             try:
-                from node_persistence import protect_environment
-            except ImportError:
-                from .node_persistence import protect_environment
-            protect_environment(ROOT)
-            # Colab's base IPython can omit this required package. Repair the
-            # base environment before the strict plugin compatibility check.
-            worker._run([sys.executable, "-m", "pip", "install", "-q", "jedi>=0.16,<0.20"], timeout=180)
-            worker._run([sys.executable, "-m", "pip", "install", "-q", "-r", str(comfy / "requirements.txt")], timeout=600)
-            if local:
-                worker._run([sys.executable, "-m", "pip", "install", "-q", "httpx>=0.27,<1"], timeout=180)
-            manager = comfy / "manager_requirements.txt"
-            if not manager.is_file():
-                raise RuntimeError("Pinned ComfyUI must support the official Manager (--enable-manager)")
-            print(f"[studio-native] Installing Manager requirements: {manager}; Python: {sys.executable}", flush=True)
-            worker._run([sys.executable, "-m", "pip", "install", "-q", "-r", str(manager)], timeout=300)
-            try:
-                from node_persistence import Persistence, protect_environment
-            except ImportError:
-                from .node_persistence import Persistence, protect_environment
-            shutil.copyfile(Path(__file__).with_name("node_persistence.py"), ROOT / "node_persistence.py")
-            persistence = Persistence(ROOT, comfy, data / "user")
-            persistence.restore(payload.get("native_plugin_generation"))
-            protect_environment(ROOT)
-            persistence.dependencies()
-            _write_secret(ROOT / "restart-lease", secret.get("lease_id") or "")
-            (comfy / "custom_nodes" / "studio_native_state.py").write_text(EXTENSION)
-            guard = comfy / "custom_nodes" / "studio_native_guard"
-            guard.mkdir(exist_ok=True)
-            (guard / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n")
-            (guard / "prestartup_script.py").write_text(
-                "import sys\nfrom pathlib import Path\n"
-                "sys.path.insert(0, '/content/ai-studio/native')\n"
-                "from node_persistence import prestartup\n"
-                "prestartup(Path('/content/ai-studio/native'))\n")
-            probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("def index_status(")]
-            (ROOT / "probe.py").write_text("import os, json\nfrom pathlib import Path\nfrom urllib.request import Request, urlopen\n" + probe)
-            stages.start("comfy_start")
-            args = [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188", "--enable-manager",
-                    "--user-directory", str(data / "user"), "--input-directory", str(data / "input"),
-                    "--output-directory", str(data / "output"), "--temp-directory", str(ROOT / "temp"),
-                    "--max-upload-size", str(secret["max_upload_mb"]),
-                    "--extra-model-paths-config", str(extra), "--preview-method", "auto", "--disable-auto-launch"]
-            if local:
-                del args[args.index("--extra-model-paths-config"):args.index("--extra-model-paths-config") + 2]
-            comfy_log = root / "comfy.log"
-            with comfy_log.open("ab") as log:
-                log_offset = log.tell()
-                worker._atomic_json(ROOT / "plugins-config.json", {"comfy": str(comfy), "user": str(data / "user"),
-                                                                  "log": str(comfy_log), "log_offset": log_offset})
-                process = subprocess.Popen(args, cwd=comfy, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            try:
-                wait_for_comfy(worker, process)
-                verify_manager(worker, comfy_log, log_offset)
-                with comfy_log.open("rb") as source:
-                    source.seek(log_offset)
-                    failed = [line.decode(errors="replace").strip() for line in source
-                              if b"(IMPORT FAILED)" in line or b"Cannot import " in line]
-                if failed:
-                    raise RuntimeError("Custom node load failed: " + "; ".join(failed)[-2000:])
-            except BaseException:
-                # A retry must not leave a second, unverified ComfyUI on the same port.
-                process.terminate()
+                stages.start("native_system")
+                if boot_pool is not None:
+                    apt_future = boot_pool.submit(_install_system_apt, worker)
+                    rclone_future = boot_pool.submit(install_rclone, ROOT, worker)
+                    cloudflared_future = boot_pool.submit(install_cloudflared, ROOT, worker)
+                    comfy_future = boot_pool.submit(_ensure_comfy_checkout, comfy, commit, worker)
+                    index_future = boot_pool.submit(_index_models, secret, worker) if not local else None
+                    apt_future.result()
+                    rclone_future.result()
+                    if index_future is not None:
+                        index_future.result()
+                else:
+                    _install_system_apt(worker)
+                    install_rclone(ROOT, worker)
+                    install_cloudflared(ROOT, worker)
+
+                stages.start("native_drive")
+                if not parallel_boot and not local:
+                    _index_models(secret, worker)
+                mount = mount_drive(ROOT, secret)
+
+                stages.start("native_models")
+                if comfy_future is not None:
+                    comfy_future.result()
+                else:
+                    _ensure_comfy_checkout(comfy, commit, worker)
+                manager = comfy / "manager_requirements.txt"
+                if not manager.is_file():
+                    raise RuntimeError("Pinned ComfyUI must support the official Manager (--enable-manager)")
+                data = prepare_paths(comfy, mount, local=True) if local else prepare_paths(comfy, mount)
+                extra = ROOT / "extra_model_paths.yaml"
+                local_config = ROOT / "local-model-config.json"
+                if local:
+                    extra.unlink(missing_ok=True)
+                    # Comfy auto-loads the checkout-local file independently of CLI flags.
+                    if (comfy / "extra_model_paths.yaml").exists() or (comfy / "extra_model_paths.yaml").is_symlink():
+                        raise RuntimeError("Remove the ComfyUI checkout extra_model_paths.yaml before starting local mode")
+                    for module in ("native_models.py", "model_dependencies.py", "model_sources.py"):
+                        shutil.copyfile(Path(__file__).with_name(module), ROOT / module)
+                    shutil.copyfile(Path(__file__).with_name("runtime_worker.py"), ROOT / "runtime_worker.py")
+                    _write_secret(local_config, json.dumps({"catalog": secret["catalog"], "channel": secret["model_channel"],
+                                                            "drive_auth": secret["drive_auth"], "tokens": secret.get("source_tokens", {}),
+                                                            "drive_account": secret["drive_account"],
+                                                            "models_folder": secret["models_folder_id"],
+                                                            "directories": secret["directories"], "rules": secret["rules"]}))
+                else:
+                    local_config.unlink(missing_ok=True)
+                    extra.write_text(json.dumps(model_paths(mount)))
+
+                stages.start("native_plugins_restore")
+                shutil.copyfile(Path(__file__).with_name("node_persistence.py"), ROOT / "node_persistence.py")
+                persistence = Persistence(ROOT, comfy, data / "user")
+                restored_plugins = persistence.restore(payload.get("native_plugin_generation"))
+
+                baseline_protected = protect_environment(ROOT)
+                site = worker._site_dir()
+                use_env_cache = _flag("NATIVE_ENV_CACHE", True) and site.is_dir() and persistence.remote.available()
+                key_info = None
+                before_site = {}
+                env_cache_hit = False
+                env_cache_plan = None
+
+                if use_env_cache:
+                    current_plugins = restored_plugins if restored_plugins is not None else inventory(comfy / "custom_nodes")
+                    before_site = site_snapshot(site)
+                    key_info = compute_env_cache_key(comfy, commit, worker._gpu_cache_tag(), comfy / "custom_nodes", current_plugins)
+                    stages.start("native_env_cache")
+                    env_cache_hit = try_restore_env_cache(ROOT, site, key_info, baseline_protected, persistence.remote)
+                    if env_cache_hit:
+                        dep_key = persistence.stamp_cached_dependencies(current_plugins)
+                        if dep_key:
+                            mark_prestartup_verified(ROOT, comfy / "custom_nodes", dep_key)
+
+                if not env_cache_hit:
+                    stages.start("native_python")
+                    _install_base_python(worker, ROOT, comfy, manager, local=local)
+                    after_base = protect_environment(ROOT)
+                    if after_base != baseline_protected:
+                        raise RuntimeError("Base dependency install changed protected PyTorch/CUDA packages; recreate runtime")
+
+                    stages.start("native_plugins_deps")
+                    dep_key = persistence.dependencies(plugins=restored_plugins)
+                    if dep_key:
+                        mark_prestartup_verified(ROOT, comfy / "custom_nodes", dep_key)
+                    if use_env_cache and key_info is not None:
+                        env_cache_plan = prepare_env_cache_plan(ROOT, site, before_site, key_info)
+
+                _write_secret(ROOT / "restart-lease", secret.get("lease_id") or "")
+                (comfy / "custom_nodes" / "studio_native_state.py").write_text(EXTENSION)
+                guard = comfy / "custom_nodes" / "studio_native_guard"
+                guard.mkdir(exist_ok=True)
+                (guard / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n")
+                (guard / "prestartup_script.py").write_text(
+                    "import sys\nfrom pathlib import Path\n"
+                    "sys.path.insert(0, '/content/ai-studio/native')\n"
+                    "from node_persistence import prestartup\n"
+                    "prestartup(Path('/content/ai-studio/native'))\n")
+                probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("def index_status(")]
+                (ROOT / "probe.py").write_text("import os, json\nfrom pathlib import Path\nfrom urllib.request import Request, urlopen\n" + probe)
+                stages.start("comfy_start")
+                args = [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188", "--enable-manager",
+                        "--user-directory", str(data / "user"), "--input-directory", str(data / "input"),
+                        "--output-directory", str(data / "output"), "--temp-directory", str(ROOT / "temp"),
+                        "--max-upload-size", str(secret["max_upload_mb"]),
+                        "--extra-model-paths-config", str(extra), "--preview-method", "auto", "--disable-auto-launch"]
+                if local:
+                    del args[args.index("--extra-model-paths-config"):args.index("--extra-model-paths-config") + 2]
+                comfy_log = root / "comfy.log"
+                with comfy_log.open("ab") as log:
+                    log_offset = log.tell()
+                    worker._atomic_json(ROOT / "plugins-config.json", {"comfy": str(comfy), "user": str(data / "user"),
+                                                                      "log": str(comfy_log), "log_offset": log_offset,
+                                                                      "flags": applied_flags})
+                    process = subprocess.Popen(args, cwd=comfy, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-                raise
-            stages.start("native_tunnel")
-            tunnel_file = ROOT / "tunnel.token"
-            _write_secret(tunnel_file, secret["tunnel_token"])
-            binary = shutil.which("cloudflared") or str(ROOT / "cloudflared")
-            with (ROOT / "tunnel.log").open("ab") as log:
-                tunnel = subprocess.Popen([binary, "tunnel", "--no-autoupdate", "--protocol", "http2", "run", "--token-file", str(tunnel_file)],
-                                          stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            (ROOT / "heartbeat").write_text(str(time.time()))
-            (ROOT / "watchdog.py").write_text(WATCHDOG)
-            with (ROOT / "watchdog.log").open("ab") as log:
-                subprocess.Popen([sys.executable, str(ROOT / "watchdog.py")], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            worker._atomic_json(marker, {"commit": commit, "pid": process.pid, "tunnel_pid": tunnel.pid,
-                                         "tunnel_start_id": worker._process_metadata(tunnel.pid)["start_id"], "tunnel_binary": binary,
-                                         "comfy": str(comfy), "comfy_log": str(comfy_log), "model_storage_mode": mode,
-                                         "comfy_log_offset": log_offset, "started": time.time()})
+                    wait_for_comfy(worker, process)
+                    verify_manager(worker, comfy_log, log_offset)
+                    with comfy_log.open("rb") as source:
+                        source.seek(log_offset)
+                        failed = [line.decode(errors="replace").strip() for line in source
+                                  if b"(IMPORT FAILED)" in line or b"Cannot import " in line]
+                    if failed:
+                        raise RuntimeError("Custom node load failed: " + "; ".join(failed)[-2000:])
+                except BaseException:
+                    # A retry must not leave a second, unverified ComfyUI on the same port.
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                    raise
+                stages.start("native_tunnel")
+                if cloudflared_future is not None:
+                    binary = cloudflared_future.result()
+                else:
+                    binary = shutil.which("cloudflared") or str(ROOT / "cloudflared")
+                tunnel_file = ROOT / "tunnel.token"
+                _write_secret(tunnel_file, secret["tunnel_token"])
+                with (ROOT / "tunnel.log").open("ab") as log:
+                    tunnel = subprocess.Popen(
+                        [binary, "tunnel", "--no-autoupdate", "--protocol", "http2", "--metrics", TUNNEL_METRICS_ADDR, "run", "--token-file", str(tunnel_file)],
+                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                    )
+                try:
+                    wait_for_tunnel(tunnel)
+                except BaseException:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                    raise
+                (ROOT / "heartbeat").write_text(str(time.time()))
+                (ROOT / "watchdog.py").write_text(WATCHDOG)
+                with (ROOT / "watchdog.log").open("ab") as log:
+                    subprocess.Popen([sys.executable, str(ROOT / "watchdog.py")], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                if env_cache_plan is not None and persistence.remote.available():
+                    with (ROOT / "env-cache.log").open("ab") as log:
+                        subprocess.Popen(
+                            [sys.executable, str(ROOT / "node_persistence.py"), "upload-env-cache", str(env_cache_plan)],
+                            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                        )
+                worker._atomic_json(marker, {"commit": commit, "pid": process.pid, "tunnel_pid": tunnel.pid,
+                                             "tunnel_start_id": worker._process_metadata(tunnel.pid)["start_id"], "tunnel_binary": binary,
+                                             "comfy": str(comfy), "comfy_log": str(comfy_log), "model_storage_mode": mode,
+                                             "comfy_log_offset": log_offset, "started": time.time()})
+            finally:
+                if boot_pool is not None:
+                    boot_pool.shutdown(wait=True, cancel_futures=True)
         stages.end()
         report = root / "outputs" / "native-ready.json"
         report.parent.mkdir(exist_ok=True)

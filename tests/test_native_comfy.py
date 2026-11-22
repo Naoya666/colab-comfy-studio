@@ -869,7 +869,11 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
             kwargs['stdout'].flush()
         return process
     monkeypatch.setattr(runtime.subprocess, 'Popen', launch)
-    stages = SimpleNamespace(start=lambda name: None, end=lambda: None, timings={})
+    recorded_stages = []
+    def start_stage(name):
+        recorded_stages.append(name)
+        stages.timings[name] = 0.1
+    stages = SimpleNamespace(start=start_stage, end=lambda: None, timings={})
     payload = {'snapshot': {'manifest': {'comfy_commit': 'a' * 40}},
                'native_secrets': {'max_upload_mb': 2048, 'tunnel_token': 'fake-token'}}
     if local:
@@ -885,10 +889,16 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
         return
 
     runtime.run(job, payload, stages)
-    assert [sys.executable, '-m', 'pip', 'install', '-q', 'jedi>=0.16,<0.20'] in commands
+    assert recorded_stages == [
+        'native_system', 'native_drive', 'native_models', 'native_plugins_restore',
+        'native_python', 'native_plugins_deps', 'comfy_start', 'native_tunnel',
+    ]
     manager_pip = [args for args in commands if str(comfy / 'manager_requirements.txt') in args]
-    assert manager_pip == [[sys.executable, '-m', 'pip', 'install', '-q', '-r',
-                            str(comfy / 'manager_requirements.txt')]]
+    assert len(manager_pip) == 1
+    assert 'jedi>=0.16,<0.20' in manager_pip[0]
+    assert str(comfy / 'requirements.txt') in manager_pip[0]
+    if local:
+        assert 'httpx>=0.27,<1' in manager_pip[0]
     args, kwargs = launches[0]
     data = drive / 'native-comfy'
     model_args = [] if local else ['--extra-model-paths-config', str(service / 'extra_model_paths.yaml')]
@@ -1443,3 +1453,287 @@ def test_utf8_content_disposition_header_forwarded_without_latin1_error(proxy, m
     assert response.content == b"\x89PNG\r\n\x1a\n"
     cd = response.headers.get("content-disposition", "")
     assert "filename*=UTF-8''Anima-%E6%94%BE%E5%A4%A7_00001_.png" in cd
+
+
+def test_native_base_python_uv_fallback_and_env_toggle(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    from app.gpu import native_runtime as runtime
+
+    comfy = tmp_path / "ComfyUI"
+    comfy.mkdir()
+    (comfy / "requirements.txt").write_text("einops\n")
+    manager = comfy / "manager_requirements.txt"
+    manager.write_text("GitPython\n")
+    (tmp_path / "gpu-constraints.txt").write_text("torch==2.8.0\n")
+
+    class FakeWorkerError(RuntimeError):
+        pass
+
+    calls = []
+
+    def run_ok(cmd, **kw):
+        calls.append(cmd)
+
+    worker = SimpleNamespace(_run=run_ok, WorkerError=FakeWorkerError)
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: "/usr/local/bin/uv" if name == "uv" else None)
+
+    monkeypatch.setenv("NATIVE_USE_UV", "1")
+    runtime._install_base_python(worker, tmp_path, comfy, manager, local=True)
+    assert calls[-1][:3] == ["/usr/local/bin/uv", "pip", "install"]
+    assert "httpx>=0.27,<1" in calls[-1]
+
+    monkeypatch.setenv("NATIVE_USE_UV", "0")
+    runtime._install_base_python(worker, tmp_path, comfy, manager, local=False)
+    assert calls[-1][:3] == [sys.executable, "-m", "pip"]
+    assert "httpx>=0.27,<1" not in calls[-1]
+
+    # Automatic fallback to pip when uv raises WorkerError
+    monkeypatch.setenv("NATIVE_USE_UV", "1")
+    calls.clear()
+
+    def fail_uv(cmd, **kw):
+        calls.append(cmd)
+        if cmd[0].endswith("uv"):
+            raise FakeWorkerError("uv build failure")
+
+    worker._run = fail_uv
+    runtime._install_base_python(worker, tmp_path, comfy, manager, local=False)
+    assert len(calls) == 2
+    assert calls[0][0].endswith("uv")
+    assert calls[1][:3] == [sys.executable, "-m", "pip"]
+
+
+def test_native_env_cache_key_roundtrip_and_corrupt_rollback(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from app.gpu import node_persistence as np
+
+    root = tmp_path / "native"
+    comfy = root / "ComfyUI"
+    nodes = comfy / "custom_nodes"
+    (nodes / "weilin").mkdir(parents=True)
+    (comfy / "requirements.txt").write_text("einops\n")
+    (comfy / "manager_requirements.txt").write_text("GitPython\n")
+    (nodes / "weilin" / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n")
+    (nodes / "weilin" / "requirements.txt").write_text("aiohttp\n")
+    db_file = nodes / "weilin" / "data.db"
+    db_file.write_bytes(b"sqlite-state-v1")
+
+    plugins_v1 = np.inventory(nodes)
+    k1 = np.compute_env_cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, plugins_v1)
+
+    # Runtime SQLite / data drift changes plugin checksum/generation, NOT env-cache key!
+    db_file.write_bytes(b"sqlite-state-v2-modified-at-runtime")
+    plugins_v2 = np.inventory(nodes)
+    assert plugins_v2[0]["checksum"] != plugins_v1[0]["checksum"]
+    k2 = np.compute_env_cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, plugins_v2)
+    assert k2["key"] == k1["key"]
+
+    # Changing GPU architecture, Comfy commit, or plugin requirements MUST change env-cache key
+    assert np.compute_env_cache_key(comfy, "b" * 40, "gpu_l4_89", nodes, plugins_v2)["key"] != k1["key"]
+    assert np.compute_env_cache_key(comfy, "a" * 40, "gpu_t4_75", nodes, plugins_v2)["key"] != k1["key"]
+    (nodes / "weilin" / "requirements.txt").write_text("aiohttp>=3.9\n")
+    k3 = np.compute_env_cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, np.inventory(nodes))
+    assert k3["key"] != k1["key"]
+
+    # Roundtrip pack -> upload -> restore on clean site-packages, plus rollback on failed pip check
+    drive_env = tmp_path / "drive_env"
+    drive_env.mkdir()
+
+    class FakeEnvRemote:
+        def available(self):
+            return True
+
+        def get_env_cache(self, name, target):
+            src = drive_env / name
+            if not src.is_file():
+                return False
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(src.read_bytes())
+            return True
+
+        def put_env_cache(self, source, name, *, verify=False):
+            (drive_env / name).write_bytes(source.read_bytes())
+
+        def prune_env_cache(self, keep=3):
+            pass
+
+    remote = FakeEnvRemote()
+    site_build = tmp_path / "site_build"
+    site_build.mkdir()
+    (site_build / "base_pkg").mkdir()
+    (site_build / "base_pkg" / "__init__.py").write_text("V = 1\n")
+    (site_build / "old_pkg").mkdir()
+    (site_build / "old_pkg" / "__init__.py").write_text("OLD = True\n")
+    before = np.site_snapshot(site_build)
+
+    # Simulate installing sam2 and replacing old_pkg
+    import shutil
+    shutil.rmtree(site_build / "old_pkg")
+    (site_build / "sam2").mkdir()
+    (site_build / "sam2" / "_C.so").write_bytes(b"\x7fELFcompiled-sam2")
+
+    plan = np.prepare_env_cache_plan(root, site_build, before, k3)
+    assert plan is not None
+    assert np.upload_env_cache_from_plan(root, plan, remote) is True
+    assert (drive_env / f"{k3['key']}.meta.json").is_file()
+    assert (drive_env / f"{k3['key']}.tar.gz").is_file()
+
+    # Fresh VM site-packages restore
+    site_fresh = tmp_path / "site_fresh"
+    site_fresh.mkdir()
+    (site_fresh / "base_pkg").mkdir()
+    (site_fresh / "base_pkg" / "__init__.py").write_text("V = 1\n")
+    (site_fresh / "old_pkg").mkdir()
+    (site_fresh / "old_pkg" / "__init__.py").write_text("OLD = True\n")
+
+    monkeypatch.setattr(np, "protect_environment", lambda r: {"torch": "2.8.0"})
+    pip_check_rc = [0]
+    orig_run = np.subprocess.run
+
+    def fake_run(args, *a, **kw):
+        if len(args) >= 3 and args[1:4] == ["-m", "pip", "check"]:
+            return SimpleNamespace(returncode=pip_check_rc[0], stdout="", stderr="")
+        return orig_run(args, *a, **kw)
+
+    monkeypatch.setattr(np.subprocess, "run", fake_run)
+
+    # First simulate pip check failure -> must roll back site_fresh untouched!
+    pip_check_rc[0] = 1
+    assert np.try_restore_env_cache(tmp_path / "fresh_root", site_fresh, k3, {"torch": "2.8.0"}, remote) is False
+    assert (site_fresh / "old_pkg" / "__init__.py").is_file()
+    assert not (site_fresh / "sam2").exists()
+
+    # Now pip check succeeds -> sam2 restored, old_pkg removed!
+    pip_check_rc[0] = 0
+    assert np.try_restore_env_cache(tmp_path / "fresh_root2", site_fresh, k3, {"torch": "2.8.0"}, remote) is True
+    assert (site_fresh / "sam2" / "_C.so").read_bytes() == b"\x7fELFcompiled-sam2"
+    assert not (site_fresh / "old_pkg").exists()
+
+    # NATIVE_ENV_CACHE=0 disables cache lookup completely
+    monkeypatch.setenv("NATIVE_ENV_CACHE", "0")
+    assert np.try_restore_env_cache(tmp_path / "fresh_root3", site_fresh, k3, {"torch": "2.8.0"}, remote) is False
+
+
+def test_scheduler_native_upload_skips_drive_storage(monkeypatch, tmp_path):
+    import hashlib
+    import json
+
+    from app.db import Store
+    from app.gpu import drive as drive_mod
+    from app.gpu.artifacts import LocalArtifactStore
+    from app.gpu.scheduler import Scheduler
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    monkeypatch.setenv("GPU_STORAGE", "drive")
+    monkeypatch.setenv("NATIVE_FAST_CONTROL_PLANE", "1")
+    monkeypatch.setattr(drive_mod, "DriveStorage", lambda *a, **kw: pytest.fail("native boot must not upload report to Drive"))
+
+    store = Store(f"sqlite:///{tmp_path / 'sched.db'}")
+    store.create("projects", "owner", {"title": "Native"}, record_id="proj-native")
+    sched = Scheduler(store)
+    exec_id = "11111111-2222-4333-8444-555555555555"
+    report_bytes = json.dumps({"native_comfy": True, "commit": "a" * 40, "stage_seconds": {"comfy_start": 12.3}}).encode()
+    art_store = LocalArtifactStore(tmp_path / "assets" / "artifacts")
+    begun = art_store.begin(
+        "owner", exec_id, "native-ready.json", "application/json",
+        len(report_bytes), hashlib.sha256(report_bytes).hexdigest(),
+    )
+    art_store.append(begun["artifact_id"], "owner", exec_id, 0, report_bytes)
+    verified = art_store.verify(begun["artifact_id"], "owner", exec_id)
+
+    job, _ = sched.store.create_job("owner", {"kind": "native-comfy", "project_id": "proj-native"}, "idem-native-upload")
+    job = sched.store.update("jobs", job["id"], {
+        "state": "uploading",
+        "project_id": "proj-native",
+        "execution_id": exec_id,
+        "provider": "colab",
+        "snapshot": {"native_comfy": True, "manifest": {"comfy_commit": "a" * 40}},
+        "outputs": [verified],
+    }, "owner")
+    updated = sched._upload(job)
+    assert updated["state"] == "cleaning_up"
+    assert (tmp_path / "gpu-results" / "owner" / job["id"] / "metadata.json").is_file()
+
+
+def test_native_ready_concurrent_probes_fail_closed_on_any_unprotected_path(proxy, monkeypatch):
+    for unauth_200_path in native.UNAUTHENTICATED_TUNNEL_PROBES:
+        def handler(req, leaked=unauth_200_path):
+            if "CF-Access-Client-Secret" not in req.headers:
+                return httpx.Response(200 if req.url.path == leaked else 403, json={"system": {}})
+            return httpx.Response(200, json={"system": {}} if req.url.path == "/system_stats" else {"busy": False})
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            assert native.ready(client) is False
+
+
+def test_worker_skips_sleep_on_advance_and_ccu_skips_drive_only_accounts(monkeypatch, tmp_path):
+    from app import worker as worker_mod
+    from app.db import Store
+    from app.gpu import ccu
+    from app.gpu.repository import Repository
+
+    # 1. ccu.sample_and_record skips accounts without a colab credential on background ticks
+    store = Store(f"sqlite:///{tmp_path / 'ccu_skip.db'}")
+    repo = Repository(store)
+    repo.create("accounts", "owner", {"account_id": "drive-only", "enabled": True}, record_id="drive-only")
+    monkeypatch.setattr(ccu, "sampling_enabled", lambda: True)
+    assert ccu.sample_and_record(repo, "owner", "drive-only", "tick") is None
+
+    # 2. worker.main skips time.sleep when result["advanced"] is True
+    sleeps = []
+    states = iter([{"advanced": True, "job_id": "j1", "state": "validating"}, {"advanced": False}])
+
+    class FakeScheduler:
+        def __init__(self, _store):
+            pass
+
+        def tick(self):
+            try:
+                return next(states)
+            except StopIteration:
+                worker_mod.stop()
+                return {"advanced": False}
+
+    monkeypatch.setattr(worker_mod, "Store", lambda url: store)
+    monkeypatch.setattr(worker_mod, "Scheduler", FakeScheduler)
+    monkeypatch.setattr("app.gpu.native_restart.tick", lambda _repo: None)
+    monkeypatch.setattr(worker_mod, "_run_ccu_tick", lambda _store: None)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: (sleeps.append(s), worker_mod.stop()))
+    monkeypatch.setattr("sys.argv", ["worker", "worker", "--interval", "2"])
+    worker_mod.running = True
+    worker_mod.main()
+    # First tick had advanced=True (no sleep), second tick had advanced=False (1 sleep which stopped loop)
+    assert sleeps == [2.0]
+
+
+def test_mcp_forwards_native_optimization_flags(monkeypatch, tmp_path):
+    from app.db import Store
+    from app.gpu import mcp, native
+    from app.gpu.repository import Repository
+
+    monkeypatch.setenv("NATIVE_ENV_CACHE", "0")
+    monkeypatch.setenv("NATIVE_USE_UV", "1")
+    monkeypatch.setenv("NATIVE_PARALLEL_RESTORE", "0")
+    flags = native.native_optimization_flags()
+    assert flags["NATIVE_ENV_CACHE"] == "0"
+    assert flags["NATIVE_USE_UV"] == "1"
+    assert flags["NATIVE_PARALLEL_RESTORE"] == "0"
+
+    store = Store(f"sqlite:///{tmp_path / 'mcp.db'}")
+    repo = Repository(store)
+    captured = {}
+    monkeypatch.setattr(native, "runtime_secrets", lambda r, j: {"model_storage_mode": "drive_mount", "tunnel_token": "t", "max_upload_mb": 2048})
+    monkeypatch.setattr(mcp, "build_bootstrap_code", lambda eid, payload: (captured.update(payload), "print('{}')")[1])
+    executor = mcp.MCPGPUExecutor(repo, "owner", google=object())
+    monkeypatch.setattr(executor, "_session", lambda h, jid: "runtimes/r1/sessions/s1")
+    monkeypatch.setattr(executor, "_exec_code_on_handle", lambda *a: {"started": True})
+    executor.start(
+        {"runtime_name": "runtimes/r1", "owner_id": "owner"},
+        {"id": "job-1", "owner_id": "owner", "snapshot": {"native_comfy": True, "manifest": {"comfy_commit": "a" * 40}}},
+        "11111111-2222-4333-8444-555555555555",
+    )
+    assert captured["native_flags"]["NATIVE_ENV_CACHE"] == "0"
+    assert captured["native_flags"]["NATIVE_PARALLEL_RESTORE"] == "0"
