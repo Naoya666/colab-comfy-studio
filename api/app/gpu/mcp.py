@@ -655,8 +655,12 @@ class MCPGPUExecutor:
         if job.get("generation_timeouts") or snapshot.get("creation_api"):
             deadlines = [job.get("deadline_epoch"), job.get("task_deadline_epoch")]
             payload["deadline_epoch"] = min((float(d) for d in deadlines if d is not None), default=None)
-        if snapshot.get("creation_api"):
+        from .instances import POOL_CREATION, job_pool
+
+        is_creation_pool = job_pool(job) == POOL_CREATION
+        if snapshot.get("creation_api") or (is_creation_pool and job.get("instance_id")):
             payload["instance_id"] = job.get("instance_id")
+            payload["use_resident_service"] = True
             if job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
                 payload["snapshot"] = {**snapshot, "runtime_compute_spec": None}
         if "lora_drive_cache" in job:
@@ -704,6 +708,32 @@ print(json.dumps({{"healthy": healthy}}))
 """
         result = self._exec_code_on_handle(handle, session, str(uuid.uuid4()), code)
         return result.get("healthy") if isinstance(result, dict) else None
+
+    def interrupt_creation_service(self, handle: dict, job: dict) -> bool:
+        """Best-effort interrupt of an active prompt on the resident ComfyUI service."""
+        interrupt_url = _service_api_url("/interrupt")
+        queue_url = _service_api_url("/queue")
+        session = self._session(handle, job["id"])
+        code = f"""import json, time, urllib.request
+interrupted = False
+try:
+    req = urllib.request.Request({interrupt_url!r}, data=b"{{}}", method="POST",
+                                 headers={{"Content-Type": "application/json"}})
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        interrupted = 200 <= resp.status < 300
+    deadline = time.time() + 4.0
+    while time.time() < deadline:
+        with urllib.request.urlopen({queue_url!r}, timeout=2) as qresp:
+            qdata = json.loads(qresp.read().decode("utf-8"))
+        if not qdata.get("queue_running"):
+            break
+        time.sleep(0.3)
+except Exception:
+    pass
+print(json.dumps({{"interrupted": interrupted}}))
+"""
+        result = self._exec_code_on_handle(handle, session, str(uuid.uuid4()), code)
+        return bool(isinstance(result, dict) and result.get("interrupted"))
 
     def start(self, handle: dict, job: dict, execution_id: str) -> dict:
         execution_id = _uuid4(execution_id)
@@ -761,9 +791,9 @@ print(json.dumps({{"healthy": healthy}}))
             }
         if state != "completed":
             raise MCPError("Colab状态值无效")
-        if (job.get("snapshot") or {}).get("creation_api"):
+        if result.get("creation_runtime") is not None or (job.get("snapshot") or {}).get("creation_api"):
             evidence["creation_runtime"] = result.get("creation_runtime")
-            if job["snapshot"].get("creation_warmup"):
+            if (job.get("snapshot") or {}).get("creation_warmup"):
                 return {**evidence, "state": "completed", "timings": result.get("timings") or {}}
         if 'artifacts' in result:
             artifacts=result['artifacts']

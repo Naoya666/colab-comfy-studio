@@ -3,6 +3,8 @@ export type V020Provider = 'mock' | 'colab';
 export type GpuAllocation = 'auto' | 'existing';
 export type GpuLifecycle = 'save' | 'batch' | 'smart' | 'retain';
 export type RetentionMode = 'save' | 'retain' | 'smart';
+export type GpuReuseAction = 'auto' | 'reuse' | 'replace' | 'new';
+export type GpuInstancePool = 'native' | 'creation' | 'ephemeral' | string;
 
 /** New execution policy fields are optional so legacy job payloads remain readable. */
 export interface GpuExecutionPolicyV020 {
@@ -12,6 +14,8 @@ export interface GpuExecutionPolicyV020 {
   allocation?: GpuAllocation;
   account_id?: string | null;
   instance_id?: string | null;
+  reuse_action?: GpuReuseAction | null;
+  replace_instance_id?: string | null;
   lifecycle?: GpuLifecycle;
   retain_idle_minutes?: number | null;
   /** Legacy fields: when present, the server validates them against lifecycle. */
@@ -102,9 +106,11 @@ export interface GpuInstance {
   account_id?: string | null;
   account_alias_snapshot?: string | null;
   provider?: V020Provider;
+  instance_pool?: GpuInstancePool;
   state: GpuInstanceState;
   retention_mode?: RetentionMode;
   retention?: RetentionMode;
+  retain_idle_minutes?: number | null;
   version?: number;
   idle_minutes?: number | null;
   retain_requested_at?: string | null;
@@ -115,6 +121,7 @@ export interface GpuInstance {
   gpu_reported?: string | null;
   runtime_spec_requested?: Record<string, unknown> | null;
   runtime_spec_reported?: Record<string, unknown> | null;
+  creation_runtime?: Record<string, unknown> | null;
   created_at?: string;
   last_seen_at?: string | null;
   retained_until?: string | null;

@@ -60,6 +60,27 @@ type Warmup = {
   gpu_reported?: string;
   creation_runtime?: { instance_id: string; process: string; devices?: { name: string }[] };
 };
+type PoolInstance = {
+  id: string;
+  instance_label?: string | null;
+  account_id?: string | null;
+  account_alias_snapshot?: string | null;
+  state: string;
+  retention_mode?: string | null;
+  retain_idle_minutes?: number | null;
+  expires_at?: number | null;
+  gpu_reported?: string | null;
+  runtime_spec_requested?: { key?: { accelerator?: string; shape?: string } } | null;
+  runtime_spec_reported?: { key?: { accelerator?: string; shape?: string } } | null;
+  creation_runtime?: {
+    instance_id?: string;
+    process?: string;
+    workflow_key?: string;
+    workflow_version?: string | number;
+    cache_reason?: string;
+  } | null;
+  current_job_id?: string | null;
+};
 type Status = {
   url: string;
   path_code?: string | null;
@@ -69,6 +90,7 @@ type Status = {
   keys: Key[];
   workflows: Workflow[];
   warmups: Warmup[];
+  pool_instances?: PoolInstance[];
 };
 type Match = {
   status: 'matched' | 'unmatched' | 'ambiguous';
@@ -106,6 +128,7 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
   const [graphText, setGraphText] = useState('');
   const [match, setMatch] = useState<Match>();
   const [warmups, setWarmups] = useState<Warmup[]>([]);
+  const [poolInstances, setPoolInstances] = useState<PoolInstance[]>([]);
   const [showAllWarmups, setShowAllWarmups] = useState(false);
   const [confirmRevokeKey, setConfirmRevokeKey] = useState(false);
   const [confirmResetCode, setConfirmResetCode] = useState(false);
@@ -121,6 +144,7 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
     setPortInput(data.config.listen_port != null ? String(data.config.listen_port) : '');
     setKeys(data.keys);
     setWarmups(data.warmups);
+    setPoolInstances(data.pool_instances || []);
     setWorkflowId(current => current || data.workflows[0]?.id || '');
   }, []);
 
@@ -133,13 +157,18 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
     return () => { live = false; };
   }, [applyLoadedStatus]);
 
-  const hasPollableWarmups = warmups.some(job => !finished.has(job.state) || job.ready);
+  const hasPollableWarmups = warmups.some(job => !finished.has(job.state) || job.ready) || poolInstances.length > 0;
   const pollWarmups = useCallback(async () => {
     const pending = warmups.filter(job => !finished.has(job.state) || job.ready);
-    if (!pending.length) return;
     try {
-      const rows = await Promise.all(pending.map(job => apiFetch<Warmup>(`${prefix}/warmups/${job.id}`)));
-      setWarmups(current => current.map(job => rows.find(row => row.id === job.id) || job));
+      const [rows, refreshed] = await Promise.all([
+        pending.length ? Promise.all(pending.map(job => apiFetch<Warmup>(`${prefix}/warmups/${job.id}`))) : Promise.resolve([]),
+        apiFetch<Status>(prefix),
+      ]);
+      if (rows.length) {
+        setWarmups(current => current.map(job => rows.find(row => row.id === job.id) || job));
+      }
+      setPoolInstances(refreshed.pool_instances || []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -389,13 +418,75 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
         </button>
       </Card>
 
+      <Card
+        title="创作池活跃实例（前端与 API 互通复用）"
+        aside={
+          <button
+            type="button"
+            className="button ghost small"
+            disabled={busy}
+            onClick={() => void run(async () => {
+              const refreshed = await apiFetch<Status>(prefix);
+              setPoolInstances(refreshed.pool_instances || []);
+            })}
+          >
+            刷新实例
+          </button>
+        }
+      >
+        <p className="muted small">
+          此处统一展示前端创作页与 API 预热启动的活跃创作池实例。创作 API 会优先复用已预热或规格足够的实例（原生 ComfyUI 实例隔离不参与复用）。
+        </p>
+        {!poolInstances.length ? (
+          <p className="muted small">当前创作池没有活跃实例。可在前端创作页使用「智能/保留」启动，或点击下方「启动工作流」预热。</p>
+        ) : (
+          <div className="stack">
+            {poolInstances.map((inst) => {
+              const specAcc = inst.gpu_reported
+                || inst.runtime_spec_reported?.key?.accelerator
+                || inst.runtime_spec_requested?.key?.accelerator
+                || 'GPU';
+              const stateText = inst.state === 'retained_idle'
+                ? '空闲可复用'
+                : inst.state === 'busy'
+                  ? '运行中（可排队复用）'
+                  : inst.state === 'allocating' || inst.state === 'requested'
+                    ? '分配中'
+                    : inst.state;
+              const wfText = inst.creation_runtime?.workflow_key
+                ? `${inst.creation_runtime.workflow_key}${inst.creation_runtime.workflow_version != null ? ` v${inst.creation_runtime.workflow_version}` : ''}`
+                : '尚未加载常驻工作流';
+              return (
+                <div key={inst.id} className="status">
+                  <strong>
+                    {inst.instance_label || `实例 #${inst.id.slice(0, 8)}`} · {specAcc} · {stateText}
+                  </strong>
+                  <p className="muted small">
+                    账号：{inst.account_alias_snapshot || inst.account_id || '默认'} · 常驻工作流：{wfText}
+                    {inst.creation_runtime?.process ? ` · 进程 ${inst.creation_runtime.process}` : ''}
+                  </p>
+                  <p className="muted small">
+                    保留策略：{inst.retention_mode || 'save'}
+                    {inst.retain_idle_minutes ? `（${inst.retain_idle_minutes} 分钟）` : ''}
+                    {inst.expires_at ? ` · 可用至 ${new Date(inst.expires_at * 1000).toLocaleString()}` : ''}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+
       <Card title="默认运行配置">
         <RuntimeSelection value={{ accountId: draft.account_id, instanceId: null, lifecycle: draft.lifecycle,
           retainIdleMinutes: draft.retain_idle_minutes }} accounts={accounts} instances={[]} provider="colab" showInstances={false}
           onChange={value => setDraft({ ...draft, account_id: value.accountId, lifecycle: value.lifecycle,
             retain_idle_minutes: value.retainIdleMinutes })} />
         <WorkflowGpuSelection manifest={null} accountId={draft.account_id} value={draft.gpu}
-          onChange={gpu => { if (gpu) setDraft({ ...draft, gpu }); }} label="默认 GPU" requireSelection />
+          onChange={gpu => { if (gpu) setDraft({ ...draft, gpu }); }} label="默认 GPU（仅新开机生效）" requireSelection />
+        <p className="muted small">
+          「默认 GPU」仅用于需要新开机器（手动预热或自动启动且创作池为空）时生效。复用已有创作池实例时按工作流默认规格与已预热实例优先匹配，且绝不会在已有低规格实例时自动多开双卡。
+        </p>
         <div className="field">
           <label htmlFor="creation-timeout">单个任务最长运行时间（分钟）</label>
           <input id="creation-timeout" type="number" min={1} step={1}

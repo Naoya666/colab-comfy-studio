@@ -31,7 +31,7 @@ from .api_access import (
 from .common import APIError, admin, current_user, get_store, ok
 from .config import settings
 from .db import utc_isoformat, utcnow
-from .gpu.instances import InstanceService
+from .gpu.instances import POOL_CREATION, AllocationError, InstanceService, instance_pool_of
 from .gpu.manifest import (
     _binding,
     _canonical_parameters,
@@ -44,7 +44,13 @@ from .gpu.manifest import (
 from .gpu.model_dependencies import rules as model_rules
 from .gpu.repository import Repository
 from .gpu.scheduler import ACTIVE_STATES, Scheduler
-from .gpu.specs import spec_key
+from .gpu.specs import (
+    check_requirements,
+    gpu_spec_order_settings,
+    is_below_workflow_default,
+    spec_id,
+    spec_key,
+)
 from .job_schemas import JobInput, Policy
 from .native_api import MAX_OUTSTANDING, MAX_WORKFLOW_BYTES, RATE_PER_MINUTE, token_digest
 from .port_listeners import probe_port_available
@@ -354,6 +360,21 @@ def submit(store, owner, workflow, params, *, key=None, idem=None, graph_hash=No
                    workflow_key=workflow["workflow_key"], workflow_version=workflow["workflow_version"],
                    params=params, execution_policy=Policy.model_validate(execution_policy(cfg))).model_dump()
 
+    def _check_boot_spec():
+        order_table = gpu_spec_order_settings(store, owner)["ordered_specs"]
+        manifest = workflow.get("manifest") or {}
+        try:
+            check_requirements(manifest, {"key": cfg["gpu"]})
+        except ValueError as exc:
+            raise APIError("GPU_SPEC_BELOW_WORKFLOW_DEFAULT", str(exc), 422) from exc
+        if is_below_workflow_default(manifest, cfg["gpu"], order_table):
+            wf_default = manifest.get("compute_spec")
+            raise APIError(
+                "GPU_SPEC_BELOW_WORKFLOW_DEFAULT",
+                f"API 默认 GPU 规格（{spec_id(cfg['gpu'])}）低于工作流默认最低规格（{spec_id(wf_default)}），不支持降配启动",
+                422,
+            )
+
     def before_create(repo, job):
         rows = repo.list("jobs", owner)
         versions = {row["id"] for row in eligible(repo, owner)}
@@ -368,6 +389,18 @@ def submit(store, owner, workflow, params, *, key=None, idem=None, graph_hash=No
                         and row.get("requested_spec") == job.get("requested_spec")
                         and (is_active(row) or warm_status(repo, row)["ready"])):
                     return row
+            try:
+                pool_state = InstanceService(repo).inspect_creation_api_admission({**raw, **job, "owner_id": owner}, rows)
+            except AllocationError as exc:
+                raise APIError("ACCOUNT_UNAVAILABLE", str(exc), 409) from exc
+            if pool_state["status"] == "spec_too_low":
+                raise APIError(
+                    "CREATION_INSTANCE_SPEC_TOO_LOW",
+                    "当前创作实例规格低于该工作流要求，API 不自动多开显卡，请先在算力页停止低规格实例或由前端手动启动高规格实例",
+                    409,
+                )
+            if pool_state["status"] not in {"compatible_instance", "inflight_compatible"}:
+                _check_boot_spec()
             return None
         if is_virtual_key:
             fresh_cfg = config(store, owner)
@@ -392,15 +425,20 @@ def submit(store, owner, workflow, params, *, key=None, idem=None, graph_hash=No
             raise APIError("API_RATE_LIMIT", "每把 Key 每分钟最多提交 20 次", 429, True)
         if sum(is_active(row) for row in relevant) >= MAX_OUTSTANDING:
             raise APIError("API_CONCURRENCY_LIMIT", "每把 Key 最多同时有 4 个未完成任务", 429, True)
-        if existing_only:
-            from .gpu.instances import AllocationError
-
-            try:
-                reusable = InstanceService(repo).creation_capacity({**raw, **job, "owner_id": owner}, rows)
-            except AllocationError as exc:
-                raise APIError("ACCOUNT_UNAVAILABLE", str(exc), 409) from exc
-            if not reusable:
+        try:
+            pool_state = InstanceService(repo).inspect_creation_api_admission({**raw, **job, "owner_id": owner}, rows)
+        except AllocationError as exc:
+            raise APIError("ACCOUNT_UNAVAILABLE", str(exc), 409) from exc
+        if pool_state["status"] == "spec_too_low":
+            raise APIError(
+                "CREATION_INSTANCE_SPEC_TOO_LOW",
+                "当前创作实例规格低于该工作流要求，API 不自动多开显卡，请先在算力页停止低规格实例或由前端手动启动高规格实例",
+                409,
+            )
+        if pool_state["status"] not in {"compatible_instance", "inflight_compatible"}:
+            if existing_only:
                 raise APIError("CREATION_START_REQUIRED", "请先在创作 → API 设置启动工作流", 409, True)
+            _check_boot_spec()
         return None
 
     try:
@@ -434,6 +472,43 @@ def _access_metadata(store, owner: str, cfg: dict) -> tuple[str | None, dict]:
     return code, urls
 
 
+def _pool_instances(repo, owner: str) -> list[dict]:
+    now = utcnow().timestamp()
+    rows = []
+    for inst in repo.list("instances", owner):
+        if inst.get("provider") != "colab" or inst.get("runtime_deleted"):
+            continue
+        if instance_pool_of(inst) != POOL_CREATION:
+            continue
+        if inst.get("state") not in {"allocating", "ready", "busy", "retained_idle"}:
+            continue
+        if inst.get("manual_stop_requested"):
+            continue
+        deadlines = [inst.get(k) for k in ("hard_deadline_at", "idle_deadline_at") if inst.get(k) is not None]
+        expires = min((float(d) for d in deadlines), default=None)
+        if inst.get("state") == "retained_idle" and expires is not None and expires <= now:
+            continue
+        rows.append({
+            "id": inst["id"],
+            "instance_label": inst.get("instance_label"),
+            "account_id": inst.get("account_id"),
+            "account_alias_snapshot": inst.get("account_alias_snapshot"),
+            "state": inst["state"],
+            "retention_mode": inst.get("retention_mode"),
+            "retain_idle_minutes": inst.get("retain_idle_minutes"),
+            "idle_deadline_at": inst.get("idle_deadline_at"),
+            "hard_deadline_at": inst.get("hard_deadline_at"),
+            "expires_at": expires,
+            "runtime_spec_requested": inst.get("runtime_spec_requested"),
+            "runtime_spec_reported": inst.get("runtime_spec_reported"),
+            "gpu_reported": inst.get("gpu_reported"),
+            "creation_runtime": inst.get("creation_runtime"),
+            "current_job_id": inst.get("current_job_id"),
+            "instance_pool": POOL_CREATION,
+        })
+    return rows
+
+
 @admin_router.get("")
 def admin_status(request: Request, user=Depends(current_user), store=Depends(get_store)):
     admin(user)
@@ -460,6 +535,7 @@ def admin_status(request: Request, user=Depends(current_user), store=Depends(get
         "keys": [public_key(row) for row in store.list(KEYS, owner)],
         "workflows": [public_workflow(row) for row in eligible(repo, owner)],
         "warmups": warmups,
+        "pool_instances": _pool_instances(repo, owner),
     }, request)
 
 

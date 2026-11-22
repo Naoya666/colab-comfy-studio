@@ -6,6 +6,7 @@ import type { GpuSettings, GpuUsage } from '../lib/gpu-api';
 import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
 import { AccountDirectory, type GpuAccount } from '../components/AccountDirectory';
 import { CuGuardSettings } from '../components/CuGuardSettings';
+import { GpuOrderSettings } from '../components/GpuOrderSettings';
 import { Card } from '../components/ui';
 import styles from '../gpu.module.css';
 import { cuNumber } from '../lib/ui-helpers';
@@ -65,6 +66,7 @@ export function SettingsPanel({
       <CuGuardSettings guard={usage?.guard} canEdit={canEditGuard} onSaved={onRefreshUsage} />
 
       <div className={`${styles.stack} ${styles.workspaceWide}`}>
+        <GpuOrderSettings canEdit={canEditGuard} />
         <ModelStorageSettings />
         <ModelSourceSettings />
       </div>

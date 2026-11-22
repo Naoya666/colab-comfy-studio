@@ -774,6 +774,7 @@ def real_smoke(
                 {
                     "project_id": project["id"],
                     "provider": "colab",
+                    "instance_pool": "ephemeral",
                     "account_id": account_id,
                     "requested_account_id": account_id,
                     "execution_policy": raw["execution_policy"],

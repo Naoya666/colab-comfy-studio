@@ -56,12 +56,19 @@ def _validate(repo, lease, instance_id, operation=None, *, check_jobs=True):
     if lease.get("current_job_id") or instance.get("current_job_id"):
         raise _busy("Studio 生成或启动任务仍在执行")
     if check_jobs:
+        from .instances import POOL_NATIVE, job_pool
+
         for job in repo.list("jobs", owner):
             policy = job.get("execution_policy") or {}
-            if ((job.get("provider") or policy.get("provider")) == "colab"
-                    and job.get("state") not in native.TERMINAL
-                    and not job.get("prep")
-                    and (job.get("instance_id") or job.get("requested_instance_id")) in {None, instance_id}):
+            if (
+                (job.get("provider") or policy.get("provider")) == "colab"
+                and job.get("state") not in native.TERMINAL
+                and not job.get("prep")
+                and (
+                    job_pool(job) == POOL_NATIVE
+                    or (job.get("instance_id") or job.get("requested_instance_id")) == instance_id
+                )
+            ):
                 raise _busy("Studio 生成或启动任务仍在排队")
 
 

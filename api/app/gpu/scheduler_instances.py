@@ -7,7 +7,7 @@ from typing import Any
 
 from app.common import APIError
 
-from .instances import CreationInstancePending, StudioModelStorageConflict
+from .instances import CreationInstancePending
 
 
 class SchedulerError(RuntimeError):
@@ -48,8 +48,10 @@ class SchedulerInstancesMixin:
             "drive_account_id",
             "account_alias_snapshot",
             "instance_label",
+            "instance_pool",
             "gpu_reported",
             "retention_mode",
+            "retain_idle_minutes",
             "retained_until",
             "idle_deadline_at",
             "hard_deadline_at",
@@ -112,7 +114,7 @@ class SchedulerInstancesMixin:
         if not self._is_v020_job(job):
             return job
         if job.get("instance_id"):
-            if job.get("creation_fingerprint") and not self._lease(job):
+            if job.get("selection_reason") in {"reuse_idle", "requested_instance"} and not self._lease(job):
                 return self._reuse_instance_lease(job, self._service_instance_for_job(job))
             return job
         try:
@@ -121,15 +123,16 @@ class SchedulerInstancesMixin:
             return job
         except APIError as exc:
             return self._begin_failure(job, exc.code, exc.message)
-        except StudioModelStorageConflict as exc:
-            return self._begin_failure(job, "gpu_instance_allocation_failed", str(exc))
         except Exception as exc:
             return self._begin_failure(job, "gpu_instance_allocation_failed", self._safe_error(exc))
         if instance is None:
             return job
-        # Retarget a legacy idle lease before merging the instance metadata so
-        # the lease handoff and job mirror cannot briefly disagree.
-        job = self._reuse_instance_lease(job, instance)
+        # InstanceService._claim_existing atomically takes over the lease and updates
+        # the job row inside one transaction. Reload before merging so we never
+        # overwrite lease_id / deadline_epoch / unit_rate with a stale job dict.
+        job = self._get("jobs", job["id"], job.get("owner_id")) or job
+        if not job.get("lease_id") and instance.get("lease_id"):
+            job = self._reuse_instance_lease(job, instance)
         return self._merge_instance(job, instance)
 
     def _reuse_instance_lease(self, job: dict, instance: dict | None) -> dict:

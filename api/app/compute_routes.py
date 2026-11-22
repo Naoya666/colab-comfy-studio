@@ -1,5 +1,6 @@
 """Colab CU accounting endpoints and a CUDA feasibility job."""
 
+import os
 import time
 from datetime import date as LocalDate
 from typing import Literal
@@ -15,6 +16,12 @@ from .gpu.google import GoogleService
 from .gpu.manifest import digest
 from .gpu.rates import minute_rate
 from .gpu.repository import Repository
+from .gpu.specs import (
+    gpu_spec_order_settings,
+    record_discovered_gpu_specs,
+    reset_gpu_spec_order,
+    save_gpu_spec_order,
+)
 
 router = APIRouter(prefix="/api/gpu")
 
@@ -204,6 +211,7 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
                 {
                     "project_id": project_id,
                     "provider": "colab",
+                    "instance_pool": "ephemeral",
                     "account_id": account_id,
                     "requested_account_id": account_id,
                     "execution_policy": raw["execution_policy"],
@@ -233,4 +241,86 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
         },
         request,
         202,
+    )
+
+
+@router.get("/settings/gpu-order")
+def get_gpu_order(request: Request, user=Depends(current_user), st=Depends(get_store)):
+    return ok(gpu_spec_order_settings(st, user["id"]), request)
+
+
+@router.put("/settings/gpu-order")
+def put_gpu_order(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    admin(user)
+    if not isinstance(body, dict) or not isinstance(body.get("ordered_specs"), list):
+        raise APIError("GPU_ORDER_INVALID", "请提供 ordered_specs 数组", 422)
+    try:
+        saved = save_gpu_spec_order(st, user["id"], body["ordered_specs"])
+    except ValueError as exc:
+        raise APIError("GPU_ORDER_INVALID", str(exc), 422) from exc
+    except RuntimeError as exc:
+        raise APIError("SCHEDULER_BUSY", str(exc), 503, True) from exc
+    return ok(saved, request)
+
+
+@router.post("/settings/gpu-order/reset")
+def reset_gpu_order(request: Request, user=Depends(current_user), st=Depends(get_store)):
+    admin(user)
+    try:
+        saved = reset_gpu_spec_order(st, user["id"])
+    except RuntimeError as exc:
+        raise APIError("SCHEDULER_BUSY", str(exc), 503, True) from exc
+    return ok(saved, request)
+
+
+@router.post("/settings/gpu-order/discover")
+def discover_gpu_order(request: Request, user=Depends(current_user), st=Depends(get_store)):
+    admin(user)
+    if os.getenv("STUDIO_OFFLINE_TEST") == "1":
+        raise APIError("OFFLINE_MODE", "站点处于离线测试模式，不能连接 Colab 探测上游 GPU", 409)
+    if not GpuConfig.from_env().real_enabled:
+        raise APIError("REAL_GPU_DISABLED", "真实 GPU 未启用，不能连接 Colab 探测上游 GPU", 409)
+    repo = Repository(st)
+    owner = user["id"]
+    accounts = [
+        row
+        for row in repo.list("accounts", owner)
+        if row.get("enabled", True) is not False and row.get("disabled", False) is not True
+    ]
+    account_ids = [row.get("account_id") or row["id"] for row in accounts]
+    connected_ids: list[str | None] = []
+    for aid in account_ids:
+        try:
+            if GoogleService(repo, owner, account_id=aid).status().get("colab", {}).get("connected"):
+                connected_ids.append(aid)
+        except Exception:
+            continue
+    if not connected_ids and not account_ids:
+        try:
+            if GoogleService(repo, owner).status().get("colab", {}).get("connected"):
+                connected_ids.append(None)
+        except Exception:
+            pass
+    collected: list[dict] = []
+    errors: list[dict] = []
+    checked = 0
+    for aid in connected_ids:
+        checked += 1
+        provider = GoogleColabProvider(repo, owner, account_id=aid)
+        try:
+            collected.extend(provider.list_specs() or [])
+        except Exception as exc:
+            errors.append({"account_id": aid, "error": str(exc)[:160]})
+        finally:
+            if hasattr(provider, "close"):
+                provider.close()
+    settings_data, newly = record_discovered_gpu_specs(st, owner, collected)
+    return ok(
+        {
+            **settings_data,
+            "newly_discovered": newly,
+            "checked_accounts": checked,
+            "errors": errors,
+        },
+        request,
     )

@@ -26,13 +26,13 @@ import {
   createProject, deleteGpuPreset, deleteGpuWorkflow, deleteProject,
   apiFetch,
   getGpuComputeSpecs, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
-  getGpuPresets, getReferenceAssets, getGpuSettings, getGpuUsage, getGpuWorkflowSchema, getGpuWorkflows, getProjects,
+  getGpuPresets, getReferenceAssets, getGpuSettings, getGpuSpecOrder, getGpuUsage, getGpuWorkflowSchema, getGpuWorkflows, getProjects,
   importGpuWorkflow,
-  isLoggedIn, publishGpuWorkflow, renameProject, retryGpuJob, retryGpuAttempt, stopGpuCompute,
+  isLoggedIn, previewGpuJobReuse, publishGpuWorkflow, renameProject, retryGpuJob, retryGpuAttempt, stopGpuCompute,
   updateGpuPreset, uploadAsset,
   validateGpuWorkflow, rollbackGpuWorkflow, deactivateGpuWorkflow, saveGpuPreset, ApiError,
   type ComputeSpec, type GalleryAsset, type GpuJob, type GpuPreset,
-  type GpuManifest, type GpuModel, type GpuSettings, type GpuUsage, type GpuWorkflow, type Project, type Provider,
+  type GpuManifest, type GpuModel, type GpuSettings, type GpuSpecKey, type GpuUsage, type GpuWorkflow, type Project, type Provider, type ReusePreviewResponse,
 } from './lib/gpu-api';
 import type { GpuAccount, GpuInstance } from './components/AccountDirectory';
 import { isAccountSelectable } from './components/RuntimeSelection';
@@ -41,7 +41,11 @@ import { referenceAssets, supportsReferences } from './components/ReferencePicke
 import { Segmented } from './components/ui';
 import { ConfirmDialog, ToastStack, type ToastItem } from './components/Feedback';
 import { resolveGpuCheckRequest } from './lib/colab-check';
-import { resolveInstanceSubmission } from './lib/instance-submission';
+import { DEFAULT_GPU_SPEC_ORDER, isBelowWorkflowDefault } from './lib/gpu-spec-order';
+import {
+  buildConfirmActions, formatReuseDecisionTitle, isCreationPoolInstance,
+  resolveInstanceSubmission, shouldBypassSkipConfirm, type ConfirmActionOption,
+} from './lib/instance-submission';
 import { projectOptionLabel } from './lib/project-label';
 import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
 import { useDesktopLayout } from './lib/desktop-layout';
@@ -160,6 +164,9 @@ export default function App() {
   const [loading, setLoading] = useState('');
   const [uploadProgress, setUploadProgress] = useState<Record<string, number>>({});
   const [confirm, setConfirm] = useState<'submit' | 'stop' | null>(null);
+  const [reusePreview, setReusePreview] = useState<ReusePreviewResponse | null>(null);
+  const [gpuOrder, setGpuOrder] = useState<GpuSpecKey[]>(DEFAULT_GPU_SPEC_ORDER);
+  const lastSubmitActionSig = useRef('');
   const [skipConfirmSig, setSkipConfirmSig] = useState('');
   const [rememberSkipConfirm, setRememberSkipConfirm] = useState(false);
   const [detail, setDetail] = useState<GpuJob | null>(null);
@@ -590,6 +597,23 @@ export default function App() {
     }
   }
 
+  useEffect(() => {
+    if (!loggedIn) return;
+    let alive = true;
+    void getGpuSpecOrder().then((res) => {
+      if (alive && Array.isArray(res.ordered_specs) && res.ordered_specs.length) {
+        setGpuOrder(res.ordered_specs);
+      }
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [loggedIn, loginRefresh, tab]);
+
+  const workflowDefaultSpec = (manifest?.compute_spec as Record<string, unknown> | undefined) || null;
+  const specBelowDefaultError = runtime === 'colab' && selectedCompute && workflowDefaultSpec
+    && isBelowWorkflowDefault(selectedCompute, workflowDefaultSpec, gpuOrder)
+    ? `所选 GPU（${computeLabel(selectedCompute)}）低于工作流默认规格（${computeLabel(workflowDefaultSpec)}），不支持降配运行；请改回默认规格或选择更高规格 GPU。`
+    : '';
+
   function submitSignature() {
     return JSON.stringify([
       workflowId, runtime, batchCount, runtimeChoice.accountId, runtimeChoice.instanceId,
@@ -597,7 +621,49 @@ export default function App() {
     ]);
   }
 
-  function requestSubmit() {
+  async function requestSubmit() {
+    if (submitting.current || !workflowParamsReady || !modelId || !activeWorkflow) return;
+    if (specBelowDefaultError) {
+      setError(specBelowDefaultError);
+      return;
+    }
+    setError('');
+    if (runtime === 'colab') {
+      setLoading('preview');
+      try {
+        const preview = await previewGpuJobReuse({
+          workflow_key: activeWorkflow.workflow_key,
+          workflow_version: activeWorkflow.workflow_version,
+          project_id: projectId,
+          provider: runtime,
+          account_id: runtimeChoice.accountId || null,
+          instance_id: runtimeChoice.instanceId || null,
+          compute_spec: selectedCompute,
+          lifecycle: runtimeChoice.lifecycle,
+          retain_idle_minutes: runtimeChoice.retainIdleMinutes,
+          ...(modelOverrides[workflowId]?.length ? { model_overrides: modelOverrides[workflowId] as unknown as Array<Record<string, unknown>> } : {}),
+        });
+        setReusePreview(preview);
+        if (preview.decision === 'unsupported_spec') {
+          setError(preview.reason || '所选 GPU 规格低于工作流默认最低规格，不支持降配运行。');
+          return;
+        }
+        const forced = shouldBypassSkipConfirm(preview);
+        if (!forced && skipConfirmSig && skipConfirmSig === submitSignature()) {
+          void submitJob();
+          return;
+        }
+        setRememberSkipConfirm(false);
+        setConfirm('submit');
+        return;
+      } catch (cause) {
+        setError(`复用预检失败：${apiMessage(cause)}`);
+        return;
+      } finally {
+        setLoading('');
+      }
+    }
+    setReusePreview(null);
     if (skipConfirmSig && skipConfirmSig === submitSignature()) {
       void submitJob();
       return;
@@ -606,18 +672,46 @@ export default function App() {
     setConfirm('submit');
   }
 
-  async function submitJob() {
+  async function submitJob(actionChoice?: ConfirmActionOption) {
     if (submitting.current || !workflowParamsReady || !modelId || !activeWorkflow) return;
+    if (specBelowDefaultError) {
+      setError(specBelowDefaultError);
+      return;
+    }
     submitting.current = true;
+    const reuseAction = actionChoice?.reuseAction || 'auto';
+    const actionSig = JSON.stringify([reuseAction, actionChoice?.instanceId || null, actionChoice?.replaceInstanceId || null]);
+    if (lastSubmitActionSig.current !== actionSig) {
+      idempotencyKey.current = '';
+      lastSubmitActionSig.current = actionSig;
+    }
     if (!idempotencyKey.current) idempotencyKey.current = keyId();
     setLoading('submit');
     setError('');
     try {
-      const decision = resolveInstanceSubmission(runtimeChoice, instances);
-      if (!decision.ok) {
-        setRuntimeChoice({ ...runtimeChoice, accountId: decision.accountId, instanceId: decision.instanceId });
-        setError(decision.message);
-        return;
+      let allocation: 'auto' | 'existing' = 'auto';
+      let resolvedAccountId: string | null = runtimeChoice.accountId || null;
+      let resolvedInstanceId: string | null = null;
+      let replaceInstanceId: string | null = null;
+      if (reuseAction === 'replace') {
+        allocation = 'auto';
+        replaceInstanceId = actionChoice?.replaceInstanceId || null;
+      } else if (reuseAction === 'new') {
+        allocation = 'auto';
+      } else if (reuseAction === 'reuse' && actionChoice?.instanceId) {
+        allocation = 'existing';
+        resolvedInstanceId = actionChoice.instanceId;
+        resolvedAccountId = runtimeChoice.accountId || reusePreview?.target_instance?.account_id || null;
+      } else {
+        const decision = resolveInstanceSubmission(runtimeChoice, instances);
+        if (!decision.ok) {
+          setRuntimeChoice({ ...runtimeChoice, accountId: decision.accountId, instanceId: decision.instanceId });
+          setError(decision.message);
+          return;
+        }
+        allocation = decision.allocation;
+        resolvedAccountId = decision.accountId;
+        resolvedInstanceId = decision.instanceId;
       }
       const validAssetIds = new Set(referenceAssets(referenceImages).filter((a) => a.project_id === projectId).map((a) => a.id));
       const body = {
@@ -634,9 +728,11 @@ export default function App() {
           provider: runtime,
           ...(runtime === 'colab' && selectedCompute ? { compute_spec: selectedCompute } : {}),
           max_runtime_minutes: maxRuntime,
-          allocation: decision.allocation,
-          account_id: decision.accountId,
-          instance_id: decision.instanceId,
+          allocation,
+          account_id: resolvedAccountId,
+          instance_id: resolvedInstanceId,
+          ...(reuseAction !== 'auto' ? { reuse_action: reuseAction } : {}),
+          ...(replaceInstanceId ? { replace_instance_id: replaceInstanceId } : {}),
           lifecycle: runtimeChoice.lifecycle,
           retain_idle_minutes: runtimeChoice.retainIdleMinutes,
         },
@@ -652,15 +748,19 @@ export default function App() {
       } else {
         ids = [(await createGpuJob(body, idempotencyKey.current)).id];
       }
-      if (rememberSkipConfirm) setSkipConfirmSig(submitSignature());
+      if (rememberSkipConfirm && !shouldBypassSkipConfirm(reusePreview)) {
+        setSkipConfirmSig(submitSignature());
+      }
       setConfirm(null);
+      setReusePreview(null);
       if (currentProjectId.current === projectId) {
         setSubmission(ids.length ? { projectId, ids } : null);
         if (!desktop) setTab('任务');
       }
       idempotencyKey.current = '';
+      lastSubmitActionSig.current = '';
       pushToast(`已提交 ${ids.length} 个生成任务`, 'success');
-      await refreshJobs();
+      await Promise.all([refreshJobs(), refreshResources()]);
     } catch (cause) {
       const code = cause instanceof ApiError ? cause.code : '';
       if (code === 'INSTANCE_UNAVAILABLE' || code === 'INSTANCE_NOT_FOUND') {
@@ -817,8 +917,14 @@ export default function App() {
 
   function continueInstance(instance: GpuInstance) {
     const id = instanceIdOf(instance);
-    if (!id) return;
-    changeRuntimeChoice({ accountId: instance.account_id || null, instanceId: id, lifecycle: 'save', retainIdleMinutes: runtimeChoice.retainIdleMinutes });
+    if (!id || !isCreationPoolInstance(instance)) return;
+    const mode = instance.retention_mode === 'smart' || instance.retention_mode === 'retain'
+      ? instance.retention_mode
+      : runtimeChoice.lifecycle;
+    const retainMinutes = typeof instance.retain_idle_minutes === 'number' && instance.retain_idle_minutes >= 1
+      ? instance.retain_idle_minutes
+      : runtimeChoice.retainIdleMinutes;
+    changeRuntimeChoice({ accountId: instance.account_id || null, instanceId: id, lifecycle: mode, retainIdleMinutes: retainMinutes });
     setRuntime(instance.provider === 'mock' ? 'mock' : 'colab');
     setTab('创作');
   }
@@ -1011,11 +1117,12 @@ export default function App() {
                   draftReady={workflowParamsReady}
                   usage={usage}
                   computeSpec={selectedCompute}
+                  specBelowDefaultError={specBelowDefaultError}
                   onEditGuard={() => {
                     navigate('设置');
                     window.requestAnimationFrame(() => document.getElementById('cu-guard')?.scrollIntoView({ block: 'center' }));
                   }}
-                  gpuSelection={runtime === 'colab' ? <WorkflowGpuSelection manifest={manifest} accountId={runtimeChoice.accountId} value={selectedCompute} onChange={chooseGpu} /> : null}
+                  gpuSelection={runtime === 'colab' ? <WorkflowGpuSelection manifest={manifest} accountId={runtimeChoice.accountId} value={selectedCompute} onChange={chooseGpu} gpuOrder={gpuOrder} /> : null}
                   projectId={projectId}
                   models={models}
                   workflows={workflows}
@@ -1304,45 +1411,86 @@ export default function App() {
         )}
       </main>
 
-      {confirm === 'submit' && activeWorkflow && (
-        <div className={styles.dialogBackdrop} role="presentation" onClick={() => setConfirm(null)}>
-          <section
-            className={styles.dialog}
-            role="dialog"
-            aria-modal="true"
-            aria-label="确认提交任务"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2>确认开始生成</h2>
-            <dl className={styles.kv}>
-              <dt>工作流</dt><dd>{activeWorkflow.workflow_key} · v{activeWorkflow.workflow_version}</dd>
-              <dt>运行方式</dt><dd>{runtime === 'colab' ? 'Colab GPU（会扣 CU）' : '离线模拟（不扣 CU）'}</dd>
-              {runtime === 'colab' && <><dt>GPU 规格</dt><dd>{computeLabel(selectedCompute || manifest?.compute_spec as Record<string, unknown>)}</dd></>}
-              <dt>机器</dt><dd>{resolveInstanceSubmission(runtimeChoice, instances).machineLabel}</dd>
-              <dt>数量</dt><dd>{batchCount}</dd>
-              {runtime === 'colab' && <><dt>最长运行</dt><dd>{maxRuntime} 分钟</dd></>}
-              {runtime === 'colab' && (runtimeChoice.lifecycle === 'smart' || runtimeChoice.lifecycle === 'retain') && (
-                <><dt>空闲保留</dt><dd>{runtimeChoice.retainIdleMinutes} 分钟</dd></>
+      {confirm === 'submit' && activeWorkflow && (() => {
+        const forcedConfirm = shouldBypassSkipConfirm(reusePreview);
+        const confirmActions = buildConfirmActions(reusePreview);
+        const targetInst = reusePreview?.target_instance;
+        return (
+          <div className={styles.dialogBackdrop} role="presentation" onClick={() => { setConfirm(null); setReusePreview(null); }}>
+            <section
+              className={styles.dialog}
+              role="dialog"
+              aria-modal="true"
+              aria-label="确认提交任务"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2>{formatReuseDecisionTitle(reusePreview)}</h2>
+              <dl className={styles.kv}>
+                <dt>工作流</dt><dd>{activeWorkflow.workflow_key} · v{activeWorkflow.workflow_version}</dd>
+                <dt>运行方式</dt><dd>{runtime === 'colab' ? 'Colab GPU（会扣 CU）' : '离线模拟（不扣 CU）'}</dd>
+                {runtime === 'colab' && <><dt>目标 GPU</dt><dd>{computeLabel(selectedCompute || manifest?.compute_spec as Record<string, unknown>)}</dd></>}
+                <dt>机器</dt><dd>{targetInst ? `${targetInst.label || targetInst.instance_id.slice(0, 8)} · ${targetInst.gpu_reported || targetInst.spec_id || 'GPU'} · ${targetInst.is_busy ? '运行中' : '空闲可复用'}` : resolveInstanceSubmission(runtimeChoice, instances).machineLabel}</dd>
+                <dt>数量</dt><dd>{batchCount}</dd>
+                {runtime === 'colab' && <><dt>最长运行</dt><dd>{maxRuntime} 分钟</dd></>}
+                <dt>结束策略</dt><dd>{runtimeChoice.lifecycle === 'smart' ? `智能保留 ${runtimeChoice.retainIdleMinutes} 分钟` : runtimeChoice.lifecycle === 'retain' ? `保留机器 ${runtimeChoice.retainIdleMinutes} 分钟` : runtimeChoice.lifecycle === 'batch' ? '批次复用' : '节省（结束后释放）'}</dd>
+              </dl>
+              {targetInst && (
+                <div className="status" role="status">
+                  <strong>
+                    创作池目标实例：{targetInst.label || `#${targetInst.instance_id.slice(0, 8)}`}（{targetInst.gpu_reported || targetInst.spec_id || 'GPU'}）
+                    {targetInst.warm_hit ? ' · 命中常驻热复用' : ''}
+                  </strong>
+                  <p className="muted small">
+                    当前状态：{targetInst.is_busy ? '正在运行任务' : '空闲保留中'}
+                    {targetInst.loaded_workflow_key ? ` · 已加载 ${targetInst.loaded_workflow_key}${targetInst.loaded_workflow_version != null ? ` v${targetInst.loaded_workflow_version}` : ''}` : ''}
+                    {targetInst.retention_mode ? ` · 原策略 ${targetInst.retention_mode}${targetInst.retain_idle_minutes ? `（${targetInst.retain_idle_minutes}分）` : ''}` : ''}
+                    {targetInst.remaining_seconds != null ? ` · 剩余约 ${Math.max(1, Math.round(targetInst.remaining_seconds / 60))} 分钟` : ''}
+                  </p>
+                </div>
               )}
-            </dl>
-            <label className={styles.checkRow}>
-              <input
-                type="checkbox"
-                checked={rememberSkipConfirm}
-                onChange={(e) => setRememberSkipConfirm(e.target.checked)}
-              />
-              <span className="small muted">本次会话相同配置直接提交，不再弹窗确认</span>
-            </label>
-            {error && <p className="status error" role="alert">{error}</p>}
-            <div className="actions">
-              <button className="button secondary" type="button" onClick={() => setConfirm(null)}>取消</button>
-              <button className="button" disabled={loading === 'submit'} type="button" onClick={() => void submitJob()}>
-                {loading === 'submit' ? '提交中…' : '确认启动'}
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
+              {reusePreview?.reason && (
+                <p className="status" role="alert">
+                  <strong>实例复用提示：</strong>{reusePreview.reason}
+                </p>
+              )}
+              {reusePreview?.shortens_lifetime && reusePreview.shorten_reasons.length > 0 && (
+                <div className="status error" role="alert">
+                  <strong>注意：复用该实例将缩短其原有存活时长</strong>
+                  {reusePreview.shorten_reasons.map((item) => <p key={item} className="small">{item}</p>)}
+                </div>
+              )}
+              {!forcedConfirm && (
+                <label className={styles.checkRow}>
+                  <input
+                    type="checkbox"
+                    checked={rememberSkipConfirm}
+                    onChange={(e) => setRememberSkipConfirm(e.target.checked)}
+                  />
+                  <span className="small muted">本次会话相同配置直接提交，不再弹窗确认</span>
+                </label>
+              )}
+              {forcedConfirm && (
+                <p className="muted small">本次涉及规格差异、实例忙碌或缩短存活时长，为避免误操作已强制开启确认。</p>
+              )}
+              {error && <p className="status error" role="alert">{error}</p>}
+              <div className="actions">
+                <button className="button secondary" type="button" onClick={() => { setConfirm(null); setReusePreview(null); }}>取消</button>
+                {confirmActions.map((opt) => (
+                  <button
+                    key={opt.key}
+                    className={`button ${opt.variant === 'danger' ? 'danger' : opt.variant === 'secondary' ? 'secondary' : ''}`}
+                    disabled={loading === 'submit'}
+                    type="button"
+                    onClick={() => void submitJob(opt)}
+                  >
+                    {loading === 'submit' ? '提交中…' : opt.label}
+                  </button>
+                ))}
+              </div>
+            </section>
+          </div>
+        );
+      })()}
 
       {confirm === 'stop' && (
         <div className={styles.dialogBackdrop} role="presentation" onClick={() => setConfirm(null)}>

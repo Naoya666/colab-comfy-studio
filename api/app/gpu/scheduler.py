@@ -266,9 +266,9 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
 
         One failed or cancelled prep stops the waiting (the job then runs uncached); it is never retried here.
         """
+        from .instances import POOL_CREATION, instance_pool_of
+
         snapshot = job.get("snapshot") or {}
-        if any(x.get("native_ready") and x.get("state") == "idle" for x in self._leases_for(job.get("owner_id"))):
-            return False
         sha = snapshot.get("workflow_sha256")
         if (
             self._provider_name(job) != "colab"
@@ -280,6 +280,21 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             or os.getenv("GPU_PREP", "on").strip().lower() == "off"
         ):
             return False
+        # If a live creation-pool instance already has this exact workflow warm in VRAM/disk
+        # (e.g. warmed via Creation API), skip CPU prep so frontend requests can hot-reuse immediately.
+        fp = job.get("creation_fingerprint")
+        reuse_action = str((job.get("execution_policy") or {}).get("reuse_action") or job.get("reuse_action") or "auto")
+        if fp and reuse_action not in {"new", "replace"}:
+            for inst in self._list("instances", job.get("owner_id")):
+                if (
+                    instance_pool_of(inst) == POOL_CREATION
+                    and inst.get("state") in {"ready", "retained_idle", "busy"}
+                    and not inst.get("manual_stop_requested")
+                    and not inst.get("runtime_deleted")
+                    and (inst.get("creation_runtime") or {}).get("fingerprint") == fp
+                    and (inst.get("creation_runtime") or {}).get("process")
+                ):
+                    return False
         drive_account_id = job.get("drive_account_id")
         if not drive_account_id and job.get("account_id"):
             from .accounts import AccountService
@@ -341,9 +356,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 deadline = job.get("task_deadline_epoch") or deadline
             elif job.get("creation_fingerprint"):
                 deadline = now + self.config.max_runtime_minutes * 60
+        from .instances import job_pool
+
         payload = {
             "owner_job_id": job["id"],
             "provider": self._provider_name(job),
+            "instance_pool": job_pool(job),
             "state": "creating",
             "request_id": request_id,
             "runtime_id": runtime_id,
@@ -524,6 +542,10 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         }, job["owner_id"])
 
     def _allocation(self, job: dict) -> dict:
+        if job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
+            existing_lease = self._lease(job)
+            if not existing_lease or not existing_lease.get("handle"):
+                return self._begin_failure(job, "creation_lease_unavailable", "复用实例租约已不可用，已中止执行（未新开机器）")
         # Persist intent under the short lock, then release it before provider I/O.
         with self.db_store.dispatch_lock() as acquired:
             if not acquired:
@@ -673,21 +695,29 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         if status.get("deleted"):
             return self._begin_failure(job, "gpu_runtime_missing", "GPU runtime disappeared")
         if status.get("ready"):
+            from .instances import POOL_CREATION, job_pool
+
             reported = status.get("runtime_spec")
             if reported and job.get("requested_spec"):
-                reused = (job.get("creation_fingerprint")
-                          and job.get("selection_reason") in {"reuse_idle", "requested_instance"})
+                reused = (
+                    job_pool(job) == POOL_CREATION
+                    and job.get("selection_reason") in {"reuse_idle", "requested_instance"}
+                )
                 if reused:
-                    from .specs import check_requirements
+                    from .specs import check_requirements, gpu_spec_order_settings, is_below_workflow_default
 
+                    manifest = (job.get("snapshot") or {}).get("manifest") or {}
                     try:
-                        check_requirements(job["snapshot"]["manifest"], reported)
+                        check_requirements(manifest, reported)
+                        order = gpu_spec_order_settings(self.db_store, job["owner_id"])["ordered_specs"]
+                        if is_below_workflow_default(manifest, reported, order):
+                            raise ValueError("复用实例实际 GPU 规格低于工作流默认最低规格")
                     except ValueError as exc:
                         return self._begin_failure(job, "gpu_spec_mismatch", str(exc))
                 elif self._spec_key({"key": reported.get("key", reported)}) != self._spec_key(job["requested_spec"]):
                     return self._begin_failure(job, "gpu_spec_mismatch", "实际分配规格与请求不匹配，已停止执行并释放实例")
                 job = self._update("jobs", job["id"], {"runtime_spec_reported": reported}, job.get("owner_id"))
-                if job.get("creation_fingerprint"):
+                if job.get("instance_id"):
                     self._update("instances", job["instance_id"], {"runtime_spec_reported": reported}, job["owner_id"])
                 self._event(job, "preparing", "实际分配规格：" + str(reported), None)
             job = self._mark_instance("mark_ready", job)
@@ -710,7 +740,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             # The lease is owned by this job (see _lease), so cleaning it up here is safe.
             return self._begin_failure(job, "gpu_execution_prepare_failed", f"Execution registration refused: {exc}")
         execution_id = job["execution_id"]
-        if job.get("creation_fingerprint"):
+        if self._provider_name(job) == "colab" and job.get("creation_fingerprint") and job.get("instance_id"):
             self._update("instances", job["instance_id"], {"creation_runtime": None}, job["owner_id"])
         if (job.get("snapshot") or {}).get("native_comfy"):
             lease = self._update("leases", lease["id"], {"native_comfy": True}, job["owner_id"])
@@ -822,22 +852,36 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         state = result.get("state")
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else None
         if state == "completed":
-            if job.get("creation_fingerprint"):
-                runtime = result.get("creation_runtime") or {}
-                if (runtime.get("instance_id") != job.get("instance_id")
-                        or not runtime.get("process") or not runtime.get("environment")
-                        or runtime.get("workflow_sha256") != job["snapshot"].get("workflow_sha256")):
-                    return self._begin_failure(job, "creation_runtime_missing", "ComfyUI 未返回有效的进程与环境记录")
-                runtime = {**runtime, "lease_id": lease["id"], "fingerprint": job["creation_fingerprint"],
-                           "devices": (job.get("gpu_diagnostics") or {}).get("devices", []),
-                           "health_checked_at": self.clock()}
-                self._update("instances", job["instance_id"], {"creation_runtime": runtime}, job["owner_id"])
-                job = self._update("jobs", job["id"], {"creation_runtime": runtime}, job["owner_id"])
-                if job.get("warmup"):
-                    if runtime.get("warmup_completed") is not True:
-                        return self._begin_failure(job, "creation_warmup_incomplete", "预热图未完成")
-                    return self._set_state(job, "cleaning_up", "模型预热图已完成",
-                                           worker_timings=timings or {}, cleanup_final_state="completed")
+            is_creation_api = bool((job.get("snapshot") or {}).get("creation_api"))
+            raw_runtime = result.get("creation_runtime")
+            if is_creation_api or (raw_runtime and job.get("creation_fingerprint") and job.get("instance_id")):
+                runtime = raw_runtime if isinstance(raw_runtime, dict) else {}
+                valid_runtime = (
+                    runtime.get("instance_id") == job.get("instance_id")
+                    and bool(runtime.get("process"))
+                    and bool(runtime.get("environment"))
+                    and runtime.get("workflow_sha256") == (job.get("snapshot") or {}).get("workflow_sha256")
+                )
+                if not valid_runtime:
+                    if is_creation_api:
+                        return self._begin_failure(job, "creation_runtime_missing", "ComfyUI 未返回有效的进程与环境记录")
+                else:
+                    runtime = {
+                        **runtime,
+                        "lease_id": lease["id"],
+                        "fingerprint": job.get("creation_fingerprint"),
+                        "workflow_key": job.get("workflow_key"),
+                        "workflow_version": job.get("workflow_version"),
+                        "devices": (job.get("gpu_diagnostics") or {}).get("devices", []),
+                        "health_checked_at": self.clock(),
+                    }
+                    self._update("instances", job["instance_id"], {"creation_runtime": runtime}, job["owner_id"])
+                    job = self._update("jobs", job["id"], {"creation_runtime": runtime}, job["owner_id"])
+                    if job.get("warmup"):
+                        if runtime.get("warmup_completed") is not True:
+                            return self._begin_failure(job, "creation_warmup_incomplete", "预热图未完成")
+                        return self._set_state(job, "cleaning_up", "模型预热图已完成",
+                                               worker_timings=timings or {}, cleanup_final_state="completed")
             if (job.get("snapshot") or {}).get("native_comfy"):
                 from app.config import settings
 
@@ -1190,10 +1234,40 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                         return job
                     transferred=self.store.handoff_lease(job['owner_id'],job['id'],next_job['id'],lease['id'],self.clock())
                 if transferred:
-                    self._event(job,'completed','Mock outputs verified; lease reused')
-                    return self._get('jobs',job['id'],job['owner_id'])
+                    msg = (
+                        "Mock outputs verified; lease reused"
+                        if self._provider_name(job) == "mock"
+                        else "GPU outputs verified; lease reused"
+                    )
+                    self._event(job, "completed", msg)
+                    return self._get("jobs", job["id"], job["owner_id"])
         final_state = job.get("cleanup_final_state") or job.get("requested_outcome") or "failed"
-        if self._is_v020_job(job) and job.get("instance_id"):
+        from .instances import POOL_CREATION, job_pool
+
+        if (
+            final_state == "cancelled"
+            and lease
+            and lease.get("handle")
+            and self._provider_name(job) == "colab"
+            and job_pool(job) == POOL_CREATION
+            and self._lifecycle(job) in {"smart", "retain"}
+            and retention_allowed
+            and not job.get("creation_interrupt_attempted")
+        ):
+            try:
+                executor = self._executor(job)
+                interrupt_fn = getattr(executor, "interrupt_creation_service", None)
+                if callable(interrupt_fn):
+                    interrupt_fn(self._lease_handle(lease), job)
+            except Exception:
+                pass
+            job = self._update("jobs", job["id"], {"creation_interrupt_attempted": True}, job.get("owner_id"))
+        owns_instance = bool(
+            instance is None
+            or instance.get("current_job_id") in {None, job["id"]}
+            or job.get("lease_id") is not None
+        )
+        if self._is_v020_job(job) and job.get("instance_id") and owns_instance:
             try:
                 job, instance = self._complete_instance(job, final_state == "completed")
             except SchedulerError as exc:
@@ -1223,7 +1297,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     self._update(
                         "executions",
                         job["execution_id"],
-                        {"state": "completed", "finished_at": self.clock()},
+                        {"state": final_state, "finished_at": self.clock()},
                         job.get("owner_id"),
                     )
                 return self._finish_cleanup(
@@ -1341,7 +1415,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         if state in TERMINAL_STATES:
             return job
         if job.get("cancel_requested") and state not in {"cleaning_up", "cleanup_pending"}:
-            if self._lease(job):
+            if self._lease(job) or job.get("instance_id"):
                 job = self._set_state(
                     job,
                     "cleaning_up",
@@ -1381,10 +1455,14 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 allocated = self._allocate_instance(job)
                 if allocated.get("state") in TERMINAL_STATES | {"cleaning_up", "cleanup_pending"}:
                     return allocated
-                job = self._reuse_instance_lease(allocated, allocated)
+                job = allocated
+                if not job.get("lease_id") and job.get("instance_id"):
+                    inst = self._service_instance_for_job(job)
+                    if inst and inst.get("lease_id"):
+                        job = self._reuse_instance_lease(job, inst)
                 if not job.get("instance_id"):
                     return job
-                if job.get("creation_fingerprint") and job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
+                if job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
                     if not self._lease(job):
                         return self._begin_failure(job, "creation_lease_unavailable", "实例租约已不可复用，请重试")
             elif job.get('compatibility_signature'):

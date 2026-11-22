@@ -467,5 +467,71 @@ def repair_legacy_identity(bind) -> None:
         if values:
             _sync_row(bind, "gpu_executions", row, **values)
 
+    _backfill_instance_pool(bind)
+
+
+def _backfill_instance_pool(bind) -> None:
+    """Backfill instance_pool on legacy gpu_instances rows without touching modern rows."""
+    if "gpu_instances" not in _tables(bind):
+        return
+    columns = _columns(bind, "gpu_instances")
+    if "data" not in columns:
+        return
+    valid_pools = {"native", "creation", "ephemeral"}
+    job_rows = _rows(bind, "gpu_jobs")
+    jobs_by_id: dict[str, dict] = {}
+    jobs_by_instance: dict[str, list[dict]] = defaultdict(list)
+    for job in job_rows:
+        jobs_by_id[job["id"]] = job
+        inst_id = _identity_from_row(job, "instance_id")
+        if inst_id:
+            jobs_by_instance[inst_id].append(job)
+
+    def _is_ephemeral_job(job: dict | None) -> bool:
+        if not job:
+            return False
+        jp = _json(job.get("data"))
+        snap = jp.get("snapshot") if isinstance(jp.get("snapshot"), dict) else {}
+        return bool(
+            jp.get("system_smoke")
+            or jp.get("workflow_smoke")
+            or jp.get("prep")
+            or snap.get("system_smoke")
+            or snap.get("workflow_smoke")
+            or snap.get("prep")
+            or jp.get("model_id") == "system-cuda-smoke"
+            or jp.get("workflow_key") == "system/cuda-smoke"
+        )
+
+    for row in _rows(bind, "gpu_instances"):
+        payload = _json(row.get("data"))
+        if payload.get("instance_pool") in valid_pools:
+            continue
+        if payload.get("native_comfy") is True:
+            pool = "native"
+        else:
+            related = list(jobs_by_instance.get(row["id"], []))
+            current_job_id = _identity_from_row(row, "current_job_id")
+            if current_job_id and current_job_id in jobs_by_id:
+                related.append(jobs_by_id[current_job_id])
+            alloc_key = payload.get("allocation_key")
+            if isinstance(alloc_key, str) and ":" in alloc_key:
+                first_job_id = alloc_key.split(":", 1)[0]
+                if first_job_id in jobs_by_id:
+                    related.append(jobs_by_id[first_job_id])
+            req_spec = payload.get("runtime_spec_requested")
+            req_key = req_spec.get("key", req_spec) if isinstance(req_spec, dict) else {}
+            is_cpu = isinstance(req_key, dict) and req_key.get("variant") in {"CPU", "VARIANT_CPU"}
+            if is_cpu or any(_is_ephemeral_job(j) for j in related):
+                pool = "ephemeral"
+            else:
+                pool = "creation"
+        payload["instance_pool"] = pool
+        bind.execute(
+            text("UPDATE gpu_instances SET data=:data WHERE id=:id"),
+            {"data": json.dumps(payload, ensure_ascii=False, separators=(",", ":")), "id": row["id"]},
+        )
+
+
 def upgrade_legacy_identity(bind) -> None:
     repair_legacy_identity(bind)

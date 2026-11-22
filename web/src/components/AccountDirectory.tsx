@@ -42,10 +42,14 @@ export interface GpuInstance {
   account_id?: string | null;
   account_alias_snapshot?: string;
   provider?: 'mock' | 'colab' | string;
+  instance_pool?: 'native' | 'creation' | 'ephemeral' | string;
   state?: string;
   lifecycle?: string;
+  retention_mode?: string;
+  retain_idle_minutes?: number | null;
   gpu_reported?: string;
   runtime_spec_reported?: string | Record<string, unknown>;
+  creation_runtime?: Record<string, unknown> | null;
   current_job_id?: string | null;
   current_job_title?: string;
   created_at?: string;

@@ -326,18 +326,27 @@ def test_retained_instance_refreshes_idle_deadline_on_subsequent_job_completion(
 
 def test_creation_prefers_compatible_instance_when_native_uses_drive_mount(repo):
     account(repo, provider="colab", budget={"daily": 20.0, "monthly": 50.0})
-    repo.create("leases", "owner-1", {"native_model_storage": {"model_storage_mode": "drive_mount"}},
-                record_id="native-lease")
+    repo.create("leases", "owner-1", {
+        "state": "idle", "deadline_epoch": 9999.0, "idle_deadline_at": 9999.0,
+        "native_model_storage": {"model_storage_mode": "drive_mount"},
+    }, record_id="native-lease")
+    repo.create("leases", "owner-1", {
+        "state": "idle", "deadline_epoch": 9999.0, "idle_deadline_at": 9999.0,
+        "handle": {"runtime_id": "rt-studio", "owner_id": "owner-1"},
+    }, record_id="studio-lease")
+    l4_spec = {"key": {"variant": "VARIANT_GPU", "accelerator": "L4", "shape": "SHAPE_STANDARD"}}
     common = {"account_id": "acct-1", "provider": "colab", "state": "retained_idle",
-              "compatibility_signature": "compat-v1"}
-    repo.create("instances", "owner-1", common, record_id="studio-idle")
-    repo.create("instances", "owner-1", {**common, "native_comfy": True, "lease_id": "native-lease"},
+              "compatibility_signature": "compat-v1", "runtime_spec_requested": l4_spec}
+    repo.create("instances", "owner-1", {**common, "instance_pool": "creation", "lease_id": "studio-lease"},
+                record_id="studio-idle")
+    repo.create("instances", "owner-1", {**common, "instance_pool": "native", "native_comfy": True, "lease_id": "native-lease"},
                 record_id="native-idle")
     service = InstanceService(repo, clock=lambda: 100.0,
                               config={"unit_rate": 0.1, "daily_units": 20.0, "monthly_units": 50.0})
-    snapshot = {"manifest": {"weight_files": [{"target": "checkpoints/model.safetensors"}]}}
-    explicit = job(provider="colab", snapshot=snapshot, execution_policy={"provider": "colab", "instance_id": "native-idle"})
-    with pytest.raises(InstanceConflict, match="Drive 挂载"):
+    snapshot = {"manifest": {"compute_spec": l4_spec["key"], "weight_files": [{"target": "checkpoints/model.safetensors"}]}}
+    explicit = job(provider="colab", snapshot=snapshot, requested_spec=l4_spec,
+                   execution_policy={"provider": "colab", "instance_id": "native-idle"})
+    with pytest.raises(AllocationError, match="不属于创作池"):
         service.allocate(explicit)
-    chosen = service.allocate(job(provider="colab", snapshot=snapshot))
+    chosen = service.allocate(job(provider="colab", snapshot=snapshot, requested_spec=l4_spec))
     assert chosen["id"] == "studio-idle"

@@ -55,8 +55,10 @@ def build_batch_router(JobInput, admit_job, public_job):
                 raise APIError("POLICY_INVALID", "同一批次的生命周期策略必须一致")
         account_ids = {policy.get("account_id") for policy in normalized}
         instance_ids = {policy.get("instance_id") for policy in normalized}
-        if len(account_ids) > 1 or len(instance_ids) > 1:
-            raise APIError("POLICY_INVALID", "同一批次必须使用一致的账号与实例")
+        reuse_actions = {policy.get("reuse_action", "auto") for policy in normalized}
+        replace_ids = {policy.get("replace_instance_id") for policy in normalized}
+        if len(account_ids) > 1 or len(instance_ids) > 1 or len(reuse_actions) > 1 or len(replace_ids) > 1:
+            raise APIError("POLICY_INVALID", "同一批次必须使用一致的账号、实例与复用策略")
         if lifecycle in {"smart", "retain"}:
             retain_minutes = {policy["retain_idle_minutes"] for policy in normalized}
             if len(retain_minutes) > 1:
@@ -86,6 +88,11 @@ def build_batch_router(JobInput, admit_job, public_job):
             normalized_jobs.append(raw_job)
         validated = [admit_job(st,user,j,f'validate:{key}:{i}',validate_only=True)
                      for i,j in enumerate(normalized_jobs)]
+        replace_target = (
+            next(iter(replace_ids))
+            if next(iter(reuse_actions)) == "replace" and next(iter(replace_ids))
+            else None
+        )
         with st.admission_lock() as acquired:
             if not acquired:
                 raise APIError("SCHEDULER_BUSY", "请沿用幂等键重试", 503, True)
@@ -102,6 +109,10 @@ def build_batch_router(JobInput, admit_job, public_job):
                                               'idle_seconds':body.idle_seconds},request_body=raw_request)
             except ValueError as exc:
                 raise APIError("IDEMPOTENCY_CONFLICT", str(exc), 409) from exc
+        if replace_target:
+            from .gpu.instances import InstanceService
+
+            InstanceService(repo).request_gentle_stop(user["id"], replace_target, f"replace-batch:{batch['id']}")
         return ok(batch, request, 202)
 
 

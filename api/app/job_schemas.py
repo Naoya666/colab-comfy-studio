@@ -15,6 +15,8 @@ _NEW_POLICY_FIELDS = {
     "instance_id",
     "lifecycle",
     "retain_idle_minutes",
+    "reuse_action",
+    "replace_instance_id",
 }
 
 
@@ -41,10 +43,12 @@ class Policy(BaseModel):
     allocation: Literal["auto", "existing"] = "auto"
     account_id: str | None = None
     instance_id: str | None = None
+    reuse_action: Literal["auto", "reuse", "replace", "new"] = "auto"
+    replace_instance_id: str | None = None
     lifecycle: Literal["save", "batch", "smart", "retain"] | None = None
     retain_idle_minutes: int = Field(default=15, ge=1)
 
-    @field_validator("account_id", "instance_id")
+    @field_validator("account_id", "instance_id", "replace_instance_id")
     @classmethod
     def _uuid_or_none(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -55,11 +59,19 @@ class Policy(BaseModel):
         try:
             parsed = uuid.UUID(str(value))
         except (AttributeError, ValueError, TypeError) as exc:
-            raise ValueError("account_id/instance_id必须是UUID或null") from exc
+            raise ValueError("account_id/instance_id/replace_instance_id必须是UUID或null") from exc
         return str(parsed)
 
     @model_validator(mode="after")
     def _validate_compatibility(self) -> "Policy":
+        if self.reuse_action == "reuse" and self.instance_id is None:
+            raise ValueError("reuse_action=reuse必须提供instance_id")
+        if self.reuse_action == "replace" and self.replace_instance_id is None:
+            raise ValueError("reuse_action=replace必须提供replace_instance_id")
+        if self.reuse_action == "replace" and self.instance_id is not None:
+            raise ValueError("reuse_action=replace不能同时指定instance_id")
+        if self.reuse_action == "new" and self.instance_id is not None:
+            raise ValueError("reuse_action=new不能同时指定instance_id")
         if self.allocation == "existing" and self.instance_id is None:
             raise ValueError("allocation=existing必须提供instance_id")
         # Supplying an instance is an unambiguous request to reuse it.  This is
@@ -100,6 +112,10 @@ def normalize_policy(policy: Policy | dict) -> dict:
         lifecycle=lifecycle,
         retain_idle_minutes=parsed.retain_idle_minutes,
     )
+    if "reuse_action" in parsed.model_fields_set or parsed.reuse_action != "auto":
+        data["reuse_action"] = parsed.reuse_action
+    if "replace_instance_id" in parsed.model_fields_set or parsed.replace_instance_id is not None:
+        data["replace_instance_id"] = parsed.replace_instance_id
     return data
 
 
@@ -153,3 +169,20 @@ class JobInput(BaseModel):
         if "execution_policy" in data:
             data["execution_policy"] = self.execution_policy.model_dump(*args, **policy_kwargs)
         return data
+
+
+class ReusePreviewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    workflow_key: str
+    workflow_version: int | str
+    project_id: str | None = None
+    provider: Literal["mock", "colab"] = "colab"
+    account_id: str | None = None
+    instance_id: str | None = None
+    compute_spec: dict | None = None
+    lifecycle: Literal["save", "batch", "smart", "retain"] = "save"
+    retain_idle_minutes: int = Field(default=15, ge=1)
+    loras: list[dict] = Field(default_factory=list, max_length=lora_registry.MAX_LORAS)
+    model_overrides: list[ModelOverrideInput] = Field(default_factory=list, max_length=100)
+    loras: list[dict] = Field(default_factory=list, max_length=lora_registry.MAX_LORAS)
+    model_overrides: list[ModelOverrideInput] = Field(default_factory=list, max_length=100)

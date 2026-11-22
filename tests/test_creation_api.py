@@ -171,6 +171,14 @@ def test_admission_binds_published_snapshot_and_deduplicates_only_retries(monkey
             return client.post("/prompt", headers=headers, json={"prompt": prompt})
 
         with_key = {**auth, "Idempotency-Key": "one-request"}
+        # API default GPU (L4) is below workflow default (A100) -> rejected with 422 when booting new machine.
+        too_low = send(graph, with_key)
+        assert too_low.status_code == 422, too_low.text
+        assert too_low.json()["error"]["type"] == "GPU_SPEC_BELOW_WORKFLOW_DEFAULT"
+        a100_gpu = {"variant": "VARIANT_GPU", "accelerator": "A100", "shape": "SHAPE_STANDARD"}
+        assert client.put(base + "/config", headers=admin_auth,
+                          json={**cfg, "auto_start": True, "gpu": a100_gpu}).status_code == 200
+
         accepted = send(graph, with_key)
         assert accepted.status_code == 200, accepted.text
         ident = accepted.json()["prompt_id"]
@@ -184,7 +192,7 @@ def test_admission_binds_published_snapshot_and_deduplicates_only_retries(monkey
         assert job["creation_workflow_id"] == first["id"]
         assert job["snapshot"]["bound_graph"][node]["inputs"][field] == 153
         assert "_meta" not in job["snapshot"]["bound_graph"][node]
-        assert job["requested_spec"]["key"]["accelerator"] == "L4"
+        assert job["requested_spec"]["key"]["accelerator"] == "A100"
         assert job["snapshot"]["manifest"]["compute_spec"]["accelerator"] == "A100"
         assert len([row for row in repo.list("jobs", "owner") if row.get("creation_key_id")]) == 3
 
@@ -200,22 +208,43 @@ def test_existing_only_admission_uses_retained_lease_with_different_gpu(tmp_path
     lease = repo.create("leases", owner, {"state": "idle", "deadline_epoch": 200, "idle_deadline_at": 190})
     l4 = {"accelerator": "L4", "shape": "SHAPE_STANDARD", "variant": "VARIANT_GPU"}
     a100 = {**l4, "accelerator": "A100"}
-    instance = repo.create("instances", owner, {
+    # Lower-spec instance (L4) cannot be reused by an A100 workflow.
+    low_instance = repo.create("instances", owner, {
+        "instance_pool": "creation",
         "state": "retained_idle", "account_id": aid, "provider": "colab", "lease_id": lease["id"],
         "runtime_spec_requested": {"key": l4}, "hard_deadline_at": 200, "idle_deadline_at": 190,
     })
-    job = {
+    a100_job = {
         "id": str(uuid.uuid4()), "owner_id": owner, "project_id": "project",
         "requested_spec": {"key": a100}, "creation_existing_only": True, "creation_fingerprint": "approved",
         "snapshot": {"creation_api": True, "manifest": {"compute_spec": a100}},
         "execution_policy": {"provider": "colab", "account_id": aid},
     }
-    assert service.creation_capacity(job, [])
+    assert not service.creation_capacity(a100_job, [])
     with service._tx() as session:
-        row = service._find(session, "instances", instance["id"], owner)
-        assert service._compatible(session, row, job, aid)
+        row = service._find(session, "instances", low_instance["id"], owner)
+        assert not service._compatible(session, row, a100_job, aid)
+
+    # Higher-spec instance (A100) CAN be reused by an L4 workflow.
+    high_lease = repo.create("leases", owner, {"state": "idle", "deadline_epoch": 200, "idle_deadline_at": 190})
+    high_instance = repo.create("instances", owner, {
+        "instance_pool": "creation",
+        "state": "retained_idle", "account_id": aid, "provider": "colab", "lease_id": high_lease["id"],
+        "runtime_spec_requested": {"key": a100}, "hard_deadline_at": 200, "idle_deadline_at": 190,
+    })
+    l4_job = {
+        "id": str(uuid.uuid4()), "owner_id": owner, "project_id": "project",
+        "requested_spec": {"key": l4}, "creation_existing_only": True, "creation_fingerprint": "approved",
+        "snapshot": {"creation_api": True, "manifest": {"compute_spec": l4}},
+        "execution_policy": {"provider": "colab", "account_id": aid},
+    }
+    assert service.creation_capacity(l4_job, [])
+    with service._tx() as session:
+        row = service._find(session, "instances", high_instance["id"], owner)
+        assert service._compatible(session, row, l4_job, aid)
+    repo.update("leases", high_lease["id"], {"idle_deadline_at": 99}, owner)
     repo.update("leases", lease["id"], {"idle_deadline_at": 99}, owner)
-    assert not service.creation_capacity(job, [])
+    assert not service.creation_capacity(l4_job, [])
 
 
 def test_batch_retains_only_for_compatible_queued_creation_request(tmp_path):

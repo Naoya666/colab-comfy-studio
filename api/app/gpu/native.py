@@ -147,9 +147,6 @@ def guard_generation(repo, owner, policy):
     if policy.get("provider") == "colab":
         from .cu_guard import CuGuardService
         CuGuardService(repo).check(owner, "colab", policy.get("account_id"), policy.get("instance_id"))
-        lease = active_lease(repo, owner)
-        if lease and policy.get("instance_id") in {None, lease.get("instance_id")} and restart_active(lease):
-            raise APIError("NATIVE_RESTARTING", "原生 ComfyUI 正在重启，请等当前操作完成后重试", 409, True)
 
 
 def busy(client=None, *, repo=None, owner="owner"):
@@ -250,20 +247,8 @@ def admit(repo, owner, body, key, *, api_key_id=None):
             if any(field in body and storage[field] != model_storage(policy)[field] for field in storage):
                 raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止实例并重新启动以修改模型存储配置", 409)
             return source
-        # Never create a second GPU while another live instance is already present.
-        instances = [i for i in repo.list("instances", owner) if i.get("state") not in {"deleted"} and i.get("provider") == "colab"]
-        requested_instance = body.get("instance_id")
-        if requested_instance and not instances:
-            raise APIError("INSTANCE_CONFLICT", "所选实例已释放或不能复用，请重新选择 GPU", 409)
-        if instances:
-            if len(instances) != 1 or (requested_instance and instances[0]["id"] != requested_instance):
-                raise APIError("INSTANCE_CONFLICT", "请明确选择唯一可复用实例，或先释放其他实例", 409)
-            instance = instances[0]
-            if instance.get("state") not in {"ready", "retained_idle"} or instance.get("current_job_id"):
-                raise APIError("INSTANCE_BUSY", "现有实例仍在执行任务或初始化，请等待完成", 409)
-            if instance.get("account_id") != account:
-                raise APIError("INSTANCE_CONFLICT", "已有实例属于其他账号，请先停止旧实例", 409)
-            requested_instance = instance["id"]
+        if body.get("instance_id"):
+            raise APIError("INSTANCE_CONFLICT", "原生 ComfyUI 仅使用独立原生实例，不复用其他域实例", 409)
         from app.compute_routes import _require_account
         _require_account(repo, owner, account)
         from .rates import minute_rate
@@ -274,13 +259,13 @@ def admit(repo, owner, body, key, *, api_key_id=None):
         raw = {"kind": "native-comfy", **body}
         job, _ = repo.create_job(owner, raw, key)
         policy = {"provider": "colab", "lifecycle": "retain", "account_id": account,
-                  **timeouts, **storage,
-                  **({"instance_id": requested_instance, "allocation": "existing"} if requested_instance else {})}
+                  **timeouts, **storage}
         return repo.update("jobs", job["id"], {
             **({"native_api_key_id": api_key_id} if api_key_id else {}),
+            "instance_pool": "native",
             "native_request_hash": digest(body), "project_id": project, "provider": "colab",
             "account_id": account, "requested_account_id": account,
-            "requested_instance_id": requested_instance, "requested_spec": body["spec"],
+            "requested_instance_id": None, "requested_spec": body["spec"],
             "lifecycle": "retain", "execution_policy": policy,
             "model_id": "native-comfy", "workflow_key": "system/native-comfy", "workflow_version": 1,
             "max_runtime_minutes": timeouts["max_runtime_minutes"], "unit_rate": rate,
@@ -396,6 +381,8 @@ def _lease_identity(lease):
 
 
 def _smart_keepalive_allowed(repo, lease, now):
+    from .instances import POOL_CREATION, instance_pool_of
+
     instance_id = lease.get("instance_id")
     instance = repo.get("instances", instance_id, lease["owner_id"]) if instance_id else None
     if (
@@ -405,9 +392,10 @@ def _smart_keepalive_allowed(repo, lease, now):
         or lease.get("native_draining")
         or lease.get("cleanup_claim_token")
         or instance.get("native_comfy")
+        or instance_pool_of(instance) != POOL_CREATION
         or instance.get("runtime_deleted")
         or instance.get("state") != "retained_idle"
-        or instance.get("retention_mode") != "smart"
+        or instance.get("retention_mode") not in {"smart", "retain"}
         or instance.get("lease_id") != lease["id"]
         or instance.get("account_id") != lease.get("account_id")
         or instance.get("current_job_id")
@@ -418,12 +406,14 @@ def _smart_keepalive_allowed(repo, lease, now):
     hard_deadline = instance.get("hard_deadline_at")
     if hard_deadline is None and lease.get("generation_timeouts"):
         hard_deadline = lease.get("deadline_epoch")
-    return now < min(
+    deadlines = [
         float(lease.get("idle_deadline_at") or 0),
         float(lease.get("deadline_epoch") or 0),
         float(instance.get("idle_deadline_at") or 0),
-        float(hard_deadline or 0),
-    )
+    ]
+    if hard_deadline is not None:
+        deadlines.append(float(hard_deadline))
+    return now < min(deadlines)
 
 
 def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None, smart=False):

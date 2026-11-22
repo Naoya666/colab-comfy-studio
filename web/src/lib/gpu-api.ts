@@ -1,3 +1,4 @@
+import type { GpuSpecKey } from './gpu-spec-order';
 import type {
   AccountRuntime,
   GoogleAccount,
@@ -7,7 +8,9 @@ import type {
   GpuExecutionPolicyV020,
   GpuInstance,
   GpuInstanceFilters,
+  GpuInstancePool,
   GpuJobRequestV020,
+  GpuReuseAction,
   InstanceRetentionRequest,
   RetentionMode,
   Workbench,
@@ -16,6 +19,7 @@ import type {
   WorkbenchActionResult,
 } from './v020-types';
 
+export type { GpuSpecKey } from './gpu-spec-order';
 export type {
   AccountRuntime,
   GoogleAccount,
@@ -24,6 +28,8 @@ export type {
   GoogleAuthPurpose,
   GpuInstance,
   GpuInstanceFilters,
+  GpuInstancePool,
+  GpuReuseAction,
   InstanceRetentionRequest,
   RetentionMode,
   Workbench,
@@ -589,3 +595,93 @@ export async function fetchNativeOutputBytes(contentUrl: string, signal?: AbortS
   }
   return new Uint8Array(await response.arrayBuffer());
 }
+
+export interface DiscoveredGpuSpec {
+  spec: GpuSpecKey;
+  discovered_at: number;
+}
+
+export interface GpuSpecOrderSettings {
+  ordered_specs: GpuSpecKey[];
+  discovered_specs: DiscoveredGpuSpec[];
+  defaults: GpuSpecKey[];
+  updated_at: number | null;
+}
+
+export interface GpuSpecDiscoverResult extends GpuSpecOrderSettings {
+  newly_discovered: DiscoveredGpuSpec[];
+  checked_accounts: number;
+  errors: Array<{ account_id: string | null; error: string }>;
+}
+
+export const getGpuSpecOrder = () => apiFetch<GpuSpecOrderSettings>('/api/gpu/settings/gpu-order', { cache: 'no-store' });
+export const saveGpuSpecOrder = (orderedSpecs: GpuSpecKey[]) =>
+  apiFetch<GpuSpecOrderSettings>('/api/gpu/settings/gpu-order', {
+    method: 'PUT',
+    body: JSON.stringify({ ordered_specs: orderedSpecs }),
+  });
+export const resetGpuSpecOrder = () =>
+  apiFetch<GpuSpecOrderSettings>('/api/gpu/settings/gpu-order/reset', post({}));
+export const discoverGpuSpecs = () =>
+  apiFetch<GpuSpecDiscoverResult>('/api/gpu/settings/gpu-order/discover', post({}), 30000);
+
+export type ReusePreviewDecision =
+  | 'unsupported_spec'
+  | 'reuse_direct'
+  | 'confirm_shorten'
+  | 'confirm_busy_same_spec'
+  | 'confirm_higher_spec'
+  | 'confirm_lower_spec'
+  | 'create_new';
+
+export interface ReusePreviewInstance {
+  id?: string;
+  instance_id: string;
+  label?: string | null;
+  instance_label?: string | null;
+  account_id?: string | null;
+  account_alias_snapshot?: string | null;
+  state: string;
+  is_busy: boolean;
+  spec?: GpuSpecKey | null;
+  spec_id?: string | null;
+  gpu_reported?: string | null;
+  retention_mode?: string;
+  retain_idle_minutes?: number | null;
+  idle_deadline_at?: number | null;
+  hard_deadline_at?: number | null;
+  expires_at?: number | null;
+  remaining_seconds?: number | null;
+  warm_hit?: boolean;
+  loaded_workflow_key?: string | null;
+  loaded_workflow_version?: string | number | null;
+  loaded_fingerprint?: string | null;
+}
+
+export interface ReusePreviewRequest {
+  workflow_key: string;
+  workflow_version: string | number;
+  project_id?: string | null;
+  provider: Provider;
+  account_id?: string | null;
+  instance_id?: string | null;
+  compute_spec?: Record<string, unknown> | null;
+  lifecycle: 'save' | 'batch' | 'smart' | 'retain';
+  retain_idle_minutes: number;
+  model_overrides?: Array<Record<string, unknown>>;
+}
+
+export interface ReusePreviewResponse {
+  workflow_default_spec?: GpuSpecKey | null;
+  selected_spec?: GpuSpecKey | null;
+  decision: ReusePreviewDecision;
+  reason?: string | null;
+  target_instance?: ReusePreviewInstance | null;
+  shortens_lifetime: boolean;
+  shorten_reasons: string[];
+  allowed_actions: string[];
+  force_confirm: boolean;
+}
+
+export const previewGpuJobReuse = (body: ReusePreviewRequest) =>
+  apiFetch<ReusePreviewResponse>('/api/gpu/jobs/reuse-preview', post(body));

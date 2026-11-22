@@ -59,7 +59,7 @@ function buildSizes(defW: number, defH: number, step: number, min: number, max: 
 }
 
 export function CreatePanel({
-  projectId, models, workflows, presets, settings, usage, computeSpec, onEditGuard, manifest, params, setParams, gallery,
+  projectId, models, workflows, presets, settings, usage, computeSpec, specBelowDefaultError, onEditGuard, manifest, params, setParams, gallery,
   selectedAssets, setSelectedAssets, uploadProgress, onUpload, setModelId, workflowId, setWorkflowId,
   runtime, setRuntime, maxRuntime, setMaxRuntime, batchCount, setBatchCount, batchMode,
   runtimeChoice, accounts, instances, onRuntimeChoiceChange,
@@ -76,6 +76,7 @@ export function CreatePanel({
   settings: GpuSettings | null;
   usage: GpuUsage | null;
   computeSpec: Record<string, unknown> | null;
+  specBelowDefaultError?: string;
   onEditGuard: () => void;
   manifest: GpuManifest | null;
   params: Record<string, unknown>;
@@ -258,12 +259,14 @@ export function CreatePanel({
     <p className="muted small">{estimate == null ? '估算费率未知' : `每个任务约 ${cuNumber(estimate)} CU（参考）`}</p>
   </>;
 
+  const specBlocked = runtime === 'colab' && Boolean(specBelowDefaultError);
+  const submitBusy = loading === 'submit' || loading === 'preview';
   const submitButton = (
-    <button className={desktop ? 'button' : 'button big'} disabled={!draftReady || loading === 'submit' || !!cuBlocked} type="button" onClick={onSubmit}>
-      <Sparkles size={18} strokeWidth={1.8} aria-hidden />{loading === 'submit' ? '提交中…' : '立即生成'}
+    <button className={desktop ? 'button' : 'button big'} disabled={!draftReady || submitBusy || !!cuBlocked || specBlocked} type="button" onClick={onSubmit}>
+      <Sparkles size={18} strokeWidth={1.8} aria-hidden />{loading === 'submit' ? '提交中…' : loading === 'preview' ? '检查复用中…' : '立即生成'}
     </button>
   );
-  const submitError = error && <p className="status error" role="alert">{error}</p>;
+  const submitError = (specBlocked ? specBelowDefaultError : error) && <p className="status error" role="alert">{specBlocked ? specBelowDefaultError : error}</p>;
 
   return (
     <div className={styles.createForm} onPaste={(e) => void handleFormPaste(e)}>

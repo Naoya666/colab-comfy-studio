@@ -91,6 +91,7 @@ def create_prep_job(
             {
                 "project_id": project_id,
                 "provider": "colab",
+                "instance_pool": "ephemeral",
                 "model_id": meta["model_id"],
                 "workflow_key": meta["workflow_key"],
                 "workflow_version": meta["workflow_version"],

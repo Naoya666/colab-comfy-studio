@@ -27,7 +27,7 @@ from starlette.websockets import WebSocketDisconnect
 
 def _publish_workflow(repo, owner, version, *, active=True, fixed="approved"):
     manifest, graph, info = Registry._template()
-    manifest["compute_spec"] = {"variant": "VARIANT_GPU", "accelerator": "A100", "shape": "SHAPE_STANDARD"}
+    manifest["compute_spec"] = {"variant": "VARIANT_GPU", "accelerator": "L4", "shape": "SHAPE_STANDARD"}
     from app.gpu.manifest import _binding, _canonical_parameters
 
     definitions, _ = _canonical_parameters(manifest)

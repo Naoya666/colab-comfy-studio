@@ -1393,32 +1393,6 @@ def _stream_output(response, target: Path, limit: int) -> int:
         partial.unlink(missing_ok=True)
 
 
-def _prepare_native_weights(api, native_dir, graph, weights, loras, payload, deadline, timeout):
-    try:
-        config = json.loads((native_dir / "local-model-config.json").read_text())
-        headers = {"X-Studio-Model-Channel": config["channel"]}
-        started = _http_json(api + "/studio_native/models/prepare-studio", "POST", {
-            "workflow": {"prompt": graph}, "weights": weights, "loras": loras,
-            "drive_cache": payload.get("drive_cache"),
-            "lora_drive_cache": payload.get("lora_drive_cache", payload.get("drive_cache")),
-            "use_drive_cache": payload.get("use_drive_cache", True),
-            "timeout": timeout,
-        }, extra_headers=headers)
-    except (OSError, ValueError, KeyError, WorkerError) as exc:
-        raise WorkerError("原生 ComfyUI 无法确认创作模式的本地模型准备能力，请重启原生本地会话或改用创作实例") from exc
-    ident = started.get("id")
-    if not isinstance(ident, str) or not re.fullmatch(r"[0-9a-f]{32}", ident):
-        raise WorkerError("Native model preparation did not return a valid ID")
-    while time.time() < deadline:
-        result = _http_json(api + "/studio_native/models/prepare/" + ident, extra_headers=headers)
-        if result.get("state") == "ready":
-            return result["models"], {**headers, "X-Studio-Model-Prepared": ident}
-        if result.get("state") == "failed":
-            raise WorkerError((result.get("message") or "Native Studio model preparation failed")[:1400])
-        time.sleep(1)
-    raise WorkerError("Native model preparation exceeded this Studio job's runtime limit")
-
-
 def _creation_service(service_dir, payload, manifest, commit, nodes, checked, user_loras, stages, deadline):
     def environment_fingerprint():
         environment = _service_fingerprint(commit, nodes, checked, manifest)
@@ -1518,14 +1492,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
     for node in graph.values():
         if not isinstance(node, dict) or node.get("class_type") not in allowlist:
             raise WorkerError("bound graph contains an unreviewed node")
-    native_marker = NATIVE_SERVICE_MARKER
-    native_state = json.loads(native_marker.read_text()) if native_marker.is_file() and not service_dir else None
-    shared_native = native_state is not None
-    if shared_native and native_state.get("model_storage_mode") != "local":
-        raise WorkerError("创作模式需要 Colab 本地模型。当前原生 ComfyUI 使用 Drive 挂载，请改用兼容实例或停止原生会话后重试")
-    if shared_native and native_state.get("commit") != commit:
-        raise WorkerError("Studio workflow uses a different ComfyUI version; stop native session before switching versions")
-    comfy = Path(native_state["comfy"]) if shared_native else (service_dir or root) / "ComfyUI"
+    comfy = (service_dir or root) / "ComfyUI"
     user_loras = (payload.get("snapshot") or {}).get("lora_files") or []
     _check_loras(graph, manifest, user_loras)
     timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
@@ -1541,16 +1508,6 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
     if service_dir:
         service, env, weights = _creation_service(
             service_dir, payload, manifest, commit, nodes, checked, user_loras, stages, deadline)
-    elif shared_native:
-        _local_models(comfy)
-        _verify_checkout(comfy, commit)
-        # The shared process already loaded its nodes. Never install packages or restart it under queued native work.
-        for node in nodes:
-            folder = comfy / "custom_nodes" / node["dir"]
-            actual = _run(["git", "rev-parse", "HEAD"], cwd=folder, timeout=30).stdout.strip()
-            if actual != node["commit"]:
-                raise WorkerError("Native service custom node version differs from reviewed Studio workflow")
-        env = {"source": "native_shared"}
     elif _warm_take(root, fingerprint, nodes, checked, user_loras=user_loras):
         # Same runtime, same environment: the previous job left it restored. Nothing to download.
         stages.start("warm_reuse")
@@ -1566,13 +1523,12 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
         weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False,
                                    warm_models=warm_models, use_drive_cache=payload.get("use_drive_cache", True))
     try:
-        if user_loras and not (shared_native or service):
+        if user_loras and not service:
             stages.start("restore_loras")
             _restore_user_loras(comfy, user_loras, _lora_drive_cache(payload))
-        if not shared_native:
-            _local_models(comfy)
-            _check_local_tree(comfy / "output")  # ComfyUI also registers model folders under its output directory.
-            _write_input_files(comfy, payload.get("snapshot") or {})
+        _local_models(comfy)
+        _check_local_tree(comfy / "output")  # ComfyUI also registers model folders under its output directory.
+        _write_input_files(comfy, payload.get("snapshot") or {})
         if not service:
             stages.start("comfy_start")
         log_path = root / "comfy.log"
@@ -1580,11 +1536,11 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
         process = None
         try:
             port = COMFY_SERVICE_PORT
-            if not (shared_native or service):
+            if not service:
                 with socket.socket() as listener:
                     listener.bind((COMFY_SERVICE_HOST, 0))
                     port = listener.getsockname()[1]
-            process = None if shared_native or service else subprocess.Popen(
+            process = None if service else subprocess.Popen(
                 [sys.executable, "main.py", "--listen", COMFY_SERVICE_HOST, "--port", str(port)],
                 cwd=comfy,
                 stdout=log,
@@ -1605,33 +1561,18 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                     time.sleep(1)
             else:
                 raise WorkerError("Comfy worker startup timed out")
-            fence = (_file_lock(native_marker.parent / "models-active.lock", shared=True)
-                     if shared_native else contextlib.nullcontext())
-            with fence:
-                submit_args = {}
-                if shared_native:
-                    stages.start("restore_weights")
-                    weights, headers = _prepare_native_weights(
-                        api, native_marker.parent, graph, checked, user_loras, payload, deadline, timeout)
-                    submit_args["extra_headers"] = headers
-                    _write_input_files(comfy, payload.get("snapshot") or {})
-                if process is not None and process.poll() is not None:
-                    raise WorkerError("Comfy worker exited before queue submission")
-                if time.time() >= deadline:
-                    raise WorkerError("Comfy execution timed out before submission")
-                stages.start("creation_warming" if warmup else "sampling")
-                if warmup:
-                    # Isolate reviewed outputs that support a prefix. Otherwise keep the private
-                    # VM file in case Comfy returns a cached result to the first real request.
-                    for node in graph.values():
-                        if "filename_prefix" in node["inputs"]:
-                            node["inputs"]["filename_prefix"] = "studio_warmup/" + payload["execution_id"]
-                try:
-                    queued = _http_json(api + "/prompt", "POST", {"prompt": graph}, timeout=30, **submit_args)
-                except WorkerError as exc:
-                    if shared_native:
-                        raise WorkerError("原生 ComfyUI 拒绝创作任务入队，请检查当前模型路径和工作流") from exc
-                    raise
+            if process is not None and process.poll() is not None:
+                raise WorkerError("Comfy worker exited before queue submission")
+            if time.time() >= deadline:
+                raise WorkerError("Comfy execution timed out before submission")
+            stages.start("creation_warming" if warmup else "sampling")
+            if warmup:
+                # Isolate reviewed outputs that support a prefix. Otherwise keep the private
+                # VM file in case Comfy returns a cached result to the first real request.
+                for node in graph.values():
+                    if "filename_prefix" in node["inputs"]:
+                        node["inputs"]["filename_prefix"] = "studio_warmup/" + payload["execution_id"]
+            queued = _http_json(api + "/prompt", "POST", {"prompt": graph}, timeout=30)
             prompt_id = queued.get("prompt_id")
             if not isinstance(prompt_id, str) or not prompt_id:
                 raise WorkerError("Comfy queue did not return a prompt id")
@@ -1712,7 +1653,7 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                     process.kill()
             log.close()
     finally:
-        if not (shared_native or service_dir):
+        if not service_dir:
             _warm_put(root, fingerprint)  # restore succeeded above, so the tree is reusable even if this job failed later
 
 
@@ -1776,14 +1717,16 @@ def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
             outputs = _run_prep(root, payload, manifest, stages)
         else:
             local_payload = {**payload, '_local_artifact_limit': min(artifact_store.max_size, 2*1024**3)} if artifact_store is not None else {k:v for k,v in payload.items() if k!='_local_artifact_limit'}
-            if snapshot.get("creation_api"):
+            use_resident = bool(snapshot.get("creation_api") or payload.get("use_resident_service")) and bool(payload.get("instance_id"))
+            if use_resident:
                 service_dir = _comfy_service_dir(payload.get("instance_id"))
                 with _file_lock(service_dir.parent / "creation-service.lock"):
                     outputs = _run_comfy(root, local_payload, manifest, graph, stages, service_dir=service_dir)
             else:
                 outputs = _run_comfy(root, local_payload, manifest, graph, stages)
         runtime_path = root / "creation-runtime.json"
-        evidence = {"creation_runtime": json.loads(runtime_path.read_text())} if snapshot.get("creation_api") else {}
+        use_resident_evidence = bool(snapshot.get("creation_api") or payload.get("use_resident_service")) and runtime_path.is_file()
+        evidence = {"creation_runtime": json.loads(runtime_path.read_text())} if use_resident_evidence else {}
         if artifact_store is not None:
             artifacts = []
             for item in outputs:
@@ -1802,7 +1745,7 @@ def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
         message = _safe_error(exc)
         log = root / "comfy.log"
         if not log.is_file() or not log.stat().st_size:
-            if (payload.get("snapshot") or {}).get("creation_api") and payload.get("instance_id"):
+            if ((payload.get("snapshot") or {}).get("creation_api") or payload.get("use_resident_service")) and payload.get("instance_id"):
                 with contextlib.suppress(OSError, WorkerError):
                     log = _comfy_service_dir(payload["instance_id"]) / "comfy.log"
         if log.is_file():

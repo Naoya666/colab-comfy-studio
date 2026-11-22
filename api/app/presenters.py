@@ -62,6 +62,8 @@ def public_job(job):
         "compute_warnings",
         "retained_until",
         "selection_reason",
+        "instance_pool",
+        "creation_runtime",
     }
     result = {k: v for k, v in job.items() if k in keys}
     result["job_id"] = job["id"]

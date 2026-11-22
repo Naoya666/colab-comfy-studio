@@ -73,8 +73,8 @@ def test_restarts_once_and_requires_new_boot(session, monkeypatch, drop):
     assert restart.submit(repo, "owner", "instance", "other-tab") == restart_id
     with pytest.raises(APIError, match="正在重启"):
         native.begin_write(repo, lease)
-    with pytest.raises(APIError, match="正在重启"):
-        native.guard_generation(repo, "owner", {"provider": "colab"})
+    # Three-pool isolation: native ComfyUI restart must NOT block creation/ephemeral generation jobs.
+    native.guard_generation(repo, "owner", {"provider": "colab"})
 
     restart.tick(repo)
     assert phase(repo) == "recovering"

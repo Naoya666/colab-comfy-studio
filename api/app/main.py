@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .account_routes import router as account_router
-from .admission import _drive, admit_job, repo_registry
+from .admission import _drive, admit_job, preview_job_reuse, repo_registry
 from .agent_routes import AGENT_TOOLS
 from .agent_routes import router as agent_router
 from .asset_routes import assets_router, gallery_router
@@ -44,7 +44,7 @@ from .gpu.scheduler import Scheduler
 from .history_routes import router as history_router
 from .instance_routes import router as instance_router
 from .job_history import job_timing_details, job_timings
-from .job_schemas import JobInput
+from .job_schemas import JobInput, ReusePreviewInput
 from .model_library_routes import router as model_library_router
 from .native_outputs_routes import router as native_outputs_router
 from .native_proxy import NativeHostMiddleware
@@ -560,6 +560,16 @@ def lora_upload(body: dict, request: Request, user=Depends(current_user), st=Dep
     return ok({"upload_url": _drive(Repository(st), user).lora_upload_session(name, size, origin)}, request)
 
 
+@router.post("/jobs/reuse-preview")
+def reuse_preview(
+    body: ReusePreviewInput,
+    request: Request,
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
+    return ok(preview_job_reuse(st, user, body.model_dump()), request)
+
+
 @router.post("/jobs", status_code=202)
 def create_job(
     body: JobInput,
@@ -748,12 +758,17 @@ def compute_specs(
     _require_account(repo, user["id"], account_id, require_allocation=False)
     from .gpu.colab import GoogleColabProvider
     from .gpu.rates import minute_rate
+    from .gpu.specs import record_discovered_gpu_specs
 
     try:
         specs = GoogleColabProvider(repo, user["id"], account_id=account_id or None).list_specs()
         for spec in specs:
             rate = minute_rate(spec)
             spec["reference_rate_hourly"] = round(rate * 60, 6) if rate is not None else None
+        try:
+            record_discovered_gpu_specs(st, user["id"], specs)
+        except Exception:
+            pass
         return ok(specs, request)
     except APIError:
         raise

@@ -381,55 +381,53 @@ def test_native_status_keeps_latest_30_events_newest_first(proxy):
     assert messages[-1] == "event-11"
 
 
-@pytest.mark.parametrize("storage", ["local", "drive_mount", None])
-def test_native_shared_studio_does_not_spawn_or_kill_comfy(monkeypatch, tmp_path, storage):
+def test_creation_worker_ignores_native_marker_and_uses_own_service_dir(monkeypatch, tmp_path):
     import json
 
     from app.gpu import runtime_worker as worker
 
     root = tmp_path / "studio-job"
     root.mkdir()
-    comfy = tmp_path / "native" / "ComfyUI"
-    comfy.mkdir(parents=True)
-    marker = tmp_path / "native" / "state.json"
-    state = {"commit": "a" * 40, "comfy": str(comfy)}
-    if storage is not None:
-        state["model_storage_mode"] = storage
-    marker.write_text(json.dumps(state))
-    (marker.parent / "local-model-config.json").write_text(json.dumps({"channel": "native-channel"}))
-    monkeypatch.setattr(worker, "NATIVE_SERVICE_MARKER", marker)
-    monkeypatch.setattr(worker, "_verify_checkout", lambda *args: None)
-    monkeypatch.setattr(worker, "_warm_put", lambda *args: pytest.fail("native process must remain in its own directory"))
-    monkeypatch.setattr(worker.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must use the resident ComfyUI process"))
-    calls = []
+    native_marker = tmp_path / "native" / "state.json"
+    native_marker.parent.mkdir(parents=True)
+    native_marker.write_text(json.dumps({"commit": "a" * 40, "comfy": str(tmp_path / "native" / "ComfyUI"), "model_storage_mode": "local"}))
+    monkeypatch.setattr(worker, "NATIVE_SERVICE_MARKER", native_marker)
+    seen = {}
 
-    prepare_id = "0" * 32
+    def fake_creation_service(service_dir, payload, manifest, commit, nodes, checked, user_loras, stages, deadline):
+        seen["service_dir"] = service_dir
+        out = service_dir / "ComfyUI" / "output"
+        out.mkdir(parents=True, exist_ok=True)
+        return (
+            {"pid": 123, "process_start_id": "1", "env_fingerprint": "fp-1", "cache_reason": "hot_reuse"},
+            {"source": "warm"},
+            [{"target": "checkpoints/model.safetensors", "sha256": "c" * 64, "source": "warm", "seconds": 0.0}],
+        )
 
     def api(url, method="GET", body=None, timeout=30, *, extra_headers=None):
-        calls.append((url, method))
-        if url.endswith("/prepare-studio"):
-            assert body["weights"][0]["sha256"] == "c" * 64
-            assert extra_headers == {"X-Studio-Model-Channel": "native-channel"}
-            return {"id": prepare_id}
-        if url.endswith("/prepare/" + prepare_id):
-            return {"state": "ready", "models": []}
+        assert "/prepare-studio" not in url, "creation pool must never call native /prepare-studio"
         if url.endswith("/prompt"):
-            assert extra_headers["X-Studio-Model-Prepared"] == prepare_id
-            return {"prompt_id": "native-and-studio"}
+            return {"prompt_id": "creation-only"}
         if "/history/" in url:
-            return {"native-and-studio": {"status": {"completed": True}, "outputs": {}}}
+            return {"creation-only": {"status": {"completed": True}, "outputs": {}}}
         return {"system": {}}
+
+    monkeypatch.setattr(worker, "_creation_service", fake_creation_service)
     monkeypatch.setattr(worker, "_http_json", api)
-    manifest = {"comfy_commit": "a" * 40, "node_allowlist": ["TestNode"], "weight_files": [{"repo_id": "test/model", "filename": "model.safetensors", "target": "checkpoints/model.safetensors", "revision": "b" * 40, "sha256": "c" * 64}]}
+    service_dir = tmp_path / "service-inst-1"
+    manifest = {
+        "comfy_commit": "a" * 40,
+        "node_allowlist": ["TestNode"],
+        "weight_files": [{
+            "repo_id": "test/model", "filename": "model.safetensors",
+            "target": "checkpoints/model.safetensors", "revision": "b" * 40, "sha256": "c" * 64,
+        }],
+    }
     graph = {"1": {"class_type": "TestNode", "inputs": {}}}
-    if storage != "local":
-        with pytest.raises(worker.WorkerError, match="Drive 挂载"):
-            worker._run_comfy(root, {"snapshot": {}}, manifest, graph, worker._Stages(root))
-        assert not calls
-        return
-    assert worker._run_comfy(root, {"snapshot": {}}, manifest, graph, worker._Stages(root)) == []
-    assert any(url.endswith("/prompt") for url, method in calls)
-    assert marker.exists()
+    assert worker._run_comfy(root, {"instance_id": "inst-1", "use_resident_service": True, "snapshot": {"workflow_sha256": "wf-sha"}},
+                             manifest, graph, worker._Stages(root), service_dir=service_dir) == []
+    assert seen["service_dir"] == service_dir
+    assert native_marker.exists()
 
 
 def test_shutdown_fence_and_inflight_uploads(proxy, monkeypatch):

@@ -425,16 +425,25 @@ class SchedulerWatchdogMixin:
                         or (lease.get("native_comfy") and lease.get("cu_fuse") == "soft_daily_limit"))
             if lease.get('state')=='idle' and not stopping and self.clock()<min(
                     float(lease.get('idle_deadline_at') or 0),float(lease.get('deadline_epoch') or 0)):
-                if instance and instance.get("creation_runtime") and associated and associated.get("creation_fingerprint"):
-                    self._probe_creation_process(associated, instance, lease)
+                from .instances import POOL_CREATION, instance_pool_of
+
+                is_creation_pool = bool(instance and instance_pool_of(instance) == POOL_CREATION)
+                if is_creation_pool and instance.get("creation_runtime"):
+                    probe_job = associated or {
+                        "id": lease.get("owner_job_id") or f"probe:{instance['id']}",
+                        "owner_id": lease["owner_id"],
+                        "provider": lease.get("provider", "colab"),
+                        "account_id": lease.get("account_id"),
+                        "instance_id": instance["id"],
+                    }
+                    self._probe_creation_process(probe_job, instance, lease)
                 if (
                     lease.get("provider") == "colab"
+                    and not lease.get("native_comfy")
                     and not lease.get("native_ready")
-                    and instance
-                    and instance.get("retention_mode") == "smart"
-                    and associated
-                    and associated.get("state") == "completed"
-                    and self._lifecycle(associated) == "smart"
+                    and is_creation_pool
+                    and instance.get("state") == "retained_idle"
+                    and instance.get("retention_mode") in {"smart", "retain"}
                 ):
                     from .native import keepalive_lease
 

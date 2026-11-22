@@ -1,5 +1,5 @@
 import type { Provider } from '../lib/gpu-api';
-import { instanceIdentity, instanceMachineLabel, instanceReusable } from '../lib/instance-submission';
+import { instanceIdentity, instanceMachineLabel, instanceReusable, isCreationPoolInstance } from '../lib/instance-submission';
 import type { GpuAccount, GpuInstance } from './AccountDirectory';
 import { formatInstanceTime } from '../lib/instance-time';
 import { gpuLabel } from '../lib/gpu-label';
@@ -50,7 +50,8 @@ function instanceLabel(instance: GpuInstance): string {
 
 export function RuntimeSelection({ value, accounts, instances, provider, showInstances = true, onChange }: RuntimeSelectionProps) {
   const selectedAccount = accounts.find((account) => account.account_id === value.accountId);
-  const sameAccount = instances.filter((instance) => !value.accountId || instance.account_id === value.accountId);
+  const creationPool = instances.filter((instance) => isCreationPoolInstance(instance));
+  const sameAccount = creationPool.filter((instance) => !value.accountId || instance.account_id === value.accountId);
   const reusableInstances = sameAccount.filter((instance) => instanceReusable(instance));
   const staleInstance = value.instanceId ? sameAccount.find((instance) => instanceId(instance) === value.instanceId && !instanceReusable(instance)) : undefined;
   const candidateInstances = staleInstance ? [...reusableInstances, staleInstance] : reusableInstances;

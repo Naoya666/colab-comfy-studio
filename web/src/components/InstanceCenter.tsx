@@ -5,6 +5,7 @@ import type { GpuInstance } from './AccountDirectory';
 import { InstanceWorkbench } from './InstanceWorkbench';
 import { formatInstanceTime as formatTime } from '../lib/instance-time';
 import { gpuLabel } from '../lib/gpu-label';
+import { isCreationPoolInstance } from '../lib/instance-submission';
 import { ConfirmDialog } from './Feedback';
 import styles from './v020.module.css';
 
@@ -55,6 +56,14 @@ function stateLabel(value?: string): string {
     retained_idle: '保留空闲', releasing: '释放中', deleted: '已删除',
     unknown: '未知', cleanup_pending: '待清理', quarantined: '已隔离',
   } as Record<string, string>)[String(value || '')] || value || '状态未知';
+}
+
+function poolLabel(pool?: string): string {
+  return ({
+    native: '原生 ComfyUI',
+    creation: '创作池',
+    ephemeral: '一次性',
+  } as Record<string, string>)[String(pool || 'creation')] || String(pool);
 }
 
 function isHistory(instance: GpuInstance): boolean {
@@ -234,18 +243,23 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
         const id = instanceId(instance);
         const isSelected = selectedId === id;
         const canMutate = !isHistory(instance) && instance.state !== 'releasing';
+        const canContinue = canMutate && isCreationPoolInstance(instance);
         const state = instance.remote_delete_source === 'provider_runtime_missing' ? '已回收' : stateLabel(instance.state);
+        const runtime = instance.creation_runtime as { workflow_key?: string; workflow_version?: string | number; process?: string } | null | undefined;
         return <article className={styles.instanceCard} key={id}>
-          <div className={styles.cardTop}><div className={styles.minWidth}><h3 title={id}>{label(instance)}</h3><p className={styles.muted}>{instance.account_alias_snapshot || (instance.account_id ? `账号 ${shortId(instance.account_id)}` : '账号未确认')} · {instance.provider || '运行时未确认'}</p></div><span className={`${styles.badge} ${instance.state === 'ready' || instance.state === 'busy' || instance.state === 'retained_idle' ? styles.good : ''}`}>{state}</span></div>
+          <div className={styles.cardTop}><div className={styles.minWidth}><h3 title={id}>{label(instance)}</h3><p className={styles.muted}>{poolLabel(instance.instance_pool)} · {instance.account_alias_snapshot || (instance.account_id ? `账号 ${shortId(instance.account_id)}` : '账号未确认')} · {instance.provider || '运行时未确认'}</p></div><span className={`${styles.badge} ${instance.state === 'ready' || instance.state === 'busy' || instance.state === 'retained_idle' ? styles.good : ''}`}>{state}</span></div>
           <div className={styles.detailGrid}>
             <div className={styles.metaCell}><span>GPU</span><b>{gpuLabel(instance)}</b></div>
             <div className={styles.metaCell}><span>实例 ID</span><b title={id}>{shortId(id)}</b></div>
             <div className={styles.metaCell}><span>当前任务</span><b title={instance.current_job_id || ''}>{instance.current_job_id ? shortId(instance.current_job_id) : '空闲'}</b></div>
             <div className={styles.metaCell}><span>保留截止</span><b>{formatTime(instance.retained_until || instance.idle_deadline_at)}</b></div>
+            {runtime && (runtime.workflow_key || runtime.process) && (
+              <div className={styles.metaCell}><span>常驻工作流</span><b>{runtime.workflow_key ? `${runtime.workflow_key}${runtime.workflow_version != null ? ` v${runtime.workflow_version}` : ''}` : `进程 ${runtime.process}`}</b></div>
+            )}
           </div>
           <div className={styles.cardActions}>
             <button type="button" className={styles.buttonSecondary} onClick={() => void openDetail(instance)}><ChevronDown size={15} aria-hidden />{isSelected ? '刷新详情' : '查看详情'}</button>
-            {onContinue && canMutate && <button type="button" className={styles.button} onClick={() => onContinue(instance)}>续用</button>}
+            {onContinue && canContinue && <button type="button" className={styles.button} onClick={() => onContinue(instance)}>续用</button>}
             {onOpenWorkbench && <button type="button" className={styles.buttonSecondary} onClick={() => chooseWorkbench(instance)}><Wrench size={15} aria-hidden />{canMutate ? '工作台' : '工作台历史'}</button>}
             {canMutate && <button type="button" className={styles.buttonSecondary} disabled={busy === `retain:${id}`} onClick={() => setConfirm({ action: 'retain', instance })}><Timer size={15} aria-hidden />保留</button>}
             {canMutate && <button type="button" className={styles.buttonDanger} disabled={busy === `stop:${id}`} onClick={() => setConfirm({ action: 'stop', instance })}><Square size={14} aria-hidden />停止</button>}

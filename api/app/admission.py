@@ -5,12 +5,20 @@ from .common import APIError, own
 from .gpu import loras as lora_registry
 from .gpu.compute import GpuConfig
 from .gpu.inputs import resolve_input_images
+from .gpu.instances import POOL_CREATION, InstanceService, instance_pool_of
 from .gpu.manifest import bind_parameters, digest, resolve_parameters, validate_manifest
 from .gpu.rates import estimate as estimate_units
 from .gpu.rates import length_factor, mode_param
 from .gpu.registry import Registry
 from .gpu.repository import Repository
-from .gpu.specs import compatibility_signature, resolve_compute
+from .gpu.specs import (
+    compatibility_signature,
+    gpu_spec_order_settings,
+    is_below_workflow_default,
+    resolve_compute,
+    spec_id,
+    spec_key,
+)
 from .job_schemas import normalize_policy
 
 
@@ -75,6 +83,8 @@ def _validate_allocation(repo, user, policy: dict) -> dict:
     if checked.get("instance_id"):
         instance = _resource(repo, "instances", checked["instance_id"], user,
                              "INSTANCE_NOT_FOUND", "指定 GPU 实例不存在或不属于当前用户")
+        if instance_pool_of(instance) != POOL_CREATION:
+            raise APIError("INSTANCE_POOL_MISMATCH", "指定实例不属于创作池，不能跨域复用", 409)
         state = str(instance.get("state", "")).lower()
         if state in {"released", "deleted", "releasing", "unknown", "cleanup_pending", "quarantined"}:
             raise APIError("INSTANCE_UNAVAILABLE", "指定 GPU 实例已释放或当前不可复用", 409)
@@ -89,8 +99,16 @@ def _validate_allocation(repo, user, policy: dict) -> dict:
                 raise APIError("ACCOUNT_UNAVAILABLE", "实例所属账号已停用或未授权", 409)
         if instance.get("provider") and instance["provider"] != checked["provider"]:
             raise APIError("PROVIDER_INVALID", "指定实例与请求 Provider 不匹配", 422)
-        if instance.get("current_job_id") or state in {"busy", "running"}:
+        if checked.get("reuse_action") != "reuse" and (instance.get("current_job_id") or state in {"busy", "running"}):
             raise APIError("INSTANCE_BUSY", "指定 GPU 实例当前正在执行其他任务", 409)
+
+    if checked.get("reuse_action") == "replace" and checked.get("replace_instance_id"):
+        target = _resource(repo, "instances", checked["replace_instance_id"], user,
+                           "INSTANCE_NOT_FOUND", "待替换的 GPU 实例不存在或不属于当前用户")
+        if instance_pool_of(target) != POOL_CREATION:
+            raise APIError("INSTANCE_POOL_MISMATCH", "只能温和替换创作池实例，不能操作原生或一次性实例", 409)
+        if target.get("provider") and target["provider"] != checked["provider"]:
+            raise APIError("PROVIDER_INVALID", "待替换实例与请求 Provider 不匹配", 422)
 
     # Automatic account selection is only allowed to inspect eligible accounts;
     # it must never silently fail over from one identity to another.
@@ -149,14 +167,49 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
     if bool(model.get("is_mock")) != (policy["provider"] == "mock"):
         raise APIError("EXECUTOR_MISMATCH", "模拟模板只能使用 Mock，真实模型不能伪装模拟成功")
     validate_manifest(workflow["manifest"], workflow["api_graph"], workflow["object_info"])
-    requested_spec, compute_warnings = resolve_compute(workflow["manifest"], policy.get("compute_spec"))
+    order_table = gpu_spec_order_settings(st, user["id"])["ordered_specs"]
+    if creation:
+        # Creation API reuses compatible creation-pool instances by workflow default;
+        # config.gpu is checked against workflow default only when booting a new VM
+        # (inside before_create and InstanceService.allocate).
+        override = policy.get("compute_spec")
+        if override is not None:
+            requested_key = spec_key(override)
+            requested_spec = {"key": requested_key}
+            verified = workflow["manifest"].get("verified_compute_specs") or (
+                [workflow["manifest"]["compute_spec"]] if workflow["manifest"].get("compute_spec") else []
+            )
+            compute_warnings = (
+                []
+                if any(spec_key(s) == requested_key for s in verified)
+                else ["此 GPU 规格尚未经过该工作流验证，可能运行失败；不会自动修改参数或切换 GPU。"]
+            )
+        else:
+            requested_spec, compute_warnings = resolve_compute(workflow["manifest"], None)
+    else:
+        requested_spec, compute_warnings = resolve_compute(workflow["manifest"], policy.get("compute_spec"))
+        if (
+            policy["provider"] == "colab"
+            and requested_spec is not None
+            and is_below_workflow_default(workflow["manifest"], requested_spec, order_table)
+        ):
+            wf_default = workflow["manifest"]["compute_spec"]
+            raise APIError(
+                "GPU_SPEC_BELOW_WORKFLOW_DEFAULT",
+                f"所选 GPU 规格（{spec_id(requested_spec)}）低于工作流默认最低规格（{spec_id(wf_default)}），不支持降配运行",
+                422,
+            )
     policy["resolved_compute_spec"] = requested_spec.get("key") if requested_spec else None
     compute_fields = {
+        "instance_pool": POOL_CREATION,
         "requested_spec": requested_spec,
         "compute_warnings": compute_warnings,
         "workflow_version_id": workflow["id"],
         "generation_timeouts": True,
+        "reuse_action": policy.get("reuse_action", "auto"),
     }
+    if policy.get("reuse_action") == "replace" and policy.get("replace_instance_id"):
+        compute_fields["wait_for_deleted_instance_id"] = policy["replace_instance_id"]
     preset = own(repo, "presets", body["preset_id"], user) if body.get("preset_id") else None
     if preset and preset["workflow_version_id"] != workflow["id"]:
         raise APIError("PRESET_INCOMPATIBLE", "预设属于不同工作流版本，请先迁移预设")
@@ -244,13 +297,13 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
     compute_fields["compatibility_signature"] = compatibility_signature(
         policy["provider"], environment, requested_spec, workflow["workflow_key"], workflow["workflow_version"]
     )
+    compute_fields["creation_fingerprint"] = compatibility_signature(
+        policy["provider"], {k: v for k, v in environment.items() if k != "runtime_compute_spec"},
+        None, workflow["workflow_key"], workflow["workflow_version"],
+    )
     if creation:
         compute_fields.update(creation, creation_binding_digest=digest(
             {"dependencies": binding["dependencies"] if binding else None}))
-        compute_fields["creation_fingerprint"] = compatibility_signature(
-            policy["provider"], {k: v for k, v in environment.items() if k != "runtime_compute_spec"},
-            None, workflow["workflow_key"], workflow["workflow_version"],
-        )
     if validate_only:
         return {**body, **compute_fields, "execution_policy": policy,
                 "requested_account_id": policy.get("account_id"),
@@ -261,6 +314,11 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
                 "max_runtime_minutes": policy["max_runtime_minutes"],
                 **_job_estimate(repo, user["id"], workflow, policy, cfg, params)}
     # A worker cannot observe a queued record without its immutable snapshot.
+    replace_target = (
+        policy.get("replace_instance_id")
+        if policy.get("reuse_action") == "replace" and policy.get("replace_instance_id")
+        else None
+    )
     with st.admission_lock() as acquired:
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "队列正在同步，请用相同幂等键稍后重试", 503, True)
@@ -292,7 +350,101 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
         })
         if created:
             repo.event(job["id"], user["id"], "queued", "任务已持久化；请求规格：" + str(requested_spec) + "；" + "；".join(compute_warnings))
+    if replace_target:
+        # Gentle stop runs outside the outer admission_lock because request_gentle_stop takes its own lock.
+        InstanceService(repo).request_gentle_stop(user["id"], replace_target, f"replace:{job['id']}")
     return job
+
+
+def preview_job_reuse(st, user, body: dict) -> dict:
+    """Preview creation-pool reuse/conflict/lifetime shortening before frontend submission."""
+    repo, registry = repo_registry(st, user)
+    try:
+        workflow = registry.get_workflow(user["id"], body["workflow_key"], body["workflow_version"])
+    except KeyError as exc:
+        raise APIError("WORKFLOW_UNPUBLISHED", "工作流未发布或不存在", 404) from exc
+    if workflow.get("state") != "published":
+        raise APIError("WORKFLOW_UNPUBLISHED", "工作流尚未发布", 409)
+    model = next((m for m in registry.models(user["id"]) if m["model_id"] == workflow["model_id"]), None)
+    provider = str(body.get("provider") or "colab")
+    snapshot = {
+        "manifest": copy.deepcopy(workflow["manifest"]),
+        "api_graph": copy.deepcopy(workflow["api_graph"]),
+        "object_info": copy.deepcopy(workflow["object_info"]),
+        "resolved_params": {},
+        "bound_graph": copy.deepcopy(workflow["api_graph"]),
+        "input_files": [],
+        "workflow_sha256": workflow["sha256"],
+        "model_revision": model.get("revision") if model else None,
+        "dependency_lock": workflow["manifest"].get("dependencies", {}),
+    }
+    if provider == "colab":
+        snapshot["manifest"] = {**snapshot["manifest"], "state": "published", "reviewed": True}
+    if body.get("loras"):
+        try:
+            _apply_loras(repo, user, workflow, body["loras"], snapshot, provider)
+        except APIError:
+            pass
+    from .gpu.model_dependencies import approved_alternates, bind, runtime_copy
+    from .gpu.model_library import ModelLibrary
+    from .gpu.model_sources import ModelError
+
+    library = ModelLibrary(repo, user["id"])
+    try:
+        binding = next(
+            (r for r in repo.list("model_dependencies", user["id"]) if r.get("workflow_id") == workflow["id"]),
+            None,
+        )
+        if body.get("model_overrides"):
+            binding = library.dependency_record(workflow["id"])
+            dependencies = copy.deepcopy(binding["dependencies"])
+            for override in body["model_overrides"]:
+                dep = next((d for d in dependencies if d["id"] == override.get("dependency_id")), None)
+                if dep is not None:
+                    replacement = library.get(override.get("model_id"))
+                    dep.update(
+                        bind(
+                            dep,
+                            replacement,
+                            confirm_unknown=override.get("confirm_unknown") is True,
+                            strengths=override.get("strengths"),
+                            disabled=override.get("disabled") is True,
+                        )
+                    )
+            binding = {**binding, "dependencies": dependencies}
+        if binding:
+            bound_models = [
+                library.get(ident)
+                for ident in {d.get("model_id") for d in binding["dependencies"] if d.get("model_id")}
+            ]
+            snapshot = runtime_copy(
+                snapshot,
+                binding["dependencies"],
+                bound_models,
+                approved=approved_alternates(repo, user["id"], workflow),
+            )
+    except (ModelError, KeyError, ValueError):
+        pass
+    finally:
+        library.close()
+
+    environment = {k: v for k, v in snapshot.items() if k not in {"creation_api", "creation_warmup", "runtime_compute_spec"}}
+    fingerprint = compatibility_signature(
+        provider, environment, None, workflow["workflow_key"], workflow["workflow_version"]
+    )
+    selected_spec = body.get("compute_spec")
+    return InstanceService(repo).preview_creation_reuse(
+        user["id"],
+        project_id=body.get("project_id"),
+        provider=provider,
+        manifest=snapshot["manifest"],
+        creation_fingerprint=fingerprint,
+        selected_spec=selected_spec,
+        account_id=body.get("account_id"),
+        instance_id=body.get("instance_id"),
+        lifecycle=str(body.get("lifecycle") or "save"),
+        retain_idle_minutes=int(body.get("retain_idle_minutes") or 15),
+    )
 
 
 def _apply_loras(repo, user, workflow, picks, snapshot, provider):
