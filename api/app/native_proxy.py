@@ -218,7 +218,10 @@ class NativeGateway:
                     headers={"Cache-Control": "no-store", **cors_headers},
                 )(scope, receive, send)
 
-            submit = request.method == "POST" and scope["path"] in {"/prompt", "/api/prompt"}
+            prompt_path = internal_path if weak_policy is not None else scope["path"]
+            submit = request.method == "POST" and prompt_path in (
+                {"/prompt"} if weak_policy is not None else {"/prompt", "/api/prompt"}
+            )
             if key and submit:
                 _, graph = await self.read_prompt(request)
                 payload = json.dumps(native_api.submission(key, graph), allow_nan=False).encode()
@@ -351,7 +354,8 @@ class NativeGateway:
     @staticmethod
     def target(scope, repo=None, owner="owner"):
         base, auth = native.backend_for(repo, owner)
-        raw = scope.get("raw_path", scope["path"].encode()).decode("ascii")
+        raw_path = scope.get("raw_path")
+        raw = raw_path.decode("ascii") if raw_path else quote(scope["path"], safe="/")
         query = scope.get("query_string", b"").decode("ascii")
         return base + raw + ("?" + query if query else ""), base, auth
 

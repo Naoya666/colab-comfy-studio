@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import signal
 import socket
 import uuid
 from contextlib import asynccontextmanager
@@ -12,13 +13,14 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 from app import native_proxy
+from app.api_access import is_native_blocked_path
 from app.config import settings
 from app.db import Store
 from app.gpu import native
 from app.gpu.registry import Registry
 from app.gpu.repository import Repository
 from app.main import app
-from app.port_listeners import _DedicatedPortASGI
+from app.port_listeners import PortListenerManager, _DedicatedPortASGI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -282,6 +284,16 @@ def test_native_weak_modes_allow_ws_and_upload_while_blocking_manager(monkeypatc
         assert prompt_res.json()["client_id"] == "ws-client-1"
         assert prompt_res.headers["access-control-allow-origin"] == "https://st.sakumoyu.com"
 
+        approved = {"1": {"class_type": "KSampler", "inputs": {}}}
+        assert client.put(settings_url, headers=admin_auth, json={
+            **saved.json()["data"], "weak_workflow_mode": "approved", "weak_workflow": approved,
+        }).status_code == 200
+        prompt_calls = len(upstream_calls)
+        assert client.post(f"/comfy/n/{code}/api/prompt/", json={
+            "prompt": {"1": {"class_type": "Example", "inputs": {}}},
+        }).status_code == 403
+        assert len(upstream_calls) == prompt_calls
+
         with client.websocket_connect(f"/comfy/n/{code}/ws?clientId=ws-client-1") as ws:
             ws.send_text('{"ping":1}')
             assert ws.receive_text() == '{"ping":1}'
@@ -316,6 +328,26 @@ def test_native_weak_modes_allow_ws_and_upload_while_blocking_manager(monkeypatc
             assert ws.receive_text() == "hello"
         # Manager remains blocked in local_open mode too!
         assert client.post("/comfy/native/customnode/install", json={}).status_code == 403
+
+
+def test_weak_native_path_rejects_ambiguous_representations():
+    assert is_native_blocked_path("/files/./image", b"/files/./image")
+    assert is_native_blocked_path("/files//image", b"/files//image")
+    assert is_native_blocked_path("/files/image", b"/files%2Fimage")
+    assert is_native_blocked_path("/files/image", b"/other/image")
+    assert not is_native_blocked_path("/files/图像.png", b"/files/%E5%9B%BE%E5%83%8F.png")
+
+
+@pytest.mark.asyncio
+async def test_dedicated_listener_leaves_main_process_signal_handlers_untouched():
+    before = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    manager = PortListenerManager(app)
+    try:
+        await manager.apply("creation", 0)
+        assert manager._listeners["creation"].server.started
+        assert all(signal.getsignal(sig) == handler for sig, handler in before.items())
+    finally:
+        await manager.shutdown()
 
 
 def test_dedicated_port_listeners_and_conflict_validation(monkeypatch, tmp_path):

@@ -1057,7 +1057,9 @@ def plugin_dep_fingerprint(nodes: Path, plugins: list[dict]) -> str:
     return digest(entries)
 
 
-def compute_env_cache_key(comfy: Path, commit: str, gpu_tag: str, nodes: Path, plugins: list[dict]) -> dict:
+def compute_env_cache_key(
+    comfy: Path, commit: str, gpu_tag: str, nodes: Path, plugins: list[dict], *, base_packages: tuple[str, ...],
+) -> dict:
     dists = sorted(
         f"{(d.metadata.get('Name') or '').lower().replace('_', '-')}=={d.version}"
         for d in importlib.metadata.distributions()
@@ -1074,6 +1076,7 @@ def compute_env_cache_key(comfy: Path, commit: str, gpu_tag: str, nodes: Path, p
         'python': sys.version,
         'ext_suffix': ext_suffix,
         'base_pkg_sha': base_pkg_sha,
+        'base_packages': sorted(base_packages),
         'gpu_tag': gpu_tag,
         'comfy_req_sha': comfy_req_sha,
         'manager_req_sha': manager_req_sha,

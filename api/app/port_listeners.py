@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +39,15 @@ class _RunningListener:
     sock: socket.socket
     server: uvicorn.Server
     task: asyncio.Task
+
+
+class _DedicatedPortServer(uvicorn.Server):
+    def capture_signals(self):
+        return nullcontext()
+
+    def install_signal_handlers(self):
+        # Older Uvicorn releases use this hook.
+        pass
 
 
 class _DedicatedPortASGI:
@@ -125,9 +135,7 @@ class PortListenerManager:
                 log_level="error",
                 lifespan="off",
             )
-            server = uvicorn.Server(cfg)
-            # Prevent uvicorn from installing process-wide SIGINT/SIGTERM handlers in sub-listeners.
-            server.install_signal_handlers = lambda: None
+            server = _DedicatedPortServer(cfg)
             task = asyncio.create_task(server.serve(sockets=[sock]), name=f"studio-{kind}-port-{port}")
             self._listeners[kind] = _RunningListener(host=target_host, port=port, sock=sock, server=server, task=task)
             self._errors.pop(kind, None)

@@ -15,6 +15,7 @@ import sys
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -549,10 +550,14 @@ def wait_for_tunnel(tunnel, timeout=10.0):
         time.sleep(0.25)
 
 
+def _base_python_packages(*, local: bool) -> tuple[str, ...]:
+    return ("jedi>=0.16,<0.20", "httpx>=0.27,<1") if local else ("jedi>=0.16,<0.20",)
+
+
 def _install_base_python(worker, root: Path, comfy: Path, manager: Path, *, local: bool) -> None:
     print(f"[studio-native] Installing Manager requirements: {manager}; Python: {sys.executable}", flush=True)
     constraints = root / "gpu-constraints.txt"
-    packages = ["jedi>=0.16,<0.20", *(["httpx>=0.27,<1"] if local else [])]
+    packages = _base_python_packages(local=local)
     req_args = ["-r", str(comfy / "requirements.txt"), "-r", str(manager)]
     uv_bin = shutil.which("uv") if _flag("NATIVE_USE_UV", True) else None
     if uv_bin:
@@ -581,6 +586,15 @@ def _ensure_comfy_checkout(comfy: Path, commit: str, worker) -> None:
         comfy.mkdir()
         worker._checkout_comfy(comfy, commit, 180)
     worker._verify_checkout(comfy, commit)
+
+
+def _stop_startup_process(process):
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def run(root, payload, stages):
@@ -707,7 +721,10 @@ def run(root, payload, stages):
                 if use_env_cache:
                     current_plugins = restored_plugins if restored_plugins is not None else inventory(comfy / "custom_nodes")
                     before_site = site_snapshot(site)
-                    key_info = compute_env_cache_key(comfy, commit, worker._gpu_cache_tag(), comfy / "custom_nodes", current_plugins)
+                    key_info = compute_env_cache_key(
+                        comfy, commit, worker._gpu_cache_tag(), comfy / "custom_nodes", current_plugins,
+                        base_packages=_base_python_packages(local=local),
+                    )
                     stages.start("native_env_cache")
                     env_cache_hit = try_restore_env_cache(ROOT, site, key_info, baseline_protected, persistence.remote)
                     if env_cache_hit:
@@ -750,13 +767,14 @@ def run(root, payload, stages):
                 if local:
                     del args[args.index("--extra-model-paths-config"):args.index("--extra-model-paths-config") + 2]
                 comfy_log = root / "comfy.log"
-                with comfy_log.open("ab") as log:
-                    log_offset = log.tell()
-                    worker._atomic_json(ROOT / "plugins-config.json", {"comfy": str(comfy), "user": str(data / "user"),
-                                                                      "log": str(comfy_log), "log_offset": log_offset,
-                                                                      "flags": applied_flags})
-                    process = subprocess.Popen(args, cwd=comfy, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-                try:
+                with ExitStack() as startup:
+                    with comfy_log.open("ab") as log:
+                        log_offset = log.tell()
+                        worker._atomic_json(ROOT / "plugins-config.json", {"comfy": str(comfy), "user": str(data / "user"),
+                                                                          "log": str(comfy_log), "log_offset": log_offset,
+                                                                          "flags": applied_flags})
+                        process = subprocess.Popen(args, cwd=comfy, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                        startup.callback(_stop_startup_process, process)
                     wait_for_comfy(worker, process)
                     verify_manager(worker, comfy_log, log_offset)
                     with comfy_log.open("rb") as source:
@@ -765,51 +783,38 @@ def run(root, payload, stages):
                                   if b"(IMPORT FAILED)" in line or b"Cannot import " in line]
                     if failed:
                         raise RuntimeError("Custom node load failed: " + "; ".join(failed)[-2000:])
-                except BaseException:
-                    # A retry must not leave a second, unverified ComfyUI on the same port.
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
-                    raise
-                stages.start("native_tunnel")
-                if cloudflared_future is not None:
-                    binary = cloudflared_future.result()
-                else:
-                    binary = shutil.which("cloudflared") or str(ROOT / "cloudflared")
-                tunnel_file = ROOT / "tunnel.token"
-                _write_secret(tunnel_file, secret["tunnel_token"])
-                with (ROOT / "tunnel.log").open("ab") as log:
-                    tunnel = subprocess.Popen(
-                        [binary, "tunnel", "--no-autoupdate", "--protocol", "http2", "--metrics", TUNNEL_METRICS_ADDR, "run", "--token-file", str(tunnel_file)],
-                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                    )
-                try:
-                    wait_for_tunnel(tunnel)
-                except BaseException:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
-                    raise
-                (ROOT / "heartbeat").write_text(str(time.time()))
-                (ROOT / "watchdog.py").write_text(WATCHDOG)
-                with (ROOT / "watchdog.log").open("ab") as log:
-                    subprocess.Popen([sys.executable, str(ROOT / "watchdog.py")], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-                if env_cache_plan is not None and persistence.remote.available():
-                    with (ROOT / "env-cache.log").open("ab") as log:
-                        subprocess.Popen(
-                            [sys.executable, str(ROOT / "node_persistence.py"), "upload-env-cache", str(env_cache_plan)],
+                    stages.start("native_tunnel")
+                    if cloudflared_future is not None:
+                        binary = cloudflared_future.result()
+                    else:
+                        binary = shutil.which("cloudflared") or str(ROOT / "cloudflared")
+                    tunnel_file = ROOT / "tunnel.token"
+                    _write_secret(tunnel_file, secret["tunnel_token"])
+                    with (ROOT / "tunnel.log").open("ab") as log:
+                        tunnel = subprocess.Popen(
+                            [binary, "tunnel", "--no-autoupdate", "--protocol", "http2", "--metrics", TUNNEL_METRICS_ADDR, "run", "--token-file", str(tunnel_file)],
                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                         )
-                worker._atomic_json(marker, {"commit": commit, "pid": process.pid, "tunnel_pid": tunnel.pid,
-                                             "tunnel_start_id": worker._process_metadata(tunnel.pid)["start_id"], "tunnel_binary": binary,
-                                             "comfy": str(comfy), "comfy_log": str(comfy_log), "model_storage_mode": mode,
-                                             "comfy_log_offset": log_offset, "started": time.time()})
+                        startup.callback(_stop_startup_process, tunnel)
+                    wait_for_tunnel(tunnel)
+                    (ROOT / "heartbeat").write_text(str(time.time()))
+                    (ROOT / "watchdog.py").write_text(WATCHDOG)
+                    with (ROOT / "watchdog.log").open("ab") as log:
+                        watchdog = subprocess.Popen([sys.executable, str(ROOT / "watchdog.py")], stdout=log,
+                                                    stderr=subprocess.STDOUT, start_new_session=True)
+                        startup.callback(_stop_startup_process, watchdog)
+                    if env_cache_plan is not None and persistence.remote.available():
+                        with (ROOT / "env-cache.log").open("ab") as log:
+                            uploader = subprocess.Popen(
+                                [sys.executable, str(ROOT / "node_persistence.py"), "upload-env-cache", str(env_cache_plan)],
+                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                            )
+                            startup.callback(_stop_startup_process, uploader)
+                    worker._atomic_json(marker, {"commit": commit, "pid": process.pid, "tunnel_pid": tunnel.pid,
+                                                 "tunnel_start_id": worker._process_metadata(tunnel.pid)["start_id"], "tunnel_binary": binary,
+                                                 "comfy": str(comfy), "comfy_log": str(comfy_log), "model_storage_mode": mode,
+                                                 "comfy_log_offset": log_offset, "started": time.time()})
+                    startup.pop_all()
             finally:
                 if boot_pool is not None:
                     boot_pool.shutdown(wait=True, cancel_futures=True)

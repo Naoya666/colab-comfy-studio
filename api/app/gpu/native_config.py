@@ -934,10 +934,10 @@ def diagnose_setup(repo, owner: str, *, client: httpx.Client | None = None) -> d
                 owns = client is None
                 http = httpx.Client(timeout=8, follow_redirects=False) if owns else client
                 try:
-                    probe_headers = {"User-Agent": "colab-gpu-studio-proxy/1.0"}
-                    if settings.studio_api_token:
-                        probe_headers["Authorization"] = f"Bearer {settings.studio_api_token}"
-                    resp = http.get(cfg.native_comfy_url + "/_studio/api/status", headers=probe_headers)
+                    resp = http.get(
+                        cfg.native_comfy_url + "/_studio/api/status",
+                        headers={"User-Agent": "colab-gpu-studio-proxy/1.0"},
+                    )
                 finally:
                     if owns:
                         http.close()

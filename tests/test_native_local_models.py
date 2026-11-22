@@ -708,6 +708,31 @@ def test_visual_ui_workflow_expands_comfy_v1_subgraphs_and_outer_widget_override
 
 
 @pytest.mark.asyncio
+async def test_concurrent_workflow_save_preserves_first_writer(local, monkeypatch):
+    models = local(lambda _: pytest.fail("saving should use only the mounted filesystem"))
+    start = threading.Barrier(2)
+    publish = threading.Barrier(2)
+    replace = Path.replace
+
+    def pause_publish(path, target):
+        try:
+            publish.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return replace(path, target)
+
+    def save(label):
+        start.wait(timeout=5)
+        return models.save_workflow("shared", {"nodes": [], "extra": {"label": label}})
+
+    monkeypatch.setattr(Path, "replace", pause_publish)
+    results = await asyncio.gather(*(asyncio.to_thread(save, label) for label in ("a", "b")), return_exceptions=True)
+    assert sum(isinstance(result, native_models.WorkflowConflictError) for result in results) == 1
+    winner = "b" if isinstance(results[0], native_models.WorkflowConflictError) else "a"
+    assert models.read_workflow("comfy", "shared.json")["workflow"]["extra"]["label"] == winner
+
+
+@pytest.mark.asyncio
 async def test_drive_workflows_list_save_delete_and_prepare_by_ref(local, monkeypatch, tmp_path):
     def response(data, status=200):
         return SimpleNamespace(body=json.dumps(data).encode(), status=status, content_type="application/json")
@@ -770,6 +795,18 @@ async def test_drive_workflows_list_save_delete_and_prepare_by_ref(local, monkey
     }))
     assert overwrite_resp.status == 201
 
+    wrapped_resp = await save_route(request("POST", "/studio_native/models/workflows", {
+        "name": "wrapped",
+        "workflow": {"workflow": ui_workflow},
+    }))
+    assert wrapped_resp.status == 201
+    assert json.loads((comfy_dir.parent / "wrapped.json").read_text()) == ui_workflow
+
+    mixed = {"workflow": ui_workflow, "prompt": graph()}
+    mixed_item = models.save_workflow("mixed", mixed)
+    assert mixed_item["source"] == "warmup"
+    assert models.read_workflow("warmup", "mixed.json") == mixed
+
     # Path traversal and hidden files are rejected.
     for bad_name in ("../escape.json", ".hidden.json", "sub/.secret.json"):
         bad_resp = await save_route(request("POST", "/studio_native/models/workflows", {
@@ -783,6 +820,8 @@ async def test_drive_workflows_list_save_delete_and_prepare_by_ref(local, monkey
     listed = json.loads((await list_route(request("GET", "/studio_native/models/workflows", query={"refresh": "1"}))).body)
     assert {(w["source"], w["path"]) for w in listed["workflows"]} == {
         ("comfy", "anima/original.json"),
+        ("comfy", "wrapped.json"),
+        ("warmup", "mixed.json"),
         ("warmup", "tavern_api.json"),
     }
 

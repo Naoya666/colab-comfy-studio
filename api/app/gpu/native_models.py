@@ -910,29 +910,39 @@ class LocalModels:
 
     def save_workflow(self, raw_name, workflow, *, overwrite=False):
         wrapped = wrap_visual_workflow(workflow)
-        # UI workflows with `nodes` belong in ComfyUI's native workflows folder so both
-        # the ComfyUI sidebar and Studio dropdown can use them; API-only graphs live in
-        # `native-comfy/warmup/` so they never break ComfyUI's canvas loader.
-        is_ui = isinstance(workflow.get("nodes"), list) or isinstance(wrapped.get("workflow"), dict)
-        source = "comfy" if is_ui else "warmup"
-        rel, target = self._resolve_workflow_file(source, raw_name, ensure_json_ext=True, create_parents=True)
-        raw = json.dumps(workflow, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+        visual = wrapped.get("workflow")
+        if visual is not None and not isinstance(visual.get("nodes"), list):
+            raise ModelError("原生工作流必须包含 nodes 数组")
+        # The sidebar reads canvas JSON directly. Keep API graphs and mixed
+        # bundles intact for warmup, where their prompt can drive model detection.
+        source = "comfy" if visual is not None and "prompt" not in wrapped else "warmup"
+        document = visual if source == "comfy" else workflow
+        try:
+            raw = json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+        except (ValueError, UnicodeError, RecursionError):
+            raise ModelError("工作流包含无法保存的 JSON 值") from None
         if len(raw) > MAX_WORKFLOW_FILE_BYTES:
             raise ModelError("工作流文件不能超过 16 MiB")
-        if target.exists() and not overwrite:
-            raise WorkflowConflictError(f"同名工作流「{rel}」已存在，请确认覆盖或更换名称")
-        scratch = target.parent / f".{target.name}.{uuid.uuid4().hex[:8]}.tmp"
         try:
-            with scratch.open("wb") as handle:
-                handle.write(raw)
-                handle.flush()
-                os.fsync(handle.fileno())
-            scratch.replace(target)
-            stat = target.stat()
+            # Serialize Studio writers on the local disk. The Drive mount
+            # provides rename for publishing the complete file.
+            with (self.root / "workflow-save.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                rel, target = self._resolve_workflow_file(source, raw_name, ensure_json_ext=True, create_parents=True)
+                if target.exists() and not overwrite:
+                    raise WorkflowConflictError(f"同名工作流「{rel}」已存在，请确认覆盖或更换名称")
+                scratch = target.parent / f".studio-workflow-{uuid.uuid4().hex}.tmp"
+                try:
+                    with scratch.open("xb") as handle:
+                        handle.write(raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    scratch.replace(target)
+                    stat = target.stat()
+                finally:
+                    scratch.unlink(missing_ok=True)
         except OSError:
             raise ModelError("无法写入 Drive 工作流目录，请检查磁盘与挂载状态") from None
-        finally:
-            scratch.unlink(missing_ok=True)
         return {"source": source, "path": rel, "size": stat.st_size, "modified_at": round(stat.st_mtime, 3)}
 
     def delete_workflow(self, source, raw_path):

@@ -812,7 +812,9 @@ def test_ready_rejects_manager_access_bypass(proxy):
         assert not native.ready(client)
 
 
-@pytest.mark.parametrize('failure,local', [(None, False), (None, True)] + [(f, False) for f in ('requirements', 'log', 'api', 'stale-log', 'node-import')])
+@pytest.mark.parametrize('failure,local', [(None, False), (None, True)] + [
+    (f, False) for f in ('requirements', 'log', 'api', 'stale-log', 'node-import', 'tunnel-install', 'tunnel-ready', 'state')
+])
 def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_path, failure, local):
     import json
     import sys
@@ -841,10 +843,24 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
     monkeypatch.setattr(runtime, 'ROOT', service)
     monkeypatch.setattr(runtime, 'install_rclone', lambda *args: None)
     monkeypatch.setattr(runtime.shutil, 'which', lambda name: '/usr/bin/' + name)
+    monkeypatch.setenv('NATIVE_PARALLEL_BOOTSTRAP', '1')
+    if failure == 'tunnel-install':
+        def fail_install(*args):
+            raise RuntimeError('cloudflared install failed')
+        monkeypatch.setattr(runtime, 'install_cloudflared', fail_install)
+    if failure == 'tunnel-ready':
+        def fail_ready(*args):
+            raise RuntimeError('cloudflared readiness failed')
+        monkeypatch.setattr(runtime, 'wait_for_tunnel', fail_ready)
+    if failure == 'state':
+        def fail_metadata(*args):
+            raise RuntimeError('tunnel metadata failed')
+        monkeypatch.setattr(worker, '_process_metadata', fail_metadata)
+    else:
+        monkeypatch.setattr(worker, '_process_metadata', lambda *args: {'start_id': '1'})
     monkeypatch.setattr(runtime, '_index_models', lambda *args: None)
     monkeypatch.setattr(runtime, 'mount_drive', lambda *args: drive)
     monkeypatch.setattr(worker, '_verify_checkout', lambda *args: None)
-    monkeypatch.setattr(worker, '_process_metadata', lambda *args: {'start_id': '1'})
     commands, launches = [], []
     monkeypatch.setattr(worker, '_run', lambda args, **kwargs: commands.append(args))
 
@@ -855,13 +871,14 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
             raise worker.WorkerError('Manager missing')
         return {'is_processing': False}
     monkeypatch.setattr(worker, '_http_json', http)
-    process = SimpleNamespace(pid=123, stopped=False, killed=False)
-    process.terminate = lambda: setattr(process, 'stopped', True)
-    process.wait = lambda **kwargs: 0
-    process.kill = lambda: setattr(process, 'killed', True)
+    processes = []
 
     def launch(args, **kwargs):
         launches.append((args, kwargs))
+        process = SimpleNamespace(pid=123 + len(processes), stopped=False)
+        process.terminate = lambda: setattr(process, 'stopped', True)
+        process.wait = lambda **kwargs: 0
+        processes.append(process)
         if 'main.py' in args and failure not in {'log', 'stale-log'}:
             kwargs['stdout'].write(b'[START] ComfyUI-Manager\n')
             if failure == 'node-import':
@@ -881,11 +898,11 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
                                          models_folder_id='models', model_channel='test-channel', directories={}, rules={})
         monkeypatch.setattr(runtime, '_index_models', lambda *args: pytest.fail("local mode created a Drive index"))
     if failure:
-        with pytest.raises(RuntimeError, match='Manager|Custom node load failed'):
+        with pytest.raises(RuntimeError, match='Manager|Custom node load failed|cloudflared|tunnel metadata'):
             runtime.run(job, payload, stages)
         assert not (service / 'state.json').exists()
-        assert len(launches) == (0 if failure == 'requirements' else 1)
-        assert process.stopped is (failure != 'requirements')
+        assert len(launches) == {'requirements': 0, 'tunnel-ready': 2, 'state': 3}.get(failure, 1)
+        assert all(process.stopped for process in processes)
         return
 
     runtime.run(job, payload, stages)
@@ -1506,10 +1523,13 @@ def test_native_base_python_uv_fallback_and_env_toggle(monkeypatch, tmp_path):
 
 
 def test_native_env_cache_key_roundtrip_and_corrupt_rollback(monkeypatch, tmp_path):
+    from functools import partial
     from types import SimpleNamespace
 
+    from app.gpu import native_runtime as runtime
     from app.gpu import node_persistence as np
 
+    cache_key = partial(np.compute_env_cache_key, base_packages=runtime._base_python_packages(local=False))
     root = tmp_path / "native"
     comfy = root / "ComfyUI"
     nodes = comfy / "custom_nodes"
@@ -1522,20 +1542,24 @@ def test_native_env_cache_key_roundtrip_and_corrupt_rollback(monkeypatch, tmp_pa
     db_file.write_bytes(b"sqlite-state-v1")
 
     plugins_v1 = np.inventory(nodes)
-    k1 = np.compute_env_cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, plugins_v1)
+    k1 = cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, plugins_v1)
+    local_key = cache_key(
+        comfy, "a" * 40, "gpu_l4_89", nodes, plugins_v1, base_packages=runtime._base_python_packages(local=True),
+    )
+    assert local_key["key"] != k1["key"]
 
     # Runtime SQLite / data drift changes plugin checksum/generation, NOT env-cache key!
     db_file.write_bytes(b"sqlite-state-v2-modified-at-runtime")
     plugins_v2 = np.inventory(nodes)
     assert plugins_v2[0]["checksum"] != plugins_v1[0]["checksum"]
-    k2 = np.compute_env_cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, plugins_v2)
+    k2 = cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, plugins_v2)
     assert k2["key"] == k1["key"]
 
     # Changing GPU architecture, Comfy commit, or plugin requirements MUST change env-cache key
-    assert np.compute_env_cache_key(comfy, "b" * 40, "gpu_l4_89", nodes, plugins_v2)["key"] != k1["key"]
-    assert np.compute_env_cache_key(comfy, "a" * 40, "gpu_t4_75", nodes, plugins_v2)["key"] != k1["key"]
+    assert cache_key(comfy, "b" * 40, "gpu_l4_89", nodes, plugins_v2)["key"] != k1["key"]
+    assert cache_key(comfy, "a" * 40, "gpu_t4_75", nodes, plugins_v2)["key"] != k1["key"]
     (nodes / "weilin" / "requirements.txt").write_text("aiohttp>=3.9\n")
-    k3 = np.compute_env_cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, np.inventory(nodes))
+    k3 = cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, np.inventory(nodes))
     assert k3["key"] != k1["key"]
 
     # Roundtrip pack -> upload -> restore on clean site-packages, plus rollback on failed pip check

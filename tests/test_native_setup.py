@@ -324,14 +324,16 @@ def test_zero_gpu_diagnose_detects_pass_leak_bad_token_and_proxy(env_app, monkey
     })
 
     # Case 1: Ideal offline-Colab pre-flight: Access blocks unauth (302), passes valid token to offline tunnel (530),
-    # and public web URL hits NativeHostMiddleware (200 {"ready": False}).
+    # and the credential-free public web probe hits NativeHostMiddleware.
     def ok_handler(req: httpx.Request) -> httpx.Response:
         if req.url.host == "backend.example.test":
             if req.headers.get("CF-Access-Client-Secret") == "csec-valid":
                 return httpx.Response(530, text="Tunnel offline")
             return httpx.Response(302, headers={"Location": "https://team.cloudflareaccess.com/login"})
         if req.url.host == "comfy.example.test" and req.url.path == "/_studio/api/status":
-            return httpx.Response(200, json={"ready": False})
+            assert "Authorization" not in req.headers
+            assert "CF-Access-Client-Secret" not in req.headers
+            return httpx.Response(401, json={"error": "UNAUTHENTICATED"})
         return httpx.Response(404)
 
     with httpx.Client(transport=httpx.MockTransport(ok_handler)) as mock_client:

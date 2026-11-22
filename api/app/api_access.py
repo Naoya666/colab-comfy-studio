@@ -8,7 +8,7 @@ import re
 import secrets
 from contextlib import nullcontext
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 from .common import APIError
 from .config import settings
@@ -123,7 +123,7 @@ def _strip_prefix(path: str, raw_path: bytes, prefix: str) -> tuple[str, bytes]:
     if raw_path.startswith(raw_prefix):
         rest_raw = raw_path[len(raw_prefix):]
     else:
-        rest_raw = rest_path.encode("utf-8")
+        rest_raw = quote(rest_path, safe="/").encode("ascii")
     if not rest_path:
         return "/", b"/"
     if not rest_path.startswith("/"):
@@ -176,7 +176,7 @@ def match_gateway_route(
 ) -> dict | None:
     """Match incoming ASGI scope for creation or native gateway and return rewritten scope metadata."""
     path: str = scope.get("path", "/")
-    raw_path: bytes = scope.get("raw_path") or path.encode("latin1", "replace")
+    raw_path: bytes = scope.get("raw_path") or quote(path, safe="/").encode("ascii")
     query_bytes: bytes = scope.get("query_string", b"")
 
     token_prefixes = _CREATION_TOKEN_PREFIXES if kind == "creation" else _NATIVE_TOKEN_PREFIXES
@@ -377,27 +377,28 @@ def check_weak_origin(
 
 
 def is_native_blocked_path(path: str, raw_path: bytes | None = None) -> bool:
-    """Block ComfyUI-Manager, custom node installation, reboot, and Studio internal paths in weak/no-auth mode."""
-    candidates = [path]
-    if raw_path:
+    """Reject ambiguous paths before applying weak-access route restrictions."""
+    if not path.startswith("/") or "//" in path or "\\" in path or re.search(r"[\x00-\x1f\x7f]", path):
+        return True
+    if {".", ".."}.intersection(path.split("/")) or re.search(r"%[0-9a-fA-F]{2}", path):
+        return True
+    if raw_path is not None:
         try:
-            candidates.append(unquote(raw_path.decode("latin1")))
-        except UnicodeDecodeError:
+            raw = raw_path.decode("ascii")
+            if re.search(r"[?#\x00-\x20\x7f]|%(?![0-9a-fA-F]{2})|%2f", raw, re.I):
+                return True
+            if unquote(raw, errors="strict") != path:
+                return True
+        except UnicodeError:
             return True
-    for item in candidates:
-        if "\x00" in item or "\\" in item:
-            return True
-        collapsed = re.sub(r"/+", "/", item.strip()) or "/"
-        parts = collapsed.split("/")
-        if any(seg == ".." for seg in parts):
-            return True
-        lowered = collapsed.lower()
-        for candidate in (lowered, lowered.removeprefix("/api") or "/"):
-            normalized = candidate.rstrip("/") or "/"
-            for blocked in _NATIVE_BLOCKED_PREFIXES:
-                if normalized == blocked or normalized.startswith(blocked + "/"):
-                    return True
-    return False
+
+    normalized = path.lower().rstrip("/")
+    internal = normalized.removeprefix("/api") if normalized.startswith("/api/") else normalized
+    return any(
+        candidate == blocked or candidate.startswith(blocked + "/")
+        for candidate in (normalized, internal)
+        for blocked in _NATIVE_BLOCKED_PREFIXES
+    )
 
 
 def build_access_urls(
