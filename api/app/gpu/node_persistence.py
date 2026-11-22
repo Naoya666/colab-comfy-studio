@@ -439,7 +439,9 @@ def fast_tree_fingerprint(nodes: Path) -> str:
                 if fp.exists():
                     fst = fp.lstat()
                     dep_meta[fname] = [fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns]
-        entries.append([str(node.relative_to(nodes)), enabled, st.st_ino, st.st_size, st.st_mtime_ns, dep_meta])
+            entries.append([str(node.relative_to(nodes)), enabled, st.st_ino, dep_meta])
+        else:
+            entries.append([str(node.relative_to(nodes)), enabled, st.st_ino, st.st_size, st.st_mtime_ns, dep_meta])
     return digest(entries)
 
 
@@ -488,6 +490,9 @@ class Remote:
                 '--ignore-times',
                 '--transfers', '8',
                 '--checkers', '8',
+                '--multi-thread-streams', '4',
+                '--multi-thread-cutoff', '16M',
+                '--buffer-size', '32M',
                 '--retries', '3',
                 '--low-level-retries', '10',
                 'studio:native-comfy/plugins/objects',
@@ -515,8 +520,13 @@ class Remote:
             return False
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
+            extra = (
+                ('--multi-thread-streams', '8', '--multi-thread-cutoff', '32M', '--buffer-size', '64M')
+                if name.endswith('.tar.gz')
+                else ()
+            )
             self.command(
-                'copyto', '--ignore-times', '--retries', '3', '--low-level-retries', '10',
+                'copyto', '--ignore-times', *extra, '--retries', '3', '--low-level-retries', '10',
                 'studio:native-comfy/env-cache/' + name, str(target),
             )
             return target.is_file()
@@ -526,8 +536,9 @@ class Remote:
             return False
 
     def put_env_cache(self, source: Path, name: str, *, verify: bool = False) -> None:
+        extra = ('--drive-chunk-size', '128M') if name.endswith('.tar.gz') else ()
         self.command(
-            'copyto', '--ignore-times', '--retries', '3', '--low-level-retries', '10',
+            'copyto', '--ignore-times', *extra, '--retries', '3', '--low-level-retries', '10',
             str(source), 'studio:native-comfy/env-cache/' + name, timeout=900,
         )
         if verify:
