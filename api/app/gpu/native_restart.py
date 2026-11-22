@@ -165,7 +165,7 @@ def submit(repo, owner, instance_id, key):
             if time.monotonic() >= deadline:
                 raise _busy("已有生成、安装或 Drive 写入请求仍在处理")
             time.sleep(0.2)
-        url, headers = native.backend()
+        url, headers = native.backend_for(repo, owner)
         with httpx.Client(timeout=8, follow_redirects=False) as client:
             state = _idle(client, url, headers, lease)
         with _transition(repo):
@@ -313,7 +313,7 @@ def tick(repo):
             try:
                 _validate(repo, lease, operation["instance_id"], operation,
                           check_jobs=phase in {"syncing", "rebooting", "recovering"})
-                url, headers = native.backend()
+                url, headers = native.backend_for(repo, lease["owner_id"])
                 with httpx.Client(timeout=8, follow_redirects=False) as client:
                     if phase == "syncing":
                         _sync_and_reboot(repo, lease, operation, client, url, headers)

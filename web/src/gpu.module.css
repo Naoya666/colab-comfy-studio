@@ -685,3 +685,95 @@
   border-top: 1px solid var(--line);
   font-variant-numeric: tabular-nums;
 }
+
+/* 原生 ComfyUI 配置向导 */
+.wizardBanner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.wizardBanner > div { display: grid; gap: 4px; flex: 1; min-width: 240px; }
+.wizardTabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.wizardTab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-full);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 0.78rem;
+}
+.wizardTab[data-active="true"] {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
+  font-weight: 600;
+}
+.wizardBody {
+  display: grid;
+  gap: 14px;
+  padding-top: 4px;
+}
+.wizardFieldHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wizardCheckList {
+  display: grid;
+  gap: 8px;
+}
+.wizardCheckRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.wizardCheckRow > div { display: grid; gap: 3px; min-width: 0; flex: 1; }
+.wizardCheckTitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.wizardCodeBox {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.wizardCodeHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wizardFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}

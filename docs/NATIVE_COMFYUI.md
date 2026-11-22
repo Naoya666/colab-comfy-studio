@@ -35,7 +35,11 @@
 
 ## 部署
 
-继续使用原有 api/worker/watchdog/model-worker 服务、同一个数据库与数据卷。升级已有部署时运行 `alembic upgrade head`，新增的表保存专用 API Key 和任务归属。以下域名、Access 策略和 tunnel 必须在部署环境配置。
+继续使用原有 api/worker/watchdog/model-worker 服务、同一个数据库与数据卷。升级已有部署时运行 `alembic upgrade head`，新增的表保存专用 API Key 和任务归属。
+
+> **网页配置向导（推荐）**：进入 Studio「原生 ComfyUI」页面点击「配置向导 / 隧道与域名配置」，可按分步指引直接填入 Cloudflare Named Tunnel、Access Service Token、ComfyUI 版本（默认推荐 `423cbd20511becb1f16122ab518e92e58bfa03d9`）与可选独立网页域名，并自动生成 Nginx/Caddy 反代配置与执行免开 GPU 的 6 项预检。凭据使用 `ENCRYPTION_KEY` 加密存库并即时同步至 api/worker/watchdog，**网页加密配置优先，已有 `.env` 与 `./secrets/*` 自动作为兜底兼容**，可随时一键清除网页配置回退环境变量。
+
+以下域名、Access 策略和 tunnel 必须在部署环境配置（或按向导在网页中完成）。
 
 1. 为 VPS 配置 `studio.example.com` 和 `comfy.example.com`，都转发至本项目 API；必须保留原始 Host、编码 URL、查询参数、WebSocket Upgrade，并关闭代理缓冲。示例 [deploy/native-comfy.nginx.conf.example](deploy/native-comfy.nginx.conf.example)。不要把 `/api/*` 单独转到 Studio 路由；整个 Comfy 域名均经过同一网关。当前仅实现独立域名，不提供未经验证的 `/comfy/` 子路径。
 2. 在 Cloudflare 创建 **named tunnel**，另用内部域名，例如 `colab-backend.example.com`，origin 为 Colab 中的 `http://127.0.0.1:8188`。不能将其指向 VPS。此域名配置独立 Access Application，策略使用 **Service Auth**，只允许网关的 service token；不要配置公开 Bypass。启动时网关会验证无 service token 的健康检查不能返回 200。

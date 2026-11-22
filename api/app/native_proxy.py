@@ -30,7 +30,7 @@ from .api_access import (
 )
 from .common import APIError
 from .config import settings
-from .gpu import native
+from .gpu import native, native_config
 from .security import read_session, sign_session
 
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
@@ -65,19 +65,21 @@ def clean_headers(headers, *, request=False):
             and not (not request and k.lower() == "set-cookie")]
 
 
-def identity(headers, cookies):
+def identity(headers, cookies, *, native_url: str | None = None):
     auth = headers.get("authorization", "")
     if auth.startswith("Bearer ") and settings.studio_api_token and secrets.compare_digest(auth[7:], settings.studio_api_token):
         return "owner"
+    resolved_url = (native_url if native_url is not None else settings.native_comfy_url).rstrip("/")
     value = read_session(cookies.get("studio_native", ""))
-    if settings.native_comfy_url and value and value.get("purpose") == "native-session" and value.get("aud") == settings.native_comfy_url.rstrip("/"):
+    if resolved_url and value and value.get("purpose") == "native-session" and value.get("aud") == resolved_url:
         return value.get("uid")
     return None
 
 
-def check_origin(headers):
+def check_origin(headers, *, native_url: str | None = None):
     origin = headers.get("origin")
-    if origin and origin.rstrip("/") != settings.native_comfy_url.rstrip("/"):
+    resolved_url = (native_url if native_url is not None else settings.native_comfy_url).rstrip("/")
+    if origin and origin.rstrip("/") != resolved_url:
         raise APIError("CSRF_ORIGIN", "跨站请求被拒绝", 403)
 
 
@@ -119,7 +121,13 @@ class NativeGateway:
                 "当前仅允许本机免密访问；局域网/容器互通请开启「允许局域网/容器私网访问」或改用 URL 路径短 Token 模式",
                 401,
             )
-        cors = check_weak_origin(headers, via_token=False, allowed_origins=pol.get("allowed_origins"))
+        native_url = native_config.public_url(repo, owner)
+        cors = check_weak_origin(
+            headers,
+            via_token=False,
+            allowed_origins=pol.get("allowed_origins"),
+            extra_trusted_urls=(native_url,) if native_url else (),
+        )
         return owner, pol, cors
 
     def _preflight_cors(self, repo, scope, headers, route_token: str | None) -> dict[str, str]:
@@ -136,8 +144,10 @@ class NativeGateway:
         request = Request(scope, receive)
         cors_headers: dict[str, str] = {}
         try:
+            repo = self.studio_app.state.repo
+            native_url = native_config.public_url(repo)
             if scope["path"] == "/_studio/session":
-                if entry != "host" or not settings.native_comfy_url:
+                if entry != "host" or not native_url:
                     raise APIError("NOT_FOUND", "接口不存在", 404)
                 if request.method != "POST" or headers.get("origin", "").rstrip("/") != settings.site_url.rstrip("/"):
                     raise APIError("CSRF_ORIGIN", "请从 Studio 打开原生 ComfyUI", 403)
@@ -146,18 +156,17 @@ class NativeGateway:
                     raise APIError("PAYLOAD_TOO_LARGE", "登录请求过大", 413)
                 from urllib.parse import parse_qs
                 ticket = read_session(parse_qs(raw.decode()).get("ticket", [""])[0])
-                if not ticket or not ticket.get("uid") or ticket.get("purpose") != "native-handoff" or ticket.get("aud") != settings.native_comfy_url.rstrip("/"):
+                if not ticket or not ticket.get("uid") or ticket.get("purpose") != "native-handoff" or ticket.get("aud") != native_url:
                     raise APIError("UNAUTHENTICATED", "登录凭证已过期，请从 Studio 重新打开", 401)
                 now = int(time.time())
                 token = sign_session({"uid": ticket["uid"], "aud": ticket["aud"], "purpose": "native-session",
                                       "iat": now, "exp": now + 43200})
                 response = RedirectResponse("/", status_code=303)
-                is_https = settings.native_comfy_url.startswith("https://")
+                is_https = native_url.startswith("https://")
                 response.set_cookie("studio_native", token, max_age=43200, secure=is_https, httponly=True, samesite="strict")
                 response.headers["Cache-Control"] = "no-store"
                 return await response(scope, receive, send)
 
-            repo = self.studio_app.state.repo
             if request.method == "OPTIONS" and headers.get("access-control-request-method"):
                 cors_headers = self._preflight_cors(repo, scope, headers, route_token)
                 return await Response(
@@ -173,7 +182,7 @@ class NativeGateway:
             ):
                 key = await asyncio.to_thread(native_api.authenticate, repo.store, auth[7:])
                 cors_headers = cors_headers_for(headers.get("origin"), wildcard_fallback=True)
-            owner = key["owner_id"] if key else identity(headers, request.cookies)
+            owner = key["owner_id"] if key else identity(headers, request.cookies, native_url=native_url)
             if not owner:
                 owner, weak_policy, cors_headers = await asyncio.to_thread(
                     self._resolve_weak_access, repo, scope, headers, route_token
@@ -196,7 +205,7 @@ class NativeGateway:
                 if key:
                     cors_headers = cors_headers_for(headers.get("origin"), wildcard_fallback=True)
                 else:
-                    check_origin(headers)
+                    check_origin(headers, native_url=native_url)
 
             path, file, payload = None, None, None
             if key:
@@ -340,8 +349,8 @@ class NativeGateway:
             await asyncio.sleep(min(remaining, 1))
 
     @staticmethod
-    def target(scope):
-        base, auth = native.backend()
+    def target(scope, repo=None, owner="owner"):
+        base, auth = native.backend_for(repo, owner)
         raw = scope.get("raw_path", scope["path"].encode()).decode("ascii")
         query = scope.get("query_string", b"").decode("ascii")
         return base + raw + ("?" + query if query else ""), base, auth
@@ -351,7 +360,8 @@ class NativeGateway:
         *, key=None, path=None, file=None, payload=None, local=False, cors_headers=None,
     ):
         cors_headers = cors_headers or {}
-        url, base, auth = self.target(scope)
+        repo = self.studio_app.state.repo
+        url, base, auth = self.target(scope, repo=repo, owner=lease["owner_id"])
         if key:
             url = base + quote(path, safe="/")
             if file:
@@ -369,7 +379,6 @@ class NativeGateway:
         mutating = request.method not in {"GET", "HEAD", "OPTIONS"} or (
             request.method == "GET" and path in {"/manager/reboot", "/v2/manager/reboot", "/manager/queue/start"}
         )
-        repo = self.studio_app.state.repo
         if payload is not None:
             headers = [(k, v) for k, v in headers if k.lower() not in {"content-length", "content-type", "content-encoding"}]
             headers.append(("Content-Type", "application/json"))
@@ -399,7 +408,7 @@ class NativeGateway:
             if key and mutating:
                 reservation = await self.reserve_prompt(client, base, auth, repo, key, lease)
             if local:
-                channel = native_model_api.headers(base, auth, lease)
+                channel = native_model_api.headers(base, auth, lease, repo=repo)
                 if request.method == "POST":
                     task = await native_model_api.start(client, base, channel, repo, lease, json.loads(payload), [], visual=False)
                     while True:
@@ -474,7 +483,7 @@ class NativeGateway:
                         data, status_code=response.status_code, headers={"Cache-Control": "no-store", **cors_headers}
                     )(scope, receive, send)
                 response_headers = clean_headers(response.headers)
-                public_origin = (settings.native_comfy_url or settings.site_url).rstrip("/")
+                public_origin = (native_config.public_url(repo, lease["owner_id"]) or settings.site_url).rstrip("/")
                 response_headers = [(k, v.replace(base, public_origin) if k.lower() == "location" else v)
                                     for k, v in response_headers]
                 response_headers += [("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")]
@@ -539,9 +548,10 @@ class NativeGateway:
         ws = WebSocket(scope, receive, send)
         try:
             repo = self.studio_app.state.repo
-            owner = identity(ws.headers, ws.cookies)
+            native_url = native_config.public_url(repo)
+            owner = identity(ws.headers, ws.cookies, native_url=native_url)
             if owner:
-                check_origin(ws.headers)
+                check_origin(ws.headers, native_url=native_url)
             else:
                 if is_native_blocked_path(scope["path"], scope.get("raw_path")):
                     return await ws.close(code=1008)
@@ -551,7 +561,7 @@ class NativeGateway:
             lease = await asyncio.to_thread(native.active_lease, repo, owner) if owner else None
             if not lease or not lease.get("native_ready"):
                 return await ws.close(code=1008)
-            url, base, auth = self.target(scope)
+            url, base, auth = self.target(scope, repo=repo, owner=lease["owner_id"])
             headers = clean_headers(httpx.Headers(scope["headers"]), request=True)
             headers = [(k, v) for k, v in headers if k.lower() not in {"origin", "referer"}]
             headers += list(auth.items())
@@ -597,10 +607,11 @@ def get_native_gateway(studio_app) -> NativeGateway:
 
 
 async def dispatch_native_scope(studio_app, scope, receive, send, *, dedicated_port: bool = False) -> bool:
+    repo = getattr(studio_app.state, "repo", None)
     matched = match_gateway_route(
         scope,
         kind="native",
-        dedicated_host_url=settings.native_comfy_url,
+        dedicated_host_url=native_config.public_url(repo),
         dedicated_port=dedicated_port,
     )
     if matched is None:

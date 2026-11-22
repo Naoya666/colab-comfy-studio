@@ -17,6 +17,7 @@ from app.common import APIError
 from app.config import settings
 from app.security import decrypt_secret
 
+from . import native_config
 from .compute import GpuConfig
 from .manifest import digest
 from .node_persistence import NATIVE_FLAG_NAMES, env_flag
@@ -73,9 +74,21 @@ def lease_storage(repo, lease):
     return model_storage((job or {}).get("execution_policy"))
 
 
-def model_channel(lease_id, tunnel_token=None):
-    token = tunnel_token or secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
+def model_channel(lease_id, tunnel_token=None, *, repo=None, owner="owner"):
+    token = tunnel_token
+    if not token:
+        cfg = native_config.resolve(repo, owner, use_cache=False, file_reader=secret_file)
+        token = cfg.tunnel_token or secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
     return hmac.new(token.encode(), ("native-models:" + lease_id).encode(), hashlib.sha256).hexdigest()
+
+
+_default_model_channel = model_channel
+
+
+def model_channel_for(lease_id, tunnel_token=None, *, repo=None, owner="owner"):
+    if model_channel is not _default_model_channel:
+        return model_channel(lease_id) if tunnel_token is None else model_channel(lease_id, tunnel_token)
+    return model_channel(lease_id, tunnel_token, repo=repo, owner=owner)
 
 
 def secret_file(name):
@@ -91,13 +104,17 @@ def secret_file(name):
     return value
 
 
-def backend():
-    url = settings.native_comfy_backend_url.rstrip("/")
+def backend(repo=None, owner="owner"):
+    cfg = native_config.resolve(repo, owner, use_cache=False, file_reader=secret_file)
+    url = cfg.native_comfy_backend_url.rstrip("/")
     p = urlsplit(url)
     if p.scheme != "https" or not p.hostname or p.username or p.password or p.path or p.query or p.fragment:
         raise APIError("NATIVE_CONFIG", "NATIVE_COMFY_BACKEND_URL 必须为独立 HTTPS 源地址", 503)
-    if p.netloc in {urlsplit(settings.site_url).netloc, urlsplit(settings.native_comfy_url).netloc}:
+    if p.netloc in {urlsplit(settings.site_url).netloc, urlsplit(cfg.native_comfy_url).netloc}:
         raise APIError("NATIVE_CONFIG", "内部 tunnel 域名必须与 Studio 和原生公网域名不同", 503)
+    if cfg.access_client_id and cfg.access_client_secret:
+        return url, {"CF-Access-Client-Id": cfg.access_client_id,
+                     "CF-Access-Client-Secret": cfg.access_client_secret}
     try:
         access = json.loads(secret_file("NATIVE_COMFY_ACCESS_FILE"))
         if not isinstance(access, dict) or any(not isinstance(access.get(k), str) or not access[k] for k in ("client_id", "client_secret")):
@@ -106,6 +123,15 @@ def backend():
         raise APIError("NATIVE_CONFIG", "Access 凭据文件必须包含 client_id 和 client_secret", 503) from exc
     return url, {"CF-Access-Client-Id": access["client_id"],
                  "CF-Access-Client-Secret": access["client_secret"]}
+
+
+_default_backend = backend
+
+
+def backend_for(repo=None, owner="owner"):
+    if backend is not _default_backend:
+        return backend()
+    return backend(repo, owner)
 
 
 def active_lease(repo, owner="owner"):
@@ -126,10 +152,10 @@ def guard_generation(repo, owner, policy):
             raise APIError("NATIVE_RESTARTING", "原生 ComfyUI 正在重启，请等当前操作完成后重试", 409, True)
 
 
-def busy(client=None):
+def busy(client=None, *, repo=None, owner="owner"):
     """Unknown is busy: network errors must never stop a video or an upload."""
     try:
-        url, headers = backend()
+        url, headers = backend_for(repo, owner)
         with httpx.Client(timeout=8) if client is None else _borrow(client) as c:
             q = c.get(url + "/queue", headers=headers)
             q.raise_for_status()
@@ -142,6 +168,15 @@ def busy(client=None):
             return queued or state.json().get("busy") is not False
     except Exception:
         return True
+
+
+_default_busy = busy
+
+
+def busy_for(repo=None, owner="owner", client=None):
+    if busy is not _default_busy:
+        return busy() if client is None else busy(client)
+    return busy(client=client, repo=repo, owner=owner)
 
 
 class _borrow:
@@ -165,11 +200,13 @@ def admit(repo, owner, body, key, *, api_key_id=None):
             raise APIError("NATIVE_INPUT", f"{field} 必须为正整数（分钟）", 422)
         timeouts[field] = value
     storage = model_storage(body, validate=True)
-    if (not settings.native_comfy_url and not settings.native_comfy_backend_url) or not cfg.real_enabled:
+    ncfg = native_config.resolve(repo, owner, use_cache=False, file_reader=secret_file)
+    if (not ncfg.native_comfy_url and not ncfg.native_comfy_backend_url) or not cfg.real_enabled:
         raise APIError("NATIVE_DISABLED", "请先配置原生 ComfyUI 隧道并启用真实 GPU", 503)
-    backend()
-    secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
-    commit = os.getenv("NATIVE_COMFY_COMMIT", "")
+    backend_for(repo, owner)
+    if not ncfg.tunnel_token:
+        secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
+    commit = ncfg.native_comfy_commit
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise APIError("NATIVE_CONFIG", "NATIVE_COMFY_COMMIT 必须锁定 40 位官方提交", 503)
     if not key or len(key) > 200:
@@ -270,7 +307,8 @@ def runtime_secrets(repo, job):
         else:
             client_id, client_secret, _ = google._config()
         storage = model_storage(job.get("execution_policy"))
-        tunnel = secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
+        ncfg = native_config.resolve(repo, job["owner_id"], use_cache=False, file_reader=secret_file)
+        tunnel = ncfg.tunnel_token or secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
         local = storage["model_storage_mode"] == "local"
         default = AccountService.default_account_id(job["owner_id"])
         drive_account = drive.account_id or default
@@ -519,7 +557,7 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
             # A VPS mirror outage must not replace the last committed manifest.
             pass
     identity = _lease_identity(lease)
-    upstream_busy = busy()
+    upstream_busy = busy_for(repo, lease["owner_id"])
     # An offline tunnel also reports "busy". It cannot veto reconciliation of
     # a VM already confirmed absent by Colab's independent control plane.
     remote_deleted = check_remote and upstream_busy and _runtime_deleted(repo, lease)
@@ -636,9 +674,9 @@ def update_write(repo, lease, write_id, *, finished=False):
         time.sleep(0.02)
 
 
-def ready(client=None):
+def ready(client=None, *, repo=None, owner="owner"):
     try:
-        url, headers = backend()
+        url, headers = backend_for(repo, owner)
         with httpx.Client(timeout=8, follow_redirects=False) if client is None else _borrow(client) as c:
             # Service-token protection of the internal tunnel is mandatory.
             # Probe installation paths with GET only: never submit an installation.
@@ -667,9 +705,18 @@ def ready(client=None):
         return False
 
 
+_default_ready = ready
+
+
+def ready_for(repo=None, owner="owner", client=None):
+    if ready is not _default_ready:
+        return ready() if client is None else ready(client)
+    return ready(client=client, repo=repo, owner=owner)
+
+
 def sync_plugins(repo, lease, client=None):
     """Pull committed metadata over the existing authenticated tunnel; no GPU token on VPS."""
-    url, headers = backend()
+    url, headers = backend_for(repo, lease["owner_id"])
     with httpx.Client(timeout=15) if client is None else _borrow(client) as c:
         response = c.get(url + '/studio_native/state', headers=headers)
         response.raise_for_status()

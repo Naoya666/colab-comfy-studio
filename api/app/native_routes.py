@@ -11,8 +11,7 @@ from fastapi import APIRouter, Depends, Request
 from . import native_api, native_model_api
 from .api_access import build_access_urls, get_or_create_path_code, peek_path_code, reset_path_code
 from .common import APIError, admin, current_user, ok
-from .config import settings
-from .gpu import native, native_restart
+from .gpu import native, native_config, native_restart
 from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
 from .port_listeners import probe_port_available
 from .security import sign_session
@@ -36,10 +35,43 @@ def _access_metadata(store, owner: str, pol: dict) -> tuple[str | None, dict]:
         auth_mode=pol.get("auth_mode", "strict"),
         path_code=code,
         listen_port=pol.get("listen_port"),
-        dedicated_url=settings.native_comfy_url,
+        dedicated_url=native_config.public_url(store, owner),
         allow_lan=bool(pol.get("allow_lan")),
     )
     return code, urls
+
+
+@router.get("/setup")
+def get_setup(request: Request, user=Depends(current_user)):
+    admin(user)
+    response = ok(native_config.public_setup(request.app.state.repo, user["id"]), request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.put("/setup")
+def save_setup(body: dict, request: Request, user=Depends(current_user)):
+    admin(user)
+    response = ok(native_config.save_setup(request.app.state.repo, user["id"], body), request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.delete("/setup")
+def clear_setup(request: Request, user=Depends(current_user)):
+    admin(user)
+    response = ok(native_config.clear_setup(request.app.state.repo, user["id"]), request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/setup/diagnose")
+async def diagnose_setup(request: Request, user=Depends(current_user)):
+    admin(user)
+    result = await asyncio.to_thread(native_config.diagnose_setup, request.app.state.repo, user["id"])
+    response = ok(result, request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @router.get("/api-settings")
@@ -53,7 +85,7 @@ def api_settings(request: Request, user=Depends(current_user)):
     starts = [job for job in repo.list("jobs", owner) if job.get("native_api_key_id")]
     return ok({
         "policy": pol,
-        "url": settings.native_comfy_url.rstrip("/"),
+        "url": native_config.public_url(repo.store, owner),
         "path_code": path_code,
         "urls": urls,
         "listener": _listener_status(request.app),
@@ -90,7 +122,7 @@ def rotate_native_path_code(request: Request, user=Depends(current_user)):
         auth_mode=pol.get("auth_mode", "strict"),
         path_code=code,
         listen_port=pol.get("listen_port"),
-        dedicated_url=settings.native_comfy_url,
+        dedicated_url=native_config.public_url(store, owner),
         allow_lan=bool(pol.get("allow_lan")),
     )
     response = ok({"path_code": code, "urls": urls}, request)
@@ -147,7 +179,7 @@ async def status(request: Request, user=Depends(current_user)):
     disk = {}
     if lease and lease.get("native_ready") and not native.restart_active(lease):
         try:
-            url, headers = native.backend()
+            url, headers = native.backend_for(repo, user["id"])
             async with httpx.AsyncClient(timeout=8) as client:
                 response = await client.get(url + "/system_stats", headers=headers)
                 ready = response.status_code == 200 and isinstance(response.json().get("system"), dict)
@@ -160,7 +192,11 @@ async def status(request: Request, user=Depends(current_user)):
             pass
     events = repo.list("events", user["id"]) if job else []
     can_restart = ready and native_restart.can_restart(repo, lease)
-    return ok({"configured": bool(settings.native_comfy_url or settings.native_comfy_backend_url), "url": settings.native_comfy_url,
+    ncfg = native_config.resolve(repo, user["id"], use_cache=False, file_reader=native.secret_file, strict_decrypt=False)
+    return ok({"configured": bool(ncfg.tunnel_configured or (not ncfg.has_db_override and ncfg.any_configured)),
+               "tunnel_configured": ncfg.tunnel_configured,
+               "web_ui_configured": ncfg.web_ui_configured,
+               "url": ncfg.native_comfy_url,
                "timeouts": native.timeout_options(), "model_storage_defaults": native.model_storage_defaults(),
                "model_storage_known": not lease or bool(lease.get("native_model_storage")),
                "model_storage": native.lease_storage(repo, lease) if lease else (
@@ -204,11 +240,11 @@ def _local_lease(request, owner):
 
 @router.get("/workflows")
 async def list_workflows(request: Request, refresh: bool = False, user=Depends(current_user)):
-    _, lease = await asyncio.to_thread(_local_lease, request, user["id"])
-    base, auth = native.backend()
+    repo, lease = await asyncio.to_thread(_local_lease, request, user["id"])
+    base, auth = native.backend_for(repo, user["id"])
     suffix = "/workflows?refresh=1" if refresh else "/workflows"
     async with httpx.AsyncClient() as client:
-        result = await native_model_api.rpc(client, "GET", base, native_model_api.headers(base, auth, lease), suffix)
+        result = await native_model_api.rpc(client, "GET", base, native_model_api.headers(base, auth, lease, repo=repo), suffix)
     return ok(result, request)
 
 
@@ -223,10 +259,10 @@ async def save_workflow(body: dict, request: Request, user=Depends(current_user)
     write_id = uuid4().hex
     await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
     try:
-        base, auth = native.backend()
+        base, auth = native.backend_for(repo, user["id"])
         async with httpx.AsyncClient() as client:
             result = await native_model_api.rpc(
-                client, "POST", base, native_model_api.headers(base, auth, lease), "/workflows",
+                client, "POST", base, native_model_api.headers(base, auth, lease, repo=repo), "/workflows",
                 body={"name": body["name"], "workflow": body["workflow"], "overwrite": body.get("overwrite", False)},
             )
         return ok(result, request, 201)
@@ -242,10 +278,10 @@ async def delete_workflow(source: str, path: str, request: Request, user=Depends
     write_id = uuid4().hex
     await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
     try:
-        base, auth = native.backend()
+        base, auth = native.backend_for(repo, user["id"])
         async with httpx.AsyncClient() as client:
             result = await native_model_api.rpc(
-                client, "POST", base, native_model_api.headers(base, auth, lease), "/workflows/delete",
+                client, "POST", base, native_model_api.headers(base, auth, lease, repo=repo), "/workflows/delete",
                 body={"source": source, "path": path},
             )
         return ok(result, request)
@@ -278,10 +314,10 @@ async def prepare_models(body: dict, request: Request, user=Depends(current_user
     write_id = uuid4().hex
     await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
     try:
-        base, auth = native.backend()
+        base, auth = native.backend_for(repo, user["id"])
         async with httpx.AsyncClient() as client:
             result = await native_model_api.start(
-                client, base, native_model_api.headers(base, auth, lease), repo, lease,
+                client, base, native_model_api.headers(base, auth, lease, repo=repo), repo, lease,
                 workflow, body.get("dependencies", []), visual=True, workflow_ref=workflow_ref,
             )
         return ok(result, request, 202)
@@ -291,19 +327,19 @@ async def prepare_models(body: dict, request: Request, user=Depends(current_user
 
 @router.get("/model-preparation/{ident}")
 async def model_preparation(ident: str, request: Request, user=Depends(current_user)):
-    _, lease = await asyncio.to_thread(_local_lease, request, user["id"])
+    repo, lease = await asyncio.to_thread(_local_lease, request, user["id"])
     if ident != "latest" and not re.fullmatch(r"[0-9a-f]{32}", ident):
         raise APIError("NATIVE_MODEL_PREPARATION_MISSING", "准备记录不存在", 404)
-    base, auth = native.backend()
+    base, auth = native.backend_for(repo, user["id"])
     async with httpx.AsyncClient() as client:
-        result = await native_model_api.rpc(client, "GET", base, native_model_api.headers(base, auth, lease),
+        result = await native_model_api.rpc(client, "GET", base, native_model_api.headers(base, auth, lease, repo=repo),
                                             "/prepare/" + ident)
     return ok(result, request)
 
 
 @router.post("/ticket")
 def ticket(request: Request, user=Depends(current_user)):
-    url = settings.native_comfy_url.rstrip("/")
+    url = native_config.public_url(request.app.state.repo, user["id"])
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower()
     is_local_http = parsed.scheme == "http" and (host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".localhost"))

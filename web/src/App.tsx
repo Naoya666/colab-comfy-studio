@@ -1718,7 +1718,7 @@ export default function App() {
           </section>
         )}
 
-        {tab === '原生 ComfyUI' && <NativeComfyPage usage={usage} accounts={accounts} accountsLoaded={accountsLoaded} instances={instances} desktop={desktop} />}
+        {tab === '原生 ComfyUI' && <NativeComfyPage usage={usage} accounts={accounts} accountsLoaded={accountsLoaded} instances={instances} desktop={desktop} onOpenSettings={() => navigate('设置')} />}
 
         {tab === '设置' && (
           <SettingsPanel

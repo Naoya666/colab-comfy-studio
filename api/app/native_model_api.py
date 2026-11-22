@@ -52,8 +52,12 @@ def runtime_context(repo, lease, *, credentials=True):
     return {"catalog": catalog, "tokens": lib.tokens(), "drive_auth": drive_auth}
 
 
-def headers(base, auth, lease):
-    return {**auth, "Origin": base, "X-Studio-Model-Channel": native.model_channel(lease["id"])}
+def headers(base, auth, lease, repo=None):
+    return {
+        **auth,
+        "Origin": base,
+        "X-Studio-Model-Channel": native.model_channel_for(lease["id"], repo=repo, owner=lease.get("owner_id", "owner")),
+    }
 
 
 async def rpc(client, method, base, auth, suffix, *, body=None, timeout=20):

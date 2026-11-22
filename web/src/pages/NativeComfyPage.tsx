@@ -5,6 +5,7 @@ import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import { NativeModelSettings, type ModelStorage } from '../components/NativeModelSettings';
 import { NativeModelPreparation } from '../components/NativeModelPreparation';
 import { NativeApiSettings } from '../components/NativeApiSettings';
+import { NativeSetupWizard } from '../components/NativeSetupWizard';
 import type { GpuAccount, GpuInstance } from '../components/AccountDirectory';
 import { formatInstanceTime } from '../lib/instance-time';
 import { submitNativeHandoff } from '../lib/native-handoff';
@@ -64,7 +65,7 @@ function saveNativePrefs(prefs: NativePrefs) {
 }
 type RestartPhase = 'checking' | 'syncing' | 'rebooting' | 'recovering' | 'succeeded' | 'failed';
 type NativeRestart = { restart_id: string; instance_id: string; phase: RestartPhase; failed_phase?: RestartPhase; error?: string };
-type NativeStatus = { configured: boolean; ready: boolean; can_restart: boolean; restart?: NativeRestart; state: string; instance_id?: string; job_id?: string | null; error?: string; timeouts: { defaults: Timeouts }; model_storage_defaults: ModelStorage; model_storage?: ModelStorage; model_storage_known?: boolean; disk?: { disk_free_bytes?: number; vfs_cache_bytes?: number }; events: { state?: string; message?: string }[] };
+type NativeStatus = { configured: boolean; tunnel_configured?: boolean; web_ui_configured?: boolean; url?: string; ready: boolean; can_restart: boolean; restart?: NativeRestart; state: string; instance_id?: string; job_id?: string | null; error?: string; timeouts: { defaults: Timeouts }; model_storage_defaults: ModelStorage; model_storage?: ModelStorage; model_storage_known?: boolean; disk?: { disk_free_bytes?: number; vfs_cache_bytes?: number }; events: { state?: string; message?: string }[] };
 const restartMessages: Record<RestartPhase, string> = {
   checking: '检查生成、安装和 Drive 同步状态',
   syncing: '同步模型索引',
@@ -74,8 +75,8 @@ const restartMessages: Record<RestartPhase, string> = {
   failed: 'ComfyUI 重启失败',
 };
 
-export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, desktop }: {
-  usage: GpuUsage | null; accounts: GpuAccount[]; accountsLoaded: boolean; instances: GpuInstance[]; desktop: boolean;
+export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, desktop, onOpenSettings }: {
+  usage: GpuUsage | null; accounts: GpuAccount[]; accountsLoaded: boolean; instances: GpuInstance[]; desktop: boolean; onOpenSettings?: () => void;
 }) {
   const initialPrefs = useMemo(() => loadNativePrefs(), []);
   const eligibleAccounts = useMemo(
@@ -102,6 +103,7 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const [storage, setStorage] = useState<ModelStorage | undefined>(() => initialPrefs.storage);
   const [idleMinutes, setIdleMinutes] = useState(() => initialPrefs.idleMinutes ?? '');
   const [runtimeMinutes, setRuntimeMinutes] = useState(() => initialPrefs.runtimeMinutes ?? '');
+  const [wizardRequest, setWizardRequest] = useState<{ seq: number; step?: 1 | 2 | 3 | 4 | 5 } | null>(null);
   const timeoutsInitialized = useRef(Boolean(initialPrefs.storage && initialPrefs.idleMinutes && initialPrefs.runtimeMinutes));
   const accountEligible = eligibleAccounts.some(a => a.account_id === account);
 
@@ -176,7 +178,7 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
       }
       if (data.ready && autoOpen) {
         setAutoOpen(false);
-        if (!desktop) await enter(false, signal);
+        if (!desktop && data.web_ui_configured !== false) await enter(false, signal);
       }
     } catch (cause) { if (!signal.aborted) setError(apiMessage(cause)); }
   }, [autoOpen, desktop]);
@@ -229,12 +231,40 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     } catch (cause) { setError(apiMessage(cause)); }
     finally { sendingStart.current = false; setStarting(false); }
   }
+  const openSetupWizard = useCallback((step?: 1 | 2 | 3 | 4 | 5) => {
+    setWizardRequest(current => ({ seq: (current?.seq || 0) + 1, step }));
+  }, []);
+  const refreshStatusNow = useCallback(() => {
+    const controller = new AbortController();
+    void pollStatus(controller.signal);
+  }, [pollStatus]);
+  const webUiReady = status?.web_ui_configured !== false;
   return <section className={`card ${styles.nativeWorkspace}`}>
     <div className="actions nativeApiHeading">
       <h1>原生 ComfyUI</h1>
-      <NativeApiSettings accounts={accounts} />
+      <div className="actions">
+        <NativeSetupWizard
+          configured={status?.configured}
+          webUiConfigured={status?.web_ui_configured}
+          openRequest={wizardRequest}
+          onSaved={refreshStatusNow}
+          onOpenSettings={onOpenSettings}
+        />
+        <NativeApiSettings accounts={accounts} />
+      </div>
     </div>
     <p>打开官方节点编辑器。可以直接导入工作流 JSON 或拖入带工作流的原图，使用原生保存、扩展和 Manager。</p>
+    {status && (!status.configured || status.tunnel_configured === false) && (
+      <div className={styles.wizardBanner} role="region" aria-label="原生 ComfyUI 初始配置引导">
+        <div>
+          <strong>首次使用？按向导完成 Cloudflare 隧道与凭据配置</strong>
+          <p className="muted small">
+            无需手动编辑服务器 .env 或设置 ./secrets 文件权限。通过向导填入 Cloudflare Named Tunnel、Access Service Token 与版本即可加密同步至后端并执行免开机预检；仅给酒馆调用 API 时还可省去第二个公网域名。
+          </p>
+        </div>
+        <button type="button" className="button" onClick={() => openSetupWizard(1)}>打开配置向导</button>
+      </div>
+    )}
     {scheduledSession && <div className={styles.inlinePanel} role="status">
       已运行 {scheduledSession.elapsed_minutes.toFixed(1)} 分钟 · 实扣 {cuNumber(scheduledSession.actual_cu)} CU
       {scheduledSession.draining && <p className={styles.cuWarning}>正在排空会话，队列与 Drive 同步空闲后释放。</p>}
@@ -258,14 +288,25 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
           <p className="muted small">修改模型存储模式和缓存参数需停止当前实例后重新启动。</p>
         </div>}
         {status?.ready && effective?.model_storage_mode === 'local' && <NativeModelPreparation />}
-        {(status?.ready || restartInProgress || (status?.instance_id && restart)) ? <div className="actions">
-          <button className="button" disabled={!status?.ready || restartInProgress || entering}
-            title={desktop ? '在新标签页打开' : undefined} onClick={() => void enter(desktop)}>
-            {entering ? '正在连接…' : '进入原生 ComfyUI'}{desktop && <ArrowUpRight size={16} aria-hidden />}
-          </button>
-          <button className="button secondary" disabled={!status?.can_restart || restartInProgress}
-            onClick={() => restartDialog.current?.showModal()}>{restartInProgress ? '正在重启…' : '重启原生 ComfyUI'}</button>
-        </div> : <>
+        {(status?.ready || restartInProgress || (status?.instance_id && restart)) ? <>
+          <div className="actions">
+            {webUiReady ? (
+              <button className="button" disabled={!status?.ready || restartInProgress || entering}
+                title={desktop ? '在新标签页打开' : undefined} onClick={() => void enter(desktop)}>
+                {entering ? '正在连接…' : '进入原生 ComfyUI'}{desktop && <ArrowUpRight size={16} aria-hidden />}
+              </button>
+            ) : (
+              <button className="button secondary" type="button" onClick={() => openSetupWizard(4)}>
+                补充网页域名以打开官方 UI
+              </button>
+            )}
+            <button className="button secondary" disabled={!status?.can_restart || restartInProgress}
+              onClick={() => restartDialog.current?.showModal()}>{restartInProgress ? '正在重启…' : '重启原生 ComfyUI'}</button>
+          </div>
+          {!webUiReady && (
+            <p className="muted small">当前为「仅 API 模式」（未配置独立原生网页域名），可直接点右上角「API 设置」复制路径短码或独立端口地址供酒馆使用。</p>
+          )}
+        </> : <>
           <label className="field">Google 账号<select value={account} onChange={e => { setAccount(e.target.value); key.current = crypto.randomUUID(); }}>
             <option value="">选择账号</option>
             {eligibleAccounts.map(a => <option key={a.account_id} value={a.account_id}>{a.alias || a.account_id}</option>)}
@@ -289,9 +330,9 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
           </div>
           <p className="muted small">参数在本次启动时生效。到期后停止接收新任务，等待生成和同步完成后释放 GPU。调整已有原生会话的参数需先停止旧实例。</p>
           <button className="button" disabled={!!blocked || starting || startupPending || !accountsLoaded || !accountEligible || !spec || !status?.configured || !validTimeouts || !validStorage} onClick={() => void start()}>
-            {starting ? '正在提交…' : startupPending ? '正在启动…' : desktop ? '启动 / 复用 GPU' : '启动 / 复用 GPU 并进入'}
+            {starting ? '正在提交…' : startupPending ? '正在启动…' : desktop || !webUiReady ? '启动 / 复用 GPU' : '启动 / 复用 GPU 并进入'}
           </button>
-          {status && !status.configured && <p className="status">请按部署文档配置原生 ComfyUI 域名和隧道。</p>}
+          {status && !status.configured && <p className="status">尚未完成 Cloudflare 隧道与凭据配置，请点击上方「打开配置向导」。</p>}
         </>}
         <dialog className="nativeRestartDialog" ref={restartDialog} aria-labelledby="native-restart-title" aria-describedby="native-restart-description">
           <h2 id="native-restart-title">重启原生 ComfyUI</h2>

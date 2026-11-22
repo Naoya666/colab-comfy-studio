@@ -1151,8 +1151,8 @@ class Scheduler:
             if (job.get("snapshot") or {}).get("native_comfy"):
                 from app.config import settings
 
-                from .native import model_storage, ready
-                if not ready():
+                from .native import model_storage, ready_for
+                if not ready_for(self.store, job["owner_id"]):
                     if job.get("stage") != "native_tunnel":
                         self._event(job, "running", "等待代理健康检查及内部隧道鉴权验证", None)
                         return self._update("jobs", job["id"], {"stage": "native_tunnel"}, job["owner_id"])
