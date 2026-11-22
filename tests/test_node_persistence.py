@@ -2,7 +2,9 @@
 import hashlib
 import json
 import shutil
+import sqlite3
 import subprocess
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -583,22 +585,32 @@ def test_content_change_between_hash_and_validation_is_rejected(tmp_path, monkey
         p.checked_source(source, p.source_stamp(source))
 
 
-def test_sqlite_transient_sidecar_files_excluded_from_inventory_and_archive(setup):
+def test_plugin_backup_captures_committed_wal_data_without_archiving_sidecars(setup):
     new, _ = setup
     instance = new('sqlite-wal')
     node = add(instance, 'weilin-demo')
     data_dir = node / 'user_data'
     data_dir.mkdir()
-    (data_dir / 'tags.db').write_bytes(b'sqlite-main')
-    before = p.digest(p.inventory(instance.nodes))
-    (data_dir / 'tags.db-wal').write_bytes(b'wal-bytes-1')
-    (data_dir / 'tags.db-shm').write_bytes(b'shm-bytes-1')
-    (data_dir / 'tags.db-journal').write_bytes(b'journal-bytes')
-    after = p.digest(p.inventory(instance.nodes))
-    assert before == after
-    sync(instance)
-    restored = new('sqlite-wal-restored')
-    restored.restore()
-    assert (restored.nodes / 'weilin-demo/user_data/tags.db').read_bytes() == b'sqlite-main'
-    assert not (restored.nodes / 'weilin-demo/user_data/tags.db-wal').exists()
-    assert not (restored.nodes / 'weilin-demo/user_data/tags.db-shm').exists()
+    db = data_dir / 'tags.db'
+    with closing(sqlite3.connect(db)) as writer:
+        writer.execute('PRAGMA journal_mode=WAL')
+        writer.execute('CREATE TABLE tags (name TEXT)')
+        writer.commit()
+        writer.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        original_main = db.read_bytes()
+        original = sync(instance)['manifest']['generation']
+
+        writer.execute("INSERT INTO tags VALUES ('committed')")
+        writer.commit()
+        assert db.read_bytes() == original_main
+        writer.execute("INSERT INTO tags VALUES ('uncommitted')")
+        latest = sync(instance)['manifest']['generation']
+        assert latest != original
+
+        restored = new('sqlite-wal-restored')
+        restored.restore()
+        restored_db = restored.nodes / 'weilin-demo/user_data/tags.db'
+        assert [entry.name for entry in restored_db.parent.iterdir()] == ['tags.db']
+        assert sync(restored)['manifest']['generation'] == latest
+        with closing(sqlite3.connect(restored_db)) as reader:
+            assert reader.execute('SELECT name FROM tags').fetchall() == [('committed',)]

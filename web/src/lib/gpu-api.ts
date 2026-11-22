@@ -340,12 +340,12 @@ export function getCuSessions({
   endDate?: string;
   limit: number;
   offset: number;
-}) {
+}, signal?: AbortSignal) {
   const query = new URLSearchParams({ kind, limit: String(limit), offset: String(offset) });
   if (date) query.set('date', date);
   if (startDate) query.set('start_date', startDate);
   if (endDate) query.set('end_date', endDate);
-  return apiFetch<CuSessionsPage>(`/api/gpu/cu/sessions?${query}`, { cache: 'no-store' });
+  return apiFetch<CuSessionsPage>(`/api/gpu/cu/sessions?${query}`, { cache: 'no-store', signal });
 }
 export function getCuDaily({
   startDate,
@@ -357,11 +357,11 @@ export function getCuDaily({
   endDate?: string;
   limit: number;
   offset: number;
-}) {
+}, signal?: AbortSignal) {
   const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   if (startDate) query.set('start_date', startDate);
   if (endDate) query.set('end_date', endDate);
-  return apiFetch<CuDailyPage>(`/api/gpu/cu/daily?${query}`, { cache: 'no-store' });
+  return apiFetch<CuDailyPage>(`/api/gpu/cu/daily?${query}`, { cache: 'no-store', signal });
 }
 export const queryCcuBalance = () => apiFetch<CcuBalance>('/api/gpu/compute/cu-balance', { cache: 'no-store' }, 60000);
 export const getGpuSettings = () => apiFetch<GpuSettings>('/api/gpu/settings');

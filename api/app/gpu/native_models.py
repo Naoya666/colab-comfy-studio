@@ -317,10 +317,13 @@ class LocalModels:
             identities = {row.get("sha256") for row in candidates}
             if len(identities) != 1 or None in identities:
                 raise ModelError("同类别和路径存在多个版本，请补充 SHA-256 或使用不同相对路径")
-        sources = {(row.get("source") or {}).get("download_url") for row in verified or candidates} - {None}
+        bindings = [row["source"] for row in verified or candidates if row.get("source")]
+        sources = {binding.get("download_url") for binding in bindings} - {None}
         if len(sources) > 1 or (not verified and (len(urls | sources) > 1 or any(e.get("conflict") for e in entries))):
             raise ModelError("工作流与模型库的来源冲突，请核对并绑定已验证的来源")
         url = next(iter(sources or urls), None)
+        source_kind = next((binding.get("kind") for binding in bindings
+                            if url and binding.get("download_url") == url and binding.get("kind")), None)
         drive = next((r for r in candidates if r.get("drive_file_id") and r.get("account") in self.drive_auth), None)
         if not drive:
             drive = next((r for r in candidates if r.get("drive_file_id")), None)
@@ -344,7 +347,7 @@ class LocalModels:
             raise ModelError("本地有多个模型匹配该引用，请核对目录别名和版本")
         target = next(iter(available), target)
         md5 = next(iter(md5s), None) or (drive or {}).get("md5")
-        return target, {"url": url, "drive": drive, "sha256": digest, "size": size, "md5": md5}
+        return target, {"url": url, "source_kind": source_kind, "drive": drive, "sha256": digest, "size": size, "md5": md5}
 
     def stamp(self, target):
         stat = target.stat()
@@ -551,7 +554,7 @@ class LocalModels:
                 filename(target.name, model_type=target_category)
             if url:
                 if is_controlled_upscale_extension(target.name):
-                    validate_controlled_upscale_source(url)
+                    validate_controlled_upscale_source(url, source=plan.get("source_kind"))
                 update(state="downloading", source="external", host=urlsplit(url).hostname)
                 try:
                     self.transfer(https_url(url), target, plan, update)

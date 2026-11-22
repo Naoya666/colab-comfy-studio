@@ -13,12 +13,14 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 import tomllib
+from contextlib import closing, contextmanager
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -132,7 +134,32 @@ def checked_source(path, stamp):
     return result
 
 
-def files(folder):
+@contextmanager
+def sqlite_snapshot(path, limit):
+    deadline = time.monotonic() + 5
+
+    def check_progress(_status, _remaining, _total):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f'SQLite snapshot timed out: {path}; retrying after settling')
+
+    with tempfile.TemporaryDirectory(prefix='studio-plugin-db-') as temp:
+        snapshot = Path(temp) / path.name
+        try:
+            with closing(sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=1)) as source:
+                source.execute('BEGIN')
+                page_size = source.execute('PRAGMA page_size').fetchone()[0]
+                page_count = source.execute('PRAGMA page_count').fetchone()[0]
+                if page_count * page_size > limit * 1024**2:
+                    raise RuntimeError(f'Plugin SQLite snapshot exceeds {limit} MiB: {path}')
+                with closing(sqlite3.connect(snapshot)) as target:
+                    source.backup(target, pages=256, progress=check_progress)
+        except sqlite3.Error as exc:
+            raise RuntimeError(f'Cannot snapshot plugin SQLite database: {path}; retrying after settling') from exc
+        snapshot.chmod(path.stat().st_mode & 0o777)
+        yield snapshot
+
+
+def files(folder, *, archive=None, snapshot_databases=True):
     """Never follow links or archive credentials, environments, or Git auth config."""
     for base, dirs, names in os.walk(folder, followlinks=False):
         if any((Path(base) / d).is_symlink() for d in dirs if d not in EXCLUDE):
@@ -147,10 +174,21 @@ def files(folder):
             limit = 128 if path.suffix.lower() == '.csv' else 64
             if path.stat().st_size > limit * 1024**2:
                 raise RuntimeError(f'Plugin source file exceeds {limit} MiB: {path}; store weights under Drive models')
-            yield path, checked_source(path, source_stamp(path))
+            with path.open('rb') as source:
+                is_database = snapshot_databases and source.read(16) == b'SQLite format 3\x00'
+            if is_database:
+                with sqlite_snapshot(path, limit) as snapshot:
+                    checksum = checked_source(snapshot, source_stamp(snapshot))
+                    if archive is not None:
+                        archive.add(snapshot, arcname=str(path.relative_to(folder)), recursive=False)
+            else:
+                checksum = checked_source(path, source_stamp(path))
+                if archive is not None:
+                    archive.add(path, arcname=str(path.relative_to(folder)), recursive=False)
+            yield path, checksum
 
 
-def inventory(nodes):
+def inventory(nodes, *, snapshot_databases=True):
     result = []
     candidates = []
     for path in sorted(nodes.iterdir()):
@@ -165,7 +203,7 @@ def inventory(nodes):
             raise RuntimeError(f'Plugin symlink is not supported: {node}')
         if node.is_file() and not node.name.endswith(('.py', '.py.disabled')):
             continue
-        entries = list(files(node)) if node.is_dir() else [(node, file_hash(node))]
+        entries = list(files(node, snapshot_databases=snapshot_databases)) if node.is_dir() else [(node, file_hash(node))]
         if node.is_file():
             check_credentials(node.read_bytes(), node)
         checks = [(str(path.relative_to(node)) if node.is_dir() else node.name, h) for path, h in entries]
@@ -331,7 +369,9 @@ class Persistence:
                         subprocess.run(['git', '-C', str(node), 'remote', 'add', 'origin', item['repo']], check=True, capture_output=True)
                     bundle.unlink()
                 # Verify semantic source checksums as well as compressed object integrity.
-            actual = inventory(stage)
+            # Archives already contain standalone database files. Hash their exact bytes,
+            # including in older archives that captured the original main database.
+            actual = inventory(stage, snapshot_databases=False)
             if [(p['path'], p['checksum']) for p in actual] != [(p['path'], p['checksum']) for p in manifest['plugins']]:
                 raise RuntimeError('Restored plugin source checksum mismatch')
             # Replace the whole set; omissions are tombstones, preventing deleted nodes reappearing.
@@ -447,8 +487,10 @@ class Persistence:
                     p['kind'] = 'directory' if node.is_dir() else 'file'
                     with tarfile.open(archive, 'w:gz') as target:
                         if node.is_dir():
-                            for path, _ in files(node):
-                                target.add(path, arcname=str(path.relative_to(node)), recursive=False)
+                            checks = [(str(path.relative_to(node)), checksum)
+                                      for path, checksum in files(node, archive=target)]
+                            if digest(checks) != p['checksum']:
+                                raise RuntimeError('Plugin files changed during backup; retrying after settling')
                             if (node / '.git').exists():
                                 # Pack only this commit/tree, never repository history or Git config.
                                 committed = subprocess.check_output(['git', '-C', str(node), 'archive', 'HEAD'])

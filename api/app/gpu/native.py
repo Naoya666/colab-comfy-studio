@@ -295,6 +295,12 @@ def local_catalog(repo, owner):
         binding = external_source(row)
         if row.get("state") != "ready" and not binding:
             continue
+        if binding and urlsplit(binding["download_url"]).hostname == "civitai.com" and (
+            row.get("source") == "civitai"
+            or ("external_source" in row and urlsplit(binding.get("url") or "").hostname == "civitai.com")
+        ):
+            # Only the server-resolved catalog can grant Civitai provenance.
+            binding = {**binding, "kind": "civitai"}
         result.append({"model_type": row["model_type"], "filename": row["filename"],
                        "relative_path": row.get("relative_path"), "legacy_target": row.get("legacy_target"),
                        "sha256": row.get("sha256") or row.get("expected_sha256"),

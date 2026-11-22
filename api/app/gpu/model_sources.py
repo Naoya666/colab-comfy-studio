@@ -96,6 +96,10 @@ class ModelError(ValueError):
     pass
 
 
+class SourceNotFound(ModelError):
+    pass
+
+
 def relative_path(value: str) -> str:
     if (not isinstance(value, str) or not value or len(value) > 512 or "\\" in value
             or any(ord(c) < 32 for c in value) or value.startswith("/")
@@ -509,7 +513,8 @@ class SourceHTTP:
         if code >= 400:
             message = {401: "鉴权失败，请更新下载源凭据", 403: "无权限或许可未接受，请到来源页面授权/接受许可",
                        404: "模型或版本不存在，或链接已失效", 429: "来源限流，请稍后重试"}.get(code, "来源服务错误，请稍后重试")
-            raise ModelError(f"{message}（HTTP {code}）")
+            error = SourceNotFound if code == 404 else ModelError
+            raise error(f"{message}（HTTP {code}）")
         if code != 200:
             raise ModelError(f"来源返回非完整响应（HTTP {code}）")
 
@@ -562,8 +567,8 @@ class Sources:
         repo_type, repo, revision, path, is_tree = parse_hf_url(url)
         try:
             return self.huggingface(repo, revision, path, repo_type=repo_type, is_tree=is_tree, model_type=model_type)
-        except ModelError as initial_error:
-            if "HTTP 404" not in str(initial_error):
+        except SourceNotFound as initial_error:
+            if "/" in revision:  # An encoded slash already identifies the exact revision.
                 raise
             # Disambiguate branch/tag names containing '/' (e.g. release/v1.0 or refs/pr/1).
             p = urlsplit(normalize_source_url(url))
@@ -603,9 +608,8 @@ class Sources:
             for cand_rev, cand_sub in candidates:
                 try:
                     return self.huggingface(repo, cand_rev, cand_sub, repo_type=repo_type, is_tree=(action == "tree"), model_type=model_type)
-                except ModelError as retry_err:
-                    if "HTTP 404" not in str(retry_err):
-                        raise
+                except SourceNotFound:
+                    continue
             raise initial_error
 
     def _github_release_metadata(self, owner: str, repo: str, tag: str, asset_name: str) -> tuple[int | None, str | None]:
@@ -697,7 +701,7 @@ class Sources:
         if path and not is_tree:
             exact = [f for f in siblings if (f.get("rfilename") or "") == path]
             if not exact:
-                raise ModelError("仓库中未找到指定文件，请检查路径或版本（HTTP 404）")
+                raise SourceNotFound("仓库中未找到指定文件，请检查路径或版本（HTTP 404）")
             leaf = PurePosixPath(path).name
             if is_controlled_upscale_extension(leaf):
                 if model_type not in {None, "", "unknown", "upscale_models"}:
@@ -735,6 +739,8 @@ class Sources:
                           "expected_sha256": digest.lower() if isinstance(digest, str) and SHA.fullmatch(digest) else None,
                           "expected_size": lfs.get("size") or f.get("size")})
         if is_tree and not files:
+            if path and not any((f.get("rfilename") or "").startswith(path + "/") for f in siblings):
+                raise SourceNotFound("仓库中未找到指定目录，请检查路径或版本（HTTP 404）")
             raise ModelError("该目录下没有符合当前分类安全策略的受支持模型文件（目录链接需选择具体权重文件）")
         return files
 

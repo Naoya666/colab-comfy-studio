@@ -74,7 +74,9 @@ const restartMessages: Record<RestartPhase, string> = {
   failed: 'ComfyUI 重启失败',
 };
 
-export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage: GpuUsage | null; accounts: GpuAccount[]; instances: GpuInstance[]; desktop: boolean }) {
+export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, desktop }: {
+  usage: GpuUsage | null; accounts: GpuAccount[]; accountsLoaded: boolean; instances: GpuInstance[]; desktop: boolean;
+}) {
   const initialPrefs = useMemo(() => loadNativePrefs(), []);
   const eligibleAccounts = useMemo(
     () => accounts.filter(a => a.enabled !== false && a.allow_allocation !== false),
@@ -82,7 +84,7 @@ export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage
   );
   const [account, setAccount] = useState(() => {
     if (initialPrefs.account) {
-      if (!accounts.length || eligibleAccounts.some(a => a.account_id === initialPrefs.account)) return initialPrefs.account;
+      if (!accountsLoaded || eligibleAccounts.some(a => a.account_id === initialPrefs.account)) return initialPrefs.account;
     }
     return eligibleAccounts[0]?.account_id || '';
   });
@@ -101,13 +103,13 @@ export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage
   const [idleMinutes, setIdleMinutes] = useState(() => initialPrefs.idleMinutes ?? '');
   const [runtimeMinutes, setRuntimeMinutes] = useState(() => initialPrefs.runtimeMinutes ?? '');
   const timeoutsInitialized = useRef(Boolean(initialPrefs.storage && initialPrefs.idleMinutes && initialPrefs.runtimeMinutes));
+  const accountEligible = eligibleAccounts.some(a => a.account_id === account);
 
   useEffect(() => {
-    if (!accounts.length) return;
-    if (account && eligibleAccounts.some(a => a.account_id === account)) return;
+    if (!accountsLoaded || accountEligible) return;
     const fallback = eligibleAccounts[0]?.account_id || '';
     if (fallback !== account) setAccount(fallback);
-  }, [accounts.length, eligibleAccounts, account]);
+  }, [accountsLoaded, accountEligible, eligibleAccounts, account]);
 
   useEffect(() => {
     const next: NativePrefs = {};
@@ -215,7 +217,7 @@ export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage
     finally { sendingRestart.current = false; setSubmittingRestart(false); }
   }
   async function start() {
-    if (sendingStart.current || startupPending) return;
+    if (sendingStart.current || startupPending || !accountsLoaded || !accountEligible) return;
     if (!validTimeouts) { setError('请填写正整数分钟数。'); return; }
     sendingStart.current = true;
     setStarting(true); setError('');
@@ -266,7 +268,7 @@ export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage
         </div> : <>
           <label className="field">Google 账号<select value={account} onChange={e => { setAccount(e.target.value); key.current = crypto.randomUUID(); }}>
             <option value="">选择账号</option>
-            {accounts.filter(a => a.enabled !== false && a.allow_allocation !== false).map(a => <option key={a.account_id} value={a.account_id}>{a.alias || a.account_id}</option>)}
+            {eligibleAccounts.map(a => <option key={a.account_id} value={a.account_id}>{a.alias || a.account_id}</option>)}
           </select></label>
           <WorkflowGpuSelection manifest={null} accountId={account} value={spec} onChange={value => { setSpec(value); key.current = crypto.randomUUID(); }}
             rateHint={rate => <p className="muted small">{rate == null || rate <= 0 ? '估算费率未知' : <>
@@ -286,7 +288,7 @@ export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage
             </label>
           </div>
           <p className="muted small">参数在本次启动时生效。到期后停止接收新任务，等待生成和同步完成后释放 GPU。调整已有原生会话的参数需先停止旧实例。</p>
-          <button className="button" disabled={!!blocked || starting || startupPending || !account || !spec || !status?.configured || !validTimeouts || !validStorage} onClick={() => void start()}>
+          <button className="button" disabled={!!blocked || starting || startupPending || !accountsLoaded || !accountEligible || !spec || !status?.configured || !validTimeouts || !validStorage} onClick={() => void start()}>
             {starting ? '正在提交…' : startupPending ? '正在启动…' : desktop ? '启动 / 复用 GPU' : '启动 / 复用 GPU 并进入'}
           </button>
           {status && !status.configured && <p className="status">请按部署文档配置原生 ComfyUI 域名和隧道。</p>}

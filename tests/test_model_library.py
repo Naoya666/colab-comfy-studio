@@ -858,6 +858,7 @@ def _make_safe_pytorch_zip() -> bytes:
 def _make_safe_pytorch_legacy() -> bytes:
     """Build a minimal legacy PyTorch checkpoint (magic + protocol + sys_info + state_dict)."""
     import pickle
+
     from app.gpu.model_sources import PYTORCH_LEGACY_MAGIC
 
     s0 = pickle.dumps(PYTORCH_LEGACY_MAGIC, protocol=2)
@@ -904,6 +905,8 @@ def test_hf_ultrasharp_slash_revision_query_params_and_errors():
             ]})
         if path == "/api/models/org/slash-branch/refs":
             return httpx.Response(200, json={"branches": [{"name": "release/v1.0"}], "tags": [], "converts": []})
+        if path == "/api/models/org/slash-branch/revision/release?blobs=true":
+            return httpx.Response(200, json={"sha": "1" * 40, "siblings": [{"rfilename": "other.safetensors"}]})
         if path == "/api/models/org/slash-branch/revision/release%2Fv1.0?blobs=true":
             return httpx.Response(200, json={"sha": commit, "siblings": [
                 {"rfilename": "sub/model.safetensors", "lfs": {"sha256": HASH, "size": len(DATA)}},
@@ -940,6 +943,9 @@ def test_hf_ultrasharp_slash_revision_query_params_and_errors():
     # Branch containing '/' disambiguated via /refs
     slash_files = sources.resolve({"url": "https://huggingface.co/org/slash-branch/blob/release/v1.0/sub/model.safetensors"})
     assert len(slash_files) == 1 and slash_files[0]["filename"] == "model.safetensors"
+    slash_tree = sources.resolve({"url": "https://huggingface.co/org/slash-branch/tree/release/v1.0/sub"})
+    encoded_tree = sources.resolve({"url": "https://huggingface.co/org/slash-branch/tree/release%2Fv1.0/sub"})
+    assert slash_tree == encoded_tree == slash_files
 
     # Missing file inside existing repo -> clear 404
     with pytest.raises(ModelError, match="404"):

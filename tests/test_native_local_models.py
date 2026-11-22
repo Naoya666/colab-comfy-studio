@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import threading
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -114,6 +115,40 @@ async def test_external_priority_and_hash_checked_drive_fallback(local, tmp_path
         assert result["source"] == "drive" and "403" in result["fallback"]
     assert "model-token" not in repr(result) and "drive-token" not in repr(result)
     assert (tmp_path / "models/checkpoints" / PATH).read_bytes() == DATA
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("external_ok", [True, False])
+async def test_catalogued_civitai_upscale_uses_external_source_or_drive(local, tmp_path, external_ok):
+    name = "example.pth"
+    url = "https://civitai.com/api/download/models/123"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("archive/data.pkl", b"\x80\x02ctorch\nFloatStorage\n.")
+    weight = buffer.getvalue()
+    model = {
+        "filename": name, "model_type": "upscale_models", "source": "civitai",
+        "download_url": url, "source_verification": "verified", "state": "ready",
+        "sha256": hashlib.sha256(weight).hexdigest(), "size": len(weight),
+        "drive_file_id": "known-file-id", "drive_account_id": "drive-account",
+    }
+    catalog = native.local_catalog(SimpleNamespace(list=lambda *_: [model]), "owner")
+
+    def handler(req):
+        host = req.headers["host"]
+        if host == "civitai.com":
+            return media(weight) if external_ok else httpx.Response(403)
+        if host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "drive-token", "expires_in": 3600})
+        assert host == "www.googleapis.com"
+        return media(weight)
+
+    models = local(handler, catalog, drive_auth={"drive-account": {}})
+    prompt = {"1": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": name}}}
+    [result] = await models.submit({"prompt": prompt})[1]
+    assert result["state"] == "ready"
+    assert result["source"] == ("external" if external_ok else "drive")
+    assert (tmp_path / "models/upscale_models" / name).read_bytes() == weight
 
 
 @pytest.mark.asyncio

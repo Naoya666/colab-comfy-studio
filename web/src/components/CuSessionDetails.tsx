@@ -1,13 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   apiMessage,
   getCuDaily,
   getCuSessions,
   type CuDailyEntry,
-  type CuDailyPage,
   type CuSession,
   type CuSessionKind,
-  type CuSessionsPage,
   type GpuUsage,
 } from '../lib/gpu-api';
 import { cuNumber, formatDateTime } from '../lib/ui-helpers';
@@ -155,6 +153,44 @@ function SessionLine({ session }: { session: CuSession }) {
   </details>;
 }
 
+type CuPageQuery = { kind: CuSessionKind | 'all'; startDate: string; endDate: string; offset: number };
+
+function useCuPage<T extends { total: number }>(
+  load: (query: CuPageQuery & { limit: number }, signal: AbortSignal) => Promise<T>,
+  { kind, startDate, endDate, offset }: CuPageQuery,
+  enabled: boolean,
+  refreshKey: string,
+  setOffset: (offset: number) => void,
+) {
+  const key = `${kind}:${startDate}:${endDate}:${offset}`;
+  const [result, setResult] = useState<{ key: string; page?: T; loading: boolean; error?: string }>();
+
+  useEffect(() => {
+    if (!enabled) return;
+    const controller = new AbortController();
+    setResult(previous => ({ key, page: previous?.key === key ? previous.page : undefined, loading: true }));
+    void load({ kind, startDate, endDate, offset, limit: PAGE_SIZE }, controller.signal).then(
+      (page) => {
+        if (controller.signal.aborted) return;
+        if (offset > 0 && offset >= page.total) {
+          setOffset(Math.floor(Math.max(0, page.total - 1) / PAGE_SIZE) * PAGE_SIZE);
+          return;
+        }
+        setResult({ key, page, loading: false });
+      },
+      (cause) => {
+        if (controller.signal.aborted) return;
+        setResult(previous => ({ key, page: previous?.key === key ? previous.page : undefined,
+          loading: false, error: apiMessage(cause) }));
+      },
+    );
+    return () => controller.abort();
+  }, [enabled, load, key, kind, startDate, endDate, offset, refreshKey, setOffset]);
+
+  const current = enabled && result?.key === key ? result : undefined;
+  return { page: current?.page, loading: enabled && (current?.loading ?? true), error: current?.error };
+}
+
 export function CuSessionDetails({ usage }: { usage: GpuUsage | null }) {
   const [tab, setTab] = useState<'sessions' | 'daily'>('sessions');
   const today = usage?.local_date || localTodayFallback();
@@ -168,45 +204,14 @@ export function CuSessionDetails({ usage }: { usage: GpuUsage | null }) {
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const [offset, setOffset] = useState(0);
-  const [sessionPage, setSessionPage] = useState<CuSessionsPage | null>(null);
-  const [sessionLoading, setSessionLoading] = useState(false);
-  const [sessionError, setSessionError] = useState('');
-  const sessionSeqRef = useRef(0);
-
   const sessionRangeInvalid = Boolean(startDate && endDate && startDate > endDate);
   const useRecent = !startDate && !endDate && kind === 'all' && offset === 0;
   const hasSessionFilter = kind !== 'all' || Boolean(startDate) || Boolean(endDate);
-
-  useEffect(() => {
-    if (tab !== 'sessions' || useRecent) {
-      setSessionLoading(false);
-      setSessionError('');
-      return;
-    }
-    if (sessionRangeInvalid) {
-      setSessionLoading(false);
-      setSessionError('起始日期不能晚于终止日期');
-      return;
-    }
-    const seq = ++sessionSeqRef.current;
-    setSessionLoading(true);
-    setSessionError('');
-    void getCuSessions({ kind, startDate, endDate, offset, limit: PAGE_SIZE }).then(
-      (value) => {
-        if (seq !== sessionSeqRef.current) return;
-        setSessionPage(value);
-        setSessionLoading(false);
-        if (offset > 0 && offset >= value.total) {
-          setOffset(value.total > 0 ? Math.floor((value.total - 1) / PAGE_SIZE) * PAGE_SIZE : 0);
-        }
-      },
-      (cause) => {
-        if (seq !== sessionSeqRef.current) return;
-        setSessionLoading(false);
-        setSessionError(apiMessage(cause));
-      },
-    );
-  }, [tab, useRecent, sessionRangeInvalid, kind, startDate, endDate, offset, usageRefreshKey]);
+  const { page: sessionPage, loading: sessionLoading, error: sessionRequestError } = useCuPage(
+    getCuSessions, { kind, startDate, endDate, offset },
+    tab === 'sessions' && !useRecent && !sessionRangeInvalid, usageRefreshKey, setOffset,
+  );
+  const sessionError = sessionRangeInvalid ? '起始日期不能晚于终止日期' : sessionRequestError;
 
   const sessionRows: CuSession[] | undefined = useRecent
     ? usage?.recent_sessions?.slice(0, PAGE_SIZE)
@@ -220,14 +225,14 @@ export function CuSessionDetails({ usage }: { usage: GpuUsage | null }) {
   const [dailyStartDate, setDailyStartDate] = useState('');
   const [dailyEndDate, setDailyEndDate] = useState('');
   const [dailyOffset, setDailyOffset] = useState(0);
-  const [dailyPage, setDailyPage] = useState<CuDailyPage | null>(null);
-  const [dailyLoading, setDailyLoading] = useState(false);
-  const [dailyError, setDailyError] = useState('');
-  const dailySeqRef = useRef(0);
-
   const dailyRangeInvalid = Boolean(dailyStartDate && dailyEndDate && dailyStartDate > dailyEndDate);
   const useDefaultDaily = !dailyStartDate && !dailyEndDate && dailyOffset === 0;
   const hasDailyFilter = Boolean(dailyStartDate) || Boolean(dailyEndDate);
+  const { page: dailyPage, loading: dailyLoading, error: dailyRequestError } = useCuPage(
+    getCuDaily, { kind: 'all', startDate: dailyStartDate, endDate: dailyEndDate, offset: dailyOffset },
+    tab === 'daily' && !useDefaultDaily && !dailyRangeInvalid, usageRefreshKey, setDailyOffset,
+  );
+  const dailyError = dailyRangeInvalid ? '起始日期不能晚于终止日期' : dailyRequestError;
 
   const defaultDailySummary = useMemo(() => {
     const history = usage?.daily_history;
@@ -241,37 +246,6 @@ export function CuSessionDetails({ usage }: { usage: GpuUsage | null }) {
       total_sessions: totalSessions,
     };
   }, [usage?.daily_history, usage?.history_actual_cu]);
-
-  useEffect(() => {
-    if (tab !== 'daily' || useDefaultDaily) {
-      setDailyLoading(false);
-      setDailyError('');
-      return;
-    }
-    if (dailyRangeInvalid) {
-      setDailyLoading(false);
-      setDailyError('起始日期不能晚于终止日期');
-      return;
-    }
-    const seq = ++dailySeqRef.current;
-    setDailyLoading(true);
-    setDailyError('');
-    void getCuDaily({ startDate: dailyStartDate, endDate: dailyEndDate, offset: dailyOffset, limit: PAGE_SIZE }).then(
-      (value) => {
-        if (seq !== dailySeqRef.current) return;
-        setDailyPage(value);
-        setDailyLoading(false);
-        if (dailyOffset > 0 && dailyOffset >= value.total) {
-          setDailyOffset(value.total > 0 ? Math.floor((value.total - 1) / PAGE_SIZE) * PAGE_SIZE : 0);
-        }
-      },
-      (cause) => {
-        if (seq !== dailySeqRef.current) return;
-        setDailyLoading(false);
-        setDailyError(apiMessage(cause));
-      },
-    );
-  }, [tab, useDefaultDaily, dailyRangeInvalid, dailyStartDate, dailyEndDate, dailyOffset, usageRefreshKey]);
 
   const dailyRows: CuDailyEntry[] | undefined = useDefaultDaily
     ? defaultDailySummary?.days
