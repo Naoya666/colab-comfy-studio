@@ -211,6 +211,7 @@ def test_native_weak_modes_allow_ws_and_upload_while_blocking_manager(monkeypatc
             yield self.data
 
     async def upstream(req: httpx.Request):
+        assert req.headers["origin"] == "https://internal.example.test"
         body = await req.aread()
         upstream_calls.append((req.method, req.url.raw_path.decode("ascii"), body))
         if req.url.path in {"/prompt", "/api/prompt"}:

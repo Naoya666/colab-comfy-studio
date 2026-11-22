@@ -357,9 +357,10 @@ class NativeGateway:
             if file:
                 url += "?" + urlencode(dict(zip(("filename", "subfolder", "type"), file)))
         headers = clean_headers(httpx.Headers(scope["headers"]), request=True)
+        # Strip client Origin and Referer before adding upstream Origin so ComfyUI's aiohttp
+        # origin guard never receives duplicate/comma-joined Origin values on browser POSTs.
+        headers = [(k, v) for k, v in headers if k.lower() not in {"origin", "referer"}]
         headers += list(auth.items()) + [("Origin", base)]
-        # Do not forward a browser Referer containing the public host to Comfy's origin checker.
-        headers = [(k, v) for k, v in headers if k.lower() != "referer"]
         path = path or scope["path"].removeprefix("/api").rstrip("/")
         mutating = request.method not in {"GET", "HEAD", "OPTIONS"} or (
             request.method == "GET" and path in {"/manager/reboot", "/v2/manager/reboot", "/manager/queue/start"}
