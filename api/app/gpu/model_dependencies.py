@@ -60,39 +60,41 @@ _WIDGET_PRIMITIVES = {"COMBO", "INT", "FLOAT", "STRING", "BOOLEAN"}
 _POWER_LORA_LOADERS = {"Power Lora Loader (rgthree)", "Power Lora Loader"}
 
 
-def _widget_fields(node_type, node_types):
+def _widget_fields(node_type, node_types, *, allowed_types=None):
     if node_type in WIDGETS:
         return WIDGETS[node_type]
+    if allowed_types is not None and node_type not in allowed_types:
+        return []
     cls = (node_types or {}).get(node_type)
     input_types_fn = getattr(cls, "INPUT_TYPES", None)
     if not callable(input_types_fn):
         return []
     try:
         spec_map = input_types_fn()
+        if not isinstance(spec_map, dict):
+            return []
+        fields = []
+        for section in ("required", "optional"):
+            entries = spec_map.get(section)
+            if not isinstance(entries, dict):
+                continue
+            for name, spec in entries.items():
+                if not isinstance(spec, (list, tuple)) or not spec:
+                    continue
+                kind = spec[0]
+                meta = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+                if meta.get("forceInput"):
+                    continue
+                if isinstance(kind, (list, tuple)) or (isinstance(kind, str) and kind in _WIDGET_PRIMITIVES):
+                    fields.append(name)
+                    if kind == "INT" and (meta.get("control_after_generate") or name in {"seed", "noise_seed"}):
+                        fields.append(f"__control_after_generate_{name}")
+        return fields
     except Exception:
         return []
-    if not isinstance(spec_map, dict):
-        return []
-    fields = []
-    for section in ("required", "optional"):
-        entries = spec_map.get(section)
-        if not isinstance(entries, dict):
-            continue
-        for name, spec in entries.items():
-            if not isinstance(spec, (list, tuple)) or not spec:
-                continue
-            kind = spec[0]
-            meta = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
-            if meta.get("forceInput"):
-                continue
-            if isinstance(kind, (list, tuple)) or kind in _WIDGET_PRIMITIVES:
-                fields.append(name)
-                if kind == "INT" and (meta.get("control_after_generate") or name in {"seed", "noise_seed"}):
-                    fields.append(f"__control_after_generate_{name}")
-    return fields
 
 
-def _visual_node_inputs(node, node_types, *, link_values=None, passthrough_links=frozenset()):
+def _visual_node_inputs(node, node_types, *, allowed_types=None, link_values=None, passthrough_links=frozenset()):
     node_type = node.get("type")
     values = node.get("widgets_values")
     if isinstance(values, dict):
@@ -101,7 +103,7 @@ def _visual_node_inputs(node, node_types, *, link_values=None, passthrough_links
         lora_rows = [item for item in values if isinstance(item, dict) and "lora" in item]
         inputs = {f"lora_{idx}": item for idx, item in enumerate(lora_rows, 1)}
     elif isinstance(values, list):
-        fields = _widget_fields(node_type, node_types)
+        fields = _widget_fields(node_type, node_types, allowed_types=allowed_types)
         if not fields and isinstance(node.get("inputs"), list):
             fields = [
                 slot["name"]
@@ -198,6 +200,7 @@ def _expand_visual_nodes(
     subgraphs,
     node_types,
     *,
+    allowed_types=None,
     prefix="",
     parent_bypassed=False,
     link_values=None,
@@ -217,6 +220,7 @@ def _expand_visual_nodes(
                 sg,
                 subgraphs,
                 node_types,
+                allowed_types=allowed_types,
                 prefix=f"{node_id}:",
                 parent_bypassed=bypassed,
                 link_values=inner_links,
@@ -224,8 +228,12 @@ def _expand_visual_nodes(
                 stack=stack | {node_type},
             )
         else:
-            inputs = _visual_node_inputs(n, node_types, link_values=link_values, passthrough_links=passthrough_links)
+            inputs = _visual_node_inputs(
+                n, node_types, allowed_types=allowed_types, link_values=link_values, passthrough_links=passthrough_links,
+            )
             yield node_id, node_type, inputs, bypassed, n
+
+
 DIRECTORIES = {x: x for x in ("checkpoints", "loras", "vae", "diffusion_models", "text_encoders",
                               "clip_vision", "controlnet", "upscale_models", "embeddings", "latent_upscale_models")}
 DIRECTORIES.update(unet="diffusion_models", clip="text_encoders")
@@ -250,6 +258,7 @@ def scan(workflow, *, node_types=None):
     visual = (workflow.get("image_extraction") or {}).get("workflow") or workflow.get("editable_graph") or {}
     nodes = [(str(i), n.get("class_type"), n.get("inputs") or {}, False)
              for i, n in (graph or {}).items() if isinstance(n, dict)]
+    mapping = rules()
     visual_nodes = {}
     if not graph and isinstance(visual, dict):
         defs = visual.get("definitions")
@@ -259,13 +268,14 @@ def scan(workflow, *, node_types=None):
             for sg in raw_subgraphs
             if isinstance(sg, dict) and isinstance(sg.get("id"), str) and isinstance(sg.get("nodes"), list)
         }
-        for node_id, node_type, inputs, bypassed, raw_node in _expand_visual_nodes(visual, subgraphs, node_types):
+        for node_id, node_type, inputs, bypassed, raw_node in _expand_visual_nodes(
+            visual, subgraphs, node_types, allowed_types=mapping,
+        ):
             nodes.append((node_id, node_type, inputs, bypassed))
             visual_nodes[node_id] = raw_node
     elif isinstance(visual, dict):
         visual_nodes = {str(n.get("id")): n for n in visual.get("nodes", []) if isinstance(n, dict)}
     dependencies = []
-    mapping = rules()
 
     def append(node_id, node_type, field, reference, category, required, **extra):
         if not isinstance(reference, str) or reference.lower() in {"none", "none.safetensors", "disabled", ""}:

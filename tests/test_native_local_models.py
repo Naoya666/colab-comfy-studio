@@ -504,11 +504,17 @@ def test_visual_ui_workflow_scans_gguf_rgthree_custom_node_types_and_skips_muted
         def INPUT_TYPES(cls):
             return {
                 "required": {
+                    "weird_dict_kind": ({"custom": True},),
                     "model": ("MODEL",),
                     "seed": ("INT", {"default": 0, "control_after_generate": True}),
                     "custom_unet": (["custom_a.safetensors"],),
                 }
             }
+
+    class BrokenThirdPartyNode:
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {"unhashable": ({"bad": 1},)}}
 
     visual = {
         "nodes": [
@@ -529,6 +535,7 @@ def test_visual_ui_workflow_scans_gguf_rgthree_custom_node_types_and_skips_muted
                 "widgets_values": ["stack_1.safetensors", 0.5, "None", 1.0, "None", 1.0, "None", 1.0],
             },
             {"id": 4, "type": "CustomUnetLoader", "widgets_values": [42, "randomize", "custom_a.safetensors"]},
+            {"id": 7, "type": "BrokenThirdPartyNode", "widgets_values": [True]},
             {"id": 5, "type": "VAELoader", "mode": 2, "widgets_values": ["muted_vae.safetensors"]},
             {
                 "id": 6,
@@ -546,7 +553,7 @@ def test_visual_ui_workflow_scans_gguf_rgthree_custom_node_types_and_skips_muted
                 {"workflow": visual},
                 [],
                 visual=True,
-                node_types={"CustomUnetLoader": CustomLoader},
+                node_types={"CustomUnetLoader": CustomLoader, "BrokenThirdPartyNode": BrokenThirdPartyNode},
             )
         )
     finally:
