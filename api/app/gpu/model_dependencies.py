@@ -92,7 +92,7 @@ def _widget_fields(node_type, node_types):
     return fields
 
 
-def _visual_node_inputs(node, node_types):
+def _visual_node_inputs(node, node_types, *, link_values=None):
     node_type = node.get("type")
     values = node.get("widgets_values")
     if isinstance(values, dict):
@@ -102,13 +102,85 @@ def _visual_node_inputs(node, node_types):
         inputs = {f"lora_{idx}": item for idx, item in enumerate(lora_rows, 1)}
     elif isinstance(values, list):
         fields = _widget_fields(node_type, node_types)
+        if not fields and isinstance(node.get("inputs"), list):
+            fields = [
+                slot["name"]
+                for slot in node["inputs"]
+                if isinstance(slot, dict) and isinstance(slot.get("widget"), dict) and isinstance(slot.get("name"), str)
+            ]
         inputs = dict(zip(fields, values))
     else:
         inputs = {}
     for slot in node.get("inputs") or ():
-        if isinstance(slot, dict) and slot.get("link") is not None and slot.get("name") in inputs:
-            inputs.pop(slot["name"], None)
+        if not isinstance(slot, dict) or slot.get("link") is None:
+            continue
+        lid = slot["link"]
+        sname = slot.get("name")
+        if link_values and lid in link_values and isinstance(sname, str):
+            inputs[sname] = link_values[lid]
+        elif sname in inputs:
+            inputs.pop(sname, None)
     return inputs
+
+
+def _subgraph_link_values(outer_node, subgraph, parent_link_values):
+    values = outer_node.get("widgets_values")
+    slots = [s for s in (outer_node.get("inputs") or ()) if isinstance(s, dict)]
+    slot_values = {}
+    widget_idx = 0
+    for slot in slots:
+        name = slot.get("name")
+        is_widget = isinstance(slot.get("widget"), dict)
+        widget_val = None
+        has_widget_val = False
+        if is_widget and isinstance(values, list):
+            if widget_idx < len(values):
+                widget_val = values[widget_idx]
+                has_widget_val = True
+            widget_idx += 1
+        elif isinstance(values, dict) and isinstance(name, str) and name in values:
+            widget_val = values[name]
+            has_widget_val = True
+        link_id = slot.get("link")
+        if link_id is not None:
+            if parent_link_values and link_id in parent_link_values and isinstance(name, str):
+                slot_values[name] = parent_link_values[link_id]
+        elif has_widget_val and isinstance(name, str):
+            slot_values[name] = widget_val
+
+    inner_links = {}
+    for sg_in in subgraph.get("inputs") or ():
+        if not isinstance(sg_in, dict):
+            continue
+        in_name = sg_in.get("name")
+        if in_name in slot_values:
+            for lid in sg_in.get("linkIds") or ():
+                inner_links[lid] = slot_values[in_name]
+    return inner_links
+
+
+def _expand_visual_nodes(container, subgraphs, node_types, *, prefix="", parent_bypassed=False, link_values=None, stack=frozenset()):
+    for n in container.get("nodes") or ():
+        if not isinstance(n, dict) or "id" not in n:
+            continue
+        node_id = f"{prefix}{n['id']}"
+        bypassed = parent_bypassed or (n.get("mode") in {2, 4})
+        node_type = n.get("type")
+        if isinstance(node_type, str) and node_type in subgraphs and node_type not in stack and len(stack) < 8:
+            sg = subgraphs[node_type]
+            inner_links = _subgraph_link_values(n, sg, link_values)
+            yield from _expand_visual_nodes(
+                sg,
+                subgraphs,
+                node_types,
+                prefix=f"{node_id}:",
+                parent_bypassed=bypassed,
+                link_values=inner_links,
+                stack=stack | {node_type},
+            )
+        else:
+            inputs = _visual_node_inputs(n, node_types, link_values=link_values)
+            yield node_id, node_type, inputs, bypassed, n
 DIRECTORIES = {x: x for x in ("checkpoints", "loras", "vae", "diffusion_models", "text_encoders",
                               "clip_vision", "controlnet", "upscale_models", "embeddings", "latent_upscale_models")}
 DIRECTORIES.update(unet="diffusion_models", clip="text_encoders")
@@ -133,12 +205,20 @@ def scan(workflow, *, node_types=None):
     visual = (workflow.get("image_extraction") or {}).get("workflow") or workflow.get("editable_graph") or {}
     nodes = [(str(i), n.get("class_type"), n.get("inputs") or {}, False)
              for i, n in (graph or {}).items() if isinstance(n, dict)]
+    visual_nodes = {}
     if not graph and isinstance(visual, dict):
-        for n in visual.get("nodes") or []:
-            if not isinstance(n, dict) or "id" not in n:
-                continue
-            inputs = _visual_node_inputs(n, node_types)
-            nodes.append((str(n["id"]), n.get("type"), inputs, n.get("mode") in {2, 4}))
+        defs = visual.get("definitions")
+        raw_subgraphs = (defs.get("subgraphs") or ()) if isinstance(defs, dict) else ()
+        subgraphs = {
+            sg["id"]: sg
+            for sg in raw_subgraphs
+            if isinstance(sg, dict) and isinstance(sg.get("id"), str) and isinstance(sg.get("nodes"), list)
+        }
+        for node_id, node_type, inputs, bypassed, raw_node in _expand_visual_nodes(visual, subgraphs, node_types):
+            nodes.append((node_id, node_type, inputs, bypassed))
+            visual_nodes[node_id] = raw_node
+    elif isinstance(visual, dict):
+        visual_nodes = {str(n.get("id")): n for n in visual.get("nodes", []) if isinstance(n, dict)}
     dependencies = []
     mapping = rules()
 
@@ -181,7 +261,6 @@ def scan(workflow, *, node_types=None):
         if not rule and node_type and re.search(r"(load|lora)", node_type, re.I) and node_type not in {"LoadImage", "LoadVideo"}:
             append(node_id, node_type, "?", "需补充节点识别规则", "unknown", not bypassed, status="manual_review")
     # ComfyUI publishes top-level model metadata and node templates can provide it per node.
-    visual_nodes = {str(n.get("id")): n for n in visual.get("nodes", []) if isinstance(n, dict)} if isinstance(visual, dict) else {}
     global_hints = visual.get("models", []) if isinstance(visual, dict) else []
     directory_map = directories()
     for dep in dependencies:

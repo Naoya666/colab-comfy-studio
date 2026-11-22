@@ -563,6 +563,119 @@ def test_visual_ui_workflow_scans_gguf_rgthree_custom_node_types_and_skips_muted
     ]
 
 
+def test_visual_ui_workflow_expands_comfy_v1_subgraphs_and_outer_widget_overrides():
+    sg_base = "7bd59413-cc00-475d-8413-f17feaa280d9"
+    sg_upscale = "f188c0f7-bd94-4e06-8bf2-2359a280af3e"
+    sg_muted = "6de93206-dd50-4fa4-b99f-67c48654c7b3"
+    visual = {
+        "nodes": [
+            {
+                "id": 343,
+                "type": sg_base,
+                "mode": 0,
+                "inputs": [
+                    {"name": "unet_name", "type": "COMBO", "widget": {"name": "unet_name"}, "link": None},
+                    {"name": "clip_name", "type": "COMBO", "widget": {"name": "clip_name"}, "link": None},
+                    {"name": "vae_name", "type": "COMBO", "widget": {"name": "vae_name"}, "link": None},
+                ],
+                "widgets_values": [
+                    "anima-aesthetic-v1.1.safetensors",
+                    "qwen_3_06b_base.safetensors",
+                    "qwen_image_vae.safetensors",
+                ],
+            },
+            {
+                "id": 222,
+                "type": sg_upscale,
+                "mode": 0,
+                "inputs": [
+                    {"name": "image", "type": "IMAGE", "link": 35557},
+                    {"name": "model_name", "type": "COMBO", "widget": {"name": "model_name"}, "link": None},
+                ],
+                "widgets_values": ["4xUltrasharp_4xUltrasharpV10.pt"],
+            },
+            {
+                "id": 1335,
+                "type": sg_muted,
+                "mode": 2,
+                "inputs": [{"name": "unet_name", "type": "COMBO", "widget": {"name": "unet_name"}, "link": None}],
+                "widgets_values": ["muted_branch_model.safetensors"],
+            },
+        ],
+        "definitions": {
+            "subgraphs": [
+                {
+                    "id": sg_base,
+                    "inputs": [
+                        {"name": "unet_name", "type": "COMBO", "linkIds": [101]},
+                        {"name": "clip_name", "type": "COMBO", "linkIds": [102]},
+                        {"name": "vae_name", "type": "COMBO", "linkIds": [103]},
+                    ],
+                    "nodes": [
+                        {
+                            "id": 339,
+                            "type": "UNETLoader",
+                            "mode": 0,
+                            "widgets_values": ["stale_default_unet.safetensors", "default"],
+                            "inputs": [{"name": "unet_name", "type": "COMBO", "widget": {"name": "unet_name"}, "link": 101}],
+                        },
+                        {
+                            "id": 340,
+                            "type": "CLIPLoader",
+                            "mode": 0,
+                            "widgets_values": ["stale_default_clip.safetensors", "stable_diffusion", "default"],
+                            "inputs": [{"name": "clip_name", "type": "COMBO", "widget": {"name": "clip_name"}, "link": 102}],
+                        },
+                        {
+                            "id": 341,
+                            "type": "VAELoader",
+                            "mode": 0,
+                            "widgets_values": ["stale_default_vae.safetensors"],
+                            "inputs": [{"name": "vae_name", "type": "COMBO", "widget": {"name": "vae_name"}, "link": 103}],
+                        },
+                    ],
+                },
+                {
+                    "id": sg_upscale,
+                    "inputs": [
+                        {"name": "image", "type": "IMAGE", "linkIds": [381]},
+                        {"name": "model_name", "type": "COMBO", "linkIds": [384]},
+                    ],
+                    "nodes": [
+                        {
+                            "id": 154,
+                            "type": "UpscaleModelLoader",
+                            "mode": 0,
+                            "widgets_values": ["RealESRGAN_x4plus_anime_6B.pth"],
+                            "inputs": [{"name": "model_name", "type": "COMBO", "widget": {"name": "model_name"}, "link": 384}],
+                        }
+                    ],
+                },
+                {
+                    "id": sg_muted,
+                    "inputs": [{"name": "unet_name", "type": "COMBO", "linkIds": [901]}],
+                    "nodes": [
+                        {
+                            "id": 999,
+                            "type": "UNETLoader",
+                            "mode": 0,
+                            "widgets_values": ["muted_inner_default.safetensors", "default"],
+                            "inputs": [{"name": "unet_name", "type": "COMBO", "widget": {"name": "unet_name"}, "link": 901}],
+                        }
+                    ],
+                },
+            ]
+        },
+    }
+    found = list(native_models.dependencies({"workflow": visual}, [], visual=True))
+    assert [(d["category"], d["name"]) for d in found] == [
+        ("diffusion_models", "anima-aesthetic-v1.1.safetensors"),
+        ("text_encoders", "qwen_3_06b_base.safetensors"),
+        ("vae", "qwen_image_vae.safetensors"),
+        ("upscale_models", "4xUltrasharp_4xUltrasharpV10.pt"),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_drive_workflows_list_save_delete_and_prepare_by_ref(local, monkeypatch, tmp_path):
     def response(data, status=200):
