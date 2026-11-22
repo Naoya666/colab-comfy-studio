@@ -88,8 +88,8 @@ Docker Compose 默认由 4 个职责分离的容器协作（共享 `studio-data`
 需要 Git、Docker、Docker Compose 和 `uv`。
 
 ```bash
-git clone https://github.com/Naoya666/colab-comfy-study.git
-cd colab-comfy-study
+git clone https://github.com/Naoya666/colab-comfy-studio.git
+cd colab-comfy-studio
 uv run python scripts/init_env.py --site-url http://127.0.0.1:8788
 cp docker-compose.example.yml docker-compose.yml
 docker compose up -d --build
