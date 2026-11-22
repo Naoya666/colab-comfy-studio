@@ -496,3 +496,173 @@ def test_rgthree_lora_loader_stack_dependencies_scanned():
     assert found["lora_01"]["model_type"] == "loras" and found["lora_01"]["required"] is True
     assert found["lora_03"]["required"] is False
     assert found["lora_04"]["reference"] == "style_b.safetensors" and found["lora_04"]["required"] is True
+
+
+def test_visual_ui_workflow_scans_gguf_rgthree_custom_node_types_and_skips_muted():
+    class CustomLoader:
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {
+                "required": {
+                    "model": ("MODEL",),
+                    "seed": ("INT", {"default": 0, "control_after_generate": True}),
+                    "custom_unet": (["custom_a.safetensors"],),
+                }
+            }
+
+    visual = {
+        "nodes": [
+            {"id": 1, "type": "UnetLoaderGGUF", "widgets_values": ["flux-q8.gguf"]},
+            {
+                "id": 2,
+                "type": "Power Lora Loader (rgthree)",
+                "widgets_values": [
+                    {},
+                    {"type": "PowerLoraLoaderHeaderWidget"},
+                    {"on": True, "lora": "active_style.safetensors", "strength": 0.75},
+                    {"on": False, "lora": "turned_off.safetensors", "strength": 1.0},
+                ],
+            },
+            {
+                "id": 3,
+                "type": "Lora Loader Stack (rgthree)",
+                "widgets_values": ["stack_1.safetensors", 0.5, "None", 1.0, "None", 1.0, "None", 1.0],
+            },
+            {"id": 4, "type": "CustomUnetLoader", "widgets_values": [42, "randomize", "custom_a.safetensors"]},
+            {"id": 5, "type": "VAELoader", "mode": 2, "widgets_values": ["muted_vae.safetensors"]},
+            {
+                "id": 6,
+                "type": "VAELoader",
+                "inputs": [{"name": "vae_name", "type": "COMBO", "link": 99}],
+                "widgets_values": ["linked_override.safetensors"],
+            },
+        ]
+    }
+    old_rules = os.environ.get("MODEL_DEPENDENCY_RULES")
+    os.environ["MODEL_DEPENDENCY_RULES"] = json.dumps({"CustomUnetLoader": {"custom_unet": "diffusion_models"}})
+    try:
+        found = list(
+            native_models.dependencies(
+                {"workflow": visual},
+                [],
+                visual=True,
+                node_types={"CustomUnetLoader": CustomLoader},
+            )
+        )
+    finally:
+        if old_rules is None:
+            os.environ.pop("MODEL_DEPENDENCY_RULES", None)
+        else:
+            os.environ["MODEL_DEPENDENCY_RULES"] = old_rules
+    pairs = [(d["category"], d["name"]) for d in found]
+    assert pairs == [
+        ("diffusion_models", "flux-q8.gguf"),
+        ("loras", "active_style.safetensors"),
+        ("loras", "stack_1.safetensors"),
+        ("diffusion_models", "custom_a.safetensors"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_drive_workflows_list_save_delete_and_prepare_by_ref(local, monkeypatch, tmp_path):
+    def response(data, status=200):
+        return SimpleNamespace(body=json.dumps(data).encode(), status=status, content_type="application/json")
+
+    def request(method, path, body=None, query=None):
+        async def read():
+            return body
+
+        return SimpleNamespace(
+            method=method,
+            path=path,
+            query=query or {},
+            json=read,
+            headers=httpx.Headers({"X-Studio-Model-Channel": "internal-channel"}),
+            match_info={"ident": path.split("/")[-1]},
+        )
+
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(web=SimpleNamespace(
+        middleware=lambda fn: fn, json_response=response, HTTPNotFound=RuntimeError,
+    )))
+    engine = SimpleNamespace(routes=Routes(), app=SimpleNamespace(middlewares=[]))
+    models = local(lambda _: media(), [row()])
+    monkeypatch.setattr(native_models, "LocalModels", lambda *args, **kwargs: models)
+    (tmp_path / "local-model-config.json").write_text("{}")
+    folder_paths = SimpleNamespace(models_dir=str(tmp_path / "models"), folder_names_and_paths={}, filename_list_cache={})
+    native_models.install(engine, tmp_path, folder_paths, {})
+
+    comfy_dir = tmp_path / "drive/native-comfy/user/default/workflows/anima"
+    comfy_dir.mkdir(parents=True)
+    ui_workflow = {
+        "nodes": [{"id": 1, "type": "CheckpointLoaderSimple", "widgets_values": [PATH]}],
+    }
+    ui_file = comfy_dir / "original.json"
+    ui_file.write_text(json.dumps(ui_workflow), encoding="utf-8")
+    (comfy_dir / ".index.json").write_text("{}", encoding="utf-8")
+
+    # Save an API workflow via route -> should land in warmup directory, not comfy UI folder.
+    save_route = engine.routes["POST", "/studio_native/models/workflows"]
+    saved_resp = await save_route(request("POST", "/studio_native/models/workflows", {
+        "name": "tavern_api",
+        "workflow": graph(),
+        "overwrite": False,
+    }))
+    assert saved_resp.status == 201
+    saved_item = json.loads(saved_resp.body)["workflow"]
+    assert saved_item["source"] == "warmup" and saved_item["path"] == "tavern_api.json"
+    assert (tmp_path / "drive/native-comfy/warmup/tavern_api.json").is_file()
+
+    # Duplicate save without overwrite returns 409; with overwrite=True succeeds.
+    conflict_resp = await save_route(request("POST", "/studio_native/models/workflows", {
+        "name": "tavern_api.json",
+        "workflow": graph(),
+        "overwrite": False,
+    }))
+    assert conflict_resp.status == 409
+    overwrite_resp = await save_route(request("POST", "/studio_native/models/workflows", {
+        "name": "tavern_api.json",
+        "workflow": graph(),
+        "overwrite": True,
+    }))
+    assert overwrite_resp.status == 201
+
+    # Path traversal and hidden files are rejected.
+    for bad_name in ("../escape.json", ".hidden.json", "sub/.secret.json"):
+        bad_resp = await save_route(request("POST", "/studio_native/models/workflows", {
+            "name": bad_name,
+            "workflow": graph(),
+        }))
+        assert bad_resp.status == 422
+
+    # List returns both comfy and warmup workflows, excluding hidden .index.json.
+    list_route = engine.routes["GET", "/studio_native/models/workflows"]
+    listed = json.loads((await list_route(request("GET", "/studio_native/models/workflows", query={"refresh": "1"}))).body)
+    assert {(w["source"], w["path"]) for w in listed["workflows"]} == {
+        ("comfy", "anima/original.json"),
+        ("warmup", "tavern_api.json"),
+    }
+
+    # Prepare directly from Drive UI workflow reference without re-uploading JSON.
+    prep_route = engine.routes["POST", "/studio_native/models/prepare"]
+    prep_resp = await prep_route(request("POST", "/studio_native/models/prepare", {
+        "workflow_ref": {"source": "comfy", "path": "anima/original.json"},
+        "visual": True,
+    }))
+    assert prep_resp.status == 202
+    ident = json.loads(prep_resp.body)["id"]
+    prep_models = await models.jobs[ident][0]
+    assert prep_models[0]["state"] == "ready"
+    assert (tmp_path / "models/checkpoints" / PATH).read_bytes() == DATA
+
+    # Deleting comfy workflow via Studio is forbidden; deleting warmup workflow succeeds.
+    del_route = engine.routes["POST", "/studio_native/models/workflows/delete"]
+    forbid_del = await del_route(request("POST", "/studio_native/models/workflows/delete", {
+        "source": "comfy", "path": "anima/original.json",
+    }))
+    assert forbid_del.status == 422 and ui_file.is_file()
+
+    ok_del = await del_route(request("POST", "/studio_native/models/workflows/delete", {
+        "source": "warmup", "path": "tavern_api.json",
+    }))
+    assert ok_del.status == 200
+    assert not (tmp_path / "drive/native-comfy/warmup/tavern_api.json").exists()

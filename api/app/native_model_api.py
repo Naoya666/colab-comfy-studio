@@ -56,15 +56,29 @@ def headers(base, auth, lease):
     return {**auth, "Origin": base, "X-Studio-Model-Channel": native.model_channel(lease["id"])}
 
 
-async def rpc(client, method, base, auth, suffix, *, body=None):
+async def rpc(client, method, base, auth, suffix, *, body=None, timeout=20):
     try:
-        request = client.build_request(method, base + PATH + suffix, headers=auth, json=body, timeout=15)
+        request = client.build_request(method, base + PATH + suffix, headers=auth, json=body, timeout=timeout)
         request.headers.pop("Cookie", None)
         response = await client.send(request)
-        if response.status_code == 404 and method == "GET":
-            raise APIError("NATIVE_MODEL_PREPARATION_MISSING", "准备记录已过期或实例已切换，请重新检查", 404)
-        if response.status_code == 422:
-            raise APIError("NATIVE_MODEL_INPUT", response.json()["error"]["message"], 422)
+        if response.status_code in {404, 409, 422}:
+            payload = {}
+            try:
+                raw = response.json()
+                if isinstance(raw, dict) and isinstance(raw.get("error"), dict):
+                    payload = raw["error"]
+            except ValueError:
+                pass
+            if response.status_code == 404:
+                code = payload.get("code")
+                if code and code != "model_preparation_failed":
+                    raise APIError(code, payload.get("message") or "请求的资源不存在", 404)
+                if method == "GET":
+                    raise APIError("NATIVE_MODEL_PREPARATION_MISSING", "准备记录已过期或实例已切换，请重新检查", 404)
+            if response.status_code == 409 and payload.get("message"):
+                raise APIError(payload.get("code") or "NATIVE_WORKFLOW_EXISTS", payload["message"], 409)
+            if response.status_code == 422 and payload.get("message"):
+                raise APIError("NATIVE_MODEL_INPUT", payload["message"], 422)
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict):
@@ -74,7 +88,11 @@ async def rpc(client, method, base, auth, suffix, *, body=None):
         raise APIError("NATIVE_MODEL_UPSTREAM", "无法连接 Colab 模型准备服务，请确认当前实例就绪", 502) from exc
 
 
-async def start(client, base, auth, repo, lease, workflow, dependencies, *, visual):
+async def start(client, base, auth, repo, lease, workflow, dependencies, *, visual, workflow_ref=None):
     context = await asyncio.to_thread(runtime_context, repo, lease)
-    return await rpc(client, "POST", base, auth, "/prepare",
-                     body={**context, "workflow": workflow, "dependencies": dependencies, "visual": visual})
+    payload = {**context, "dependencies": dependencies, "visual": visual}
+    if workflow_ref is not None:
+        payload["workflow_ref"] = workflow_ref
+    else:
+        payload["workflow"] = workflow
+    return await rpc(client, "POST", base, auth, "/prepare", body=payload)

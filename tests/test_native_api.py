@@ -294,3 +294,79 @@ def test_manual_preparation_uses_same_runtime_and_does_not_submit_prompt(server,
     assert result.status_code == 202 and result.json()["data"]["id"] == ident
     assert client.get(route + "/" + ident, headers=ADMIN).json()["data"]["models"][0]["bytes"] == 12
     assert client.get(route + "/" + ident).status_code == 401
+
+
+def test_drive_workflows_routes_and_ref_preparation_control_plane(server, monkeypatch):
+    client, repo, lease = server
+    repo.update("leases", lease["id"], {"native_model_storage": {"model_storage_mode": "local"}}, "owner")
+    monkeypatch.setattr(native, "model_channel", lambda lease_id: "trusted-runtime-channel")
+    ident = "3" * 32
+    observed = []
+
+    async def upstream(req):
+        assert req.headers["X-Studio-Model-Channel"] == "trusted-runtime-channel"
+        observed.append((req.method, req.url.path, req.url.query.decode()))
+        if req.method == "GET" and req.url.path == "/studio_native/models/workflows":
+            return httpx.Response(200, json={
+                "workflows": [{"source": "comfy", "path": "anima/base.json", "size": 512, "modified_at": 1700000000.0}]
+            })
+        if req.method == "POST" and req.url.path == "/studio_native/models/workflows":
+            body = json.loads(await req.aread())
+            if not body.get("overwrite"):
+                return httpx.Response(409, json={
+                    "error": {"code": "NATIVE_WORKFLOW_EXISTS", "message": "同名工作流已存在"}
+                })
+            return httpx.Response(201, json={
+                "workflow": {"source": "warmup", "path": "tavern.json", "size": 256, "modified_at": 1700000005.0}
+            })
+        if req.method == "POST" and req.url.path == "/studio_native/models/workflows/delete":
+            body = json.loads(await req.aread())
+            assert body == {"source": "warmup", "path": "tavern.json"}
+            return httpx.Response(200, json={"deleted": True, "source": "warmup", "path": "tavern.json"})
+        if req.method == "POST" and req.url.path == "/studio_native/models/prepare":
+            body = json.loads(await req.aread())
+            assert body["workflow_ref"] == {"source": "comfy", "path": "anima/base.json"}
+            assert "workflow" not in body and body["visual"] is True
+            return httpx.Response(202, json={"id": ident})
+        raise AssertionError(f"unexpected request {req.method} {req.url}")
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(native_proxy.httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(upstream), **kw))
+
+    listed = client.get("/api/gpu/native/workflows?refresh=true", headers=ADMIN)
+    assert listed.status_code == 200
+    assert listed.json()["data"]["workflows"][0]["path"] == "anima/base.json"
+    assert ("GET", "/studio_native/models/workflows", "refresh=1") in observed
+
+    conflict = client.post("/api/gpu/native/workflows", headers=ADMIN, json={
+        "name": "tavern.json",
+        "workflow": {"1": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}}},
+    })
+    assert conflict.status_code == 409 and conflict.json()["error"] == "NATIVE_WORKFLOW_EXISTS"
+
+    saved = client.post("/api/gpu/native/workflows", headers=ADMIN, json={
+        "name": "tavern.json",
+        "workflow": {"1": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}}},
+        "overwrite": True,
+    })
+    assert saved.status_code == 201 and saved.json()["data"]["workflow"]["source"] == "warmup"
+
+    prep = client.post("/api/gpu/native/model-preparation", headers=ADMIN, json={
+        "workflow_ref": {"source": "comfy", "path": "anima/base.json"},
+    })
+    assert prep.status_code == 202 and prep.json()["data"]["id"] == ident
+
+    # Reject ambiguous payload containing both workflow and workflow_ref.
+    both = client.post("/api/gpu/native/model-preparation", headers=ADMIN, json={
+        "workflow": {"nodes": []},
+        "workflow_ref": {"source": "comfy", "path": "anima/base.json"},
+    })
+    assert both.status_code == 422
+
+    # Reject deleting comfy workflows from Studio API.
+    forbid = client.delete("/api/gpu/native/workflows?source=comfy&path=anima/base.json", headers=ADMIN)
+    assert forbid.status_code == 422
+
+    deleted = client.delete("/api/gpu/native/workflows?source=warmup&path=tavern.json", headers=ADMIN)
+    assert deleted.status_code == 200 and deleted.json()["data"]["deleted"] is True
+    assert not repo.get("leases", lease["id"], "owner").get("native_writes")

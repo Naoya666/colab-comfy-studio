@@ -204,10 +204,10 @@ AI-Studio/<owner>/
 ### 在酒馆首次调用前准备
 
 1. 启动本地模式的原生 ComfyUI。在 Studio 原生页打开「检查并下载此工作流所需模型」。
-2. 上传或粘贴 ComfyUI 的普通工作流 JSON 或 API 工作流 JSON。对于动态或自定义加载器，按需填写显式依赖，例如 `[{"category":"loras","name":"styles/pencil.safetensors"}]`。可以通过模型库绑定准确路径，也可为显式依赖补上 `url`、`sha256` 和字节数 `size`。
+2. 可直接从「Drive 工作流」下拉列表选择已在原生 ComfyUI 保存的工作流（自动读取 `native-comfy/user/default/workflows/` 及自定义预热目录 `native-comfy/warmup/`），也可切换到「手动粘贴 / 上传」上传或粘贴普通工作流 JSON / API 工作流 JSON，并可按需保存到 Drive 列表以便下次直接选择。对于动态或自定义加载器，可在「显式模型依赖（可选）」填写声明，例如 `[{"category":"loras","name":"styles/pencil.safetensors"}]`。可以通过模型库绑定准确路径，也可为显式依赖补上 `url`、`sha256` 和字节数 `size`。
 3. 查看缺失项、下载进度和失败信息。准备完成后，酒馆按原方式提交工作流。
 
-Studio 预准备接口为 `POST /api/gpu/native/model-preparation`，请求字段为 `workflow` 和可选的 `dependencies`；随后 `GET /api/gpu/native/model-preparation/{id}` 获取状态。可用 `GET /api/gpu/native/model-preparation/latest` 查看最近一次准备，包括自动提交的来源和回退原因。预准备不把任务放入 ComfyUI 队列。历史状态保存在当前 ComfyUI 进程。再次浏览 `/object_info` 或模型列表时可看到模型库中可用的登记名称，加载时仍使用经过校验的实际文件。
+Studio 工作流列表与保存接口为 `GET /api/gpu/native/workflows`（支持 `?refresh=true` 刷新挂载目录缓存）、`POST /api/gpu/native/workflows` 与 `DELETE /api/gpu/native/workflows`；预准备接口为 `POST /api/gpu/native/model-preparation`，请求字段支持二选一传入 `workflow_ref`（`{"source":"comfy"|"warmup","path":"..."}`，由 Colab 原地读取 Drive 工作流）或内联 `workflow`，以及可选的 `dependencies`；随后 `GET /api/gpu/native/model-preparation/{id}` 获取状态。可用 `GET /api/gpu/native/model-preparation/latest` 查看最近一次准备，包括自动提交的来源和回退原因。预准备不把任务放入 ComfyUI 队列。历史状态保存在当前 ComfyUI 进程。再次浏览 `/object_info` 或模型列表时可看到模型库中可用的登记名称，加载时仍使用经过校验的实际文件。
 
 网页、专用 API Key、管理员 API 和共享该实例的 Studio 工作流都经过 Colab 的准备逻辑。投递前刷新 ComfyUI 文件列表，再由原生处理器校验、入队并返回真实 `prompt_id`。后续队列、WebSocket、history、取图保持原协议。客户端首个冷请求仍可能因客户端、中继或网关的等待限制而断开。准备阶段断开时不会代为入队，已经开始的共享下载可继续，后续提交可复用文件。一旦请求交给 ComfyUI，则沿用其取消和队列语义。重复请求共享权重下载；相互独立且成功送达的提交仍按 ComfyUI 原规则分别入队。
 

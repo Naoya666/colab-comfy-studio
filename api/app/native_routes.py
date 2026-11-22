@@ -144,14 +144,79 @@ def _local_lease(request, owner):
     return repo, lease
 
 
+@router.get("/workflows")
+async def list_workflows(request: Request, refresh: bool = False, user=Depends(current_user)):
+    _, lease = await asyncio.to_thread(_local_lease, request, user["id"])
+    base, auth = native.backend()
+    suffix = "/workflows?refresh=1" if refresh else "/workflows"
+    async with httpx.AsyncClient() as client:
+        result = await native_model_api.rpc(client, "GET", base, native_model_api.headers(base, auth, lease), suffix)
+    return ok(result, request)
+
+
+@router.post("/workflows", status_code=201)
+async def save_workflow(body: dict, request: Request, user=Depends(current_user)):
+    repo, lease = await asyncio.to_thread(_local_lease, request, user["id"])
+    if (set(body) - {"name", "workflow", "overwrite"}
+            or not isinstance(body.get("name"), str) or not body["name"].strip()
+            or not isinstance(body.get("workflow"), dict)
+            or not isinstance(body.get("overwrite", False), bool)):
+        raise APIError("NATIVE_MODEL_INPUT", "请提供有效的工作流名称和 JSON 对象", 422)
+    write_id = uuid4().hex
+    await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
+    try:
+        base, auth = native.backend()
+        async with httpx.AsyncClient() as client:
+            result = await native_model_api.rpc(
+                client, "POST", base, native_model_api.headers(base, auth, lease), "/workflows",
+                body={"name": body["name"], "workflow": body["workflow"], "overwrite": body.get("overwrite", False)},
+            )
+        return ok(result, request, 201)
+    finally:
+        await asyncio.to_thread(native.update_write, repo, lease, write_id, finished=True)
+
+
+@router.delete("/workflows")
+async def delete_workflow(source: str, path: str, request: Request, user=Depends(current_user)):
+    repo, lease = await asyncio.to_thread(_local_lease, request, user["id"])
+    if source != "warmup" or not isinstance(path, str) or not path.strip():
+        raise APIError("NATIVE_MODEL_INPUT", "仅允许移除已保存的 API 预热工作流", 422)
+    write_id = uuid4().hex
+    await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
+    try:
+        base, auth = native.backend()
+        async with httpx.AsyncClient() as client:
+            result = await native_model_api.rpc(
+                client, "POST", base, native_model_api.headers(base, auth, lease), "/workflows/delete",
+                body={"source": source, "path": path},
+            )
+        return ok(result, request)
+    finally:
+        await asyncio.to_thread(native.update_write, repo, lease, write_id, finished=True)
+
+
+def _valid_workflow_ref(ref):
+    return (isinstance(ref, dict) and set(ref) == {"source", "path"}
+            and ref.get("source") in {"comfy", "warmup"}
+            and isinstance(ref.get("path"), str) and bool(ref["path"].strip()))
+
+
 @router.post("/model-preparation", status_code=202)
 async def prepare_models(body: dict, request: Request, user=Depends(current_user)):
     repo, lease = await asyncio.to_thread(_local_lease, request, user["id"])
-    if set(body) - {"workflow", "dependencies"} or not isinstance(body.get("workflow"), dict):
-        raise APIError("NATIVE_MODEL_INPUT", "请提供工作流 JSON 和可选的显式模型依赖", 422)
-    workflow = body["workflow"]
-    if "prompt" not in workflow and "workflow" not in workflow:
-        workflow = {"workflow": workflow} if "nodes" in workflow else {"prompt": workflow}
+    has_workflow = "workflow" in body
+    has_ref = "workflow_ref" in body
+    if (set(body) - {"workflow", "workflow_ref", "dependencies"}
+            or has_workflow == has_ref
+            or (has_workflow and not isinstance(body.get("workflow"), dict))
+            or (has_ref and not _valid_workflow_ref(body.get("workflow_ref")))):
+        raise APIError("NATIVE_MODEL_INPUT", "请提供工作流 JSON 或选择 Drive 工作流，并可附带显式模型依赖", 422)
+    workflow = None
+    workflow_ref = body.get("workflow_ref")
+    if has_workflow:
+        workflow = body["workflow"]
+        if "prompt" not in workflow and "workflow" not in workflow:
+            workflow = {"workflow": workflow} if "nodes" in workflow else {"prompt": workflow}
     write_id = uuid4().hex
     await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
     try:
@@ -159,7 +224,7 @@ async def prepare_models(body: dict, request: Request, user=Depends(current_user
         async with httpx.AsyncClient() as client:
             result = await native_model_api.start(
                 client, base, native_model_api.headers(base, auth, lease), repo, lease,
-                workflow, body.get("dependencies", []), visual=True,
+                workflow, body.get("dependencies", []), visual=True, workflow_ref=workflow_ref,
             )
         return ok(result, request, 202)
     finally:

@@ -32,13 +32,83 @@ RULES = {
     "UpscaleModelLoader": {"model_name": "upscale_models"},
 }
 # Only schemas with known stable widget order are decoded without object_info.
-WIDGETS = {"CheckpointLoaderSimple": ["ckpt_name"], "LoraLoader": ["lora_name", "strength_model", "strength_clip"],
-           "LoraLoaderModelOnly": ["lora_name", "strength_model"], "VAELoader": ["vae_name"],
-           "UNETLoader": ["unet_name", "weight_dtype"], "CLIPLoader": ["clip_name", "type", "device"],
-           "DualCLIPLoader": ["clip_name1", "clip_name2", "type", "device"],
-           "TripleCLIPLoader": ["clip_name1", "clip_name2", "clip_name3"],
-           "CLIPVisionLoader": ["clip_name"], "ControlNetLoader": ["control_net_name"],
-           "UpscaleModelLoader": ["model_name"]}
+WIDGETS = {
+    "CheckpointLoaderSimple": ["ckpt_name"],
+    "CheckpointLoader": ["config_name", "ckpt_name"],
+    "LoraLoader": ["lora_name", "strength_model", "strength_clip"],
+    "LoraLoaderModelOnly": ["lora_name", "strength_model"],
+    "Lora Loader Stack (rgthree)": [
+        "lora_01", "strength_01", "lora_02", "strength_02",
+        "lora_03", "strength_03", "lora_04", "strength_04",
+    ],
+    "VAELoader": ["vae_name"],
+    "UNETLoader": ["unet_name", "weight_dtype"],
+    "DiffusionModelLoader": ["unet_name", "weight_dtype"],
+    "UnetLoaderGGUF": ["unet_name"],
+    "CLIPLoader": ["clip_name", "type", "device"],
+    "DualCLIPLoader": ["clip_name1", "clip_name2", "type", "device"],
+    "TripleCLIPLoader": ["clip_name1", "clip_name2", "clip_name3"],
+    "QuadrupleCLIPLoader": ["clip_name1", "clip_name2", "clip_name3", "clip_name4"],
+    "CLIPVisionLoader": ["clip_name"],
+    "ControlNetLoader": ["control_net_name"],
+    "DiffControlNetLoader": ["control_net_name"],
+    "UpscaleModelLoader": ["model_name"],
+    "CLIPTextEncode": ["text"],
+    "CLIPTextEncodeSDXL": ["width", "height", "crop_w", "crop_h", "target_width", "target_height", "text_g", "text_l"],
+}
+_WIDGET_PRIMITIVES = {"COMBO", "INT", "FLOAT", "STRING", "BOOLEAN"}
+_POWER_LORA_LOADERS = {"Power Lora Loader (rgthree)", "Power Lora Loader"}
+
+
+def _widget_fields(node_type, node_types):
+    if node_type in WIDGETS:
+        return WIDGETS[node_type]
+    cls = (node_types or {}).get(node_type)
+    input_types_fn = getattr(cls, "INPUT_TYPES", None)
+    if not callable(input_types_fn):
+        return []
+    try:
+        spec_map = input_types_fn()
+    except Exception:
+        return []
+    if not isinstance(spec_map, dict):
+        return []
+    fields = []
+    for section in ("required", "optional"):
+        entries = spec_map.get(section)
+        if not isinstance(entries, dict):
+            continue
+        for name, spec in entries.items():
+            if not isinstance(spec, (list, tuple)) or not spec:
+                continue
+            kind = spec[0]
+            meta = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+            if meta.get("forceInput"):
+                continue
+            if isinstance(kind, (list, tuple)) or kind in _WIDGET_PRIMITIVES:
+                fields.append(name)
+                if kind == "INT" and (meta.get("control_after_generate") or name in {"seed", "noise_seed"}):
+                    fields.append(f"__control_after_generate_{name}")
+    return fields
+
+
+def _visual_node_inputs(node, node_types):
+    node_type = node.get("type")
+    values = node.get("widgets_values")
+    if isinstance(values, dict):
+        inputs = dict(values)
+    elif node_type in _POWER_LORA_LOADERS and isinstance(values, list):
+        lora_rows = [item for item in values if isinstance(item, dict) and "lora" in item]
+        inputs = {f"lora_{idx}": item for idx, item in enumerate(lora_rows, 1)}
+    elif isinstance(values, list):
+        fields = _widget_fields(node_type, node_types)
+        inputs = dict(zip(fields, values))
+    else:
+        inputs = {}
+    for slot in node.get("inputs") or ():
+        if isinstance(slot, dict) and slot.get("link") is not None and slot.get("name") in inputs:
+            inputs.pop(slot["name"], None)
+    return inputs
 DIRECTORIES = {x: x for x in ("checkpoints", "loras", "vae", "diffusion_models", "text_encoders",
                               "clip_vision", "controlnet", "upscale_models", "embeddings", "latent_upscale_models")}
 DIRECTORIES.update(unet="diffusion_models", clip="text_encoders")
@@ -58,16 +128,16 @@ def weights_of(workflow):
     return manifest.get("weight_files") or (manifest.get("dependencies") or {}).get("weight_files") or []
 
 
-def scan(workflow):
+def scan(workflow, *, node_types=None):
     graph = workflow.get("api_graph") or (workflow.get("image_extraction") or {}).get("prompt")
     visual = (workflow.get("image_extraction") or {}).get("workflow") or workflow.get("editable_graph") or {}
     nodes = [(str(i), n.get("class_type"), n.get("inputs") or {}, False)
              for i, n in (graph or {}).items() if isinstance(n, dict)]
     if not graph and isinstance(visual, dict):
         for n in visual.get("nodes") or []:
-            fields = WIDGETS.get(n.get("type"), [])
-            values = n.get("widgets_values") or []
-            inputs = dict(zip(fields, values)) if isinstance(values, list) else {}
+            if not isinstance(n, dict) or "id" not in n:
+                continue
+            inputs = _visual_node_inputs(n, node_types)
             nodes.append((str(n["id"]), n.get("type"), inputs, n.get("mode") in {2, 4}))
     dependencies = []
     mapping = rules()

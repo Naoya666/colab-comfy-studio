@@ -51,11 +51,65 @@ except ImportError:  # The bootstrap ships standalone modules to Colab.
 
 RESERVE = 5 * 1024**3
 CHUNK = 1024**2
+MAX_WORKFLOW_FILE_BYTES = 16 * 1024**2
+MAX_WORKFLOW_LIST_ITEMS = 500
+WORKFLOW_SOURCES = {
+    "comfy": ("native-comfy", "user", "default", "workflows"),
+    "warmup": ("native-comfy", "warmup"),
+}
 MD5 = re.compile(r"[0-9a-fA-F]{32}")
 FILE_ID = re.compile(r"[A-Za-z0-9_-]{1,200}")
 RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 ALIASES = {"unet": "diffusion_models", "clip": "text_encoders", "t2i_adapter": "controlnet"}
 LOG = logging.getLogger("studio-native.models")
+
+
+class WorkflowConflictError(ModelError):
+    pass
+
+
+class WorkflowNotFoundError(ModelError):
+    pass
+
+
+def _is_api_node_map(data):
+    return isinstance(data, dict) and bool(data) and all(
+        isinstance(node, dict) and isinstance(node.get("class_type"), str) and isinstance(node.get("inputs"), dict)
+        for node in data.values()
+    )
+
+
+def wrap_visual_workflow(workflow):
+    if not isinstance(workflow, dict) or not workflow:
+        raise ModelError("请提供有效的 ComfyUI 工作流 JSON 对象")
+    if "prompt" in workflow or "workflow" in workflow:
+        if "prompt" in workflow and not _is_api_node_map(workflow.get("prompt")):
+            raise ModelError("工作流中的 prompt 字段必须是有效的 API 节点字典")
+        if "workflow" in workflow and not isinstance(workflow.get("workflow"), dict):
+            raise ModelError("工作流中的 workflow 字段必须是有效的 JSON 对象")
+        return workflow
+    if isinstance(workflow.get("nodes"), list):
+        return {"workflow": workflow}
+    if _is_api_node_map(workflow):
+        return {"prompt": workflow}
+    raise ModelError("无法识别的工作流 JSON：需包含原生 nodes 数组或 API 节点图")
+
+
+def workflow_relpath(value, *, ensure_json_ext=False):
+    if not isinstance(value, str):
+        raise ModelError("工作流路径无效")
+    cleaned = value.strip()
+    if ensure_json_ext and cleaned and not cleaned.lower().endswith(".json"):
+        cleaned += ".json"
+    try:
+        normalized = relative_path(cleaned)
+    except ModelError:
+        raise ModelError("工作流路径无效，不能包含绝对路径、特殊字符或目录穿越") from None
+    parts = normalized.split("/")
+    if (len(normalized) > 255 or any(part.startswith(".") or len(part) > 120 for part in parts)
+            or not parts[-1].lower().endswith(".json") or len(parts[-1]) <= 5):
+        raise ModelError("工作流文件名需以 .json 结尾且不能为隐藏文件")
+    return normalized
 
 
 def category_for(category):
@@ -117,8 +171,10 @@ def dependencies(body, explicit, *, visual=False, trusted=False, node_types=None
     selected = graph if visual else runnable_graph(graph, body.get("partial_execution_targets"), node_types)
     # Empty reachable API graphs should not fall through to the visual widget scanner.
     visual_metadata = workflow if selected or not graph else {}
-    for dep in deps.scan({"api_graph": selected, "editable_graph": visual_metadata}):
+    for dep in deps.scan({"api_graph": selected, "editable_graph": visual_metadata}, node_types=node_types):
         if dep.get("bypassed") or dep["status"] == "manual_review":
+            continue
+        if dep.get("enabled_field") and not dep.get("required", True):
             continue
         if dep["node_type"] == "VAELoader" and dep["reference"] in {
             "pixel_space", "taesd", "taesdxl", "taesd3", "taef1", "taef2", "taeqi2_1",
@@ -150,8 +206,8 @@ def dependencies(body, explicit, *, visual=False, trusted=False, node_types=None
                "sha256": digest.lower() if digest else None, "size": size, "md5": md5.lower() if md5 else None, "drive_file_id": drive_id}
 
 
-def model_problem(message):
-    return {"error": {"type": "model_preparation_failed", "message": message, "details": message,
+def model_problem(message, *, code="model_preparation_failed"):
+    return {"error": {"type": code, "code": code, "message": message, "details": message,
                       "extra_info": {}}, "node_errors": {}}
 
 
@@ -738,6 +794,159 @@ class LocalModels:
                     names.add(row["drive_file_id"] + "-" + row["filename"])
         return sorted(name for name in names if not extensions or Path(name).suffix.lower() in extensions)
 
+    def _workflow_base(self, source):
+        if source not in WORKFLOW_SOURCES:
+            raise ModelError("工作流来源类型无效")
+        drive_root = self.root / "drive"
+        current = drive_root
+        if current.is_symlink():
+            raise ModelError("Drive 挂载根目录异常")
+        for segment in WORKFLOW_SOURCES[source]:
+            current = current / segment
+            if current.is_symlink():
+                raise ModelError("工作流目录含软链接，拒绝访问")
+        return current
+
+    def _resolve_workflow_file(self, source, raw_path, *, ensure_json_ext=False, create_parents=False):
+        rel = workflow_relpath(raw_path, ensure_json_ext=ensure_json_ext)
+        base = self._workflow_base(source)
+        expected_base = self.root.resolve() / "drive" / Path(*WORKFLOW_SOURCES[source])
+        if create_parents:
+            base.mkdir(parents=True, exist_ok=True)
+        if base.exists() and base.resolve() != expected_base:
+            raise ModelError("工作流目录路径校验失败")
+        current = base
+        parts = rel.split("/")
+        for folder in parts[:-1]:
+            current = current / folder
+            if current.is_symlink():
+                raise ModelError("工作流子目录含软链接，拒绝访问")
+            if create_parents:
+                current.mkdir(exist_ok=True)
+        target = current / parts[-1]
+        if target.is_symlink():
+            raise ModelError("工作流文件为软链接，拒绝访问")
+        if base.exists() and not target.resolve().is_relative_to(expected_base):
+            raise ModelError("工作流路径越界")
+        return rel, target
+
+    def _refresh_workflows_vfs(self):
+        if not (self.root / "rclone.conf").is_file():
+            return
+        from urllib.request import Request, urlopen
+
+        for parts in WORKFLOW_SOURCES.values():
+            rel_dir = "/".join(parts)
+            try:
+                payload = json.dumps({"dir": rel_dir, "recursive": "true"}).encode()
+                req = Request("http://127.0.0.1:5572/vfs/refresh", data=payload,
+                              headers={"Content-Type": "application/json"})
+                with urlopen(req, timeout=10) as resp:
+                    resp.read()
+            except Exception:
+                # An uncreated directory on Drive does not prevent local directory scans.
+                continue
+
+    def list_workflows(self, *, refresh=False):
+        if refresh:
+            self._refresh_workflows_vfs()
+        items = []
+        for source in ("comfy", "warmup"):
+            base = self._workflow_base(source)
+            if not base.is_dir():
+                continue
+            expected_base = self.root.resolve() / "drive" / Path(*WORKFLOW_SOURCES[source])
+            if base.resolve() != expected_base:
+                continue
+            for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+                current_dir = Path(dirpath)
+                dirnames[:] = sorted(
+                    d for d in dirnames
+                    if not d.startswith(".") and not (current_dir / d).is_symlink()
+                )
+                for fname in sorted(filenames):
+                    if fname.startswith(".") or not fname.lower().endswith(".json"):
+                        continue
+                    fpath = current_dir / fname
+                    if fpath.is_symlink():
+                        continue
+                    try:
+                        stat = fpath.stat()
+                        rel = fpath.relative_to(base).as_posix()
+                        workflow_relpath(rel)
+                    except (OSError, ValueError, ModelError):
+                        continue
+                    if not (0 < stat.st_size <= MAX_WORKFLOW_FILE_BYTES):
+                        continue
+                    items.append({
+                        "source": source,
+                        "path": rel,
+                        "size": stat.st_size,
+                        "modified_at": round(stat.st_mtime, 3),
+                    })
+                    if len(items) >= MAX_WORKFLOW_LIST_ITEMS:
+                        break
+                if len(items) >= MAX_WORKFLOW_LIST_ITEMS:
+                    break
+        items.sort(key=lambda item: (-item["modified_at"], item["source"] != "comfy", item["path"]))
+        return items
+
+    def read_workflow(self, source, raw_path):
+        _, target = self._resolve_workflow_file(source, raw_path)
+        if not target.is_file():
+            raise WorkflowNotFoundError(f"Drive 中找不到工作流：{raw_path}")
+        try:
+            size = target.stat().st_size
+            if size <= 0 or size > MAX_WORKFLOW_FILE_BYTES:
+                raise ModelError("工作流文件大小超出允许范围（最大 16 MiB）")
+            parsed = json.loads(target.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            raise ModelError("工作流文件不是有效的 UTF-8 文本") from None
+        except json.JSONDecodeError:
+            raise ModelError("工作流文件内容不是有效的 JSON") from None
+        except OSError:
+            raise ModelError("无法读取 Drive 工作流文件，请稍后重试") from None
+        return wrap_visual_workflow(parsed)
+
+    def save_workflow(self, raw_name, workflow, *, overwrite=False):
+        wrapped = wrap_visual_workflow(workflow)
+        # UI workflows with `nodes` belong in ComfyUI's native workflows folder so both
+        # the ComfyUI sidebar and Studio dropdown can use them; API-only graphs live in
+        # `native-comfy/warmup/` so they never break ComfyUI's canvas loader.
+        is_ui = isinstance(workflow.get("nodes"), list) or isinstance(wrapped.get("workflow"), dict)
+        source = "comfy" if is_ui else "warmup"
+        rel, target = self._resolve_workflow_file(source, raw_name, ensure_json_ext=True, create_parents=True)
+        raw = json.dumps(workflow, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+        if len(raw) > MAX_WORKFLOW_FILE_BYTES:
+            raise ModelError("工作流文件不能超过 16 MiB")
+        if target.exists() and not overwrite:
+            raise WorkflowConflictError(f"同名工作流「{rel}」已存在，请确认覆盖或更换名称")
+        scratch = target.parent / f".{target.name}.{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            with scratch.open("wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            scratch.replace(target)
+            stat = target.stat()
+        except OSError:
+            raise ModelError("无法写入 Drive 工作流目录，请检查磁盘与挂载状态") from None
+        finally:
+            scratch.unlink(missing_ok=True)
+        return {"source": source, "path": rel, "size": stat.st_size, "modified_at": round(stat.st_mtime, 3)}
+
+    def delete_workflow(self, source, raw_path):
+        if source != "warmup":
+            raise ModelError("仅允许在 Studio 移除自定义保存的 API 预热工作流；原生工作流请在 ComfyUI 中管理")
+        rel, target = self._resolve_workflow_file(source, raw_path)
+        if not target.is_file():
+            raise WorkflowNotFoundError(f"工作流不存在或已移除：{rel}")
+        try:
+            target.unlink()
+        except OSError:
+            raise ModelError("无法删除 Drive 工作流文件，请稍后重试") from None
+        return {"deleted": True, "source": source, "path": rel}
+
 
 def graph_key(body):
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
@@ -828,6 +1037,49 @@ def install(server, root, folder_paths, node_types):
         sync(await json_body(request))
         return web.json_response({})
 
+    @server.routes.get("/studio_native/models/workflows")
+    async def list_drive_workflows(request):
+        if not local.signed(request):
+            raise web.HTTPNotFound()
+        query = getattr(request, "query", None) or {}
+        refresh_flag = query.get("refresh") in {"1", "true"}
+        try:
+            workflows = await asyncio.to_thread(local.list_workflows, refresh=refresh_flag)
+        except ModelError as exc:
+            return web.json_response(model_problem(str(exc)), status=422)
+        return web.json_response({"workflows": workflows})
+
+    @server.routes.post("/studio_native/models/workflows")
+    async def save_drive_workflow(request):
+        if not local.signed(request):
+            raise web.HTTPNotFound()
+        try:
+            data = await json_body(request)
+            saved = await asyncio.to_thread(
+                local.save_workflow,
+                data.get("name"),
+                data.get("workflow"),
+                overwrite=data.get("overwrite") is True,
+            )
+        except WorkflowConflictError as exc:
+            return web.json_response(model_problem(str(exc), code="NATIVE_WORKFLOW_EXISTS"), status=409)
+        except ModelError as exc:
+            return web.json_response(model_problem(str(exc)), status=422)
+        return web.json_response({"workflow": saved}, status=201)
+
+    @server.routes.post("/studio_native/models/workflows/delete")
+    async def delete_drive_workflow(request):
+        if not local.signed(request):
+            raise web.HTTPNotFound()
+        try:
+            data = await json_body(request)
+            result = await asyncio.to_thread(local.delete_workflow, data.get("source"), data.get("path"))
+        except WorkflowNotFoundError as exc:
+            return web.json_response(model_problem(str(exc), code="NATIVE_WORKFLOW_NOT_FOUND"), status=404)
+        except ModelError as exc:
+            return web.json_response(model_problem(str(exc)), status=422)
+        return web.json_response(result)
+
     @server.routes.post("/studio_native/models/prepare")
     async def start(request):
         if not local.signed(request):
@@ -836,7 +1088,13 @@ def install(server, root, folder_paths, node_types):
             data = await json_body(request)
             if "catalog" in data:
                 sync(data)
-            body = data["workflow"]
+            ref = data.get("workflow_ref")
+            if ref is not None:
+                if not isinstance(ref, dict):
+                    raise ModelError("工作流引用格式无效")
+                body = await asyncio.to_thread(local.read_workflow, ref.get("source"), ref.get("path"))
+            else:
+                body = data["workflow"]
             ident, _ = local.submit(body, data.get("dependencies", []), visual=data.get("visual") is True,
                                     trusted=data.get("reviewed") is True)
             await asyncio.sleep(0)  # Acquire the download fence before acknowledging the gateway.
@@ -845,6 +1103,8 @@ def install(server, root, folder_paths, node_types):
             # Bound the handoff map with the same lifetime and count as progress records.
             for old in completed.keys() - local.jobs.keys():
                 del completed[old]
+        except WorkflowNotFoundError as exc:
+            return web.json_response(model_problem(str(exc), code="NATIVE_WORKFLOW_NOT_FOUND"), status=404)
         except ModelError as exc:
             return web.json_response(model_problem(str(exc)), status=422)
         return web.json_response({"id": ident}, status=202)
