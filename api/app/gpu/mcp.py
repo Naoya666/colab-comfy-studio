@@ -162,7 +162,7 @@ if not _status_path.exists():
 else:
     _status = _json.loads(_status_path.read_text(encoding="utf-8"))
     if isinstance(_status, dict):
-        _result.update({{key: _status.get(key) for key in ("state", "error_code", "error_message", "stage", "timings", "stage_started", "gpu_diagnostics", "creation_runtime") if key in _status}})
+        _result.update({{key: _status.get(key) for key in ("state", "error_code", "error_message", "stage", "timings", "stage_started", "updated_at", "gpu_diagnostics", "creation_runtime") if key in _status}})
     if _result.get("state") == "completed" and _meta_path.exists():
         _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
         _artifacts = _meta.get("artifacts") if isinstance(_meta, dict) else None
@@ -479,7 +479,9 @@ class MCPGPUExecutor:
     def _execute_tunnel_code(self, lease: dict, code: str) -> dict:
         from websockets.sync.client import connect as ws_connect
 
+        t_start = time.monotonic()
         proxy_url, proxy_token = self._refresh_tunnel_proxy(lease)
+        refresh_s = time.monotonic() - t_start
         auth_params = {"colab-runtime-proxy-token": proxy_token, "authuser": "0"}
         headers = {
             "Accept": "application/json",
@@ -488,6 +490,7 @@ class MCPGPUExecutor:
             "X-Colab-Runtime-Proxy-Token": proxy_token,
         }
         kernel_id = lease.get("kernel_id")
+        t_kernel = time.monotonic()
         try:
             if kernel_id:
                 r = self.client.get(f"{proxy_url}/api/kernels/{kernel_id}", headers=headers, params=auth_params)
@@ -512,6 +515,7 @@ class MCPGPUExecutor:
                 self.store.update("leases", lease["id"], {"kernel_id": kernel_id}, self.owner_id)
         except httpx.HTTPError as exc:
             raise MCPTransient(f"Colab kernel HTTP error ({type(exc).__name__})") from exc
+        kernel_http_s = time.monotonic() - t_kernel
 
         ws_base = re.sub(r"^http", "ws", proxy_url, count=1)
         session_id = uuid.uuid4().hex
@@ -544,6 +548,8 @@ class MCPGPUExecutor:
         reply_seen = False
         idle_seen = False
         deadline = time.monotonic() + self.timeout
+        t_ws = time.monotonic()
+        ws_open_s = 0.0
         try:
             with ws_connect(
                 ws_url,
@@ -555,6 +561,7 @@ class MCPGPUExecutor:
                 close_timeout=5.0,
                 max_size=32 * 1024 * 1024,
             ) as ws:
+                ws_open_s = time.monotonic() - t_ws
                 ws.send(self._ws_pack_default(req_msg))
                 while time.monotonic() < deadline:
                     remaining = max(0.5, deadline - time.monotonic())
@@ -588,11 +595,26 @@ class MCPGPUExecutor:
                     if reply_seen and idle_seen:
                         break
         except TimeoutError as exc:
+            log.warning(
+                "tunnel_exec timeout total_s=%.3f refresh_s=%.3f kernel_http_s=%.3f ws_open_s=%.3f",
+                time.monotonic() - t_start, refresh_s, kernel_http_s, ws_open_s,
+            )
             raise MCPTransient("Colab 隧道 Kernel 执行超时") from exc
         except Exception as exc:
             if isinstance(exc, (MCPError, MCPTransient)):
                 raise
+            log.warning(
+                "tunnel_exec ws_error=%s total_s=%.3f refresh_s=%.3f kernel_http_s=%.3f ws_open_s=%.3f",
+                type(exc).__name__, time.monotonic() - t_start, refresh_s, kernel_http_s, ws_open_s,
+            )
             raise MCPTransient(f"Colab 隧道 WebSocket 异常（{type(exc).__name__}）") from exc
+        total_s = time.monotonic() - t_start
+        ws_exec_s = max(0.0, total_s - refresh_s - kernel_http_s - ws_open_s)
+        if total_s >= 2.0:
+            log.info(
+                "tunnel_exec slow total_s=%.3f refresh_s=%.3f kernel_http_s=%.3f ws_open_s=%.3f ws_exec_s=%.3f",
+                total_s, refresh_s, kernel_http_s, ws_open_s, ws_exec_s,
+            )
         if error_info is not None:
             return {"isError": True, "executionError": error_info, "stdout": "".join(stdout_parts)}
         return {"stdout": "".join(stdout_parts)}
@@ -677,10 +699,12 @@ class MCPGPUExecutor:
             for attempt in range(_NETWORK_ATTEMPTS):
                 try:
                     return self._tool_value(self._execute_tunnel_code(tunnel_lease, code))
-                except MCPTransient:
+                except MCPTransient as exc:
                     if attempt == _NETWORK_ATTEMPTS - 1:
                         raise
-                    time.sleep(2 * (attempt + 1))
+                    delay = 2 * (attempt + 1)
+                    log.warning("tunnel_exec retry attempt=%d/%d delay_s=%d err=%s", attempt + 1, _NETWORK_ATTEMPTS, delay, type(exc).__name__)
+                    time.sleep(delay)
         return self._tool("execute_code", {"session": session, "executionId": execution_id, "code": code})
 
     def creation_process_health(self, handle: dict, job: dict, runtime: dict) -> bool | None:
@@ -759,20 +783,28 @@ print(json.dumps({{"interrupted": interrupted}}))
     def poll(self, handle: dict, job: dict) -> dict:
         if not isinstance(job, dict) or not isinstance(job.get("id"), str):
             raise MCPError("job无效")
+        t_poll0 = time.monotonic()
         execution_id = _uuid4(job.get("execution_id"))
         session = self._session(handle, job["id"])
         probe_id = str(uuid.uuid4())
         code = build_poll_code(execution_id)
         result = self._exec_code_on_handle(handle, session, probe_id, code)
+        status_poll_s = time.monotonic() - t_poll0
         if not isinstance(result, dict):
             raise MCPError("Colab状态响应无效")
         if result.get("execution_id") not in {None, execution_id}:
             raise MCPError("Colab状态执行标识不匹配")
         state = result.get("state", "running")
         # The scheduler cleans gpu_diagnostics before saving it.
-        evidence = {"execution_id": execution_id, "gpu_diagnostics": result.get("gpu_diagnostics")}
+        evidence = {
+            "execution_id": execution_id,
+            "gpu_diagnostics": result.get("gpu_diagnostics"),
+            "status_updated_at": result.get("updated_at"),
+        }
         if state in {"reserved", "starting", "running", None}:
             stage = result.get("stage")
+            if status_poll_s >= 2.0:
+                log.info("mcp_poll job=%s state=running stage=%s status_poll_s=%.3f", job["id"], stage, status_poll_s)
             return {
                 **evidence,
                 "state": "running",
@@ -801,6 +833,8 @@ print(json.dumps({{"interrupted": interrupted}}))
                     or result.get('execution_id')!=execution_id
                     or len(json.dumps(artifacts))>1048576):
                 raise MCPError('invalid artifact manifest')
+            t_art0 = time.monotonic()
+            chunk_reads = 0
             if any('storage' not in item for item in artifacts):
                 from app.config import settings
 
@@ -813,6 +847,7 @@ print(json.dumps({{"interrupted": interrupted}}))
                     key = value['artifact_id']
                     offset = objects.offset(key, self.owner_id, execution_id)
                     while offset < item['size_bytes']:
+                        chunk_reads += 1
                         reply = self._exec_code_on_handle(
                             handle,
                             session,
@@ -833,6 +868,10 @@ print(json.dumps({{"interrupted": interrupted}}))
                         verified.update(comfy_node=item.get("comfy_node"), comfy_category=item.get("comfy_category"))
                     local.append(verified)
                 artifacts = local
+            log.info(
+                "mcp_poll job=%s state=completed status_poll_s=%.3f artifact_s=%.3f chunks=%d total_s=%.3f",
+                job["id"], status_poll_s, time.monotonic() - t_art0, chunk_reads, time.monotonic() - t_poll0,
+            )
             return {**evidence, 'state':'completed','artifacts':artifacts,
                     'timings':result.get('timings') or {}}
         outputs = []

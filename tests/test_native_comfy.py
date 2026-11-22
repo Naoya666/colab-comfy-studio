@@ -1759,3 +1759,358 @@ def test_mcp_forwards_native_optimization_flags(monkeypatch, tmp_path):
     )
     assert captured["native_flags"]["NATIVE_ENV_CACHE"] == "0"
     assert captured["native_flags"]["NATIVE_PARALLEL_RESTORE"] == "0"
+
+
+def test_native_env_cache_v2_namespace_overlay_pycache_filter_and_v1_prune(monkeypatch, tmp_path):
+    import tarfile
+    from functools import partial
+    from types import SimpleNamespace
+
+    from app.gpu import native_runtime as runtime
+    from app.gpu import node_persistence as np
+
+    root = tmp_path / "native"
+    comfy = root / "ComfyUI"
+    nodes = comfy / "custom_nodes"
+    (nodes / "demo").mkdir(parents=True)
+    (comfy / "requirements.txt").write_text("einops\n")
+    (comfy / "manager_requirements.txt").write_text("GitPython\n")
+    (nodes / "demo" / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n")
+    (nodes / "demo" / "requirements.txt").write_text("google-genai\n")
+
+    cache_key = partial(np.compute_env_cache_key, base_packages=runtime._base_python_packages(local=False))
+    key_info = cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, np.inventory(nodes))
+    assert key_info["key"].startswith("native-env-v2-")
+    assert key_info["spec"]["schema"] == 2
+
+    def seed_base(site):
+        # Preinstalled protected torch
+        (site / "torch").mkdir(parents=True)
+        (site / "torch" / "__init__.py").write_text("TORCH = '2.8'\n")
+        (site / "torch-2.8.0.dist-info").mkdir()
+        (site / "torch-2.8.0.dist-info" / "METADATA").write_text("Name: torch\nVersion: 2.8.0\n")
+        (site / "torch-2.8.0.dist-info" / "RECORD").write_text("torch/__init__.py,,\ntorch-2.8.0.dist-info/METADATA,,\n")
+
+        # Shared namespace base package: google/colab
+        (site / "google" / "colab").mkdir(parents=True)
+        (site / "google" / "colab" / "__init__.py").write_text("COLAB = True\n")
+        (site / "google_colab-1.0.dist-info").mkdir()
+        (site / "google_colab-1.0.dist-info" / "METADATA").write_text("Name: google-colab\nVersion: 1.0\n")
+        (site / "google_colab-1.0.dist-info" / "RECORD").write_text(
+            "google/colab/__init__.py,,\ngoogle_colab-1.0.dist-info/METADATA,,\n"
+        )
+
+        # Upgraded base package: foo 1.0 (has a file that will vanish in 2.0)
+        (site / "foo").mkdir()
+        (site / "foo" / "__init__.py").write_text("VER = 1\n")
+        (site / "foo" / "legacy.py").write_text("LEGACY = True\n")
+        (site / "foo-1.0.dist-info").mkdir()
+        (site / "foo-1.0.dist-info" / "METADATA").write_text("Name: foo\nVersion: 1.0\n")
+        (site / "foo-1.0.dist-info" / "RECORD").write_text(
+            "foo/__init__.py,,\nfoo/legacy.py,,\nfoo-1.0.dist-info/METADATA,,\n"
+        )
+
+    site_build = tmp_path / "site_build"
+    seed_base(site_build)
+    before = np.site_snapshot(site_build)
+
+    # Simulate runtime import generating __pycache__ inside protected torch/ and google/colab/
+    (site_build / "torch" / "__pycache__").mkdir()
+    (site_build / "torch" / "__pycache__" / "__init__.cpython-313.pyc").write_bytes(b"pyc-bytes")
+    (site_build / "google" / "colab" / "__pycache__").mkdir()
+    (site_build / "google" / "colab" / "__pycache__" / "__init__.cpython-313.pyc").write_bytes(b"pyc-bytes")
+
+    # Install google-genai into shared google/ namespace (with external ../../../bin/genai script!)
+    (site_build / "google" / "genai").mkdir(parents=True)
+    (site_build / "google" / "genai" / "__init__.py").write_text("GENAI = True\n")
+    (site_build / "google" / "genai" / "__pycache__").mkdir()
+    (site_build / "google" / "genai" / "__pycache__" / "x.pyc").write_bytes(b"skip-me")
+    (site_build / "google_genai-0.1.dist-info").mkdir()
+    (site_build / "google_genai-0.1.dist-info" / "METADATA").write_text("Name: google-genai\nVersion: 0.1\n")
+    (site_build / "google_genai-0.1.dist-info" / "RECORD").write_text(
+        "google/genai/__init__.py,,\n"
+        "google/genai/__pycache__/x.pyc,,\n"
+        "google_genai-0.1.dist-info/METADATA,,\n"
+        "../../../bin/genai-cli,,\n"
+    )
+
+    # Upgrade foo 1.0 -> 2.0 (removes foo/legacy.py, updates foo/__init__.py, adds foo/new.py)
+    import shutil as _shutil
+    _shutil.rmtree(site_build / "foo-1.0.dist-info")
+    (site_build / "foo" / "legacy.py").unlink()
+    (site_build / "foo" / "__init__.py").write_text("VER = 2\n")
+    (site_build / "foo" / "new.py").write_text("NEW = True\n")
+    (site_build / "foo-2.0.dist-info").mkdir()
+    (site_build / "foo-2.0.dist-info" / "METADATA").write_text("Name: foo\nVersion: 2.0\n")
+    (site_build / "foo-2.0.dist-info" / "RECORD").write_text(
+        "foo/__init__.py,,\nfoo/new.py,,\nfoo-2.0.dist-info/METADATA,,\n"
+    )
+
+    # Brand new package with C extension + __pycache__
+    (site_build / "sam2").mkdir()
+    (site_build / "sam2" / "_C.so").write_bytes(b"\x7fELFcompiled")
+    (site_build / "sam2" / "__pycache__").mkdir()
+    (site_build / "sam2" / "__pycache__" / "mod.pyc").write_bytes(b"ignore")
+    (site_build / "sam_2-1.0.dist-info").mkdir()
+    (site_build / "sam_2-1.0.dist-info" / "METADATA").write_text("Name: sam-2\nVersion: 1.0\n")
+    (site_build / "sam_2-1.0.dist-info" / "RECORD").write_text(
+        "sam2/_C.so,,\nsam_2-1.0.dist-info/METADATA,,\n"
+    )
+
+    plan_path = np.prepare_env_cache_plan(root, site_build, before, key_info)
+    assert plan_path is not None
+    plan = np.read(plan_path)
+    assert "torch" not in plan["added"]
+    assert "google" not in plan["added"]
+    assert "foo" not in plan["added"]
+    assert "sam2" in plan["added"]
+    assert "google_genai-0.1.dist-info" in plan["added"]
+    assert "foo-2.0.dist-info" in plan["added"]
+    assert "foo-1.0.dist-info" in plan["removed"]
+    assert "google/genai/__init__.py" in plan["overlay_files"]
+    assert "google/colab/__init__.py" not in plan["overlay_files"]
+    assert "foo/__init__.py" in plan["overlay_files"]
+    assert "foo/new.py" in plan["overlay_files"]
+    assert "foo/legacy.py" in plan["removed_files"]
+    assert plan["external_ignored"] == 1
+
+    drive_env = tmp_path / "drive_env"
+    drive_env.mkdir()
+
+    class FakeRemote:
+        def available(self):
+            return True
+
+        def get_env_cache(self, name, target):
+            src = drive_env / name
+            if not src.is_file():
+                return False
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(src.read_bytes())
+            return True
+
+        def put_env_cache(self, source, name, *, verify=False):
+            (drive_env / name).write_bytes(source.read_bytes())
+
+        def prune_env_cache(self, keep=3):
+            pass
+
+    remote = FakeRemote()
+    assert np.upload_env_cache_from_plan(root, plan_path, remote) is True
+    tar_file = drive_env / f"{key_info['key']}.tar.gz"
+    with tarfile.open(tar_file, "r:gz") as tf:
+        names = tf.getnames()
+    assert not any("__pycache__" in n or n.endswith(".pyc") for n in names)
+    assert not any("torch" in n or "google/colab" in n for n in names)
+    assert "overlay/google/genai/__init__.py" in names
+    assert "site/sam2/_C.so" in names
+
+    # Fresh VM restore + rollback check
+    site_fresh = tmp_path / "site_fresh"
+    seed_base(site_fresh)
+    monkeypatch.setattr(np, "protect_environment", lambda r: {"torch": "2.8.0"})
+    pip_rc = [1]
+    orig_run = np.subprocess.run
+
+    def fake_run(args, *a, **kw):
+        if len(args) >= 3 and args[1:4] == ["-m", "pip", "check"]:
+            return SimpleNamespace(returncode=pip_rc[0], stdout="", stderr="")
+        return orig_run(args, *a, **kw)
+
+    monkeypatch.setattr(np.subprocess, "run", fake_run)
+
+    # First: pip check fails -> full rollback of both overlay and top-level!
+    assert np.try_restore_env_cache(tmp_path / "r1", site_fresh, key_info, {"torch": "2.8.0"}, remote) is False
+    assert (site_fresh / "google" / "colab" / "__init__.py").read_text() == "COLAB = True\n"
+    assert not (site_fresh / "google" / "genai").exists()
+    assert (site_fresh / "foo" / "__init__.py").read_text() == "VER = 1\n"
+    assert (site_fresh / "foo" / "legacy.py").is_file()
+    assert not (site_fresh / "foo" / "new.py").exists()
+    assert (site_fresh / "foo-1.0.dist-info").is_dir()
+    assert not (site_fresh / "sam2").exists()
+
+    # Second: pip check passes -> namespace merged cleanly, foo upgraded, torch untouched!
+    pip_rc[0] = 0
+    assert np.try_restore_env_cache(tmp_path / "r2", site_fresh, key_info, {"torch": "2.8.0"}, remote) is True
+    assert (site_fresh / "torch" / "__init__.py").read_text() == "TORCH = '2.8'\n"
+    assert (site_fresh / "google" / "colab" / "__init__.py").read_text() == "COLAB = True\n"
+    assert (site_fresh / "google" / "genai" / "__init__.py").read_text() == "GENAI = True\n"
+    assert (site_fresh / "foo" / "__init__.py").read_text() == "VER = 2\n"
+    assert (site_fresh / "foo" / "new.py").is_file()
+    assert not (site_fresh / "foo" / "legacy.py").exists()
+    assert not (site_fresh / "foo-1.0.dist-info").exists()
+    assert (site_fresh / "sam2" / "_C.so").read_bytes() == b"\x7fELFcompiled"
+
+    # Protected torch modification in plan must skip cache build
+    site_bad = tmp_path / "site_bad"
+    seed_base(site_bad)
+    before_bad = np.site_snapshot(site_bad)
+    (site_bad / "torch-2.8.0.dist-info" / "METADATA").write_text("Name: torch\nVersion: 2.9.0\n")
+    assert np.prepare_env_cache_plan(root, site_bad, before_bad, key_info) is None
+
+    # Missing RECORD on a changed dist touching existing space skips cache build cleanly
+    site_norec = tmp_path / "site_norec"
+    seed_base(site_norec)
+    before_norec = np.site_snapshot(site_norec)
+    (site_norec / "mystery-1.0.dist-info").mkdir()
+    (site_norec / "mystery-1.0.dist-info" / "METADATA").write_text("Name: mystery\nVersion: 1.0\n")
+    assert np.prepare_env_cache_plan(root, site_norec, before_norec, key_info) is None
+
+    # prune_env_cache deletes all native-env-v1-* files and keeps latest keep v2 entries
+    deleted = []
+    remote_real = np.Remote(tmp_path / "rclone_root")
+    (tmp_path / "rclone_root").mkdir()
+    (tmp_path / "rclone_root" / "rclone").write_text("#!/bin/sh\n")
+    (tmp_path / "rclone_root" / "rclone.conf").write_text("[studio]\n")
+
+    def fake_rclone(*args, timeout=600):
+        if args[0] == "lsf":
+            return SimpleNamespace(
+                stdout=(
+                    "2026-11-22 10:00:00\tnative-env-v1-old1.meta.json\n"
+                    "2026-11-22 10:00:00\tnative-env-v1-old1.tar.gz\n"
+                    "2026-11-22 11:00:00\tnative-env-v2-a.meta.json\n"
+                    "2026-11-22 12:00:00\tnative-env-v2-b.meta.json\n"
+                    "2026-11-22 13:00:00\tnative-env-v2-c.meta.json\n"
+                    "2026-11-22 14:00:00\tnative-env-v2-d.meta.json\n"
+                )
+            )
+        if args[0] == "deletefile":
+            deleted.append(args[1].split("/")[-1])
+            return SimpleNamespace(stdout="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(remote_real, "command", fake_rclone)
+    remote_real.prune_env_cache(keep=3)
+    assert "native-env-v1-old1.meta.json" in deleted
+    assert "native-env-v1-old1.tar.gz" in deleted
+    assert "native-env-v2-a.meta.json" in deleted
+    assert "native-env-v2-a.tar.gz" in deleted
+    assert "native-env-v2-b.meta.json" not in deleted
+
+
+def test_scheduler_native_wait_event_emitted_even_when_stage_already_native_tunnel(monkeypatch, tmp_path):
+    from app.db import Store
+    from app.gpu import native as native_mod
+    from app.gpu.scheduler import Scheduler
+
+    store = Store(f"sqlite:///{tmp_path / 'wait_event.db'}")
+    store.create("projects", "owner", {"title": "Native"}, record_id="proj-native")
+
+    class FakeExec:
+        def poll(self, handle, job):
+            return {"state": "completed", "execution_id": job["execution_id"], "status_updated_at": 100.0, "outputs": []}
+
+    sched = Scheduler(store, executor_factory=lambda job: FakeExec())
+    job, _ = sched.store.create_job("owner", {"kind": "native-comfy", "project_id": "proj-native"}, "idem-wait")
+    lease = sched.store.create("leases", "owner", {
+        "provider": "colab", "state": "active", "deadline_epoch": 9999999999.0,
+        "owner_job_id": job["id"], "current_job_id": job["id"],
+        "handle": {"runtime_name": "runtimes/r1", "owner_id": "owner"},
+    })
+    inst = sched.store.create("instances", "owner", {
+        "provider": "colab", "state": "provisioning", "lease_id": lease["id"], "current_job_id": job["id"],
+    })
+    job = sched.store.update("jobs", job["id"], {
+        "state": "running", "stage": "native_tunnel", "lease_id": lease["id"],
+        "instance_id": inst["id"], "execution_id": "11111111-2222-4333-8444-555555555555",
+        "provider": "colab", "snapshot": {"native_comfy": True, "manifest": {"comfy_commit": "a" * 40}},
+    }, "owner")
+
+    monkeypatch.setattr(native_mod, "ready", lambda *a, **kw: False)
+    after1 = sched._run(job)
+    assert after1["stage"] == "native_tunnel"
+    assert after1["native_proxy_wait_logged"] is True
+    events1 = [e["message"] for e in sched.store.list("events", "owner") if e.get("job_id") == job["id"]]
+    assert events1.count("等待代理健康检查及内部隧道鉴权验证") == 1
+
+    # Second unready poll does not spam duplicate wait events
+    after2 = sched._run(after1)
+    events2 = [e["message"] for e in sched.store.list("events", "owner") if e.get("job_id") == job["id"]]
+    assert events2.count("等待代理健康检查及内部隧道鉴权验证") == 1
+
+
+@pytest.mark.asyncio
+async def test_native_state_route_fails_closed_fast_during_boot_scan_without_duplicate_inventory(monkeypatch, tmp_path):
+    import threading
+    from types import SimpleNamespace
+
+    from app.gpu import native_runtime as runtime
+
+    # Extract only the /studio_native/state handler body logic by inspecting EXTENSION syntax & compiling in isolation
+    assert "has_status = status_file.exists()" in runtime.EXTENSION
+    assert "boot_scanning = bool(boot_done is not None and not boot_done.is_set())" in runtime.EXTENSION
+    assert "probe, (not has_status) and (not boot_scanning)" in runtime.EXTENSION
+
+    # Execute EXTENSION route handler in a stubbed PromptServer namespace
+    routes = {}
+
+    class FakeRoutes:
+        def get(self, path):
+            def deco(fn):
+                routes[("GET", path)] = fn
+                return fn
+            return deco
+
+        def post(self, path):
+            def deco(fn):
+                routes[("POST", path)] = fn
+                return fn
+            return deco
+
+    fake_server = SimpleNamespace(
+        instance=SimpleNamespace(
+            routes=FakeRoutes(),
+            app=SimpleNamespace(middlewares=[]),
+            loop=SimpleNamespace(create_task=lambda coro: coro.close()),
+        )
+    )
+    fake_web = SimpleNamespace(
+        middleware=lambda fn: fn,
+        json_response=lambda data, status=200: SimpleNamespace(data=data, status=status),
+        HTTPClientError=Exception,
+    )
+
+    boot_done = threading.Event()  # unset = boot scan in progress
+    probe_calls = []
+    status_calls = []
+    fake_persistence = SimpleNamespace(
+        boot_scan_done=boot_done,
+        status=lambda: (status_calls.append(1), {"durable": True, "error": None})[1],
+    )
+
+    import sys
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(web=fake_web))
+    monkeypatch.setitem(sys.modules, "server", SimpleNamespace(PromptServer=fake_server))
+    monkeypatch.setitem(sys.modules, "node_persistence", SimpleNamespace(install=lambda *a, **kw: fake_persistence))
+
+    ns = {}
+    ext_src = runtime.EXTENSION.replace("/content/ai-studio/native", str(tmp_path))
+    exec(compile(ext_src, "studio_native_state_test", "exec"), ns)
+    ns["probe"] = lambda check_plugins=True: (probe_calls.append(check_plugins), {"busy": False, "busy_reason": None})[1]
+
+    handler = routes[("GET", "/studio_native/state")]
+
+    # Case 1: boot scan still running -> probe(check_plugins=False), fail-closed busy=True, no PERSISTENCE.status()
+    resp1 = await handler(SimpleNamespace())
+    assert probe_calls == [False]
+    assert status_calls == []
+    assert resp1.data["busy"] is True
+    assert resp1.data["busy_reason"] == "plugins"
+
+    # Case 2: boot scan done, status file absent -> probe(check_plugins=True), no PERSISTENCE.status()
+    boot_done.set()
+    probe_calls.clear()
+    resp2 = await handler(SimpleNamespace())
+    assert probe_calls == [True]
+    assert status_calls == []
+    assert resp2.data["busy"] is False
+
+    # Case 3: boot scan done, status file present -> probe(check_plugins=False), single PERSISTENCE.status()
+    (tmp_path / "plugins-status.json").write_text("{}")
+    probe_calls.clear()
+    resp3 = await handler(SimpleNamespace())
+    assert probe_calls == [False]
+    assert status_calls == [1]
+    assert resp3.data["busy"] is False
+

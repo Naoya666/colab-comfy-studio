@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import time
@@ -21,6 +22,8 @@ from . import native_config
 from .compute import GpuConfig
 from .manifest import digest
 from .node_persistence import NATIVE_FLAG_NAMES, env_flag
+
+log = logging.getLogger("studio.native")
 
 TERMINAL = {"completed", "failed", "cancelled", "rejected"}
 UNAUTHENTICATED_TUNNEL_PROBES = (
@@ -665,33 +668,75 @@ def update_write(repo, lease, write_id, *, finished=False):
 
 
 def ready(client=None, *, repo=None, owner="owner"):
+    started = time.monotonic()
+    unauth_codes: list[int] = []
+    unauth_max_s = 0.0
+    stats_s = 0.0
+    stats_code = None
+    state_s = 0.0
+    state_code = None
+    state_busy = None
+    state_reason = None
     try:
         url, headers = backend_for(repo, owner)
         with httpx.Client(timeout=8, follow_redirects=False) if client is None else _borrow(client) as c:
+            def _timed_get(path: str, req_headers: dict | None = None):
+                t0 = time.monotonic()
+                resp = c.get(url + path, headers=req_headers) if req_headers is not None else c.get(url + path)
+                return resp, time.monotonic() - t0
+
             # Service-token protection of the internal tunnel is mandatory.
             # Probe installation paths with GET only: never submit an installation.
             # Access must protect Manager too, including deployments with path-based rules.
             if env_flag("NATIVE_FAST_CONTROL_PLANE", True):
                 with ThreadPoolExecutor(max_workers=7) as pool:
-                    unauth_futures = [pool.submit(c.get, url + path) for path in UNAUTHENTICATED_TUNNEL_PROBES]
-                    stats_future = pool.submit(c.get, url + "/system_stats", headers=headers)
-                    state_future = pool.submit(c.get, url + "/studio_native/state", headers=headers)
+                    unauth_futures = [pool.submit(_timed_get, path) for path in UNAUTHENTICATED_TUNNEL_PROBES]
+                    stats_future = pool.submit(_timed_get, "/system_stats", headers)
+                    state_future = pool.submit(_timed_get, "/studio_native/state", headers)
                     for fut in unauth_futures:
-                        if fut.result().status_code not in {401, 403, 302}:
+                        unauthenticated, elapsed = fut.result()
+                        unauth_max_s = max(unauth_max_s, elapsed)
+                        unauth_codes.append(unauthenticated.status_code)
+                        if unauthenticated.status_code not in {401, 403, 302}:
+                            log.info(
+                                "native_ready ok=False reason=unauth_open total_s=%.3f unauth_max_s=%.3f unauth_codes=%s",
+                                time.monotonic() - started, unauth_max_s, unauth_codes,
+                            )
                             return False
-                    response = stats_future.result()
-                    state = state_future.result()
+                    response, stats_s = stats_future.result()
+                    state, state_s = state_future.result()
             else:
                 for path in UNAUTHENTICATED_TUNNEL_PROBES:
-                    unauthenticated = c.get(url + path)
+                    unauthenticated, elapsed = _timed_get(path)
+                    unauth_max_s = max(unauth_max_s, elapsed)
+                    unauth_codes.append(unauthenticated.status_code)
                     if unauthenticated.status_code not in {401, 403, 302}:
+                        log.info(
+                            "native_ready ok=False reason=unauth_open total_s=%.3f unauth_max_s=%.3f unauth_codes=%s",
+                            time.monotonic() - started, unauth_max_s, unauth_codes,
+                        )
                         return False
-                response = c.get(url + "/system_stats", headers=headers)
-                state = c.get(url + "/studio_native/state", headers=headers)
+                response, stats_s = _timed_get("/system_stats", headers)
+                state, state_s = _timed_get("/studio_native/state", headers)
+            stats_code = response.status_code
+            state_code = state.status_code
             response.raise_for_status()
             state.raise_for_status()
-            return isinstance(response.json().get("system"), dict) and isinstance(state.json().get("busy"), bool)
-    except Exception:
+            stats_json = response.json()
+            state_json = state.json()
+            state_busy = state_json.get("busy")
+            state_reason = state_json.get("busy_reason")
+            ok = isinstance(stats_json.get("system"), dict) and isinstance(state_busy, bool)
+            log.info(
+                "native_ready ok=%s total_s=%.3f unauth_max_s=%.3f unauth_codes=%s stats_s=%.3f stats_code=%s state_s=%.3f state_code=%s busy=%s busy_reason=%s",
+                ok, time.monotonic() - started, unauth_max_s, unauth_codes, stats_s, stats_code, state_s, state_code, state_busy, state_reason,
+            )
+            return ok
+    except Exception as exc:
+        log.info(
+            "native_ready ok=False total_s=%.3f unauth_max_s=%.3f unauth_codes=%s stats_s=%.3f stats_code=%s state_s=%.3f state_code=%s err=%s",
+            time.monotonic() - started, unauth_max_s, unauth_codes, stats_s, stats_code, state_s, state_code, type(exc).__name__,
+        )
         return False
 
 

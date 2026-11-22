@@ -55,9 +55,9 @@
 ### 问题 2（P0 · 缓存命中最大卡点）：`env-cache` 增量包被错误膨大至 `1.58 GiB`（多耗 **~50–55 秒**，并拖慢收尾）
 
 - **现象与证据**：
-  - Drive 上现有两个缓存包体积均高达 **`1.58 GiB`**（`1,657,288,993` 字节与 `1,657,298,860` 字节）。
-  - 导致前 3 次命中缓存时，单 `native_env_cache` 下载 + 解压就占了 **65.0–67.8 秒**（远高于正常 150–250 MB 增量包的 10–15 秒）。
-  - 本次冷构建在 `13:13:38.6Z` 启动后台打包上传 `1.58 GiB`（`env-cache.log` 于 `13:15:10Z` 结束，耗时 **91.4 秒**），高并发 `pigz` + `rclone` 立即打满 CPU 与带宽，直接叠加了就绪检出延迟。
+  - Drive 上现有两个缓存包体积均高达 **`1.54 GiB`（`1,581 MiB`）**（`1,657,288,993` 字节与 `1,657,298,860` 字节）。
+  - 导致前 3 次命中缓存时，单 `native_env_cache` 下载 + 解压就占了 **65.0–67.8 秒**（远高于正常 150–250 MiB 增量包的 10–15 秒）。
+  - 本次冷构建在 `13:13:38.6Z` 启动后台打包上传 `1.54 GiB`（`env-cache.log` 于 `13:15:10Z` 结束，耗时 **91.4 秒**），高并发 `pigz` + `rclone` 立即打满 CPU 与带宽，叠加了就绪检出延迟。
 - **代码根因**：
   - 检查 Colab 上 `env-cache-plan.json` 的 `added`（共 141 项），赫然包含 Colab 镜像原本预装且受保护的巨型包：
     - `"torch"`
@@ -92,11 +92,11 @@
   - **热缓存样本 `1639fdd7`**（无后台 `env-cache` 上传）：Worker 阶段于 `10:10:33.8Z` 完成，但直到 `10:11:01.98Z` 才进入 `uploading`（空窗 **28.2 秒**）。
   - **冷构建样本 `c1566a79`**：`exec/status.json` 写入完成时间戳为 `13:13:38.516Z`，`tunnel.log` 于 `13:13:38Z` 已连上 `sin13`，但直到 `13:14:13.087Z` 才进入 `uploading`（空窗 **34.6 秒**）。
   - 同次任务在运行期也出现多次 17–21 秒的状态推送延迟（如 `native_system` 晚 21.3s、`native_plugins_restore` 晚 17.6s 才写入事件）。
-  - 且上述样本均**未**触发 `等待代理健康检查及内部隧道鉴权验证` 事件，说明耗时发生在 `Scheduler._run()` 的单次 `poll()` 或首次 `native.ready()` 调用内部（未抛错返回 False，而是慢返回或内部重试后成功）。
+  - 注：上述样本未出现 `等待代理健康检查及内部隧道鉴权验证` 事件，除单次 `poll()`/`ready()` 耗时外，也可能是因为 `cloudflared` 期间 `job["stage"]` 已被置为 `native_tunnel`，导致 [scheduler.py](../../api/app/gpu/scheduler.py) `if job.get("stage") != "native_tunnel"` 静默跳过等待事件；因此需先修复该事件记录并补齐分段耗时日志再定夺第二批优化。
 - **需重点排查与治理的环节**：
-  1. **后台 `env-cache` 打包上传抢占资源**：[native_runtime.py](../../api/app/gpu/native_runtime.py) 第 806–812 行在写入 `status.json = completed` **之前**就立即拉起了全核 `pigz` + `rclone` 上传进程，与控制面最终 poll、artifact 拉取及 `native.ready()` 争抢 CPU 与网络。
-  2. **`GET /studio_native/state` 首次探针开销**：[native.py](../../api/app/gpu/native.py) `ready()` 并发请求 `/studio_native/state`；而 `studio_native_state.py` 收到 `/studio_native/state` 时会调用 `probe()`（内部扫一次 `inventory(nodes)`）以及 `PERSISTENCE.status()`（内部又扫一次 `inventory(nodes)`），同一请求内重复扫目录；在 `plugins-status.json` 与 `scan-cache.json` 尚未完全稳定时容易导致长耗时。
-  3. **Colab 隧道轮询通道开销**：[mcp.py](../../api/app/gpu/mcp.py) `_execute_tunnel_code()` 每次 `poll()` 都重新 `GET /api/kernels/{id}` 并新建一次 WebSocket 连接执行短脚本，缺少单次 `poll()` 与 `native.ready()` 的分项耗时观测日志，遇到偶发 30s WebSocket 超时重试时无法从日志一眼定位。
+  1. **后台 `env-cache` 打包上传抢占资源**：[native_runtime.py](../../api/app/gpu/native_runtime.py) 第 806–812 行在写入 `status.json = completed` **之前**就立即拉起了全核 `pigz` + `rclone` 上传进程，与控制面最终 poll、artifact 拉取及 `native.ready()` 争抢 CPU 与网络（待第一批埋点量化后再决定是否延迟/限流）。
+  2. **`GET /studio_native/state` TOCTOU 竞争与冷扫冲突**：[native_runtime.py](../../api/app/gpu/native_runtime.py) 正常情况下在 `probe()` 与 `PERSISTENCE.status()` 之间二选一扫描，仅在 `plugins-status.json` 恰好于两次 `exists()` 间创建时可能双扫；若与异步 `boot_fingerprint` 扫描并发还可能触发 `native.ready()` 8 秒超时，需固定单次 `exists()` 并在首扫进行中直接 fail-closed 返回 `busy=True`。
+  3. **Colab 隧道轮询通道与 `native.ready()` 观测盲区**：[mcp.py](../../api/app/gpu/mcp.py) 与 [native.py](../../api/app/gpu/native.py) 缺少单次 `poll()`（含 `worker_completed_age_s` / 代理刷新 / WS 建连与重试 / artifact chunk）与 `native.ready()` 7 路探针的分项耗时观测日志。
 
 ---
 

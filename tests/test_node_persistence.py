@@ -731,3 +731,118 @@ def test_parallel_restore_uses_rclone_files_from_and_verifies_sha256(setup, tmp_
     bad_pers = p.Persistence(bad_vm, bad_vm / 'ComfyUI', bad_vm / 'user', CorruptBatchRemote(bad_vm))
     with pytest.raises(RuntimeError, match='Corrupt plugin cache'):
         bad_pers.restore()
+
+
+def test_dependencies_batch_fast_path_skips_manager_runs_install_py_and_falls_back(setup, monkeypatch):
+    new, _ = setup
+    obj = new('batch-fast')
+    node_a = add(obj, 'plugin-a')
+    (node_a / 'requirements.txt').write_text('einops\n')
+    (node_a / 'install.py').write_text('print("installed")\n')
+    node_b = add(obj, 'plugin-b')
+    (node_b / 'requirements.txt').write_text('requests\n')
+    disabled_dir = obj.nodes / '.disabled'
+    disabled_dir.mkdir()
+    disabled_node = disabled_dir / 'plugin-off'
+    disabled_node.mkdir()
+    (disabled_node / '__init__.py').write_text('NODE_CLASS_MAPPINGS = {}\n')
+    (disabled_node / 'install.py').write_text('raise SystemExit(1)\n')
+
+    monkeypatch.setattr(p, 'manager_cli', lambda comfy: Path('/fake/cm-cli.py'))
+    monkeypatch.setattr(p, 'protect_environment', lambda root: {'torch': '2.8'})
+    monkeypatch.setattr(p.shutil, 'which', lambda name: '/usr/local/bin/uv' if name == 'uv' else None)
+
+    calls = []
+    batch_rc = [0]
+    install_rc = [0]
+
+    def fake_run(args, **kw):
+        calls.append((args, kw.get('cwd')))
+        if args[0] == '/usr/local/bin/uv':
+            return SimpleNamespace(returncode=batch_rc[0], stdout='', stderr='')
+        if len(args) >= 2 and str(args[1]).endswith('install.py'):
+            return SimpleNamespace(returncode=install_rc[0], stdout='ok', stderr='bad' if install_rc[0] else '')
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr(p.subprocess, 'run', fake_run)
+
+    # 1. Batch uv succeeds -> skips cm-cli, runs ONLY enabled install.py in plugin cwd, then pip check
+    key = obj.dependencies()
+    assert key is not None
+    assert (obj.root / 'plugin-dependencies.json').is_file()
+    assert any(c[0][0] == '/usr/local/bin/uv' for c in calls)
+    assert not any('restore-dependencies' in c[0] for c in calls)
+    install_calls = [c for c in calls if len(c[0]) >= 2 and str(c[0][1]).endswith('install.py')]
+    assert len(install_calls) == 1
+    assert install_calls[0][1] == node_a
+    assert any(c[0][1:4] == ['-m', 'pip', 'check'] for c in calls)
+
+    # 2. install.py failure -> records plugin-errors.json & log, does not stamp or call cm-cli
+    (obj.root / 'plugin-dependencies.json').unlink()
+    calls.clear()
+    install_rc[0] = 1
+    with pytest.raises(RuntimeError, match='Plugin install.py failed'):
+        obj.dependencies()
+    assert not (obj.root / 'plugin-dependencies.json').exists()
+    assert (obj.root / 'plugin-errors.json').is_file()
+    assert (obj.root / 'plugin-dependencies.log').is_file()
+    assert not any('restore-dependencies' in c[0] for c in calls)
+
+    # 3. Batch uv failure -> falls back cleanly to cm-cli restore-dependencies
+    calls.clear()
+    batch_rc[0] = 1
+    install_rc[0] = 0
+    key2 = obj.dependencies()
+    assert key2 == key
+    assert any('restore-dependencies' in c[0] for c in calls)
+
+
+def test_secret_prefilter_skips_benign_csv_and_hf_identifiers_without_false_negatives():
+    assert p._may_contain_secret(b'password,1girl,solo,12345\n') is False
+    assert p._may_contain_secret(b'password:1girl,solo\n') is True
+    assert p._may_contain_secret(b'api_key = "secret123456789"\n') is True
+    assert p._may_contain_secret(b'from huggingface_hub import hf_hub_download\n') is False
+    assert p._may_contain_secret(b'token = "hf_1234567890abcdef12"\n') is True
+    assert p._may_contain_secret(b'token = "ghp_1234567890abcdef12"\n') is True
+    assert p._may_contain_secret(b'-----BEGIN RSA PRIVATE KEY-----\n') is True
+
+
+@pytest.mark.asyncio
+async def test_install_runs_boot_scan_asynchronously_without_blocking_import(setup, monkeypatch):
+    import asyncio
+    import io
+    import threading
+
+    new, drive = setup
+    obj = new('async-boot')
+    add(obj)
+    log = obj.root / 'comfy.log'
+    log.write_text('startup complete\n')
+    p.atomic(obj.root / 'plugins-config.json', {
+        'comfy': str(obj.comfy), 'user': str(obj.user), 'log': str(log), 'log_offset': 0,
+    })
+
+    gate = threading.Event()
+    orig_inv = p.inventory
+
+    def gated_inventory(nodes, **kw):
+        gate.wait(timeout=5)
+        return orig_inv(nodes, **kw)
+
+    monkeypatch.setattr(p, 'inventory', gated_inventory)
+    monkeypatch.setattr(p, 'Remote', lambda root: drive)
+    monkeypatch.setattr('urllib.request.urlopen', lambda *a, **kw: io.BytesIO(b'{"system": {"os": "linux"}}'))
+
+    tasks = []
+    server = SimpleNamespace(loop=SimpleNamespace(create_task=lambda coro: tasks.append(asyncio.create_task(coro))))
+    persistence = p.install(server, obj.root, lambda: False)
+    # install() returns immediately while boot scan is still blocked on gate!
+    assert not persistence.boot_scan_done.is_set()
+    assert persistence.boot is None
+
+    gate.set()
+    assert persistence.boot_scan_done.wait(timeout=5)
+    tasks[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tasks[0]
+

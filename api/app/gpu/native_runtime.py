@@ -157,10 +157,16 @@ def index_status(models, refresh):
 async def state(request):
     Path("/content/ai-studio/native/heartbeat").write_text(str(time.time()))
     status_file = Path("/content/ai-studio/native/plugins-status.json")
-    result = await asyncio.to_thread(probe, not status_file.exists())
+    has_status = status_file.exists()
+    boot_done = getattr(PERSISTENCE, "boot_scan_done", None) if PERSISTENCE is not None else None
+    boot_scanning = bool(boot_done is not None and not boot_done.is_set())
+    result = await asyncio.to_thread(probe, (not has_status) and (not boot_scanning))
     if LOCAL_MODELS and LOCAL_MODELS.handoffs:
         result.update(busy=True, busy_reason="model_preparation")
-    if status_file.exists():
+    if boot_scanning:
+        if not result.get("busy"):
+            result.update(busy=True, busy_reason="plugins")
+    elif has_status:
         result["plugins"] = await asyncio.to_thread(PERSISTENCE.status)
         if not result["busy"] and (not result["plugins"].get("durable") or result["plugins"].get("error")):
             result.update(busy=True, busy_reason="plugins")
@@ -720,7 +726,6 @@ def run(root, payload, stages):
 
                 if use_env_cache:
                     current_plugins = restored_plugins if restored_plugins is not None else inventory(comfy / "custom_nodes")
-                    before_site = site_snapshot(site)
                     key_info = compute_env_cache_key(
                         comfy, commit, worker._gpu_cache_tag(), comfy / "custom_nodes", current_plugins,
                         base_packages=_base_python_packages(local=local),
@@ -733,6 +738,8 @@ def run(root, payload, stages):
                             mark_prestartup_verified(ROOT, comfy / "custom_nodes", dep_key)
 
                 if not env_cache_hit:
+                    if use_env_cache and key_info is not None:
+                        before_site = site_snapshot(site)
                     stages.start("native_python")
                     _install_base_python(worker, ROOT, comfy, manager, local=local)
                     after_base = protect_environment(ROOT)

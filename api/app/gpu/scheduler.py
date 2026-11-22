@@ -823,6 +823,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         lease = self._lease(job)
         if not lease:
             return self._begin_failure(job, "gpu_lease_missing", "GPU lease is missing")
+        t_poll0 = time.monotonic()
         try:
             executor_job = {
                 **job,
@@ -839,6 +840,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 return self._set_state(job, 'running', 'GPU connection interrupted; retry pending',
                     poll_retry_count=retries, poll_retry_at=self.clock() + min(2**retries, 30))
             return self._begin_failure(job, "gpu_poll_failed", self._safe_error(exc))
+        poll_s = time.monotonic() - t_poll0
         current = self._get("jobs", job["id"], job["owner_id"])
         if current and current.get("cancel_requested") and current.get("error_code") == "CU_BALANCE_FLOOR_REACHED":
             return current
@@ -851,6 +853,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             job = self.store.record_gpu_diagnostics(job, result["gpu_diagnostics"]) or job
         state = result.get("state")
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else None
+        status_updated_at = result.get("status_updated_at")
+        worker_age_s = (
+            round(self.clock() - float(status_updated_at), 3)
+            if isinstance(status_updated_at, (int, float))
+            else None
+        )
         if state == "completed":
             is_creation_api = bool((job.get("snapshot") or {}).get("creation_api"))
             raw_runtime = result.get("creation_runtime")
@@ -886,11 +894,24 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 from app.config import settings
 
                 from .native import model_storage, ready_for
-                if not ready_for(self.store, job["owner_id"]):
-                    if job.get("stage") != "native_tunnel":
+                t_ready0 = time.monotonic()
+                is_ready = ready_for(self.store, job["owner_id"])
+                ready_s = time.monotonic() - t_ready0
+                if not is_ready:
+                    logging.getLogger(__name__).info(
+                        "native_run_wait job=%s stage=%s poll_s=%.3f ready_s=%.3f worker_completed_age_s=%s",
+                        job["id"], job.get("stage"), poll_s, ready_s, worker_age_s,
+                    )
+                    if not job.get("native_proxy_wait_logged"):
                         self._event(job, "running", "等待代理健康检查及内部隧道鉴权验证", None)
-                        return self._update("jobs", job["id"], {"stage": "native_tunnel"}, job["owner_id"])
+                        return self._update(
+                            "jobs",
+                            job["id"],
+                            {"stage": "native_tunnel", "native_proxy_wait_logged": True},
+                            job["owner_id"],
+                        )
                     return job
+                t_mark0 = time.monotonic()
                 deadline = min(float(lease["deadline_epoch"]),
                                float(job.get("native_session_deadline_epoch") or lease["deadline_epoch"]))
                 lease = self._update("leases", lease["id"], {
@@ -907,7 +928,16 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 job = self._update("jobs", job["id"], {
                     "deadline_epoch": deadline, "hard_deadline_at": deadline,
                 }, job["owner_id"])
+                logging.getLogger(__name__).info(
+                    "native_run_ready job=%s poll_s=%.3f ready_s=%.3f mark_ready_s=%.3f worker_completed_age_s=%s",
+                    job["id"], poll_s, ready_s, time.monotonic() - t_mark0, worker_age_s,
+                )
             job = self._note_restored(job, lease, timings or {})
+        elif poll_s >= 3.0:
+            logging.getLogger(__name__).info(
+                "gpu_poll_slow job=%s state=%s stage=%s poll_s=%.3f",
+                job["id"], state, result.get("stage"), poll_s,
+            )
         if state == "running":
             stage = result.get("stage")
             if stage in _STAGE_TEXT and stage != job.get("stage"):

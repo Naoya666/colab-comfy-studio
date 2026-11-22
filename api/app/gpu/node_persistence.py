@@ -6,6 +6,7 @@ Third-party code runs with the runtime's privileges, not in a security sandbox.
 from __future__ import annotations
 
 import ast
+import csv
 import hashlib
 import importlib
 import importlib.metadata
@@ -72,8 +73,10 @@ EXCLUDE = {'.git', '__pycache__', '.venv', 'venv', 'node_modules', '.env', 'toke
            '.cache', '.pytest_cache', 'models', 'checkpoints', 'output', 'input'}
 SECRET = re.compile(rb'(?i:(?:access_token|refresh_token|client_secret|api_key|password)["\s]*[:=]["\s]*(?P<assignment_value>[A-Za-z0-9_./+\-]{8,}))|(?:gh[pousr]_|hf_)[A-Za-z0-9]{16,}|-----BEGIN .*PRIVATE KEY-----')
 _DEFAULT_SECRET = SECRET
-_SECRET_EXACT_HINTS = (b'ghp_', b'gho_', b'ghu_', b'ghs_', b'ghr_', b'hf_', b'-----BEGIN ')
+_SECRET_TOKEN_PREFIXES = (b'ghp_', b'gho_', b'ghu_', b'ghs_', b'ghr_', b'hf_')
 _SECRET_LOWER_HINTS = (b'access_token', b'refresh_token', b'client_secret', b'api_key', b'password')
+_SECRET_ASSIGN_SKIP = frozenset(b' \t\r\n\f\v"')
+_SECRET_ASSIGN_DELIM = frozenset(b':=')
 _SCAN_CACHE_LOCK = threading.Lock()
 _MEM_SCAN_CACHE: dict[str, str] = {}
 _LOADED_SCAN_CACHE_PATH: Path | None = None
@@ -83,10 +86,33 @@ def _may_contain_secret(chunk: bytes) -> bool:
     """Exact pre-filter using C memmem before running case-insensitive regex."""
     if SECRET is not _DEFAULT_SECRET or not env_flag('NATIVE_FAST_SCAN', True):
         return True
-    if any(token in chunk for token in _SECRET_EXACT_HINTS):
+    if b'-----BEGIN ' in chunk:
         return True
+    chunk_len = len(chunk)
+    for prefix in _SECRET_TOKEN_PREFIXES:
+        pos = chunk.find(prefix)
+        plen = len(prefix)
+        while pos != -1:
+            end = pos + plen + 16
+            if end <= chunk_len:
+                tail = chunk[pos + plen:end]
+                if tail.isascii() and tail.isalnum():
+                    return True
+            pos = chunk.find(prefix, pos + 1)
+    if b':' not in chunk and b'=' not in chunk:
+        return False
     lowered = chunk.lower()
-    return any(token in lowered for token in _SECRET_LOWER_HINTS)
+    for token in _SECRET_LOWER_HINTS:
+        pos = lowered.find(token)
+        tlen = len(token)
+        while pos != -1:
+            idx = pos + tlen
+            while idx < chunk_len and lowered[idx] in _SECRET_ASSIGN_SKIP:
+                idx += 1
+            if idx < chunk_len and lowered[idx] in _SECRET_ASSIGN_DELIM:
+                return True
+            pos = lowered.find(token, pos + 1)
+    return False
 
 
 def is_verified_binary(path: Path, header: bytes) -> bool:
@@ -380,6 +406,7 @@ def _scan_single_plugin(nodes: Path, node: Path, enabled: bool, *, snapshot_data
 
 
 def inventory(nodes, *, snapshot_databases=True, check_secrets=True):
+    started = time.monotonic()
     nodes = Path(nodes)
     cache_path = _scan_cache_path_for_nodes(nodes) if check_secrets else None
     use_disk_cache = cache_path is not None
@@ -395,13 +422,19 @@ def inventory(nodes, *, snapshot_databases=True, check_secrets=True):
         elif not path.name.startswith('.'):
             candidates.append((path, not path.name.endswith('.disabled')))
 
+    timings: list[tuple[float, str]] = []
+
     def worker_fn(pair):
-        return _scan_single_plugin(
+        t0 = time.monotonic()
+        item = _scan_single_plugin(
             nodes, pair[0], pair[1],
             snapshot_databases=snapshot_databases,
             check_secrets=check_secrets,
             use_disk_cache=use_disk_cache,
         )
+        if item is not None:
+            timings.append((time.monotonic() - t0, item['path']))
+        return item
 
     if env_flag('NATIVE_FAST_SCAN', True) and len(candidates) > 1:
         max_workers = min(8, len(candidates), os.cpu_count() or 4)
@@ -412,6 +445,14 @@ def inventory(nodes, *, snapshot_databases=True, check_secrets=True):
 
     if use_disk_cache and len(_MEM_SCAN_CACHE) != before_cache_size:
         _save_disk_scan_cache(cache_path)
+    elapsed = time.monotonic() - started
+    if elapsed >= 1.0 and timings:
+        top = ', '.join(f'{name}={sec:.2f}s' for sec, name in sorted(timings, reverse=True)[:3])
+        print(
+            f'[studio-native] inventory(secrets={check_secrets}, db={snapshot_databases}) '
+            f'{elapsed:.2f}s ({len(timings)} plugins; top: {top})',
+            flush=True,
+        )
     result = [item for item in scanned if item is not None]
     return sorted(result, key=lambda item: item['path'])
 
@@ -555,10 +596,21 @@ class Remote:
         except subprocess.CalledProcessError:
             return
         metas = []
+        legacy_files: list[str] = []
         for line in res.stdout.splitlines():
             parts = line.strip().split('\t', 1)
-            if len(parts) == 2 and parts[1].endswith('.meta.json'):
-                metas.append((parts[0], parts[1][:-len('.meta.json')]))
+            if len(parts) != 2:
+                continue
+            ts, fname = parts[0], parts[1].strip()
+            if fname.startswith('native-env-v1-') and fname.endswith(('.meta.json', '.tar.gz')):
+                legacy_files.append(fname)
+            elif fname.startswith('native-env-v2-') and fname.endswith('.meta.json'):
+                metas.append((ts, fname[:-len('.meta.json')]))
+        for fname in sorted(set(legacy_files)):
+            try:
+                self.command('deletefile', f'studio:native-comfy/env-cache/{fname}', timeout=120)
+            except subprocess.CalledProcessError:
+                pass
         metas.sort(key=lambda item: item[0], reverse=True)
         for _, stale_key in metas[keep:]:
             for suffix in ('.meta.json', '.tar.gz'):
@@ -708,6 +760,8 @@ class Persistence:
         self.previous = None
         self.stable_since = 0
         self.boot = None
+        self.boot_scan_done = threading.Event()
+        self.boot_scan_done.set()
         self.manifest = read(self.root / 'plugins-verified.json')
         self.error = None
 
@@ -868,6 +922,7 @@ class Persistence:
                 env.setdefault('TORCH_CUDA_ARCH_LIST', arch_list)
             env.setdefault('MAX_JOBS', str(min(8, os.cpu_count() or 4)))
         self._write_install_notes(plugins)
+        batch_ok = False
         if env_flag('NATIVE_BATCH_PLUGIN_PIP', True):
             req_files = [
                 self.nodes / p['path'] / 'requirements.txt'
@@ -884,28 +939,76 @@ class Persistence:
                     else [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '-q', '-c', str(constraints), *req_args]
                 )
                 try:
+                    t_batch = time.monotonic()
                     batch_res = subprocess.run(batch_cmd, cwd=self.comfy, env=env, capture_output=True, text=True, timeout=1500)
-                    if batch_res.returncode != 0:
+                    if batch_res.returncode == 0:
+                        batch_ok = True
+                        print(
+                            f'[studio-native] Batch plugin requirements installed ({len(req_files)} files in {time.monotonic() - t_batch:.1f}s)',
+                            flush=True,
+                        )
+                    else:
                         print('[studio-native] Batch plugin requirements install exited non-zero; Manager restore-dependencies will reconcile', flush=True)
                 except (subprocess.SubprocessError, OSError):
                     print('[studio-native] Batch plugin requirements install skipped; falling back to Manager restore-dependencies', flush=True)
-        command = [sys.executable, '-c', DEPENDENCY_LAUNCHER, str(manager_cli(self.comfy)),
-                   'restore-dependencies', '--user-directory', str(self.user)]
-        try:
-            result = subprocess.run(command, cwd=self.comfy, env=env, capture_output=True, text=True, timeout=1800)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            atomic(self.root / 'plugin-errors.json', {'plugins': [p['path'] for p in plugins],
-                                                     'error': 'Manager dependency restore could not finish: ' + type(exc).__name__})
-            raise RuntimeError('Manager dependency restore could not finish: ' + type(exc).__name__) from None
-        log = result.stdout + '\n' + result.stderr
-        # Manager versions can swallow execute_install_script's False return value.
-        if result.returncode or re.search(r'(?im)(?:^ERROR:|Traceback|installation failed|Failed to install|\[ERROR\])', log):
-            error = {'plugins': [p['path'] for p in plugins], 'error': 'Manager dependency restore failed; see local plugin-dependencies.log',
-                     'detail': SECRET.sub(b'[redacted]', log.encode()).decode(errors='replace')[-3000:]}
-            atomic(self.root / 'plugin-errors.json', error)
-            (self.root / 'plugin-dependencies.log').write_text(log)
-            (self.root / 'plugin-dependencies.log').chmod(0o600)
-            raise RuntimeError(error['error'] + ': ' + error['detail'])
+        if batch_ok:
+            install_scripts = [
+                (p['path'], self.nodes / p['path'] / 'install.py')
+                for p in plugins
+                if p.get('enabled') and (self.nodes / p['path'] / 'install.py').is_file()
+            ]
+            print(
+                f'[studio-native] Skipping redundant Manager restore-dependencies; executing {len(install_scripts)} install.py script(s)',
+                flush=True,
+            )
+            for plugin_path, script in install_scripts:
+                t_script = time.monotonic()
+                try:
+                    script_res = subprocess.run(
+                        [sys.executable, str(script)],
+                        cwd=script.parent,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=900,
+                    )
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    err_msg = f'Plugin install.py could not finish ({plugin_path}): {type(exc).__name__}'
+                    atomic(self.root / 'plugin-errors.json', {'plugins': [p['path'] for p in plugins], 'error': err_msg})
+                    raise RuntimeError(err_msg) from None
+                script_log = script_res.stdout + '\n' + script_res.stderr
+                if script_res.returncode != 0:
+                    error = {
+                        'plugins': [p['path'] for p in plugins],
+                        'error': f'Plugin install.py failed ({plugin_path}); see local plugin-dependencies.log',
+                        'detail': SECRET.sub(b'[redacted]', script_log.encode()).decode(errors='replace')[-3000:],
+                    }
+                    atomic(self.root / 'plugin-errors.json', error)
+                    (self.root / 'plugin-dependencies.log').write_text(script_log)
+                    (self.root / 'plugin-dependencies.log').chmod(0o600)
+                    raise RuntimeError(error['error'] + ': ' + error['detail'])
+                print(
+                    f'[studio-native] Plugin install.py completed: {plugin_path} ({time.monotonic() - t_script:.1f}s)',
+                    flush=True,
+                )
+        else:
+            command = [sys.executable, '-c', DEPENDENCY_LAUNCHER, str(manager_cli(self.comfy)),
+                       'restore-dependencies', '--user-directory', str(self.user)]
+            try:
+                result = subprocess.run(command, cwd=self.comfy, env=env, capture_output=True, text=True, timeout=1800)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                atomic(self.root / 'plugin-errors.json', {'plugins': [p['path'] for p in plugins],
+                                                         'error': 'Manager dependency restore could not finish: ' + type(exc).__name__})
+                raise RuntimeError('Manager dependency restore could not finish: ' + type(exc).__name__) from None
+            log = result.stdout + '\n' + result.stderr
+            # Manager versions can swallow execute_install_script's False return value.
+            if result.returncode or re.search(r'(?im)(?:^ERROR:|Traceback|installation failed|Failed to install|\[ERROR\])', log):
+                error = {'plugins': [p['path'] for p in plugins], 'error': 'Manager dependency restore failed; see local plugin-dependencies.log',
+                         'detail': SECRET.sub(b'[redacted]', log.encode()).decode(errors='replace')[-3000:]}
+                atomic(self.root / 'plugin-errors.json', error)
+                (self.root / 'plugin-dependencies.log').write_text(log)
+                (self.root / 'plugin-dependencies.log').chmod(0o600)
+                raise RuntimeError(error['error'] + ': ' + error['detail'])
         after = protect_environment(self.root)
         if protected != after:
             raise RuntimeError('Plugin installer changed protected PyTorch/CUDA packages; recreate runtime')
@@ -1029,7 +1132,153 @@ class Persistence:
                 'error': error}
 
 
-# --- Phase 2: Incremental Native Environment Cache (site-packages delta) ---
+# --- Phase 2: Incremental Native Environment Cache (site-packages delta v2) ---
+
+_ENV_CACHE_SCHEMA = 2
+_PROTECTED_TOP_DIRS = frozenset({'torch', 'torchvision', 'torchaudio', 'triton', 'torchgen', 'functorch'})
+
+
+def _normalize_dist_name(name: str) -> str:
+    return re.sub(r'[-_.]+', '-', name.strip()).lower()
+
+
+def _is_protected_dist_name(name: str) -> bool:
+    norm = _normalize_dist_name(name)
+    return norm in {'torch', 'torchvision', 'torchaudio', 'triton'} or norm.startswith('nvidia-')
+
+
+def _dist_name_from_entry(entry: Path) -> str:
+    if entry.is_dir():
+        for meta_name in ('METADATA', 'PKG-INFO'):
+            meta_file = entry / meta_name
+            if meta_file.is_file():
+                try:
+                    for line in meta_file.read_text(errors='replace').splitlines():
+                        if line.lower().startswith('name:'):
+                            raw = line.split(':', 1)[1].strip()
+                            if raw:
+                                return _normalize_dist_name(raw)
+                        if not line.strip():
+                            break
+                except OSError:
+                    pass
+    base = entry.name
+    for suffix in ('.dist-info', '.egg-info'):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    if '-' in base:
+        base = base.split('-', 1)[0]
+    return _normalize_dist_name(base)
+
+
+def _is_protected_site_top_name(name: str, site: Path | None = None) -> bool:
+    if name in _PROTECTED_TOP_DIRS:
+        return True
+    if name.endswith(('.dist-info', '.egg-info')):
+        if site is not None and (site / name).exists():
+            return _is_protected_dist_name(_dist_name_from_entry(site / name))
+        base = name.rsplit('.', 1)[0]
+        prefix = base.split('-', 1)[0]
+        return _is_protected_dist_name(prefix)
+    return False
+
+
+def _is_pycache_rel(rel: str) -> bool:
+    parts = Path(rel).parts
+    return '__pycache__' in parts or rel.endswith(('.pyc', '.pyo'))
+
+
+def _normalize_site_rel(raw_path: str) -> str | None:
+    cleaned = raw_path.strip().replace('\\', '/')
+    if not cleaned or cleaned.startswith('/'):
+        return None
+    norm = os.path.normpath(cleaned).replace('\\', '/')
+    if norm in {'', '.'} or norm == '..' or norm.startswith('../') or os.path.isabs(norm):
+        return None
+    return norm
+
+
+def _read_dist_record_paths(site: Path, dist_entry: Path) -> tuple[list[str] | None, int]:
+    """Parse PEP 376 RECORD (or egg-info installed-files.txt) relative to site-packages.
+
+    Returns (relative_paths_in_site, external_ignored_count), or (None, 0) if missing.
+    External paths (e.g. ../../../bin/<cli>) are ignored cleanly rather than aborting cache builds.
+    """
+    if not dist_entry.is_dir():
+        return None, 0
+    record = dist_entry / 'RECORD'
+    if record.is_file():
+        paths: set[str] = set()
+        external = 0
+        try:
+            with record.open('r', encoding='utf-8', errors='replace', newline='') as stream:
+                for row in csv.reader(stream):
+                    if not row:
+                        continue
+                    raw = row[0].strip()
+                    if not raw:
+                        continue
+                    rel = _normalize_site_rel(raw)
+                    if rel is None:
+                        external += 1
+                        continue
+                    if _is_pycache_rel(rel):
+                        continue
+                    paths.add(rel)
+        except (OSError, csv.Error):
+            return None, 0
+        return sorted(paths), external
+    installed = dist_entry / 'installed-files.txt'
+    if installed.is_file():
+        paths = set()
+        external = 0
+        dist_rel = dist_entry.name
+        try:
+            for line in installed.read_text(encoding='utf-8', errors='replace').splitlines():
+                raw = line.strip()
+                if not raw:
+                    continue
+                joined = f'{dist_rel}/{raw}' if not raw.startswith('/') else raw
+                rel = _normalize_site_rel(joined)
+                if rel is None:
+                    external += 1
+                    continue
+                if _is_pycache_rel(rel):
+                    continue
+                paths.add(rel)
+        except OSError:
+            return None, 0
+        return sorted(paths), external
+    return None, 0
+
+
+def _dist_fingerprint(entry: Path) -> str:
+    if entry.is_symlink():
+        return digest(['symlink', os.readlink(entry)])
+    if entry.is_file():
+        return file_hash(entry)
+    items: list[tuple[str, str]] = []
+    for base, dirs, names in os.walk(entry, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d != '__pycache__')
+        for name in sorted(names):
+            if name.endswith(('.pyc', '.pyo')):
+                continue
+            fp = Path(base) / name
+            rel = str(fp.relative_to(entry))
+            if fp.is_symlink():
+                items.append((rel, 'symlink:' + os.readlink(fp)))
+            elif fp.is_file():
+                items.append((rel, file_hash(fp)))
+    return digest(items)
+
+
+def _env_cache_tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    parts = Path(tarinfo.name).parts
+    if '__pycache__' in parts or tarinfo.name.endswith(('.pyc', '.pyo')):
+        return None
+    return tarinfo
+
 
 def plugin_dep_fingerprint(nodes: Path, plugins: list[dict]) -> str:
     """Hash only dependency-relevant plugin inputs so runtime SQLite/config writes do not bust env-cache."""
@@ -1071,7 +1320,7 @@ def compute_env_cache_key(
     plugin_deps_sha = plugin_dep_fingerprint(nodes, plugins)
     ext_suffix = sysconfig.get_config_var('EXT_SUFFIX') or ''
     spec = {
-        'schema': 1,
+        'schema': _ENV_CACHE_SCHEMA,
         'comfy_commit': commit,
         'python': sys.version,
         'ext_suffix': ext_suffix,
@@ -1084,20 +1333,30 @@ def compute_env_cache_key(
     }
     spec_sha = digest(spec)
     py_tag = f'py{sys.version_info.major}{sys.version_info.minor}'
-    key = f'native-env-v1-{commit[:12]}-{py_tag}-img{base_pkg_sha[:12]}-gpu{gpu_tag[:12]}-deps{spec_sha[:16]}'
+    key = f'native-env-v2-{commit[:12]}-{py_tag}-img{base_pkg_sha[:12]}-gpu{gpu_tag[:12]}-deps{spec_sha[:16]}'
     return {'key': key, 'spec': spec}
 
 
-def site_snapshot(site: Path) -> dict[str, list[int]]:
+def site_snapshot(site: Path) -> dict:
     if not site.is_dir():
-        return {}
-    state = {}
+        return {'version': _ENV_CACHE_SCHEMA, 'entries': {}, 'dists': {}}
+    entries: dict[str, list] = {}
+    dists: dict[str, dict] = {}
     for entry in site.iterdir():
         if entry.name == '__pycache__' or entry.name.startswith('.studio-native-'):
             continue
         st = entry.lstat()
-        state[entry.name] = [st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
-    return state
+        kind = 'l' if entry.is_symlink() else ('d' if entry.is_dir() else 'f')
+        entries[entry.name] = [kind, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+        if entry.name.endswith(('.dist-info', '.egg-info')):
+            rec_files, ext_ignored = _read_dist_record_paths(site, entry)
+            dists[entry.name] = {
+                'name': _dist_name_from_entry(entry),
+                'fp': _dist_fingerprint(entry),
+                'files': rec_files,
+                'external_ignored': ext_ignored,
+            }
+    return {'version': _ENV_CACHE_SCHEMA, 'entries': entries, 'dists': dists}
 
 
 def _remove_entry(path: Path) -> None:
@@ -1149,8 +1408,30 @@ def _safe_extract_env_archive(archive: Path, stage_dir: Path) -> None:
         tar.extractall(stage_dir, members=members)
 
 
+def _walk_overlay_relpaths(overlay_root: Path) -> list[str]:
+    if not overlay_root.is_dir():
+        return []
+    rels: list[str] = []
+    for base, dirs, names in os.walk(overlay_root, followlinks=False):
+        dirs.sort()
+        for name in sorted(names):
+            fp = Path(base) / name
+            rels.append(str(fp.relative_to(overlay_root)).replace('\\', '/'))
+    return sorted(rels)
+
+
+def _prune_empty_dirs(dirs: list[Path], stop_at: Path) -> None:
+    stop_resolved = stop_at.resolve()
+    for folder in sorted(set(dirs), key=lambda p: len(p.parts), reverse=True):
+        try:
+            if folder.is_dir() and not folder.is_symlink() and folder.resolve() != stop_resolved:
+                folder.rmdir()
+        except OSError:
+            pass
+
+
 def try_restore_env_cache(root: Path, site: Path, key_info: dict, baseline_protected: dict, remote: Remote) -> bool:
-    """Restore incremental site-packages cache atomically; return False cleanly on miss or validation failure."""
+    """Restore incremental site-packages cache atomically (top-level + file-level overlay); return False cleanly on miss or failure."""
     if not env_flag('NATIVE_ENV_CACHE', True) or not site.is_dir():
         return False
     if not (hasattr(remote, 'get_env_cache') and callable(getattr(remote, 'available', None)) and remote.available()):
@@ -1166,7 +1447,7 @@ def try_restore_env_cache(root: Path, site: Path, key_info: dict, baseline_prote
         meta = read(meta_path)
         if (
             not isinstance(meta, dict)
-            or meta.get('schema') != 1
+            or meta.get('schema') != _ENV_CACHE_SCHEMA
             or meta.get('key') != key
             or meta.get('spec') != key_info['spec']
             or not re.fullmatch(r'[0-9a-f]{64}', str(meta.get('archive_sha256') or ''))
@@ -1188,22 +1469,76 @@ def try_restore_env_cache(root: Path, site: Path, key_info: dict, baseline_prote
     rollback = site.parent / f'.studio-native-env-rollback-{os.getpid()}'
     shutil.rmtree(stage, ignore_errors=True)
     shutil.rmtree(rollback, ignore_errors=True)
-    moved_to_rollback: list[str] = []
-    installed_names: list[str] = []
+    moved_top: list[str] = []
+    installed_top: list[str] = []
+    moved_overlay: list[str] = []
+    installed_overlay: list[str] = []
+    created_overlay_dirs: list[Path] = []
     try:
         _safe_extract_env_archive(tar_path, stage)
         staged_site = stage / 'site'
-        removed = [str(x) for x in (meta.get('removed') or []) if isinstance(x, str) and '/' not in x and x not in {'.', '..'}]
-        incoming = [entry.name for entry in staged_site.iterdir()] if staged_site.is_dir() else []
-        rollback.mkdir(mode=0o700, parents=True, exist_ok=True)
-        for name in sorted(set(removed) | set(incoming)):
+        staged_overlay = stage / 'overlay'
+        removed = [
+            str(x) for x in (meta.get('removed') or [])
+            if isinstance(x, str) and '/' not in x and x not in {'', '.', '..'}
+        ]
+        removed_files = []
+        for raw_rel in (meta.get('removed_files') or []):
+            if not isinstance(raw_rel, str):
+                raise RuntimeError('Invalid removed_files entry in env-cache metadata')
+            norm = _normalize_site_rel(raw_rel)
+            if norm is None:
+                raise RuntimeError('Unsafe removed_files path in env-cache metadata')
+            removed_files.append(norm)
+        incoming_top = sorted(entry.name for entry in staged_site.iterdir()) if staged_site.is_dir() else []
+        incoming_overlay = _walk_overlay_relpaths(staged_overlay)
+        for name in set(removed) | set(incoming_top):
+            if _is_protected_site_top_name(name, site):
+                raise RuntimeError(f'env-cache attempted to touch protected entry: {name}')
+        for rel in set(removed_files) | set(incoming_overlay):
+            top = rel.split('/', 1)[0]
+            if _is_protected_site_top_name(top, site):
+                raise RuntimeError(f'env-cache attempted to touch protected path: {rel}')
+
+        rb_site = rollback / 'site'
+        rb_overlay = rollback / 'overlay'
+        rb_site.mkdir(mode=0o700, parents=True, exist_ok=True)
+        rb_overlay.mkdir(mode=0o700, parents=True, exist_ok=True)
+        site_resolved = site.resolve()
+
+        # Phase 1: top-level additions and removals
+        for name in sorted(set(removed) | set(incoming_top)):
             target = site / name
             if target.exists() or target.is_symlink():
-                shutil.move(str(target), str(rollback / name))
-                moved_to_rollback.append(name)
-        for name in incoming:
+                shutil.move(str(target), str(rb_site / name))
+                moved_top.append(name)
+        for name in incoming_top:
             shutil.move(str(staged_site / name), str(site / name))
-            installed_names.append(name)
+            installed_top.append(name)
+
+        # Phase 2: file-level overlay and deletions inside pre-existing directories
+        for rel in sorted(set(removed_files) | set(incoming_overlay)):
+            target = site / rel
+            if target.exists() or target.is_symlink():
+                backup = rb_overlay / rel
+                backup.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                shutil.move(str(target), str(backup))
+                moved_overlay.append(rel)
+        for rel in incoming_overlay:
+            target = site / rel
+            cur = site
+            for part in Path(rel).parts[:-1]:
+                cur = cur / part
+                if cur.is_symlink():
+                    raise RuntimeError(f'env-cache overlay parent is symlink: {cur}')
+                if not cur.exists():
+                    cur.mkdir(mode=0o755)
+                    created_overlay_dirs.append(cur)
+            if target.parent.resolve() != site_resolved and site_resolved not in target.parent.resolve().parents:
+                raise RuntimeError(f'env-cache overlay path escaped site-packages: {rel}')
+            shutil.move(str(staged_overlay / rel), str(target))
+            installed_overlay.append(rel)
+
         importlib.invalidate_caches()
         after_protected = protect_environment(Path(root))
         if after_protected != baseline_protected:
@@ -1211,14 +1546,28 @@ def try_restore_env_cache(root: Path, site: Path, key_info: dict, baseline_prote
         check = subprocess.run([sys.executable, '-m', 'pip', 'check'], capture_output=True, text=True, timeout=60)
         if check.returncode != 0:
             raise RuntimeError('env-cache failed pip check')
-        print(f'[studio-native] Restored native env-cache: {key} ({len(installed_names)} site entries)', flush=True)
+        print(
+            f'[studio-native] Restored native env-cache: {key} '
+            f'({len(installed_top)} site entries, {len(installed_overlay)} overlay files)',
+            flush=True,
+        )
         return True
     except Exception as exc:
         print(f'[studio-native] env-cache restore rejected ({exc}); rolling back to clean base image', flush=True)
-        for name in installed_names:
+        for rel in reversed(installed_overlay):
+            _remove_entry(site / rel)
+        _prune_empty_dirs(created_overlay_dirs, site)
+        for rel in reversed(moved_overlay):
+            src = rollback / 'overlay' / rel
+            if src.exists() or src.is_symlink():
+                dst = site / rel
+                dst.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                _remove_entry(dst)
+                shutil.move(str(src), str(dst))
+        for name in reversed(installed_top):
             _remove_entry(site / name)
-        for name in moved_to_rollback:
-            src = rollback / name
+        for name in reversed(moved_top):
+            src = rollback / 'site' / name
             if src.exists() or src.is_symlink():
                 _remove_entry(site / name)
                 shutil.move(str(src), str(site / name))
@@ -1230,49 +1579,142 @@ def try_restore_env_cache(root: Path, site: Path, key_info: dict, baseline_prote
         tar_path.unlink(missing_ok=True)
 
 
-def prepare_env_cache_plan(root: Path, site: Path, before_site: dict[str, list[int]], key_info: dict) -> Path | None:
-    if not env_flag('NATIVE_ENV_CACHE', True) or not site.is_dir():
-        return None
-    after_site = site_snapshot(site)
-    changed = {name for name, st in after_site.items() if before_site.get(name) != st}
-    # Include top-level package dirs referenced by newly installed dist-info RECORDs (e.g. namespace packages).
-    for name in list(changed):
-        if name.endswith('.dist-info'):
-            record = site / name / 'RECORD'
-            if record.is_file():
-                for line in record.read_text(errors='replace').splitlines():
-                    top = line.split(',', 1)[0].split('/', 1)[0].strip()
-                    if top and top not in {'.', '..', '__pycache__'} and ((site / top).exists() or (site / top).is_symlink()):
-                        changed.add(top)
+def _check_pth_entries(site: Path, root: Path, pth_rels: list[str]) -> bool:
     site_resolved = site.resolve()
     native_resolved = Path(root).resolve()
-    for name in changed:
-        if name.endswith('.pth') and (site / name).is_file():
-            for line in (site / name).read_text(errors='replace').splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith(('#', 'import ')):
+    for rel in pth_rels:
+        pth = site / rel
+        if not pth.is_file():
+            continue
+        for line in pth.read_text(errors='replace').splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(('#', 'import ')):
+                continue
+            candidate = Path(stripped)
+            if candidate.is_absolute():
+                resolved = candidate.resolve()
+                if (
+                    resolved != site_resolved
+                    and site_resolved not in resolved.parents
+                    and resolved != native_resolved
+                    and native_resolved not in resolved.parents
+                ):
+                    print(f'[studio-native] Skipping env-cache build due to external .pth entry in {rel}', flush=True)
+                    return False
+    return True
+
+
+def prepare_env_cache_plan(root: Path, site: Path, before_site: dict, key_info: dict) -> Path | None:
+    if not env_flag('NATIVE_ENV_CACHE', True) or not site.is_dir():
+        return None
+    if not isinstance(before_site, dict) or before_site.get('version') != _ENV_CACHE_SCHEMA:
+        return None
+    after_site = site_snapshot(site)
+    before_entries: dict[str, list] = before_site.get('entries') or {}
+    after_entries: dict[str, list] = after_site.get('entries') or {}
+    before_dists: dict[str, dict] = before_site.get('dists') or {}
+    after_dists: dict[str, dict] = after_site.get('dists') or {}
+
+    changed_dists = {
+        dist_dir for dist_dir, info in after_dists.items()
+        if before_dists.get(dist_dir, {}).get('fp') != info['fp']
+    }
+    removed_dists = {dist_dir for dist_dir in before_dists if dist_dir not in after_dists}
+
+    protected_paths: set[str] = set()
+    for dist_dir, info in before_dists.items():
+        if _is_protected_dist_name(info.get('name', '')):
+            if dist_dir in changed_dists or dist_dir in removed_dists:
+                print(f'[studio-native] Skipping env-cache build: protected distribution changed ({dist_dir})', flush=True)
+                return None
+            protected_paths.add(dist_dir)
+            for rel in (info.get('files') or ()):
+                protected_paths.add(rel)
+
+    new_top = {name for name in after_entries if name not in before_entries}
+    removed_top = {name for name in before_entries if name not in after_entries}
+    # Top-level regular files / symlinks (e.g. .pth, standalone .py/.so) cannot be dirtied by __pycache__.
+    changed_top_files = {
+        name for name, st in after_entries.items()
+        if name in before_entries and st[0] != 'd' and before_entries[name] != st
+    }
+    added_top: set[str] = set(new_top) | set(changed_top_files)
+    overlay_files: set[str] = set()
+    removed_files: set[str] = set()
+    external_ignored = 0
+
+    for dist_dir in sorted(changed_dists):
+        info = after_dists[dist_dir]
+        if _is_protected_dist_name(info.get('name', '')):
+            print(f'[studio-native] Skipping env-cache build: protected distribution added ({dist_dir})', flush=True)
+            return None
+        added_top.add(dist_dir)
+        external_ignored += int(info.get('external_ignored') or 0)
+        rec_files = info.get('files')
+        if rec_files is None:
+            top_level_txt = site / dist_dir / 'top_level.txt'
+            if top_level_txt.is_file():
+                tops = [ln.strip() for ln in top_level_txt.read_text(errors='replace').splitlines() if ln.strip()]
+                if tops and all(t in new_top or (t + '.py') in new_top for t in tops):
                     continue
-                candidate = Path(stripped)
-                if candidate.is_absolute():
-                    resolved = candidate.resolve()
-                    if (
-                        resolved != site_resolved
-                        and site_resolved not in resolved.parents
-                        and resolved != native_resolved
-                        and native_resolved not in resolved.parents
-                    ):
-                        print(f'[studio-native] Skipping env-cache build due to external .pth entry in {name}', flush=True)
-                        return None
-    removed = sorted(name for name in before_site if name not in after_site)
+            print(f'[studio-native] Skipping env-cache build: changed distribution lacks RECORD ({dist_dir})', flush=True)
+            return None
+        for rel in rec_files:
+            top = rel.split('/', 1)[0]
+            if top in added_top:
+                continue
+            target = site / rel
+            if target.is_dir() and not target.is_symlink():
+                continue
+            if target.exists() or target.is_symlink():
+                overlay_files.add(rel)
+
+    for dist_dir in sorted(removed_dists | (changed_dists & set(before_dists))):
+        old_files = before_dists[dist_dir].get('files')
+        if not old_files:
+            continue
+        for rel in old_files:
+            top = rel.split('/', 1)[0]
+            if top in removed_top or top in added_top:
+                continue
+            if rel in overlay_files:
+                continue
+            target = site / rel
+            if not (target.exists() or target.is_symlink()):
+                removed_files.add(rel)
+
+    for name in added_top | removed_top:
+        if _is_protected_site_top_name(name, site):
+            print(f'[studio-native] Skipping env-cache build: protected top-level entry touched ({name})', flush=True)
+            return None
+    for rel in overlay_files | removed_files:
+        top = rel.split('/', 1)[0]
+        if rel in protected_paths or _is_protected_site_top_name(top, site):
+            print(f'[studio-native] Skipping env-cache build: protected path touched ({rel})', flush=True)
+            return None
+
+    pth_candidates = [n for n in added_top if n.endswith('.pth')] + [r for r in overlay_files if r.endswith('.pth')]
+    if not _check_pth_entries(site, root, pth_candidates):
+        return None
+
     plan_path = Path(root) / 'env-cache-plan.json'
     atomic(plan_path, {
-        'schema': 1,
+        'schema': _ENV_CACHE_SCHEMA,
         'key': key_info['key'],
         'spec': key_info['spec'],
         'site': str(site),
-        'added': sorted(changed),
-        'removed': removed,
+        'added': sorted(added_top),
+        'removed': sorted(removed_top),
+        'overlay_files': sorted(overlay_files),
+        'removed_files': sorted(removed_files),
+        'external_ignored': external_ignored,
     })
+    print(
+        f'[studio-native] Prepared env-cache plan v2: added={len(added_top)}, '
+        f'overlay_files={len(overlay_files)}, removed={len(removed_top)}, '
+        f'removed_files={len(removed_files)}, external_ignored={external_ignored}',
+        flush=True,
+    )
     return plan_path
 
 
@@ -1290,19 +1732,23 @@ def upload_env_cache_from_plan(root: Path, plan_path: Path, remote: Remote | Non
         except BlockingIOError:
             return False
         plan = read(Path(plan_path))
-        if not isinstance(plan, dict) or plan.get('schema') != 1:
+        if not isinstance(plan, dict) or plan.get('schema') != _ENV_CACHE_SCHEMA:
             return False
         key = plan['key']
         site = Path(plan['site'])
         added = [str(x) for x in (plan.get('added') or [])]
         removed = [str(x) for x in (plan.get('removed') or [])]
+        overlay_files = [str(x) for x in (plan.get('overlay_files') or [])]
+        removed_files = [str(x) for x in (plan.get('removed_files') or [])]
         cache_dir = root / 'env-cache'
         cache_dir.mkdir(parents=True, exist_ok=True)
         existing_meta = cache_dir / f'{key}.remote.meta.json'
         if remote.get_env_cache(f'{key}.meta.json', existing_meta):
             existing_meta.unlink(missing_ok=True)
             return True
-        if any(not ((site / name).exists() or (site / name).is_symlink()) for name in added):
+        if any(not ((site / name).exists() or (site / name).is_symlink()) for name in added) or any(
+            not ((site / rel).exists() or (site / rel).is_symlink()) for rel in overlay_files
+        ):
             print('[studio-native] Aborting env-cache pack: site-packages changed before archive build', flush=True)
             return False
         tar_tmp = cache_dir / f'{key}.tar.gz.tmp'
@@ -1310,14 +1756,20 @@ def upload_env_cache_from_plan(root: Path, plan_path: Path, remote: Remote | Non
         meta_file = cache_dir / f'{key}.meta.json'
         tar_tmp.unlink(missing_ok=True)
         try:
+            def _write_archive(tar: tarfile.TarFile) -> None:
+                for name in added:
+                    tar.add(site / name, arcname=f'site/{name}', filter=_env_cache_tar_filter)
+                for rel in overlay_files:
+                    if not _is_pycache_rel(rel):
+                        tar.add(site / rel, arcname=f'overlay/{rel}', recursive=False)
+
             if shutil.which('pigz'):
                 with tar_tmp.open('wb') as out_stream:
                     pigz = subprocess.Popen(['pigz', '-1', '-c'], stdin=subprocess.PIPE, stdout=out_stream, stderr=subprocess.PIPE)
                     try:
                         assert pigz.stdin is not None
                         with tarfile.open(fileobj=pigz.stdin, mode='w|') as tar:
-                            for name in added:
-                                tar.add(site / name, arcname=f'site/{name}')
+                            _write_archive(tar)
                         pigz.stdin.close()
                         pigz.stdin = None
                         _, err = pigz.communicate(timeout=600)
@@ -1329,25 +1781,30 @@ def upload_env_cache_from_plan(root: Path, plan_path: Path, remote: Remote | Non
                             pigz.wait(timeout=5)
             else:
                 with tarfile.open(tar_tmp, 'w:gz', compresslevel=1) as tar:
-                    for name in added:
-                        tar.add(site / name, arcname=f'site/{name}')
+                    _write_archive(tar)
             tar_tmp.replace(tar_final)
             archive_sha = file_hash(tar_final)
             size = tar_final.stat().st_size
             remote.put_env_cache(tar_final, f'{key}.tar.gz', verify=False)
             atomic(meta_file, {
-                'schema': 1,
+                'schema': _ENV_CACHE_SCHEMA,
                 'key': key,
                 'spec': plan['spec'],
                 'archive_sha256': archive_sha,
                 'size': size,
                 'added_count': len(added),
+                'overlay_count': len(overlay_files),
                 'removed': removed,
+                'removed_files': removed_files,
                 'created_at': time.time(),
             })
             remote.put_env_cache(meta_file, f'{key}.meta.json', verify=True)
             remote.prune_env_cache(keep=3)
-            print(f'[studio-native] Uploaded env-cache {key} ({size / 1024**2:.1f} MiB)', flush=True)
+            print(
+                f'[studio-native] Uploaded env-cache {key} ({size / 1024**2:.1f} MiB; '
+                f'{len(added)} site entries, {len(overlay_files)} overlay files)',
+                flush=True,
+            )
             return True
         finally:
             tar_tmp.unlink(missing_ok=True)
@@ -1367,11 +1824,28 @@ def install(server, root, manager_busy):
     persistence = Persistence(root, config['comfy'], config['user'])
     # A rejected plugin must not prevent the status endpoint/loop from loading.
     # Leave boot unset on failure: later repairs require restart before head promotion.
-    boot_fingerprint = None
-    try:
-        boot_fingerprint = digest(inventory(persistence.nodes))
-    except Exception as exc:
-        persistence.error = str(exc)
+    boot_result: dict[str, object] = {'fingerprint': None, 'error': None}
+    persistence.boot_scan_done.clear()
+
+    def _run_boot_scan() -> None:
+        t0 = time.monotonic()
+        try:
+            boot_result['fingerprint'] = digest(inventory(persistence.nodes))
+        except Exception as exc:
+            boot_result['error'] = str(exc)
+            persistence.error = str(exc)
+        finally:
+            persistence.boot_scan_done.set()
+            print(
+                f'[studio-native] boot_fingerprint scan completed in {time.monotonic() - t0:.2f}s '
+                f'(ok={boot_result["error"] is None})',
+                flush=True,
+            )
+
+    if env_flag('NATIVE_FAST_SCAN', True):
+        threading.Thread(target=_run_boot_scan, name='studio-native-boot-scan', daemon=True).start()
+    else:
+        _run_boot_scan()
 
     def healthy():
         from urllib.request import urlopen
@@ -1386,6 +1860,7 @@ def install(server, root, manager_busy):
         # includes earlier nodes as well as later ones, unlike extension order hooks.
         while not await asyncio.to_thread(healthy):
             await asyncio.sleep(1)
+        await asyncio.to_thread(persistence.boot_scan_done.wait)
         try:
             dependency_error = read(root / 'plugin-errors.json')
             if dependency_error:
@@ -1397,7 +1872,7 @@ def install(server, root, manager_busy):
             failed = [line for line in startup.splitlines() if '(IMPORT FAILED)' in line or 'Cannot import ' in line]
             if failed:
                 raise RuntimeError('Plugin load verification failed: ' + '; '.join(failed)[-2000:])
-            persistence.boot = boot_fingerprint
+            persistence.boot = boot_result['fingerprint']
         except Exception as exc:
             persistence.error = str(exc)
             atomic(root / 'plugin-errors.json', {'error': str(exc)})
