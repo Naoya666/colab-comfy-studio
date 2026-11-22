@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Film, Folder, Image as ImageIcon, Play, RefreshCw, Search, Star } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Check, CheckSquare, Film, Folder, Image as ImageIcon, Play, RefreshCw, Search, Star, Trash2, X } from 'lucide-react';
 import {
   apiMessage,
   getNativeOutputs,
@@ -7,6 +7,7 @@ import {
   type NativeOutputsPage,
 } from '../lib/gpu-api';
 import { bytesLabel } from '../lib/model-library';
+import { ConfirmDialog } from './Feedback';
 import styles from '../gpu.module.css';
 
 type Filter = 'all' | 'image' | 'video' | 'favorite' | 'unfavorited';
@@ -25,6 +26,7 @@ export function NativeGalleryPanel({
   deletedIds,
   onOpen,
   onFavorite,
+  onBatchDelete,
 }: {
   inspectedId?: string;
   refreshToken?: number;
@@ -32,6 +34,7 @@ export function NativeGalleryPanel({
   deletedIds: Set<string>;
   onOpen: (asset: NativeOutputAsset, ordered: NativeOutputAsset[]) => void;
   onFavorite: (asset: NativeOutputAsset) => void;
+  onBatchDelete?: (ids: string[]) => Promise<{ removedIds: string[]; error?: string }>;
 }) {
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
@@ -42,6 +45,10 @@ export function NativeGalleryPanel({
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
   const [brokenThumbs, setBrokenThumbs] = useState<Set<string>>(() => new Set());
+  const [batchMode, setBatchMode] = useState(false);
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(() => new Set());
+  const [confirmBatchDelete, setConfirmBatchDelete] = useState<{ ids: string[]; title: string; description: string; error?: string } | null>(null);
+  const [deletingBatch, setDeletingBatch] = useState(false);
   const seqRef = useRef(0);
 
   const load = useCallback(async (opts: { refresh?: boolean; append?: boolean; offset?: number } = {}) => {
@@ -80,7 +87,7 @@ export function NativeGalleryPanel({
     return () => window.clearTimeout(timer);
   }, [load, query, refreshToken]);
 
-  const visible = items
+  const visible = useMemo(() => items
     .filter((item) => !deletedIds.has(item.id))
     .map((item) => (
       Object.prototype.hasOwnProperty.call(favoriteOverrides, item.id)
@@ -91,7 +98,54 @@ export function NativeGalleryPanel({
       if (filter === 'favorite' && !item.favorite) return false;
       if (filter === 'unfavorited' && item.favorite) return false;
       return true;
+    }), [items, deletedIds, favoriteOverrides, filter]);
+
+  const activeCheckedIds = useMemo(() => {
+    const valid = new Set(visible.map((item) => item.id));
+    return [...checkedIds].filter((id) => valid.has(id));
+  }, [checkedIds, visible]);
+
+  function toggleChecked(id: string) {
+    setBatchMode(true);
+    setCheckedIds((curr) => {
+      const next = new Set(curr);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
     });
+  }
+
+  function exitBatchMode() {
+    setBatchMode(false);
+    setCheckedIds(new Set());
+  }
+
+  async function executeBatchDelete() {
+    if (!confirmBatchDelete || !onBatchDelete || deletingBatch) return;
+    setDeletingBatch(true);
+    try {
+      const { removedIds, error: batchError } = await onBatchDelete(confirmBatchDelete.ids);
+      const removed = new Set(removedIds);
+      setCheckedIds((curr) => {
+        const next = new Set(curr);
+        removed.forEach((id) => next.delete(id));
+        return next;
+      });
+      if (batchError) {
+        const remainingIds = confirmBatchDelete.ids.filter((id) => !removed.has(id));
+        setConfirmBatchDelete({
+          ...confirmBatchDelete,
+          ids: remainingIds,
+          title: removed.size ? `移入回收站（剩余 ${remainingIds.length} 件）？` : confirmBatchDelete.title,
+          error: batchError,
+        });
+      } else {
+        setConfirmBatchDelete(null);
+      }
+    } finally {
+      setDeletingBatch(false);
+    }
+  }
 
   const chip = (value: Filter, label: string, icon?: React.ReactNode) => (
     <button type="button" className={styles.chip} data-active={filter === value} onClick={() => setFilter(value)}>
@@ -117,6 +171,15 @@ export function NativeGalleryPanel({
             <RefreshCw size={14} className={loading ? styles.spin : undefined} aria-hidden />
             {loading ? '读取中…' : '刷新 Drive'}
           </button>
+          {onBatchDelete && visible.length > 0 && (
+            <button
+              type="button"
+              className={`button small ${batchMode ? '' : 'secondary'}`}
+              onClick={() => (batchMode ? exitBatchMode() : setBatchMode(true))}
+            >
+              {batchMode ? <><X size={14} aria-hidden />完成管理</> : <><CheckSquare size={14} aria-hidden />批量管理</>}
+            </button>
+          )}
         </div>
       </div>
 
@@ -127,6 +190,48 @@ export function NativeGalleryPanel({
       )}
 
       {error && <p className="status error" role="alert">{error}</p>}
+
+      {batchMode && onBatchDelete && (
+        <div className={styles.cleanupBar} role="toolbar" aria-label="批量管理原生作品">
+          <strong>已选 {activeCheckedIds.length} 件</strong>
+          <div className="actions">
+            <button
+              type="button"
+              className="button secondary small"
+              onClick={() => setCheckedIds(new Set(visible.map((a) => a.id)))}
+            >
+              全选当前 ({visible.length})
+            </button>
+            <button
+              type="button"
+              className="button secondary small"
+              onClick={() => setCheckedIds(new Set(visible.filter((a) => !a.favorite).map((a) => a.id)))}
+            >
+              选中未收藏 ({visible.filter((a) => !a.favorite).length})
+            </button>
+            <button
+              type="button"
+              className="button ghost small"
+              disabled={!activeCheckedIds.length}
+              onClick={() => setCheckedIds(new Set())}
+            >
+              清空选择
+            </button>
+            <button
+              type="button"
+              className="button danger small"
+              disabled={!activeCheckedIds.length || deletingBatch}
+              onClick={() => setConfirmBatchDelete({
+                ids: activeCheckedIds,
+                title: `将选中的 ${activeCheckedIds.length} 件作品移入回收站？`,
+                description: '文件将移入 Google Drive 回收站，可在 Drive 回收站中恢复。',
+              })}
+            >
+              <Trash2 size={14} aria-hidden />批量移至回收站 ({activeCheckedIds.length})
+            </button>
+          </div>
+        </div>
+      )}
 
       {page && !page.connected ? (
         <div className="empty">
@@ -179,7 +284,8 @@ export function NativeGalleryPanel({
             <div className={styles.galleryGrid}>
               {visible.map((asset) => {
                 const isVideo = asset.mime.startsWith('video/');
-                const selected = inspectedId === asset.id;
+                const isChecked = checkedIds.has(asset.id);
+                const selected = batchMode ? isChecked : inspectedId === asset.id;
                 const hud = dimsLabel(asset);
                 const thumbBroken = brokenThumbs.has(asset.id);
                 return (
@@ -190,7 +296,13 @@ export function NativeGalleryPanel({
                         type="button"
                         aria-label={`查看 ${asset.filename}`}
                         aria-pressed={inspectedId === undefined ? undefined : selected}
-                        onClick={() => onOpen(asset, visible)}
+                        onClick={() => {
+                          if (batchMode) {
+                            toggleChecked(asset.id);
+                            return;
+                          }
+                          onOpen(asset, visible);
+                        }}
                       >
                         {isVideo && thumbBroken ? (
                           <video src={asset.content_url} preload="metadata" muted playsInline aria-label={asset.filename} />
@@ -214,6 +326,18 @@ export function NativeGalleryPanel({
                         {isVideo ? <Film size={12} strokeWidth={1.8} aria-hidden /> : <ImageIcon size={12} strokeWidth={1.8} aria-hidden />}
                         {isVideo ? '视频' : '图片'}
                       </span>
+                      {batchMode && (
+                        <button
+                          type="button"
+                          className={styles.tileCheck}
+                          data-on={isChecked}
+                          aria-label={isChecked ? '取消选中' : '选中'}
+                          aria-pressed={isChecked}
+                          onClick={() => toggleChecked(asset.id)}
+                        >
+                          {isChecked && <Check size={13} strokeWidth={2.6} aria-hidden />}
+                        </button>
+                      )}
                       {(hud || isVideo) && (
                         <span className={styles.tileHud}>
                           {isVideo && <Play size={10} strokeWidth={2} aria-hidden />}
@@ -259,6 +383,18 @@ export function NativeGalleryPanel({
           )}
         </>
       )}
+
+      <ConfirmDialog
+        open={Boolean(confirmBatchDelete)}
+        title={confirmBatchDelete?.title || ''}
+        description={confirmBatchDelete?.description}
+        confirmLabel="移至回收站"
+        danger
+        busy={deletingBatch}
+        error={confirmBatchDelete?.error}
+        onCancel={() => setConfirmBatchDelete(null)}
+        onConfirm={() => void executeBatchDelete()}
+      />
     </div>
   );
 }

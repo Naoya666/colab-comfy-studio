@@ -1,14 +1,15 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import {
   Zap, Search, RefreshCw, Image as ImageIcon, Film, Loader, ChevronRight, ChevronDown,
   Square, RotateCcw, Trash2, Layers, Eraser,
 } from 'lucide-react';
-import { type GpuJob } from '../lib/gpu-api';
+import { type GpuJob, type GpuWorkflow } from '../lib/gpu-api';
 import styles from '../gpu.module.css';
 import { formatDateTime, jobSize, progressPercent, readableState, terminalStates } from '../lib/ui-helpers';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
 import { canRetainJobInstance, gpuLabel } from '../lib/gpu-label';
 import { groupJobsByBatch, partitionJobEntries, type DateBucketKey, type JobBatchEntry, type JobDisplayEntry } from '../lib/history-grouping';
+import { workflowTitle } from '../lib/workflow-copy';
 import { ConfirmDialog } from '../components/Feedback';
 
 // 与后端 scheduler.ACTIVE_STATES 对应：前四个算排队，后面算运行。
@@ -21,9 +22,10 @@ type Filter = 'all' | 'running' | 'completed' | 'failed' | string;
 export type JobClearRequest = { scope?: 'all_terminal' | 'failed_cancelled' | 'mock'; jobIds?: string[] };
 
 export function TasksPanel({
-  jobs, error, refreshing, clearingHistory = false, onRefresh, onCancel, onRetry, onDetail, onRetain, onInstance, onClearHistory, selectedId,
+  jobs, workflows = [], error, refreshing, clearingHistory = false, onRefresh, onCancel, onRetry, onDetail, onRetain, onInstance, onClearHistory, selectedId,
 }: {
   jobs: GpuJob[];
+  workflows?: GpuWorkflow[];
   error: string;
   refreshing: boolean;
   clearingHistory?: boolean;
@@ -70,14 +72,27 @@ export function TasksPanel({
     mockTerminal: uniqueJobs.filter((j) => j.provider === 'mock' && terminalStates.has(stateOf(j))).length,
   }), [uniqueJobs]);
 
+  const workflowByKey = useMemo(() => {
+    const map = new Map<string, GpuWorkflow>();
+    for (const wf of workflows) {
+      if (!map.has(wf.workflow_key) || wf.active) map.set(wf.workflow_key, wf);
+    }
+    return map;
+  }, [workflows]);
+
+  const wfName = useCallback((key?: string) => {
+    if (!key) return '';
+    return workflowTitle(workflowByKey.get(key) || { workflow_key: key });
+  }, [workflowByKey]);
+
   const filtered = useMemo(() => uniqueJobs.filter((job) => {
     const s = stateOf(job);
     if (filter === 'running' && !isActive(job)) return false;
     if (filter === 'completed' && !DONE.includes(s)) return false;
     if (filter === 'failed' && !FAILED.includes(s)) return false;
     if (!['all', 'running', 'completed', 'failed'].includes(filter) && job.state !== filter) return false;
-    return `${job.workflow_key || ''} ${job.id} ${job.batch_id || ''}`.toLowerCase().includes(query.toLowerCase());
-  }), [uniqueJobs, filter, query]);
+    return `${job.workflow_key || ''} ${wfName(job.workflow_key)} ${job.id} ${job.batch_id || ''}`.toLowerCase().includes(query.toLowerCase());
+  }), [uniqueJobs, filter, query, wfName]);
 
   const entries = useMemo<JobDisplayEntry[]>(() => {
     if (!stackBatches) {
@@ -164,7 +179,9 @@ export function TasksPanel({
           </div>
           <div className={styles.jobInfo}>
             <div className={styles.jobTitleRow}>
-              <strong title={job.workflow_key || job.id}>{job.workflow_key || `任务 ${job.id.slice(0, 8)}`}</strong>
+              <strong title={job.workflow_key ? `${wfName(job.workflow_key)} (${job.workflow_key})` : job.id}>
+                {job.workflow_key ? wfName(job.workflow_key) : `任务 ${job.id.slice(0, 8)}`}
+              </strong>
               <span className={`pill ${done ? 'solid' : failed ? 'danger' : ''}`}>{jobStateLabel(job.state)}</span>
             </div>
             <p className="muted small">
@@ -249,7 +266,7 @@ export function TasksPanel({
             <span className={styles.batchIcon}><Layers size={18} strokeWidth={1.6} aria-hidden /></span>
             <span className={styles.batchMeta}>
               <span className={styles.jobTitleRow}>
-                <strong>{entry.workflowKey}</strong>
+                <strong title={entry.workflowKey}>{wfName(entry.workflowKey) || entry.workflowKey}</strong>
                 <span className={`pill ${entry.activeCount > 0 ? '' : entry.failedCount === total ? 'danger' : 'solid'}`}>
                   批次 ×{total}
                 </span>

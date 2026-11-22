@@ -47,6 +47,7 @@ export function useGalleryState({
   const [gallery, setGallery] = useState<GalleryAsset[]>([]);
   const [galleryError, setGalleryError] = useState('');
   const [galleryRevision, setGalleryRevision] = useState(0);
+  const [refreshingGallery, setRefreshingGallery] = useState(false);
 
   const [viewerSelection, setViewer] = useState<GalleryAsset | null>(null);
   const [viewerList, setViewerList] = useState<GalleryAsset[]>([]);
@@ -119,16 +120,27 @@ export function useGalleryState({
     if (!projectId || !loggedIn) return;
     let alive = true;
     setGalleryError('');
+    setRefreshingGallery(true);
     getGpuGallery(projectId).then((next) => {
       if (alive) setGallery(next.map((asset) => (asset.project_id ? asset : { ...asset, project_id: projectId })));
     }).catch((cause) => {
       if (alive) setGalleryError(apiMessage(cause));
+    }).finally(() => {
+      if (alive) setRefreshingGallery(false);
     });
     return () => { alive = false; };
   }, [projectId, loggedIn, tab, galleryOutputs, galleryRevision]);
 
+  const refreshGallery = useCallback(() => {
+    setGalleryRevision((revision) => revision + 1);
+  }, []);
+
   useEffect(() => {
-    if (!inlineViewer || !viewerJobId || !projectId || !loggedIn) return;
+    if (!viewerJobId || !projectId || !loggedIn) {
+      setViewerJob(null);
+      setViewerJobError('');
+      return;
+    }
     let alive = true;
     setViewerJobError('');
     getGpuJob(viewerJobId).then((job) => {
@@ -137,7 +149,7 @@ export function useGalleryState({
       if (alive) setViewerJobError(apiMessage(cause));
     });
     return () => { alive = false; };
-  }, [inlineViewer, viewerJobId, projectId, loggedIn]);
+  }, [viewerJobId, projectId, loggedIn]);
 
   const closeViewers = useCallback(() => {
     setViewer(null);
@@ -274,12 +286,36 @@ export function useGalleryState({
     }
   }
 
+  async function batchRemoveNative(ids: string[]) {
+    const removedIds = new Set<string>();
+    let batchError = '';
+    setGalleryError('');
+    for (const id of ids) {
+      try {
+        await deleteNativeOutput(id);
+        removedIds.add(id);
+      } catch (cause) {
+        batchError = `批量移至回收站失败：${apiMessage(cause)}`;
+        break;
+      }
+    }
+    if (removedIds.size > 0) {
+      setNativeDeletedIds((curr) => new Set([...curr, ...removedIds]));
+      setNativeViewer((curr) => (curr && removedIds.has(curr.id) ? null : curr));
+      setNativeRefreshToken((n) => n + 1);
+    }
+    if (!batchError) pushToast(`已将 ${removedIds.size} 件原生作品移入 Google Drive 回收站`, 'success');
+    return { removedIds: [...removedIds], error: batchError };
+  }
+
   return {
     gallerySource,
     setGallerySource,
     projectGallery,
     galleryError,
     setGalleryError,
+    refreshingGallery,
+    refreshGallery,
     viewer,
     setViewer,
     setViewerList,
@@ -311,5 +347,6 @@ export function useGalleryState({
     favoriteNative,
     importNativeRef,
     removeNative,
+    batchRemoveNative,
   };
 }

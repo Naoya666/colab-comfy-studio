@@ -34,6 +34,10 @@ test('gpu-spec-order enforces default low-to-high ranking, L4 highmem normalizat
   const L4_HM = { variant: 'VARIANT_GPU', accelerator: 'L4', shape: 'SHAPE_HIGHMEM' };
   const A100 = { variant: 'VARIANT_GPU', accelerator: 'A100', shape: 'SHAPE_STANDARD' };
   const A100_HM = { variant: 'VARIANT_GPU', accelerator: 'A100', shape: 'SHAPE_HIGHMEM' };
+  const G4 = { variant: 'VARIANT_GPU', accelerator: 'G4', shape: 'SHAPE_STANDARD' };
+  const G4_HM = { variant: 'VARIANT_GPU', accelerator: 'G4', shape: 'SHAPE_HIGHMEM' };
+  const H100 = { variant: 'VARIANT_GPU', accelerator: 'H100', shape: 'SHAPE_STANDARD' };
+  const H100_HM = { variant: 'VARIANT_GPU', accelerator: 'H100', shape: 'SHAPE_HIGHMEM' };
   const B200 = { variant: 'VARIANT_GPU', accelerator: 'B200', shape: 'SHAPE_STANDARD' };
 
   assert.equal(specOrder.compareGpuSpecs(T4, T4_HM), 'lower');
@@ -41,6 +45,11 @@ test('gpu-spec-order enforces default low-to-high ranking, L4 highmem normalizat
   assert.equal(specOrder.compareGpuSpecs(L4_HM, L4), 'equal');
   assert.equal(specOrder.compareGpuSpecs(L4, A100), 'lower');
   assert.equal(specOrder.compareGpuSpecs(A100, A100_HM), 'lower');
+  assert.equal(specOrder.compareGpuSpecs(A100_HM, G4), 'lower');
+  assert.equal(specOrder.compareGpuSpecs(G4, G4_HM), 'lower');
+  assert.equal(specOrder.compareGpuSpecs(G4_HM, H100), 'lower');
+  assert.equal(specOrder.compareGpuSpecs(H100, H100_HM), 'lower');
+  assert.equal(specOrder.compareGpuSpecs(H100_HM, G4_HM), 'higher');
   assert.equal(specOrder.compareGpuSpecs(A100, L4), 'higher');
   assert.equal(specOrder.compareGpuSpecs(B200, B200), 'equal');
   assert.equal(specOrder.compareGpuSpecs(B200, L4), 'unknown');

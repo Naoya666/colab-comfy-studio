@@ -18,7 +18,9 @@ DEFAULT_GPU_SPEC_ORDER: list[dict[str, str]] = [
     {"variant": "VARIANT_GPU", "accelerator": "A100", "shape": "SHAPE_STANDARD"},
     {"variant": "VARIANT_GPU", "accelerator": "A100", "shape": "SHAPE_HIGHMEM"},
     {"variant": "VARIANT_GPU", "accelerator": "G4", "shape": "SHAPE_STANDARD"},
+    {"variant": "VARIANT_GPU", "accelerator": "G4", "shape": "SHAPE_HIGHMEM"},
     {"variant": "VARIANT_GPU", "accelerator": "H100", "shape": "SHAPE_STANDARD"},
+    {"variant": "VARIANT_GPU", "accelerator": "H100", "shape": "SHAPE_HIGHMEM"},
 ]
 
 

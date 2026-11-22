@@ -19,6 +19,7 @@
   --warning: #ffd27d;
   --warning-bg: rgba(255, 210, 125, 0.08);
   --warning-line: rgba(255, 210, 125, 0.38);
+  --workspace-accent: #83cdb4;
   --overlay: rgba(0, 0, 0, 0.7);
 
   --r-sm: 8px;
@@ -53,6 +54,7 @@
   --warning: #8a5200;
   --warning-bg: #fff8e6;
   --warning-line: rgba(154, 92, 0, 0.35);
+  --workspace-accent: #1b634c;
   --overlay: rgba(0, 0, 0, 0.45);
   color-scheme: light;
 }
@@ -76,6 +78,7 @@
     --warning: #8a5200;
     --warning-bg: #fff8e6;
     --warning-line: rgba(154, 92, 0, 0.35);
+    --workspace-accent: #1b634c;
     --overlay: rgba(0, 0, 0, 0.45);
     color-scheme: light;
   }
@@ -296,7 +299,6 @@ details.foldable[open] > summary::after { transform: rotate(-135deg) translateY(
   .app {
     --desktop-header-height: calc(64px + var(--safe-t));
     --desktop-sidebar-width: 76px;
-    --workspace-accent: light-dark(#1b634c, #83cdb4);
     display: grid;
     grid-template-columns: var(--desktop-sidebar-width) minmax(0, 1fr);
     grid-template-rows: var(--desktop-header-height) 1fr;
@@ -376,5 +378,5 @@ details.foldable[open] > summary::after { transform: rotate(-135deg) translateY(
 .specList .muted { flex-basis: 100%; font-size: 0.75rem; }
 
 /* Model catalog hashes and long filenames remain readable on narrow screens. */
-progress { width: 100%; accent-color: var(--accent); }
+progress { width: 100%; accent-color: var(--primary); }
 article p, section[aria-label="模型详情"] p { overflow-wrap: anywhere; }

@@ -1,10 +1,11 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import {
   Image as ImageIcon, Film, Search, Star, Check, Eye, RotateCcw, Trash2, Play,
-  Layers, CheckSquare, X, FileJson,
+  Layers, CheckSquare, X, FileJson, RefreshCw, Workflow,
 } from 'lucide-react';
-import { assetUrl, type GalleryAsset } from '../lib/gpu-api';
+import { assetUrl, type GalleryAsset, type GpuWorkflow } from '../lib/gpu-api';
 import { groupGalleryAssets, isDiagnosticAsset } from '../lib/history-grouping';
+import { workflowTitle } from '../lib/workflow-copy';
 import { ConfirmDialog } from '../components/Feedback';
 import styles from '../gpu.module.css';
 
@@ -18,10 +19,13 @@ function dims(asset: GalleryAsset): string {
 }
 
 export function GalleryPanel({
-  gallery, error, onFavorite, onBatchDelete, onOpen, onReuse, onGoCreate, inspectedId,
+  gallery, workflows = [], error, refreshing = false, onRefresh, onFavorite, onBatchDelete, onOpen, onReuse, onGoCreate, inspectedId,
 }: {
   gallery: GalleryAsset[];
+  workflows?: GpuWorkflow[];
   error?: string;
+  refreshing?: boolean;
+  onRefresh?: () => void;
   onFavorite: (asset: GalleryAsset) => void;
   onBatchDelete: (ids: string[]) => Promise<{ removedIds: string[]; error?: string }>;
   onOpen: (asset: GalleryAsset, ordered?: GalleryAsset[]) => void;
@@ -30,6 +34,7 @@ export function GalleryPanel({
   inspectedId?: string;
 }) {
   const [filter, setFilter] = useState<Filter>('all');
+  const [workflowFilter, setWorkflowFilter] = useState('');
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [stackedView, setStackedView] = useState(true);
   const [expandedStacks, setExpandedStacks] = useState<Set<string>>(() => new Set());
@@ -41,8 +46,34 @@ export function GalleryPanel({
   const [confirmBatchDelete, setConfirmBatchDelete] = useState<{ ids: string[]; title: string; description: string; error?: string } | null>(null);
   const [deletingBatch, setDeletingBatch] = useState(false);
 
+  const workflowByKey = useMemo(() => {
+    const map = new Map<string, GpuWorkflow>();
+    for (const wf of workflows) {
+      if (!map.has(wf.workflow_key) || wf.active) map.set(wf.workflow_key, wf);
+    }
+    return map;
+  }, [workflows]);
+
+  const workflowLabel = useCallback((key?: string) => {
+    if (!key) return '';
+    return workflowTitle(workflowByKey.get(key) || { workflow_key: key });
+  }, [workflowByKey]);
+
   const diagnosticAssets = useMemo(() => gallery.filter(isDiagnosticAsset), [gallery]);
   const mediaCount = gallery.length - diagnosticAssets.length;
+
+  const workflowOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const asset of gallery) {
+      if (isDiagnosticAsset(asset) || !asset.workflow_key) continue;
+      counts.set(asset.workflow_key, (counts.get(asset.workflow_key) || 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([key, count]) => ({ key, label: workflowLabel(key), count }))
+      .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  }, [gallery, workflowLabel]);
+
+  const activeWorkflowFilter = workflowOptions.some((o) => o.key === workflowFilter) ? workflowFilter : '';
 
   const filtered = useMemo(() => gallery.filter((asset) => {
     const isDiag = isDiagnosticAsset(asset);
@@ -53,8 +84,10 @@ export function GalleryPanel({
     if (filter === 'video' && !isVideo) return false;
     if (filter === 'favorite' && !asset.favorite) return false;
     if (filter === 'unfavorited' && asset.favorite) return false;
-    return `${asset.filename || ''} ${asset.source_job_id || ''} ${asset.workflow_key || ''}`.toLowerCase().includes(query.toLowerCase());
-  }), [gallery, filter, query, showDiagnostics]);
+    if (activeWorkflowFilter && asset.workflow_key !== activeWorkflowFilter) return false;
+    const wfName = workflowLabel(asset.workflow_key);
+    return `${asset.filename || ''} ${asset.source_job_id || ''} ${asset.workflow_key || ''} ${wfName}`.toLowerCase().includes(query.toLowerCase());
+  }), [gallery, filter, activeWorkflowFilter, query, showDiagnostics, workflowLabel]);
 
   const stacks = useMemo(() => groupGalleryAssets(filtered), [filtered]);
   const hasMultiStacks = useMemo(() => stacks.some((s) => s.items.length > 1), [stacks]);
@@ -201,12 +234,27 @@ export function GalleryPanel({
         </div>
         <div className={styles.tileMeta}>
           <div>
-            <strong title={asset.filename || asset.id}>{asset.filename || `作品 ${asset.id.slice(0, 6)}`}</strong>
-            <small className="muted">
-              {isStackedCover && stackInfo
-                ? `同批共 ${stackInfo.count} 件 · ${asset.workflow_key || '点击展开'}`
-                : asset.source_job_id ? `任务 ${asset.source_job_id.slice(0, 6)}` : '上传素材'}
-            </small>
+            {(() => {
+              const wfName = workflowLabel(asset.workflow_key);
+              const primary = wfName || asset.filename || `作品 ${asset.id.slice(0, 6)}`;
+              const versionTag = asset.workflow_version != null ? `v${asset.workflow_version}` : '';
+              const jobTag = asset.source_job_id ? `任务 ${asset.source_job_id.slice(0, 6)}` : '';
+              const secondary = isStackedCover && stackInfo
+                ? `同批共 ${stackInfo.count} 件${versionTag ? ` · ${versionTag}` : ''}${jobTag ? ` · ${jobTag}` : ''}`
+                : wfName
+                  ? [versionTag, jobTag || '作品', asset.filename].filter(Boolean).join(' · ')
+                  : jobTag || '上传素材';
+              const fullTitle = [
+                wfName ? `${wfName}${versionTag ? ` ${versionTag}` : ''}` : '',
+                asset.filename || asset.id,
+              ].filter(Boolean).join(' · ');
+              return (
+                <>
+                  <strong title={fullTitle}>{primary}</strong>
+                  <small className="muted" title={secondary}>{secondary}</small>
+                </>
+              );
+            })()}
           </div>
           <button
             type="button"
@@ -231,6 +279,17 @@ export function GalleryPanel({
           <span className="pill">{mediaCount} 件作品</span>
         </h2>
         <div className={styles.titleActions}>
+          {onRefresh && (
+            <button
+              type="button"
+              className="button secondary small"
+              disabled={refreshing}
+              onClick={onRefresh}
+            >
+              <RefreshCw size={14} className={refreshing ? styles.spin : undefined} aria-hidden />
+              {refreshing ? '刷新中…' : '刷新'}
+            </button>
+          )}
           {gallery.length > 0 && (
             <button
               type="button"
@@ -300,6 +359,22 @@ export function GalleryPanel({
           {chip('unfavorited', '未收藏')}
         </div>
         <div className={styles.filterRight}>
+          {workflowOptions.length > 0 && (
+            <label className={`small muted ${styles.filterSelectWrap}`}>
+              <Workflow size={13} aria-hidden />
+              <select
+                aria-label="按工作流筛选"
+                className={styles.miniSelect}
+                value={activeWorkflowFilter}
+                onChange={(e) => { setWorkflowFilter(e.target.value); setLimit(24); }}
+              >
+                <option value="">全部工作流</option>
+                {workflowOptions.map((opt) => (
+                  <option key={opt.key} value={opt.key}>{opt.label} ({opt.count})</option>
+                ))}
+              </select>
+            </label>
+          )}
           {hasMultiStacks && (
             <button
               type="button"
@@ -347,7 +422,7 @@ export function GalleryPanel({
                 }
                 return [
                   <div key={`${stack.key}:header`} className={styles.expandedStackBar}>
-                    <span><Layers size={14} aria-hidden />同批次共 {stack.items.length} 件{stack.workflowKey ? ` · ${stack.workflowKey}` : ''}</span>
+                    <span><Layers size={14} aria-hidden />同批次共 {stack.items.length} 件{stack.workflowKey ? ` · ${workflowLabel(stack.workflowKey)}` : ''}</span>
                     <div className="actions">
                       {batchMode && (
                         <button type="button" className="button ghost small" onClick={() => toggleChecked(stack.items.map((i) => i.id))}>

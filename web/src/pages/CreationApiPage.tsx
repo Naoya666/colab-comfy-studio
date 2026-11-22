@@ -7,6 +7,7 @@ import { ConfirmDialog } from '../components/Feedback';
 import { Card } from '../components/ui';
 import { apiFetch, clearCreationWarmups } from '../lib/gpu-api';
 import { useSmartPoll } from '../lib/smart-poll';
+import styles from '../gpu.module.css';
 
 type AuthMode = 'strict' | 'url_path' | 'local_open';
 type WorkflowScope = 'active' | 'selected';
@@ -230,7 +231,7 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
     setWarmups(rows => [job, ...rows.filter(row => row.id !== job.id)].slice(0, 20));
   }
 
-  return <div className="stack">
+  return <div className={styles.stack}>
     <h2>创作 API 设置</h2>
     {error && <p className="status error" role="alert">{error}</p>}
     {notice && <p className="status" role="status">{notice}</p>}
@@ -293,7 +294,7 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
         )}
 
         {draft.auth_mode !== 'strict' && (
-          <div className="stack">
+          <div className={styles.stack}>
             <div className="field">
               <label htmlFor="creation-wf-scope">弱鉴权 / 免鉴权开放的工作流范围</label>
               <select
@@ -357,7 +358,7 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
         )}
 
         {urls && !accessDirty && (
-          <div className="stack">
+          <div className={styles.stack}>
             {activeMode === 'url_path' ? (
               <>
                 {urls.dedicated_code_url && (
@@ -440,7 +441,7 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
         {!poolInstances.length ? (
           <p className="muted small">当前创作池没有活跃实例。可在前端创作页使用「智能/保留」启动，或点击下方「启动工作流」预热。</p>
         ) : (
-          <div className="stack">
+          <div className={styles.stack}>
             {poolInstances.map((inst) => {
               const specAcc = inst.gpu_reported
                 || inst.runtime_spec_reported?.key?.accelerator

@@ -136,31 +136,20 @@ export function GpuOrderSettings({ canEdit }: { canEdit: boolean }) {
         !error && <p className="muted small">正在读取 GPU 规格顺序…</p>
       ) : (
         <div className={styles.stack}>
-          <ol className={styles.stack} style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+          <ol className={styles.gpuOrderList}>
             {draft.map((spec, index) => {
               const id = gpuSpecId(spec) || `${spec.accelerator}:${spec.shape}`;
               const isCustom = !defaultIds.has(id);
               return (
-                <li
-                  key={id}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    gap: '0.5rem',
-                    padding: '0.45rem 0.65rem',
-                    borderRadius: '0.5rem',
-                    border: '1px solid var(--border, rgba(128,128,128,0.22))',
-                  }}
-                >
-                  <span>
-                    <strong style={{ marginRight: '0.5rem' }}>#{index + 1}</strong>
+                <li key={id} className={styles.gpuOrderRow}>
+                  <span className={styles.gpuOrderInfo}>
+                    <strong className={styles.gpuOrderRank}>#{index + 1}</strong>
                     <span>{formatGpuSpecName(spec)}</span>
-                    <small className="muted" style={{ marginLeft: '0.5rem' }}>{id}</small>
-                    {isCustom && <span className="pill" style={{ marginLeft: '0.4rem' }}>自定义</span>}
+                    <small className="muted">{id}</small>
+                    {isCustom && <span className="pill">自定义</span>}
                   </span>
                   {canEdit && (
-                    <span style={{ display: 'inline-flex', gap: '0.25rem' }}>
+                    <span className={styles.gpuOrderControls}>
                       <button
                         type="button"
                         className="button ghost small"
@@ -198,13 +187,13 @@ export function GpuOrderSettings({ canEdit }: { canEdit: boolean }) {
           </ol>
 
           {pendingDiscovered.length > 0 && (
-            <div className="status" role="region" aria-label="新探测到的 GPU">
+            <div className={`status ${styles.stack}`} role="region" aria-label="新探测到的 GPU">
               <strong>新探测到的上游 GPU（尚未纳入排序，仅支持精确同规格复用）：</strong>
-              <div className={styles.stack} style={{ marginTop: '0.4rem' }}>
+              <div className={styles.stack}>
                 {pendingDiscovered.map((item) => {
                   const id = gpuSpecId(item.spec) || `${item.spec.accelerator}:${item.spec.shape}`;
                   return (
-                    <div key={id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
+                    <div key={id} className={styles.gpuDiscoveredRow}>
                       <span>{formatGpuSpecName(item.spec)} <small className="muted">({id})</small></span>
                       {canEdit && (
                         <button

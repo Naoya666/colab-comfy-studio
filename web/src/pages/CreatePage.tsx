@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, type Dispatch, type ReactNode, type SetStateAction } from 'react';
 import {
   Sparkles, Image as ImageIcon, Film, Layers, Pencil, SlidersHorizontal, Play, Monitor, Cloud,
-  ChevronRight, ChevronDown, Minus, Plus, X, Check, Trash2, Save,
+  ChevronRight, ChevronDown, Minus, Plus, X, Check, Trash2, Save, ArrowLeftRight,
 } from 'lucide-react';
 import type {
   GalleryAsset, GpuManifest, GpuModel, GpuPreset, GpuSettings, GpuUsage, GpuWorkflow, Provider,
@@ -441,8 +441,6 @@ export function CreatePanel({
                 }}
               />
             </div>
-          ) : draftReady && manifest ? (
-            <p className="muted small">当前工作流未提供单独的负面提示词参数。</p>
           ) : null}
         </Card>
 
@@ -493,7 +491,16 @@ export function CreatePanel({
                     onChange={(e) => patch({ width: Number(e.target.value) || 0 })} />
                   <em>px</em>
                 </label>
-                <span className="muted">×</span>
+                <button
+                  type="button"
+                  className={styles.iconGhost}
+                  aria-label="互换宽高"
+                  title="互换宽高"
+                  disabled={!curW && !curH}
+                  onClick={() => patch({ width: curH, height: curW })}
+                >
+                  <ArrowLeftRight size={15} strokeWidth={1.7} aria-hidden />
+                </button>
                 <label className={styles.sizeInput}>
                   <span>高</span>
                   <input type="number" inputMode="numeric" min={minSide} max={maxSide} step={step} value={String(params.height ?? '')}

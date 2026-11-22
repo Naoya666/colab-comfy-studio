@@ -84,6 +84,7 @@ export default function App() {
   const [tab, setTab] = useState<MainTab>(initialRoute.tab);
   const [assetsSubTab, setAssetsSubTab] = useState<AssetsSubTab>(initialRoute.assetsSubTab);
   const [creationApiOpen, setCreationApiOpen] = useState(initialRoute.creationApiOpen);
+  const [settingsFocusSection, setSettingsFocusSection] = useState<'model-storage' | null>(null);
   const [adminRole, setAdminRole] = useState(false);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
@@ -999,9 +1000,32 @@ export default function App() {
     window.scrollTo(0, 0);
   }
 
+  function openJobFromViewer(jobId: string) {
+    gs.closeViewers();
+    gs.setPendingRouteAssetId('');
+    setTab('任务');
+    inspectJob(jobId);
+    window.scrollTo(0, 0);
+  }
+
+  function openOutputAsset(assetId: string) {
+    gs.setGallerySource('studio');
+    const existing = gs.projectGallery.find((asset) => asset.id === assetId);
+    if (existing) {
+      gs.setViewerList(gs.projectGallery);
+      gs.setViewer(existing);
+    } else {
+      gs.setPendingRouteAssetId(assetId);
+    }
+    setDetailId('');
+    setTab('作品');
+    window.scrollTo(0, 0);
+  }
+
   const viewerNode = gs.activeViewerItem && (
     <GalleryViewer
       item={gs.activeViewerItem}
+      workflows={workflows}
       navCount={gs.activeNavCount}
       navIndex={gs.activeNavIndex}
       inlineViewer={gs.inlineViewer}
@@ -1013,6 +1037,7 @@ export default function App() {
       onClose={gs.closeViewers}
       onError={gs.setGalleryError}
       onToast={pushToast}
+      onOpenJob={openJobFromViewer}
       onFavoriteStudio={(asset) => void gs.favorite(asset)}
       onReuseStudio={(asset) => void gs.reuseAsset(asset)}
       onUseStudioAsReference={useAssetAsReference}
@@ -1119,8 +1144,10 @@ export default function App() {
                   computeSpec={selectedCompute}
                   specBelowDefaultError={specBelowDefaultError}
                   onEditGuard={() => {
-                    navigate('设置');
-                    window.requestAnimationFrame(() => document.getElementById('cu-guard')?.scrollIntoView({ block: 'center' }));
+                    navigate('算力');
+                    window.requestAnimationFrame(() => {
+                      window.requestAnimationFrame(() => document.getElementById('cu-guard')?.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+                    });
                   }}
                   gpuSelection={runtime === 'colab' ? <WorkflowGpuSelection manifest={manifest} accountId={runtimeChoice.accountId} value={selectedCompute} onChange={chooseGpu} gpuOrder={gpuOrder} /> : null}
                   projectId={projectId}
@@ -1191,6 +1218,7 @@ export default function App() {
           <div className={styles.detailWorkspace}>
             <TasksPanel
               jobs={projectJobs}
+              workflows={workflows}
               error={jobError}
               refreshing={refreshingJobs}
               clearingHistory={loading === 'clear-jobs'}
@@ -1224,6 +1252,8 @@ export default function App() {
                   detailId={detailId}
                   detailError={detailError}
                   inspectedJob={inspectedJob}
+                  workflows={workflows}
+                  onOpenOutput={openOutputAsset}
                   onClose={() => setDetailId('')}
                 />
               </section>
@@ -1254,7 +1284,10 @@ export default function App() {
                 <GalleryPanel
                   key={projectId}
                   gallery={gs.projectGallery}
+                  workflows={workflows}
                   error={gs.viewer ? '' : gs.galleryError}
+                  refreshing={gs.refreshingGallery}
+                  onRefresh={gs.refreshGallery}
                   inspectedId={desktop ? gs.viewer?.id || '' : undefined}
                   onFavorite={(asset) => void gs.favorite(asset)}
                   onBatchDelete={gs.batchRemove}
@@ -1277,6 +1310,7 @@ export default function App() {
                     gs.setNativeViewer(asset);
                   }}
                   onFavorite={(asset) => void gs.favoriteNative(asset)}
+                  onBatchDelete={gs.batchRemoveNative}
                 />
               )}
 
@@ -1376,7 +1410,7 @@ export default function App() {
                 />
               </>
             ) : (
-              <ModelLibraryPage onOpenSettings={() => navigate('设置')} />
+              <ModelLibraryPage onOpenSettings={() => { setSettingsFocusSection('model-storage'); navigate('设置'); }} />
             )}
           </section>
         )}
@@ -1399,9 +1433,10 @@ export default function App() {
             settings={settings}
             usage={usage}
             canEditGuard={adminRole}
-            onRefreshUsage={refreshUsage}
+            desktop={desktop}
+            focusSection={settingsFocusSection}
+            onFocusHandled={() => setSettingsFocusSection(null)}
             error={error}
-            onOpenCompute={() => navigate('算力')}
             onLogout={() => {
               sessionStorage.removeItem('colab-gpu-studio-token');
               setLoggedIn(false);
@@ -1544,6 +1579,8 @@ export default function App() {
               detailId={detailId}
               detailError={detailError}
               inspectedJob={inspectedJob}
+              workflows={workflows}
+              onOpenOutput={openOutputAsset}
               onClose={() => setDetailId('')}
             />
           </section>

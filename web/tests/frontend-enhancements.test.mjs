@@ -143,3 +143,44 @@ test('PWA manifest and icons exist and are linked from index.html', () => {
     assert.equal(existsSync(join(webRoot, 'public', icon.src.replace(/^\//, ''))), true);
   }
 });
+
+test('SettingsPage removes duplicate CU usage/guard cards, uses full-width appearance banner and two-column accounts', () => {
+  const settings = readFileSync(join(webRoot, 'src/pages/SettingsPage.tsx'), 'utf8');
+  const app = readFileSync(join(webRoot, 'src/App.tsx'), 'utf8');
+  const accounts = readFileSync(join(webRoot, 'src/components/AccountDirectory.tsx'), 'utf8');
+  const v020Css = readFileSync(join(webRoot, 'src/components/v020.module.css'), 'utf8');
+  assert.doesNotMatch(settings, /CuGuardSettings/);
+  assert.doesNotMatch(settings, /用量与额度/);
+  assert.match(settings, /appearanceBanner/);
+  assert.match(settings, /跟随系统/);
+  assert.doesNotMatch(settings, /跟随手机系统/);
+  assert.match(settings, /className=\{styles\.workspaceWide\}[\s\S]*title="Google 账号"/);
+  assert.match(accounts, /styles\.accountGrid/);
+  assert.match(v020Css, /\.accountGrid[\s\S]*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+  assert.match(app, /onEditGuard=\{\(\) => \{\s*navigate\('算力'\)/);
+});
+
+test('Studio Gallery shows workflows, supports workflow filtering, and GalleryViewer displays metadata everywhere', () => {
+  const gallery = readFileSync(join(webRoot, 'src/pages/GalleryPage.tsx'), 'utf8');
+  const viewer = readFileSync(join(webRoot, 'src/components/GalleryViewer.tsx'), 'utf8');
+  const galleryState = readFileSync(join(webRoot, 'src/hooks/useGalleryState.ts'), 'utf8');
+  const labels = readFileSync(join(webRoot, 'src/lib/labels.ts'), 'utf8');
+  assert.match(gallery, /aria-label="按工作流筛选"/);
+  assert.match(gallery, /workflowTitle/);
+  assert.match(viewer, /<summary>作品信息<\/summary>/);
+  assert.match(viewer, /<dt>工作流<\/dt>/);
+  assert.doesNotMatch(viewer, /item\.kind === 'studio' && inlineViewer && viewerJobId/);
+  assert.doesNotMatch(galleryState, /if \(!inlineViewer \|\| !viewerJobId/);
+  assert.match(labels, /正向提示词/);
+});
+
+test('CreationApiPage uses CSS module stack and styles.css defines valid progress accent & theme vars', () => {
+  const creationApi = readFileSync(join(webRoot, 'src/pages/CreationApiPage.tsx'), 'utf8');
+  const stylesCss = readFileSync(join(webRoot, 'src/styles.css'), 'utf8');
+  const gpuCss = readFileSync(join(webRoot, 'src/gpu.module.css'), 'utf8');
+  assert.doesNotMatch(creationApi, /className="stack"/);
+  assert.match(creationApi, /className=\{styles\.stack\}/);
+  assert.doesNotMatch(stylesCss, /var\(--accent\)/);
+  assert.doesNotMatch(stylesCss, /light-dark\(/);
+  assert.doesNotMatch(gpuCss, /light-dark\(/);
+});

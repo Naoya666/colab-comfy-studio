@@ -29,7 +29,9 @@ L4_HM = {"variant": "VARIANT_GPU", "accelerator": "L4", "shape": "SHAPE_HIGHMEM"
 A100_STD = {"variant": "VARIANT_GPU", "accelerator": "A100", "shape": "SHAPE_STANDARD"}
 A100_HM = {"variant": "VARIANT_GPU", "accelerator": "A100", "shape": "SHAPE_HIGHMEM"}
 G4_STD = {"variant": "VARIANT_GPU", "accelerator": "G4", "shape": "SHAPE_STANDARD"}
+G4_HM = {"variant": "VARIANT_GPU", "accelerator": "G4", "shape": "SHAPE_HIGHMEM"}
 H100_STD = {"variant": "VARIANT_GPU", "accelerator": "H100", "shape": "SHAPE_STANDARD"}
+H100_HM = {"variant": "VARIANT_GPU", "accelerator": "H100", "shape": "SHAPE_HIGHMEM"}
 B200_STD = {"variant": "VARIANT_GPU", "accelerator": "B200", "shape": "SHAPE_STANDARD"}
 
 
@@ -39,7 +41,7 @@ def test_default_gpu_spec_order_and_highmem_normalization():
     assert spec_id(L4_HM) == "L4:SHAPE_STANDARD"
     assert compare_specs(L4_HM, L4_STD) == "equal"
 
-    chain = [T4_STD, T4_HM, L4_STD, A100_STD, A100_HM, G4_STD, H100_STD]
+    chain = [T4_STD, T4_HM, L4_STD, A100_STD, A100_HM, G4_STD, G4_HM, H100_STD, H100_HM]
     for i in range(len(chain)):
         assert compare_specs(chain[i], chain[i]) == "equal"
         for j in range(i + 1, len(chain)):

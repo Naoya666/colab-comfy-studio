@@ -37,6 +37,10 @@ def gallery(
                 item["batch_id"] = job["batch_id"]
             if job.get("workflow_key") and not item.get("workflow_key"):
                 item["workflow_key"] = job["workflow_key"]
+            if job.get("workflow_version") is not None and item.get("workflow_version") is None:
+                item["workflow_version"] = job["workflow_version"]
+            if job.get("gpu_reported") and not item.get("gpu_reported"):
+                item["gpu_reported"] = job["gpu_reported"]
             if job.get("provider") == "mock" and item.get("mock") is None:
                 item["mock"] = True
         result.append(item)

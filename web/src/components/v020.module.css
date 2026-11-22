@@ -101,6 +101,21 @@
   min-width: 0;
 }
 
+.accountGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  min-width: 0;
+}
+
+.togglePair {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+}
+
 .accountCard, .instanceCard, .detailPanel, .workbenchPanel, .empty {
   border: 1px solid var(--v-border);
   border-radius: var(--r-md, 12px);
@@ -220,6 +235,7 @@
 .createRow {
   align-items: stretch;
   gap: 8px;
+  max-width: 520px;
 }
 
 .createRow input {
@@ -258,15 +274,30 @@
   background: var(--v-text);
   color: var(--v-bg);
   border-color: var(--v-text);
+  transition: opacity 0.12s, background 0.12s, border-color 0.12s;
+}
+.button:hover:not(:disabled) {
+  opacity: 0.88;
 }
 
 .buttonSecondary {
   background: transparent;
+  transition: background 0.12s, border-color 0.12s;
+}
+.buttonSecondary:hover:not(:disabled),
+.iconButton:hover:not(:disabled),
+.filterButton:hover:not(:disabled):not([aria-pressed="true"]),
+.tabButton:hover:not(:disabled):not([aria-selected="true"]) {
+  background: var(--v-panel-2);
 }
 
 .buttonDanger {
   color: var(--v-danger);
   border-color: var(--v-danger-line);
+  transition: background 0.12s, border-color 0.12s;
+}
+.buttonDanger:hover:not(:disabled) {
+  background: var(--v-panel-2);
 }
 
 .iconButton {
@@ -637,4 +668,29 @@
 .logList {
   max-height: 48vh;
   overflow-y: auto;
+}
+
+@media (min-width: 700px) {
+  .sheetBackdrop {
+    align-items: center;
+    padding: 16px;
+  }
+  .sheet {
+    border-bottom: 1px solid var(--v-border-strong);
+    border-radius: 20px;
+    padding-bottom: 18px;
+  }
+}
+
+@media (min-width: 960px) {
+  .accountGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .instanceMeta {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+  .instanceCard .cardActions > button {
+    flex: 0 1 auto;
+  }
 }

@@ -1,25 +1,49 @@
 import { ModelSourceSettings, ModelStorageSettings } from './ModelLibraryPage';
-import { useState } from 'react';
-import { Settings, ChevronLeft, Monitor, Gauge, Plug, LogOut, ArrowUpRight } from 'lucide-react';
-import { ThemePicker } from './ComputePage';
+import { useEffect, useState } from 'react';
+import { Settings, ChevronLeft, Monitor, Moon, Sun, Plug, LogOut } from 'lucide-react';
 import type { GpuSettings, GpuUsage } from '../lib/gpu-api';
 import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
 import { AccountDirectory, type GpuAccount } from '../components/AccountDirectory';
-import { CuGuardSettings } from '../components/CuGuardSettings';
 import { GpuOrderSettings } from '../components/GpuOrderSettings';
-import { Card } from '../components/ui';
+import { Card, Segmented } from '../components/ui';
 import styles from '../gpu.module.css';
-import { cuNumber } from '../lib/ui-helpers';
+
+type ThemeMode = 'dark' | 'light' | 'system';
+
+export function ThemePicker() {
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    const saved = localStorage.getItem('studio-theme');
+    return saved === 'light' || saved === 'system' ? saved : 'dark';
+  });
+  function change(value: ThemeMode) {
+    setTheme(value);
+    localStorage.setItem('studio-theme', value);
+    document.documentElement.dataset.theme = value;
+  }
+  return (
+    <Segmented<ThemeMode>
+      ariaLabel="界面颜色"
+      value={theme}
+      onChange={change}
+      options={[
+        { value: 'dark', label: '深色', icon: <Moon size={15} strokeWidth={1.6} aria-hidden /> },
+        { value: 'light', label: '浅色', icon: <Sun size={15} strokeWidth={1.6} aria-hidden /> },
+        { value: 'system', label: '跟随系统', icon: <Monitor size={15} strokeWidth={1.6} aria-hidden /> },
+      ]}
+    />
+  );
+}
 
 export function SettingsPanel({
-  settings, usage, canEditGuard, onRefreshUsage, error, accounts = [], onAccountsChange, onOpenCompute, onLogout, onBack,
+  settings, usage, canEditGuard, desktop = false, focusSection = null, onFocusHandled, error, accounts = [], onAccountsChange, onLogout, onBack,
 }: {
   settings: GpuSettings | null;
   usage?: GpuUsage | null;
   canEditGuard: boolean;
-  onRefreshUsage: () => Promise<void>;
+  desktop?: boolean;
+  focusSection?: 'model-storage' | null;
+  onFocusHandled?: () => void;
   error: string;
-  onOpenCompute?: () => void;
   onLogout: () => void;
   onBack?: () => void;
   accounts?: GpuAccount[];
@@ -27,56 +51,60 @@ export function SettingsPanel({
 }) {
   const [oauthConfigured, setOauthConfigured] = useState(false);
 
-  const activeCount = Number(usage?.active_runtimes ?? 0);
-  const dailyCap = usage?.guard?.daily_limit_cu;
-  const used = usage?.today_actual_cu;
-  const pct = dailyCap != null && used != null
-    ? (dailyCap === 0 ? '已达上限' : `${Math.round((used / dailyCap) * 100)}%`)
-    : '—';
+  useEffect(() => {
+    if (focusSection !== 'model-storage') return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById('settings-model-storage')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      onFocusHandled?.();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusSection, onFocusHandled]);
 
   return (
     <div className={`${styles.stack} ${styles.workspaceGrid}`}>
-      <div className={`${styles.subHead} ${styles.workspaceWide}`}>
-        <button type="button" className={styles.backBtn} onClick={onBack}><ChevronLeft size={18} strokeWidth={1.6} aria-hidden />返回</button>
-        <h2><Settings size={20} strokeWidth={1.6} aria-hidden />设置</h2>
-      </div>
-
-      <Card icon={<Monitor size={17} strokeWidth={1.6} aria-hidden />} title="外观">
-        <ThemePicker />
-      </Card>
-
-      <Card
-        icon={<Gauge size={17} strokeWidth={1.6} aria-hidden />}
-        title="用量与额度"
-        aside={<span className="pill">{usage?.local_date || '—'}</span>}
-      >
-        <div className={styles.grid2}>
-          <div className={styles.statBox}><small className="muted">运行中机器</small><strong>{activeCount}</strong></div>
-          <div className={styles.statBox}><small className="muted">今日总上限</small><strong>{dailyCap == null ? '不限' : <>{cuNumber(dailyCap)}<em> CU</em></>}</strong></div>
-          <div className={styles.statBox}><small className="muted">今日扣费</small><strong>{cuNumber(used)}<em> CU</em></strong></div>
-          <div className={styles.statBox}><small className="muted">使用率</small><strong>{pct}</strong></div>
+      {desktop ? (
+        <div className={`${styles.pageTitle} ${styles.workspaceWide}`}>
+          <h2><Settings size={20} strokeWidth={1.6} aria-hidden />设置</h2>
+          <div className={styles.titleActions}>
+            <button className="button secondary small" type="button" onClick={onLogout}>
+              <LogOut size={15} strokeWidth={1.6} aria-hidden />退出登录
+            </button>
+          </div>
         </div>
-        {onOpenCompute && (
-          <button type="button" className="button secondary small" onClick={onOpenCompute}>
-            管理实例、检查 GPU 与急停<ArrowUpRight size={14} aria-hidden />
-          </button>
-        )}
-      </Card>
+      ) : (
+        <div className={`${styles.subHead} ${styles.workspaceWide}`}>
+          <button type="button" className={styles.backBtn} onClick={onBack}><ChevronLeft size={18} strokeWidth={1.6} aria-hidden />返回</button>
+          <h2><Settings size={20} strokeWidth={1.6} aria-hidden />设置</h2>
+        </div>
+      )}
 
-      <CuGuardSettings guard={usage?.guard} canEdit={canEditGuard} onSaved={onRefreshUsage} />
+      <section className={`${styles.card} ${styles.workspaceWide} ${styles.appearanceBanner}`} aria-label="外观设置">
+        <div className={styles.appearanceIntro}>
+          <Monitor size={18} strokeWidth={1.6} aria-hidden />
+          <div>
+            <h2>外观</h2>
+            <p className="muted small">选择工作台界面主题色，修改后立即生效。</p>
+          </div>
+        </div>
+        <div className={styles.appearanceControl}>
+          <ThemePicker />
+        </div>
+      </section>
 
-      <div className={`${styles.stack} ${styles.workspaceWide}`}>
+      <div className={styles.workspaceWide}>
         <GpuOrderSettings canEdit={canEditGuard} />
-        <ModelStorageSettings />
-        <ModelSourceSettings />
       </div>
 
+      <ModelStorageSettings id="settings-model-storage" defaultOpen={focusSection === 'model-storage'} />
+      <ModelSourceSettings id="settings-model-source" defaultOpen={focusSection === 'model-storage'} />
+
       <Card
+        className={styles.workspaceWide}
         icon={<Plug size={17} strokeWidth={1.6} aria-hidden />}
         title="Google 账号"
         aside={settings?.offline_mode ? <span className="pill">离线模式</span> : oauthConfigured ? <span className="pill solid">应用已配置</span> : undefined}
       >
-        <AccountDirectory balances={usage?.accounts} accounts={accounts} onAccountsChange={onAccountsChange} />
+        <AccountDirectory hideTitle balances={usage?.accounts} accounts={accounts} onAccountsChange={onAccountsChange} />
         {!settings?.offline_mode && (
           <details className="foldable">
             <summary>Google 应用配置（首次使用）</summary>
@@ -85,10 +113,12 @@ export function SettingsPanel({
         )}
       </Card>
 
-      <div className={styles.workspaceWide}>
-        <button className="button secondary big" type="button" onClick={onLogout}><LogOut size={17} strokeWidth={1.6} aria-hidden />退出登录</button>
-      </div>
-      {error && <p className="status error" role="alert">{error}</p>}
+      {!desktop && (
+        <div className={styles.workspaceWide}>
+          <button className="button secondary big" type="button" onClick={onLogout}><LogOut size={17} strokeWidth={1.6} aria-hidden />退出登录</button>
+        </div>
+      )}
+      {error && <p className={`status error ${styles.workspaceWide}`} role="alert">{error}</p>}
     </div>
   );
 }

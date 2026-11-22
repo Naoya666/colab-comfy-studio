@@ -4,6 +4,10 @@ type Rule = { test: RegExp; label: string; hint: string };
 
 const RULES: Rule[] = [
   { test: /negative/i, label: '负向提示词', hint: '写下不想出现的内容，例如「模糊、多余的手指」。' },
+  { test: /^prompt$/i, label: '正向提示词', hint: '' },
+  { test: /^width$/i, label: '宽度', hint: '' },
+  { test: /^height$/i, label: '高度', hint: '' },
+  { test: /^batch_size$/i, label: '单次批数', hint: '' },
   { test: /(^|_)seed$/i, label: '随机种子', hint: '种子和参数都相同，结果就相近；填 -1 表示每次随机。' },
   { test: /(^|_)steps?$/i, label: '采样步数', hint: '步数越多细节越好，但更慢、更费 CU。' },
   { test: /(^|_)cfg(_scale)?$/i, label: '提示词相关度（CFG）', hint: '越高越贴近提示词，太高画面会发硬。拿不准就保持默认。' },

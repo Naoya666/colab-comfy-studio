@@ -91,7 +91,7 @@ export interface GpuJob {
   [key: string]: unknown;
 }
 export interface GpuEvent { id?: string; state?: string; event_type?: string; message?: string; progress?: number; created_at?: string; payload?: Record<string, unknown>; [key: string]: unknown; }
-export interface GalleryAsset { id: string; project_id: string; mime: string; filename?: string; thumbnail_url?: string; download_url?: string; favorite?: boolean; gpu_job_id?: string; source_job_id?: string; batch_id?: string; workflow_key?: string; created_at?: string; mock?: boolean; metadata?: Record<string, unknown>; [key: string]: unknown; }
+export interface GalleryAsset { id: string; project_id: string; mime: string; filename?: string; thumbnail_url?: string; download_url?: string; favorite?: boolean; gpu_job_id?: string; source_job_id?: string; batch_id?: string; workflow_key?: string; workflow_version?: string | number; gpu_reported?: string; created_at?: string; mock?: boolean; metadata?: Record<string, unknown>; [key: string]: unknown; }
 export interface CcuSnapshot {
   alias?: string | null;
   balance?: number | null;

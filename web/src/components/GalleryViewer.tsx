@@ -1,16 +1,17 @@
 import { Fragment, useEffect, useState } from 'react';
 import {
-  ChevronLeft, ChevronRight, Copy, Download, FileCode2, ImagePlus, Maximize2, RotateCcw, Star, Trash2,
+  ArrowUpRight, ChevronLeft, ChevronRight, Copy, Download, FileCode2, ImagePlus, Maximize2, RotateCcw, Star, Trash2,
 } from 'lucide-react';
 import {
   apiMessage, assetUrl, fetchNativeOutputBytes,
-  type GalleryAsset, type GpuJob, type NativeOutputAsset,
+  type GalleryAsset, type GpuJob, type GpuWorkflow, type NativeOutputAsset,
 } from '../lib/gpu-api';
 import { extractPromptText } from '../lib/create-runtime-prefs';
 import { formatInstanceTime } from '../lib/instance-time';
 import { paramRows } from '../lib/job-detail-copy';
 import { bytesLabel } from '../lib/model-library';
 import { extractPng, MAX_IMAGE, type ExtractedWorkflow } from '../lib/png-workflow';
+import { workflowTitle } from '../lib/workflow-copy';
 import styles from '../gpu.module.css';
 
 export type ViewerItem =
@@ -19,6 +20,7 @@ export type ViewerItem =
 
 export function GalleryViewer({
   item,
+  workflows = [],
   navCount,
   navIndex,
   inlineViewer,
@@ -30,6 +32,7 @@ export function GalleryViewer({
   onClose,
   onError,
   onToast,
+  onOpenJob,
   onFavoriteStudio,
   onReuseStudio,
   onUseStudioAsReference,
@@ -40,6 +43,7 @@ export function GalleryViewer({
   onDeleteNative,
 }: {
   item: ViewerItem;
+  workflows?: GpuWorkflow[];
   navCount: number;
   navIndex: number;
   inlineViewer: boolean;
@@ -51,6 +55,7 @@ export function GalleryViewer({
   onClose: () => void;
   onError: (msg: string) => void;
   onToast: (message: string, tone?: 'info' | 'success' | 'error') => void;
+  onOpenJob?: (jobId: string) => void;
   onFavoriteStudio: (asset: GalleryAsset) => void;
   onReuseStudio: (asset: GalleryAsset) => void;
   onUseStudioAsReference: (asset: GalleryAsset) => void;
@@ -81,9 +86,26 @@ export function GalleryViewer({
     : `${item.asset.content_url}${item.asset.content_url.includes('?') ? '&' : '?'}download=true`;
 
   const viewerJobId = item.kind === 'studio' ? (item.asset.source_job_id || item.asset.gpu_job_id) : undefined;
-  const viewerPrompt = item.kind === 'studio' && viewerJob && viewerJob.id === viewerJobId
-    ? extractPromptText(viewerJob.resolved_params || viewerJob.params)
+  const matchedViewerJob = item.kind === 'studio' && viewerJob && viewerJob.id === viewerJobId ? viewerJob : null;
+  const viewerPrompt = matchedViewerJob
+    ? extractPromptText(matchedViewerJob.resolved_params || matchedViewerJob.params)
     : '';
+  const studioWfKey = item.kind === 'studio' ? (matchedViewerJob?.workflow_key || item.asset.workflow_key || '') : '';
+  const studioWfVersion = item.kind === 'studio' ? (matchedViewerJob?.workflow_version ?? item.asset.workflow_version) : undefined;
+  const studioWfObj = studioWfKey
+    ? (workflows.find((w) => w.workflow_key === studioWfKey && w.active) || workflows.find((w) => w.workflow_key === studioWfKey))
+    : undefined;
+  const studioWfName = studioWfKey ? workflowTitle(studioWfObj || { workflow_key: studioWfKey }) : '';
+  const studioMeta = item.kind === 'studio' ? ((item.asset.metadata || {}) as Record<string, unknown>) : {};
+  const studioWidth = Number(studioMeta.width ?? (item.kind === 'studio' ? item.asset.width : 0));
+  const studioHeight = Number(studioMeta.height ?? (item.kind === 'studio' ? item.asset.height : 0));
+  const studioGpu = item.kind === 'studio'
+    ? (matchedViewerJob?.provider === 'mock' || item.asset.mock
+      ? '离线模拟'
+      : (matchedViewerJob?.gpu_reported || item.asset.gpu_reported || ''))
+    : '';
+  const studioCreatedAt = item.kind === 'studio' ? (item.asset.created_at || matchedViewerJob?.created_at || '') : '';
+  const hasStudioInfo = Boolean(studioWfName || (studioWidth > 0 && studioHeight > 0) || studioGpu || studioCreatedAt || viewerJobId);
 
   async function handleExtractPng() {
     if (item.kind !== 'native' || extracting) return;
@@ -190,9 +212,50 @@ export function GalleryViewer({
         <p className="muted">这是诊断文件，不能直接预览，请下载查看。</p>
       )}
 
-      {item.kind === 'studio' && inlineViewer && viewerJobId && (
-        viewerJob?.id === viewerJobId ? (
-          <details className="foldable" open>
+      {item.kind === 'studio' && hasStudioInfo && (
+        <details className="foldable" open={inlineViewer}>
+          <summary>作品信息</summary>
+          <div className="foldContent">
+            <dl className={styles.kv}>
+              {studioWfName && (
+                <>
+                  <dt>工作流</dt>
+                  <dd title={studioWfKey}>
+                    {studioWfName}
+                    {studioWfVersion != null && ` · v${studioWfVersion}`}
+                    {studioWfKey && studioWfName !== studioWfKey && <span className="muted small"> ({studioWfKey})</span>}
+                  </dd>
+                </>
+              )}
+              {studioWidth > 0 && studioHeight > 0 && (
+                <><dt>分辨率</dt><dd>{studioWidth} × {studioHeight}</dd></>
+              )}
+              {studioGpu && (
+                <><dt>运行环境</dt><dd>{studioGpu}</dd></>
+              )}
+              {studioCreatedAt && (
+                <><dt>生成时间</dt><dd>{formatInstanceTime(studioCreatedAt)}</dd></>
+              )}
+              {viewerJobId && (
+                <>
+                  <dt>来源任务</dt>
+                  <dd>
+                    {onOpenJob ? (
+                      <button type="button" className={styles.inlineLinkBtn} onClick={() => onOpenJob(viewerJobId)}>
+                        #{viewerJobId.slice(0, 8)}<ArrowUpRight size={13} aria-hidden />
+                      </button>
+                    ) : `#${viewerJobId.slice(0, 8)}`}
+                  </dd>
+                </>
+              )}
+            </dl>
+          </div>
+        </details>
+      )}
+
+      {item.kind === 'studio' && viewerJobId && (
+        matchedViewerJob ? (
+          <details className="foldable" open={inlineViewer}>
             <summary>生成参数</summary>
             <div className="foldContent">
               {viewerPrompt && (
@@ -212,7 +275,7 @@ export function GalleryViewer({
                 </button>
               )}
               <dl className={styles.kv}>
-                {paramRows(viewerJob.resolved_params || viewerJob.params || {}).map((row) => (
+                {paramRows(matchedViewerJob.resolved_params || matchedViewerJob.params || {}).map((row) => (
                   <Fragment key={row.key}><dt>{row.label}</dt><dd>{row.value}</dd></Fragment>
                 ))}
               </dl>

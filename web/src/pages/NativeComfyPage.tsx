@@ -239,7 +239,7 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     void pollStatus(controller.signal);
   }, [pollStatus]);
   const webUiReady = status?.web_ui_configured !== false;
-  return <section className={`card ${styles.nativeWorkspace}`}>
+  return <section className={styles.nativeWorkspace}>
     <div className="actions nativeApiHeading">
       <h1>原生 ComfyUI</h1>
       <div className="actions">

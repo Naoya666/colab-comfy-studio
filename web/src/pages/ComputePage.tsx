@@ -73,6 +73,9 @@ export function ComputePage({
   const realEnabled = Boolean(settings?.real_enabled) && settings?.offline_mode !== true;
   const actual = usage?.today_actual_cu;
   const limit = usage?.guard?.daily_limit_cu;
+  const dailyPct = limit != null && actual != null
+    ? (limit === 0 ? '已达上限' : `${Math.round((actual / limit) * 100)}%`)
+    : '不限';
   const unresolved = (usage?.ccu?.anomalies || []).filter((item) => !item.resolved_at);
 
   return (
@@ -93,6 +96,11 @@ export function ComputePage({
               <progress aria-label="今日 CU 上限使用进度" max={limit || 1} value={limit === 0 ? 1 : Math.min(actual, limit)} />
             </>}
           </div>
+          <div className={styles.statBox}>
+            <small className="muted">今日额度使用率</small>
+            <strong>{dailyPct}</strong>
+            <small className="muted">{limit == null ? '未设置今日总上限' : `今日上限 ${cuNumber(limit)} CU`}</small>
+          </div>
           <div className={styles.statBox}><small className="muted">历史累计扣费</small><strong>{cuNumber(usage?.history_actual_cu)}<em> CU</em></strong></div>
           <div className={styles.statBox}><small className="muted">当前剩余 CU</small><strong>{cuNumber(usage?.ccu?.total_balance)}<em> CU</em></strong>
             {usage?.ccu?.sampled_at && <small className="muted">{formatDateTime(usage.ccu.sampled_at * 1000)}</small>}
@@ -111,38 +119,20 @@ export function ComputePage({
         <InstanceCenter instances={instances} onContinue={onContinue} onOpenWorkbench={onOpenWorkbench} onRefresh={onRefreshInstances} />
       </div>
 
-      <div className={styles.note}><Info size={16} strokeWidth={1.6} aria-hidden /><span>{realEnabled ? '每日扣费来自 Google 账户余额流水，按工作台时区切日。' : '模拟模式的数据仅供演示，不代表真实账单。'}</span></div>
-
-      <div className={styles.twoButtons}>
-        <button className="button" style={{ flex: 1 }} disabled={loadingCheck} type="button" onClick={onCheck}>
-          <Search size={16} strokeWidth={1.8} aria-hidden />{loadingCheck ? '检查中…' : '检查可用 GPU'}
-        </button>
-        <button className="button danger" style={{ flex: 1 }} disabled={loadingStop} type="button" onClick={onStop}>
-          <Square size={14} strokeWidth={1.8} aria-hidden />{loadingStop ? '停止中…' : '停止全部任务'}
-        </button>
+      <div className={`${styles.computeFooter} ${styles.workspaceWide}`}>
+        <div className={styles.note}><Info size={16} strokeWidth={1.6} aria-hidden /><span>{realEnabled ? '每日扣费来自 Google 账户余额流水，按工作台时区切日。' : '模拟模式的数据仅供演示，不代表真实账单。'}</span></div>
+        <div className={styles.computeFooterActions}>
+          <button className="button" disabled={loadingCheck} type="button" onClick={onCheck}>
+            <Search size={16} strokeWidth={1.8} aria-hidden />{loadingCheck ? '检查中…' : '检查可用 GPU'}
+          </button>
+          <button className="button danger" disabled={loadingStop} type="button" onClick={onStop}>
+            <Square size={14} strokeWidth={1.8} aria-hidden />{loadingStop ? '停止中…' : '停止全部任务'}
+          </button>
+        </div>
       </div>
-      {specsNote && <p className="muted small" role="status">{specsNote}</p>}
+      {specsNote && <p className={`muted small ${styles.workspaceWide}`} role="status">{specsNote}</p>}
       {specs.length > 0 && <div className={styles.workspaceWide}><ComputeSpecs specs={specs} /></div>}
-      {error && <p className="status error" role="alert">{error}</p>}
-    </div>
-  );
-}
-
-export function ThemePicker() {
-  const [theme, setTheme] = useState(() => localStorage.getItem('studio-theme') || 'dark');
-  function change(value: string) {
-    setTheme(value);
-    localStorage.setItem('studio-theme', value);
-    document.documentElement.dataset.theme = value;
-  }
-  return (
-    <div className="field">
-      <label htmlFor="theme-select">界面颜色</label>
-      <select id="theme-select" value={theme} onChange={(e) => change(e.target.value)}>
-        <option value="dark">深色（黑底）</option>
-        <option value="light">浅色（白底）</option>
-        <option value="system">跟随手机系统</option>
-      </select>
+      {error && <p className={`status error ${styles.workspaceWide}`} role="alert">{error}</p>}
     </div>
   );
 }

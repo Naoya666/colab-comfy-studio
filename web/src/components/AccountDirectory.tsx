@@ -103,6 +103,8 @@ export interface AccountDirectoryProps {
   balances?: CuAccount[];
   api?: Partial<AccountDirectoryApi>;
   onAccountsChange?: (accounts: GpuAccount[]) => void;
+  /** Hide inner section title when embedded inside a parent Card that already provides a heading. */
+  hideTitle?: boolean;
 }
 
 let idSequence = 0;
@@ -167,7 +169,7 @@ function safeAuthRedirect(value: { authorization_url?: string } | string): strin
   }
 }
 
-export function AccountDirectory({ accounts: suppliedAccounts, balances = [], api, onAccountsChange }: AccountDirectoryProps) {
+export function AccountDirectory({ accounts: suppliedAccounts, balances = [], api, onAccountsChange, hideTitle = false }: AccountDirectoryProps) {
   const accountApi = useMemo(() => ({ ...defaultAccountApi, ...api }), [api]);
   const [accounts, setAccounts] = useState<GpuAccount[]>(suppliedAccounts || []);
   const [alias, setAlias] = useState('');
@@ -266,11 +268,20 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
 
   return (
     <section className={styles.directory} aria-label="Google 账号目录">
-      <header className={styles.sectionHeader}>
-        <div><p className={styles.eyebrow}>设置 · 单一账号入口</p><h2>账号目录</h2></div>
-        <button type="button" className={styles.iconButton} onClick={() => void refresh()} disabled={Boolean(busy)} aria-label="刷新账号"><RefreshCw size={16} aria-hidden /></button>
-      </header>
-      <p className={styles.muted}>每个账号的 Colab 与 Drive 授权分开管理。只会使用当前 owner 已授权、允许分配且预算可用的账号。</p>
+      {hideTitle ? (
+        <div className={styles.toolbar}>
+          <p className={styles.muted}>每个账号的 Colab 与 Drive 授权分开管理。只会使用当前 owner 已授权、允许分配且预算可用的账号。</p>
+          <button type="button" className={styles.iconButton} onClick={() => void refresh()} disabled={Boolean(busy)} aria-label="刷新账号" title="刷新账号"><RefreshCw size={16} aria-hidden /></button>
+        </div>
+      ) : (
+        <>
+          <header className={styles.sectionHeader}>
+            <div><p className={styles.eyebrow}>设置 · 单一账号入口</p><h2>账号目录</h2></div>
+            <button type="button" className={styles.iconButton} onClick={() => void refresh()} disabled={Boolean(busy)} aria-label="刷新账号"><RefreshCw size={16} aria-hidden /></button>
+          </header>
+          <p className={styles.muted}>每个账号的 Colab 与 Drive 授权分开管理。只会使用当前 owner 已授权、允许分配且预算可用的账号。</p>
+        </>
+      )}
       {status && <p className={styles.status} role="status">{status}</p>}
       {error && <p className={styles.error} role="alert">{error}</p>}
 
@@ -282,7 +293,7 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
 
       {!accounts.length ? (
         <div className={styles.empty}><strong>还没有账号目录</strong><span>先新增别名，再分别完成 Colab / Drive 授权。</span></div>
-      ) : <div className={styles.stack}>
+      ) : <div className={styles.accountGrid}>
         {accounts.map((account) => {
           const balance = balances.find(row => row.account_id === account.account_id);
           const active = activeCount(account);
@@ -308,8 +319,10 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
                 })}
               </div>
               <div className={styles.accountControls}>
-                <label className={styles.toggleRow}><input type="checkbox" checked={account.enabled !== false} disabled={Boolean(busy)} onChange={(event) => void updateAccount(account, { enabled: event.target.checked }, `account-enabled-${account.account_id}`, event.target.checked ? '账号已启用。' : '账号已停用，不会分配新任务。')} /><span>允许使用</span></label>
-                <label className={styles.toggleRow}><input type="checkbox" checked={account.allow_allocation === true} disabled={Boolean(busy) || account.enabled === false} onChange={(event) => void updateAccount(account, { allow_allocation: event.target.checked }, `account-allocation-${account.account_id}`, event.target.checked ? '已允许新任务分配。' : '已禁止新任务分配。')} /><span>允许分配</span></label>
+                <div className={styles.togglePair}>
+                  <label className={styles.toggleRow}><input type="checkbox" checked={account.enabled !== false} disabled={Boolean(busy)} onChange={(event) => void updateAccount(account, { enabled: event.target.checked }, `account-enabled-${account.account_id}`, event.target.checked ? '账号已启用。' : '账号已停用，不会分配新任务。')} /><span>允许使用</span></label>
+                  <label className={styles.toggleRow}><input type="checkbox" checked={account.allow_allocation === true} disabled={Boolean(busy) || account.enabled === false} onChange={(event) => void updateAccount(account, { allow_allocation: event.target.checked }, `account-allocation-${account.account_id}`, event.target.checked ? '已允许新任务分配。' : '已禁止新任务分配。')} /><span>允许分配</span></label>
+                </div>
                 {accounts.length > 1 && (
                   <label className={styles.budgetField}>
                     <span>Drive 存储来源</span>

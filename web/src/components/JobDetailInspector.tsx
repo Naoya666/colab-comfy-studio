@@ -1,10 +1,12 @@
 import { Fragment } from 'react';
-import { X } from 'lucide-react';
-import type { GpuJob } from '../lib/gpu-api';
+import { ArrowUpRight, X } from 'lucide-react';
+import type { GpuJob, GpuWorkflow } from '../lib/gpu-api';
 import { formatInstanceTime } from '../lib/instance-time';
 import { jobDetailTimings, paramRows, stageSecondsTotal, taskStatusNote } from '../lib/job-detail-copy';
 import { jobStateLabel } from '../lib/job-stage-rows';
+import { gpuLabel } from '../lib/gpu-label';
 import { shown } from '../lib/create-runtime-prefs';
+import { workflowTitle } from '../lib/workflow-copy';
 import { JobHistoryDetails } from './JobHistoryDetails';
 import styles from '../gpu.module.css';
 
@@ -12,13 +14,25 @@ export function JobDetailInspector({
   detailId,
   detailError,
   inspectedJob,
+  workflows = [],
+  onOpenOutput,
   onClose,
 }: {
   detailId: string;
   detailError: string;
   inspectedJob: GpuJob | null;
+  workflows?: GpuWorkflow[];
+  onOpenOutput?: (assetId: string) => void;
   onClose: () => void;
 }) {
+  const wfKey = inspectedJob?.workflow_key || '';
+  const wfObj = wfKey
+    ? (workflows.find((w) => w.workflow_key === wfKey && w.active) || workflows.find((w) => w.workflow_key === wfKey))
+    : undefined;
+  const wfName = wfKey ? workflowTitle(wfObj || { workflow_key: wfKey }) : '';
+  const outputIds = (inspectedJob?.output_asset_ids || []).filter(Boolean);
+  const isVideo = /i2v|video|ref2v|t2v/i.test(wfKey);
+
   return (
     <>
       <div className={styles.cardHead}>
@@ -33,11 +47,37 @@ export function JobDetailInspector({
       {inspectedJob ? (
         <>
           <dl className={styles.kv}>
+            {wfName && (
+              <>
+                <dt>工作流</dt>
+                <dd title={wfKey}>
+                  {wfName}
+                  {inspectedJob.workflow_version != null && ` · v${inspectedJob.workflow_version}`}
+                </dd>
+              </>
+            )}
             <dt>状态</dt><dd>{jobStateLabel(inspectedJob.state)}</dd>
             <dt>运行方式</dt>
             <dd>{inspectedJob.provider === 'mock' ? '离线模拟' : inspectedJob.provider === 'colab' ? 'Colab GPU' : shown(inspectedJob.provider)}</dd>
+            <dt>GPU</dt><dd>{gpuLabel(inspectedJob)}</dd>
             <dt>创建时间</dt><dd>{formatInstanceTime(inspectedJob.created_at)}</dd>
           </dl>
+          {outputIds.length > 0 && onOpenOutput && (
+            <div className={styles.outputStrip} aria-label="任务产出作品">
+              {outputIds.slice(0, 4).map((assetId, idx) => (
+                <button
+                  key={assetId}
+                  type="button"
+                  className={styles.outputThumbBtn}
+                  onClick={() => onOpenOutput(assetId)}
+                >
+                  {!isVideo && <img src={`/api/assets/${assetId}/thumbnail`} alt="" loading="lazy" />}
+                  <span>查看作品{outputIds.length > 1 ? ` #${idx + 1}` : ''}</span>
+                  <ArrowUpRight size={13} aria-hidden />
+                </button>
+              ))}
+            </div>
+          )}
           <p className="muted small">{taskStatusNote(inspectedJob)}</p>
           {Array.isArray(inspectedJob.attempts) && (
             <details className="foldable" open>
