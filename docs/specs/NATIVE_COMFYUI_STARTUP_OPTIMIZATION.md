@@ -261,3 +261,58 @@
   - `NATIVE_BATCH_PLUGIN_PIP=1|0`（Phase 2.1 冷构建加速）：未命中 `env-cache` 时批量合并插件 `requirements.txt` 预安装 + 注入当前 GPU `TORCH_CUDA_ARCH_LIST` / `MAX_JOBS` 加速源码扩展编译。
   - `NATIVE_PARALLEL_BOOTSTRAP=1|0`（Phase 2.2）：`apt-get`、`rclone`、`cloudflared`、ComfyUI checkout 与模型索引并发初始化。
 - Drive 既有 `native-comfy/plugins/objects/` 与 `head.json`/`pending.json` 格式保持 **100% 向后兼容**，任何时候均可在 `bero` 一键切回 `3cba89e` 镜像。
+
+---
+
+## 6. 实际落地相对初稿方案的改进点与 `bero` L4 真机验收报告
+
+### 6.1 相对初稿方案的架构增强与差异说明
+
+在落地实现与真机压测过程中，针对初稿方案的潜在盲区与边界问题做了以下 7 项工程增强，并已同步回上文对应章节：
+
+1. **环境变量跨控制面/Colab 自动透传与 7 项细粒度独立开关**：
+   - 初稿仅列出了 3 个环境变量且未解决 VPS `.env` 如何传入远端 Colab VM 的问题。
+   - 实际实现扩充为 **7 个完全正交的环境变量开关**（`NATIVE_FAST_SCAN`、`NATIVE_PARALLEL_RESTORE`、`NATIVE_USE_UV`、`NATIVE_FAST_CONTROL_PLANE`、`NATIVE_ENV_CACHE`、`NATIVE_BATCH_PLUGIN_PIP`、`NATIVE_PARALLEL_BOOTSTRAP`），在 `bero` 的 `.env` 中独立显式配置，并由 `native.native_optimization_flags()` + `mcp.py` 注入启动 `payload["native_flags"]` 同步至 Colab 运行时及 `ComfyUI` 子进程，修改 `.env` 即可直接对任意单项优化做灰度/AB 对比。
+2. **调整初始化流水线顺序（`native_plugins_restore` 前置到 Python 环境阶段之前）**：
+   - 初稿先跑 `native_python` 再跑 `native_plugins_restore`。由于 `node_persistence.restore()` 仅依赖 Python 标准库与 `rclone`，实际实现将其前置到 `native_models` 之后、任何 `pip/uv` 操作之前。
+   - 收益：一方面可在干净的基础镜像上精确计算所有启用插件的依赖指纹（`requirements.txt`/`install.py`/`pyproject.toml`）；另一方面当 `NATIVE_ENV_CACHE=1` 命中时，`native_env_cache` 单步即可同时恢复 **ComfyUI 基础依赖 + Manager 依赖 + 全部 19 个插件依赖**，彻底省掉命中缓存时的 `native_python` 安装耗时。
+3. **新增 C 级凭据预筛并消除隐藏的第 4/5 次 `inventory()` 扫描**：
+   - 初稿仅识别了 3 次扫描，且 `danbooru_tags_cooccurrence.csv`（98.5 MB 纯文本 CSV）无法走二进制白名单跳过。
+   - 实际实现：① 为 `SECRET` 正则增加零漏报的 C 级 `bytes` 子串预筛（使 98.5 MB CSV 扫描从 9.38s 降至 `<0.1s`）；② 通过跨进程持久化 `scan-cache.json` 消除了 ComfyUI 导入 `studio_native_state.py` 时的第 4 次隐藏扫描；③ 修复了 `/studio_native/state` 单次请求内 `probe()` 与 `PERSISTENCE.status()` 重复执行两次 `inventory()` 的问题；④ 修复了 `fast_tree_fingerprint` 因前置自定义节点生成 `__pycache__` 更新目录 `mtime` 导致缓存命中模式下 `prestartup` 快路径误判失配的问题。
+4. **后台 `env-cache` 上传改用独立守护子进程而非 Python `daemon` 线程**：
+   - 初稿计划在 `native_runtime.py` 中用守护线程异步打包上传 `env-cache`。但 `runtime_worker.py` 在 `native_runtime.run()` 返回并写完 `status.json` 后会立即 `SystemExit(0)` 退出进程，导致同进程内的守护线程被直接杀死。
+   - 实际实现改为：在依赖安装通过后立即快照 `site-packages` 增量（结合新增 `.dist-info/RECORD` 覆盖命名空间包）写入 `env-cache-plan.json`，待隧道就绪后通过 `start_new_session=True` 拉起独立后台子进程打包上传（先传 `.tar.gz`、最后原子提交并读回校验 `.meta.json`），既不阻塞就绪，也不会因引导进程退出而中断。
+5. **`site-packages` 同文件系统原子解包与失败无损回滚**：
+   - 解包临时目录与回滚目录均创建在 `site.parent` 同挂载点下，利用 `O(1)` 原子 `rename` 替换 141 个包目录（避免跨 `/content` 与容器根文件系统的全量拷贝），一旦 `protect_environment()` 或 `pip check` 失败立即原子回滚至原始基础镜像状态。
+6. **`rclone` 大文件多流并发拉取（`--multi-thread-streams 8`）与冷构建目标架构编译（`TORCH_CUDA_ARCH_LIST`）**：
+   - 针对实测包含 141 个 `site-packages` 条目（压缩后 `1580.5 MiB`）的环境缓存包，启用 `--multi-thread-streams 8 --multi-thread-cutoff 32M --buffer-size 64M` 与上传 `--drive-chunk-size 128M`；冷构建期自动注入当前 GPU 架构 `TORCH_CUDA_ARCH_LIST`（L4 为 `8.9`）与 `MAX_JOBS`。
+7. **补齐历史详情 API 与前端阶段耗时展示**：
+   - 同步更新 `api/app/job_history.py`（`_WORKER_KEYS`）与 `web/src/lib/job-stage-rows.ts`，使所有新增 `native_*` 阶段耗时在任务历史接口与前端界面完整可见。
+
+---
+
+### 6.2 `bero` 生产环境 L4 真机验收实测数据（2026-11-22）
+
+在 `bero` 生产环境（账号 `colab cli账号`、规格 `NVIDIA L4 · SHAPE_STANDARD`、`model_storage_mode=local`、19 个持久化插件归档共 299.4 MB）完成了冷缓存构建与全新 L4 命中缓存多轮端到端实测：
+
+| 指标 / 阶段 | 优化前基线 (`3cba89e`<br>任务 `e508d30a`) | 第 1 轮：冷缓存构建 (`ed22389`<br>任务 `8d545f54`) | 第 2 轮：全新 L4 命中缓存 (`ed22389`<br>任务 `5775c77b`) | 第 3 轮：全新 L4 命中缓存 + 多流/快路径 (`4ad9447`<br>任务 `3f124d4c`) | 核心优化收益说明 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 控制面排队 (`queue`) | ~6.0s | **0.5s** | **0.6s** | **1.1s** | `advanced=True` 免 `sleep(2)` 连续推进 |
+| 分配运行时 (`allocate`) | 6.4s | **4.9s** | **4.6s** | **4.3s** | 消除轮询空等 |
+| 系统依赖 (`native_system`) | 23.7s | 41.5s | **22.2s** | 69.0s *(Colab APT 源波动)* | `apt`、`rclone`、`cloudflared`、ComfyUI checkout 并发执行 |
+| Drive 挂载 (`native_drive`) | 0.6s | **0.6s** | **1.2s** | **0.6s** | 保持极快 |
+| 源码与目录 (`native_models`) | 6.3s | **3.0s** | **3.7s** | **2.0s** | ComfyUI checkout 已在 `native_system` 阶段并发完成 |
+| 插件归档恢复 (`native_plugins_restore`) | 189.0s *(147.5s 下载解压 + 41.5s 扫描 #1)* | **21.4s** | **21.3s** | **18.8s** | **提速 90.1%（省 170.2s）**：单次 `rclone copy --files-from-raw` 8 路并发 + `pigz` 并行解压 + 免正则哈希校验 |
+| 环境缓存恢复 (`native_env_cache`) | — | 2.8s *(未命中探测)* | **69.9s** | **64.8s** | **替代原 `358.4s`（基础依赖 32.9s + 扫描 #2 42.3s + 插件依赖/sam2 编译 283.2s），净省 ~293.6s！** 恢复 141 个 `site-packages` 条目（`1580.5 MiB`）并通过 `pip check` |
+| 基础 Python 依赖 (`native_python`) | 32.9s | **7.6s** *(uv 合并安装)* | *0s（缓存命中跳过）* | *0s（缓存命中跳过）* | 冷构建期 `uv` 单次安装提速 76.9%；缓存命中时完全跳过 |
+| 插件依赖安装 (`native_plugins_deps`) | 325.5s *(42.3s 扫描 #2 + 283.2s 编译安装)* | 312.5s *(冷构建含 sam2)* | *0s（缓存命中跳过）* | *0s（缓存命中跳过）* | 缓存命中时完全免除 `sam2/_C.so` `nvcc` 编译与全部 pip 安装 |
+| ComfyUI 启动 (`comfy_start`) | 101.1s *(含 42.4s 扫描 #3)* | **72.0s** | **73.0s** | **62.1s** | **省 39.0s（-38.6%）**：`prestartup` 一次性指纹快路径命中，消除 42.4s 第 3 次全量扫描 |
+| 隧道就绪 (`native_tunnel`) | 0.0s *(未等就绪即返回)* | **0.8s** | **0.8s** | **0.5s** | 本地 `:20241/ready` 确认边缘隧道注册完成 |
+| 收尾校验、报告落盘与清理 | 71.1s *(57.9s 调度延迟 + 10.9s Drive 上传 + 2.3s 清理)* | **~2.0s** (`upload=0.2s`, `cleanup=0.9s`) | **~2.0s** (`upload=0.1s`, `cleanup=0.9s`) | **~2.0s** (`upload=0.2s`, `cleanup=0.9s`) | **省 ~69s（-97%）**：7 路并发 Access 探针 + 本地化报告落盘 + 异步 `tick_ccu` |
+| **端到端总耗时（提交 → Ready）** | **771.8s（12 分 51.8 秒）** | **~468s（7 分 48 秒，冷构建）** | **215.4s（3 分 35.4 秒）** | **240.3s** *(扣除 47s APT 源抖动后稳态 **~193s / 3 分 13 秒**)* | **端到端冷启动提速 72.1%–75.0%，单次启动节省约 9.3–9.6 分钟！** |
+
+#### 真机功能、安全与资源回收核验结论
+- **插件与节点完整性**：全部 3 轮真机测试中，19 个持久化插件均 100% 恢复加载，`import_failed=[]`，`plugins_error=None`，`/object_info` 暴露完整 **`1955` 个节点**。
+- **后台异步缓存构建不阻塞**：第 1 轮就绪后，独立子进程在后台耗时 `78.3s` 完成 `native-env-v1-423cbd20511b-py313-imga193ed6a3f15-gpucc7fa4b6a21e-depsda9caa8fbc80e635`（`141` 个 `site-packages` 条目，压缩包 `1580.5 MiB`）上传与 `.meta.json` 校验，对当次就绪时间零阻塞。
+- **公网代理出图与取图链路**：第 3 轮通过公网原生域名代理提交工作流 `POST /prompt` 返回 `HTTP 200`（`prompt_id=43c9adad-0285-438c-ac4f-8f1a89ac2631`），L4 执行成功并通过 `/view` 正常取回生成 PNG 图像（`accept_opt_00001_.png`）。
+- **日志清洁与零残留回收**：`worker` 日志中历史每分钟刷屏的 `GoogleOAuthError` 警告已彻底清零；三轮验收结束后执行停止实例均在 `12–18s` 内确认远端释放（`active_leases=[]`、`active_instances=[]`、`active_jobs=[]`、`ccu_anomalies=[]`）。
