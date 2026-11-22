@@ -10,7 +10,13 @@ const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const bundled = await build({
   stdin: {
     contents: `
-      export { buildDailySeries, niceMaxValue, shiftCalendarDate } from './src/lib/cu-chart.ts';
+      export {
+        buildDailySeries,
+        buildSmoothLinePath,
+        computeYAxisScale,
+        niceMaxValue,
+        shiftCalendarDate,
+      } from './src/lib/cu-chart.ts';
     `,
     resolveDir: webRoot,
     sourcefile: 'cu-chart-entry.ts',
@@ -23,7 +29,13 @@ const bundled = await build({
   logLevel: 'silent',
 });
 
-const { buildDailySeries, niceMaxValue, shiftCalendarDate } = await import(
+const {
+  buildDailySeries,
+  buildSmoothLinePath,
+  computeYAxisScale,
+  niceMaxValue,
+  shiftCalendarDate,
+} = await import(
   'data:text/javascript;base64,' + Buffer.from(bundled.outputFiles[0].text).toString('base64')
 );
 
@@ -64,6 +76,53 @@ test('niceMaxValue rounds up to crisp chart tick bounds', () => {
   assert.equal(niceMaxValue(3.4), 5);
   assert.equal(niceMaxValue(7.8), 10);
   assert.equal(niceMaxValue(14), 20);
+});
+
+test('computeYAxisScale adapts to real data unless limit is toggled or approached', () => {
+  const snug = computeYAxisScale(17.83, 300, null);
+  assert.equal(snug.hasLimit, true);
+  assert.equal(snug.autoLimitVisible, false);
+  assert.equal(snug.showLimitInPlot, false);
+  assert.equal(snug.yMax, 20);
+  assert.deepEqual(snug.ticks, [0, 5, 10, 15, 20]);
+
+  const toggledOn = computeYAxisScale(17.83, 300, true);
+  assert.equal(toggledOn.showLimitInPlot, true);
+  assert.equal(toggledOn.yMax, 400);
+  assert.deepEqual(toggledOn.ticks, [0, 100, 200, 300, 400]);
+
+  const nearLimit = computeYAxisScale(180, 300, null);
+  assert.equal(nearLimit.autoLimitVisible, true);
+  assert.equal(nearLimit.showLimitInPlot, true);
+  assert.equal(nearLimit.yMax, 400);
+});
+
+test('buildSmoothLinePath builds monotone cubic SVG curves without undershooting baseline', () => {
+  assert.deepEqual(buildSmoothLinePath([], 150), { linePath: '', areaPath: '' });
+  assert.deepEqual(buildSmoothLinePath([{ x: 50, y: 80 }], 150), { linePath: '', areaPath: '' });
+
+  const baselineY = 150;
+  const coords = [
+    { x: 40, y: 150 },
+    { x: 120, y: 140 },
+    { x: 200, y: 150 },
+    { x: 280, y: 140 },
+    { x: 360, y: 140 },
+    { x: 440, y: 30 },
+  ];
+  const { linePath, areaPath } = buildSmoothLinePath(coords, baselineY);
+  assert.match(linePath, /^M 40 150 C /);
+  assert.match(areaPath, /L 440 150 L 40 150 Z$/);
+
+  // Extract all C control-point Y values and confirm none dip below baselineY or overshoot peak.
+  const cubicMatches = [...linePath.matchAll(/C ([\d.-]+) ([\d.-]+), ([\d.-]+) ([\d.-]+), ([\d.-]+) ([\d.-]+)/g)];
+  assert.equal(cubicMatches.length, coords.length - 1);
+  for (const m of cubicMatches) {
+    const cp1y = Number(m[2]);
+    const cp2y = Number(m[4]);
+    assert.ok(cp1y <= baselineY && cp2y <= baselineY, `control point dipped below baseline: ${m[0]}`);
+    assert.ok(cp1y >= 30 && cp2y >= 30, `control point overshot peak: ${m[0]}`);
+  }
 });
 
 test('RuntimeTelemetryCard is wired to ComputePage and excluded from NativeComfyPage', () => {

@@ -906,11 +906,11 @@
   color: var(--text-2);
 }
 
-/* ───── CU 每日趋势 SVG 图表 ───── */
+/* ───── CU 每日趋势 SVG 面积折线图 ───── */
 .chartCard {
   display: grid;
-  gap: 8px;
-  padding: 12px;
+  gap: 10px;
+  padding: 14px 14px 10px;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--bg);
@@ -919,71 +919,245 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 8px 12px;
   flex-wrap: wrap;
 }
-.chartReadout {
+.chartSummary {
   display: inline-flex;
-  align-items: center;
+  align-items: baseline;
   gap: 8px;
   flex-wrap: wrap;
-  font-size: 0.84rem;
   font-variant-numeric: tabular-nums;
 }
-.chartReadout strong { font-weight: 650; }
-.chartReadout b { font-weight: 650; }
+.chartStat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 0.84rem;
+}
+.chartStat strong {
+  font-weight: 650;
+  color: var(--text);
+}
+.chartStat small {
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.chartStatSep {
+  width: 1px;
+  height: 11px;
+  background: var(--line-strong);
+  align-self: center;
+}
 .chartHeadActions {
   display: inline-flex;
   align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.chartLimitHint {
+  font-size: 0.74rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.chartToggleBtn {
+  display: inline-flex;
+  align-items: center;
   gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 0.74rem;
+  font-weight: 500;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.chartToggleBtn:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+.chartToggleBtn[data-active="true"] {
+  border-color: var(--warning-line);
+  background: var(--warning-bg);
+  color: var(--warning);
+  font-weight: 600;
+}
+.chartToggleDash {
+  width: 12px;
+  height: 0;
+  border-top: 1.5px dashed currentColor;
+  opacity: 0.85;
+}
+.chartStage {
+  position: relative;
+  width: 100%;
+  color: var(--text);
 }
 .chartSvg {
-  width: 100%;
-  height: auto;
   display: block;
+  width: 100%;
   overflow: visible;
   user-select: none;
+  touch-action: pan-y;
 }
 .chartGridLine {
   stroke: var(--line);
   stroke-width: 1;
+  stroke-dasharray: 2 3;
+}
+.chartBaseLine {
+  stroke: var(--line-strong);
+  stroke-width: 1;
+  opacity: 0.65;
 }
 .chartLimitLine {
   stroke: var(--warning);
-  stroke-width: 1.2;
+  stroke-width: 1.15;
   stroke-dasharray: 4 3;
-  opacity: 0.85;
+  opacity: 0.9;
 }
 .chartLimitText {
   fill: var(--warning);
-  font-size: 10px;
+  font-size: 10.5px;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 4px;
+  stroke-linejoin: round;
 }
 .chartAxisText {
   fill: var(--muted);
-  font-size: 10.5px;
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
 .chartAxisText[data-active="true"] {
   fill: var(--text);
   font-weight: 600;
 }
-.chartBarGroup { cursor: pointer; }
-.chartBar {
-  fill: var(--text);
-  opacity: 0.55;
-  transition: opacity 0.15s ease;
+.chartAreaPath {
+  pointer-events: none;
 }
-.chartBar[data-empty="true"] {
-  fill: var(--line-strong);
-  opacity: 0.55;
+.chartLinePath {
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
 }
-.chartBar[data-over="true"] {
+.chartSingleStem {
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-dasharray: 2 3;
+  opacity: 0.45;
+  pointer-events: none;
+}
+.chartDot {
+  fill: var(--bg);
+  stroke: currentColor;
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+.chartDot[data-over="true"] {
+  stroke: var(--warning);
+}
+.chartCrosshairGroup {
+  pointer-events: none;
+}
+.chartCrosshair {
+  stroke: var(--line-strong);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+.chartFocusHalo {
+  fill: currentColor;
+  opacity: 0.14;
+}
+.chartFocusHalo[data-over="true"] {
   fill: var(--warning);
-  opacity: 0.85;
+  opacity: 0.24;
 }
-.chartBar[data-active="true"] {
-  opacity: 1;
+.chartFocusDot {
+  fill: currentColor;
+  stroke: var(--bg);
+  stroke-width: 2;
+}
+.chartFocusDot[data-over="true"] {
+  fill: var(--warning);
+}
+.chartTooltip {
+  position: absolute;
+  z-index: 3;
+  min-width: 136px;
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-strong);
+  background: var(--card);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+  font-size: 0.76rem;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  white-space: nowrap;
+  transition: left 0.08s ease-out, top 0.08s ease-out;
+}
+.chartTooltip[data-side="left"] {
+  transform: translateX(-100%);
+}
+.chartTooltip[data-interactive="true"] {
+  pointer-events: auto;
+}
+.chartTooltipDate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.chartTooltipDate strong {
+  color: var(--text-2);
+  font-weight: 600;
+}
+.chartTooltipWarn {
+  padding: 0 5px;
+  border-radius: var(--r-full);
+  background: var(--warning-bg);
+  color: var(--warning);
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+.chartTooltipMetric {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 0.8rem;
+}
+.chartTooltipMetric strong {
+  font-size: 0.98rem;
+  font-weight: 700;
+  color: var(--text);
+}
+.chartTooltipHint {
+  margin-top: 2px;
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.chartTooltipLink {
+  margin-top: 4px;
+  padding: 2px 0 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.72rem;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  text-align: left;
 }
 
 /* ───── 模型库与 Drive 空间拆解（黑白极简堆叠条） ───── */
