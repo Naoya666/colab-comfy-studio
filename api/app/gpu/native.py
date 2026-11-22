@@ -30,6 +30,15 @@ def timeout_options():
     }
 
 
+def model_storage_defaults():
+    """Default model storage configuration for newly started native sessions."""
+    return {
+        "model_storage_mode": "local",
+        "cache_gb": settings.native_comfy_cache_gb,
+        "cache_max_age_minutes": settings.native_comfy_cache_max_age_minutes,
+    }
+
+
 def model_storage(values=None, *, validate=False):
     defaults = {"model_storage_mode": "drive_mount", "cache_gb": settings.native_comfy_cache_gb,
                 "cache_max_age_minutes": settings.native_comfy_cache_max_age_minutes}

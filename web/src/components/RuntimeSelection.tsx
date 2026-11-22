@@ -38,7 +38,7 @@ function instanceId(instance: GpuInstance): string {
   return instanceIdentity(instance);
 }
 
-function isAccountSelectable(account: GpuAccount): boolean {
+export function isAccountSelectable(account: GpuAccount): boolean {
   const colabConnected = account.authorization?.colab?.connected === true || account.colab?.status === 'connected' || account.colab_status === 'connected';
   return account.enabled !== false && account.allow_allocation === true && accountStatus(account) === 'connected' && colabConnected;
 }

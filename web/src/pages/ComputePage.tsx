@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Cpu, Layers, Monitor, Cloud, HardDrive, Leaf, Boxes, Sparkles, ChevronDown, Info, Square, Search } from 'lucide-react';
+import { Cpu, Monitor, HardDrive, Info, Square, Search } from 'lucide-react';
 import { apiMessage, queryCcuBalance, type ComputeSpec, type GpuSettings, type GpuUsage } from '../lib/gpu-api';
 import { CuGuardSettings } from '../components/CuGuardSettings';
 import { CuSessionDetails } from '../components/CuSessionDetails';
@@ -7,11 +7,8 @@ import { ComputeSpecs } from '../components/ComputeSpecs';
 import { InstanceCenter } from '../components/InstanceCenter';
 import type { GpuInstance } from '../components/AccountDirectory';
 import { Card } from '../components/ui';
-import { STRATEGIES } from '../lib/labels';
 import styles from '../gpu.module.css';
 import { cuNumber, formatDateTime, shown } from '../lib/ui-helpers';
-
-const STRATEGY_ICON = { save: Leaf, batch: Boxes, smart: Sparkles } as const;
 
 function CcuBalanceQuery({ usage, refresh }: { usage: GpuUsage | null; refresh: () => Promise<void> }) {
   const [loading, setLoading] = useState(false);
@@ -72,7 +69,6 @@ export function ComputePage({
   specsNote?: string;
   error?: string;
 }) {
-  const [open, setOpen] = useState<string>('');
   const realEnabled = Boolean(settings?.real_enabled) && settings?.offline_mode !== true;
   const activeCount = Number(usage?.active_runtimes ?? 0);
   const actual = usage?.today_actual_cu;
@@ -86,12 +82,19 @@ export function ComputePage({
         <p className="muted small">任务在后台运行，关闭页面后仍可回来查看进度。</p>
       </div>
 
-      <Card icon={<Monitor size={17} strokeWidth={1.6} aria-hidden />} title="当前环境" aside={<span className={`pill ${realEnabled ? 'solid' : ''}`}>{realEnabled ? '真实 GPU' : '模拟模式'}</span>}>
-        <p className="muted small">{realEnabled ? '任务会在 Google Colab 的 GPU 上真实运行。' : '现在是本地模拟，不会连接 Colab，也不会扣 CU。'}</p>
-        <div className={styles.triple}>
-          <div><small className="muted">真实 GPU</small><strong>{realEnabled ? '已启用' : '未启用'}</strong></div>
-          <div><small className="muted">在线机器</small><strong>{activeCount}</strong></div>
-          <div><small className="muted">文件存放</small><strong>{settings?.storage === 'drive' ? 'Google 云盘' : '本站服务器'}</strong></div>
+      <Card
+        className={styles.workspaceWide}
+        icon={<Monitor size={17} strokeWidth={1.6} aria-hidden />}
+        title="当前环境"
+        aside={<span className={`pill ${realEnabled ? 'solid' : ''}`}>{realEnabled ? '真实 GPU' : '模拟模式'}</span>}
+      >
+        <div className={styles.envBanner}>
+          <p className="muted small">{realEnabled ? '任务会在 Google Colab 的 GPU 上真实运行。' : '现在是本地模拟，不会连接 Colab，也不会扣 CU。'}</p>
+          <div className={styles.triple}>
+            <div><small className="muted">真实 GPU</small><strong>{realEnabled ? '已启用' : '未启用'}</strong></div>
+            <div><small className="muted">在线机器</small><strong>{activeCount}</strong></div>
+            <div><small className="muted">文件存放</small><strong>{settings?.storage === 'drive' ? 'Google 云盘' : '本站服务器'}</strong></div>
+          </div>
         </div>
       </Card>
 
@@ -117,25 +120,6 @@ export function ComputePage({
 
       <CuGuardSettings guard={usage?.guard} canEdit={canEditGuard} onSaved={onRefreshUsage} />
       <div className={styles.workspaceWide}><CuSessionDetails usage={usage} /></div>
-
-      <Card icon={<Layers size={17} strokeWidth={1.6} aria-hidden />} title="运行策略">
-        <div className={styles.strategyList}>
-          {STRATEGIES.map((s) => {
-            const Icon = STRATEGY_ICON[s.value];
-            const isOpen = open === s.value;
-            return (
-              <div key={s.value} className={styles.strategy} data-open={isOpen}>
-                <button type="button" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? '' : s.value)}>
-                  <Icon size={18} strokeWidth={1.5} aria-hidden />
-                  <span><strong>{s.name}</strong><small className="muted">{s.short}</small></span>
-                  <ChevronDown size={16} strokeWidth={1.6} aria-hidden className={styles.chev} />
-                </button>
-                {isOpen && <p className="muted small">{s.long}<br />在「创作 › 运行设置 › 运行策略」里选择。</p>}
-              </div>
-            );
-          })}
-        </div>
-      </Card>
 
       <div className={styles.workspaceWide}>
         <InstanceCenter instances={instances} onContinue={onContinue} onOpenWorkbench={onOpenWorkbench} onRefresh={onRefreshInstances} />

@@ -28,6 +28,7 @@ import {
   type GpuManifest, type GpuModel, type GpuSettings, type GpuUsage, type GpuWorkflow, type Project, type Provider,
 } from './lib/gpu-api';
 import type { GpuAccount, GpuInstance } from './components/AccountDirectory';
+import { isAccountSelectable } from './components/RuntimeSelection';
 import type { RuntimeChoice } from './pages/CreatePage';
 import { referenceAssets, supportsReferences } from './components/ReferencePicker';
 import { Segmented } from './components/ui';
@@ -148,6 +149,49 @@ function Login({ onLoggedIn }: { onLoggedIn: () => void }) {
 }
 
 const PROJECT_KEY = 'colab-gpu-studio-project';
+const CREATE_RUNTIME_PREFS_KEY = 'studio-create-runtime-prefs';
+type SavedCreateRuntimePrefs = {
+  runtime: Provider;
+  accountId: string;
+  lifecycle: RuntimeChoice['lifecycle'];
+  retainIdleMinutes: number;
+  maxRuntime: number;
+};
+
+function loadCreateRuntimePrefs(): SavedCreateRuntimePrefs {
+  const fallback: SavedCreateRuntimePrefs = {
+    runtime: 'mock',
+    accountId: '',
+    lifecycle: 'save',
+    retainIdleMinutes: 15,
+    maxRuntime: 30,
+  };
+  try {
+    const raw = localStorage.getItem(CREATE_RUNTIME_PREFS_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return fallback;
+    const runtime: Provider = parsed.runtime === 'colab' ? 'colab' : 'mock';
+    const accountId = typeof parsed.accountId === 'string' ? parsed.accountId : '';
+    const rawLifecycle = parsed.lifecycle;
+    // 'retain' binds a live instance, which is not persisted across reloads; fall back smoothly to 'smart'.
+    const lifecycle: RuntimeChoice['lifecycle'] = rawLifecycle === 'batch' || rawLifecycle === 'smart' || rawLifecycle === 'save'
+      ? rawLifecycle
+      : rawLifecycle === 'retain' ? 'smart' : 'save';
+    const retainIdleMinutes = typeof parsed.retainIdleMinutes === 'number' && Number.isInteger(parsed.retainIdleMinutes) && parsed.retainIdleMinutes >= 1
+      ? parsed.retainIdleMinutes : 15;
+    const maxRuntime = typeof parsed.maxRuntime === 'number' && Number.isInteger(parsed.maxRuntime) && parsed.maxRuntime >= 1
+      ? parsed.maxRuntime : 30;
+    return { runtime, accountId, lifecycle, retainIdleMinutes, maxRuntime };
+  } catch {
+    return fallback;
+  }
+}
+
+function saveCreateRuntimePrefs(prefs: SavedCreateRuntimePrefs) {
+  try { localStorage.setItem(CREATE_RUNTIME_PREFS_KEY, JSON.stringify(prefs)); } catch { /* storage can be unavailable */ }
+}
+
 function savedProjectId(): string { try { return localStorage.getItem(PROJECT_KEY) || ''; } catch { return ''; } }
 function saveProjectId(id: string) { try { if (id) localStorage.setItem(PROJECT_KEY, id); } catch { /* storage can be unavailable */ } }
 
@@ -395,12 +439,19 @@ export default function App() {
   const [referenceImages, setReferenceImages] = useState<GalleryAsset[]>([]);
   const [jobs, setJobs] = useState<GpuJob[]>([]);
   const [selectedAssets, setSelectedAssets] = useState<string[]>([]);
-  const [runtime, setRuntime] = useState<Provider>('mock');
-  const [maxRuntime, setMaxRuntime] = useState(30);
+  const initialRuntimePrefs = useMemo(() => loadCreateRuntimePrefs(), []);
+  const [runtime, setRuntime] = useState<Provider>(() => initialRuntimePrefs.runtime);
+  const [maxRuntime, setMaxRuntime] = useState(() => initialRuntimePrefs.maxRuntime);
   const [batchCount, setBatchCount] = useState(1);
-  const [batchMode, setBatchMode] = useState<'save' | 'smart' | 'batch' | 'retain'>('save');
-  const [runtimeChoice, setRuntimeChoice] = useState<RuntimeChoice>({ accountId: '', instanceId: '', lifecycle: 'save', retainIdleMinutes: 15 });
+  const [batchMode, setBatchMode] = useState<'save' | 'smart' | 'batch' | 'retain'>(() => initialRuntimePrefs.lifecycle);
+  const [runtimeChoice, setRuntimeChoice] = useState<RuntimeChoice>(() => ({
+    accountId: initialRuntimePrefs.accountId,
+    instanceId: '',
+    lifecycle: initialRuntimePrefs.lifecycle,
+    retainIdleMinutes: initialRuntimePrefs.retainIdleMinutes,
+  }));
   const [accounts, setAccounts] = useState<GpuAccount[]>([]);
+  const [accountsLoaded, setAccountsLoaded] = useState(false);
   const [instances, setInstances] = useState<GpuInstance[]>([]);
   const [, setResourceError] = useState('');
   const resourceRefresh = useRef<(() => void) | null>(null);
@@ -594,12 +645,42 @@ export default function App() {
       const nextAccounts = (Array.isArray(accountResult) ? accountResult : record(accountResult) && Array.isArray(accountResult.data) ? accountResult.data : []) as GpuAccount[];
       const nextInstances = instanceResult as unknown as GpuInstance[];
       setAccounts(uniqueBy(nextAccounts, (account) => account.account_id));
+      setAccountsLoaded(true);
       setInstances(uniqueBy(nextInstances, (instance) => instanceIdOf(instance)));
       setResourceError('');
     } catch (cause) {
       if (seq === resourceSequenceRef.current) setResourceError(`账号/实例：${apiMessage(cause)}`);
     }
   }, []);
+
+  // Persist stable creation runtime preferences (never persisting ephemeral instanceId).
+  useEffect(() => {
+    saveCreateRuntimePrefs({
+      runtime,
+      accountId: runtimeChoice.accountId || '',
+      lifecycle: runtimeChoice.lifecycle,
+      retainIdleMinutes: Number.isInteger(runtimeChoice.retainIdleMinutes) && runtimeChoice.retainIdleMinutes >= 1
+        ? runtimeChoice.retainIdleMinutes : 15,
+      maxRuntime: Number.isInteger(maxRuntime) && maxRuntime >= 1 ? maxRuntime : 30,
+    });
+  }, [runtime, runtimeChoice.accountId, runtimeChoice.lifecycle, runtimeChoice.retainIdleMinutes, maxRuntime]);
+
+  // Self-heal saved preferences when server disables real GPU or saved account is no longer selectable.
+  useEffect(() => {
+    if (!settings) return;
+    const realAvailable = Boolean(settings.real_enabled) && settings.offline_mode !== true;
+    if (!realAvailable && runtime === 'colab') setRuntime('mock');
+  }, [settings, runtime]);
+
+  useEffect(() => {
+    if (!accountsLoaded || !runtimeChoice.accountId) return;
+    const matched = accounts.find((account) => account.account_id === runtimeChoice.accountId);
+    if (!matched || !isAccountSelectable(matched)) {
+      setRuntimeChoice((current) => (current.accountId === runtimeChoice.accountId
+        ? { ...current, accountId: null, instanceId: null }
+        : current));
+    }
+  }, [accountsLoaded, accounts, runtimeChoice.accountId]);
 
   useEffect(() => {
     resourceRefresh.current = () => void refreshResources();

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUpRight } from 'lucide-react';
 import { apiFetch, apiMessage, type GpuUsage } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
@@ -14,8 +14,54 @@ import { useSmartPoll } from '../lib/smart-poll';
 import styles from '../gpu.module.css';
 
 const EVENTS_COLLAPSED_LIMIT = 5;
+const NATIVE_PREFS_KEY = 'studio-native-comfy-prefs';
 
 type Timeouts = { retain_idle_minutes: number; max_runtime_minutes: number };
+type NativePrefs = {
+  account?: string;
+  spec?: Record<string, unknown> | null;
+  storage?: ModelStorage;
+  idleMinutes?: string;
+  runtimeMinutes?: string;
+};
+
+function isValidStorage(value: unknown): value is ModelStorage {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return (item.model_storage_mode === 'local' || item.model_storage_mode === 'drive_mount')
+    && typeof item.cache_gb === 'number' && Number.isInteger(item.cache_gb) && item.cache_gb >= 1 && item.cache_gb <= 2147483647
+    && typeof item.cache_max_age_minutes === 'number' && Number.isInteger(item.cache_max_age_minutes)
+    && item.cache_max_age_minutes >= 1 && item.cache_max_age_minutes <= 153722867;
+}
+
+function isPositiveIntText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '' && Number.isInteger(Number(value)) && Number(value) >= 1;
+}
+
+function loadNativePrefs(): NativePrefs {
+  try {
+    const raw = localStorage.getItem(NATIVE_PREFS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const spec = parsed.spec && typeof parsed.spec === 'object' && !Array.isArray(parsed.spec)
+      ? parsed.spec as Record<string, unknown>
+      : null;
+    return {
+      account: typeof parsed.account === 'string' ? parsed.account : undefined,
+      spec,
+      storage: isValidStorage(parsed.storage) ? parsed.storage : undefined,
+      idleMinutes: isPositiveIntText(parsed.idleMinutes) ? parsed.idleMinutes : undefined,
+      runtimeMinutes: isPositiveIntText(parsed.runtimeMinutes) ? parsed.runtimeMinutes : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function saveNativePrefs(prefs: NativePrefs) {
+  try { localStorage.setItem(NATIVE_PREFS_KEY, JSON.stringify(prefs)); } catch { /* browser storage unavailable */ }
+}
 type RestartPhase = 'checking' | 'syncing' | 'rebooting' | 'recovering' | 'succeeded' | 'failed';
 type NativeRestart = { restart_id: string; instance_id: string; phase: RestartPhase; failed_phase?: RestartPhase; error?: string };
 type NativeStatus = { configured: boolean; ready: boolean; can_restart: boolean; restart?: NativeRestart; state: string; instance_id?: string; job_id?: string | null; error?: string; timeouts: { defaults: Timeouts }; model_storage_defaults: ModelStorage; model_storage?: ModelStorage; model_storage_known?: boolean; disk?: { disk_free_bytes?: number; vfs_cache_bytes?: number }; events: { state?: string; message?: string }[] };
@@ -29,8 +75,18 @@ const restartMessages: Record<RestartPhase, string> = {
 };
 
 export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage: GpuUsage | null; accounts: GpuAccount[]; instances: GpuInstance[]; desktop: boolean }) {
-  const [account, setAccount] = useState(accounts.find(a => a.enabled !== false && a.allow_allocation !== false)?.account_id || '');
-  const [spec, setSpec] = useState<Record<string, unknown> | null>(null);
+  const initialPrefs = useMemo(() => loadNativePrefs(), []);
+  const eligibleAccounts = useMemo(
+    () => accounts.filter(a => a.enabled !== false && a.allow_allocation !== false),
+    [accounts],
+  );
+  const [account, setAccount] = useState(() => {
+    if (initialPrefs.account) {
+      if (!accounts.length || eligibleAccounts.some(a => a.account_id === initialPrefs.account)) return initialPrefs.account;
+    }
+    return eligibleAccounts[0]?.account_id || '';
+  });
+  const [spec, setSpec] = useState<Record<string, unknown> | null>(() => initialPrefs.spec ?? null);
   const [status, setStatus] = useState<NativeStatus | null>(null);
   const [error, setError] = useState('');
   const [starting, setStarting] = useState(false);
@@ -41,10 +97,27 @@ export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage
   const [pendingRestart, setPendingRestart] = useState<{ id: string; previous?: string }>();
   const [autoOpen, setAutoOpen] = useState(false);
   const [showAllEvents, setShowAllEvents] = useState(false);
-  const [storage, setStorage] = useState<ModelStorage>();
-  const [idleMinutes, setIdleMinutes] = useState('');
-  const [runtimeMinutes, setRuntimeMinutes] = useState('');
-  const timeoutsInitialized = useRef(false);
+  const [storage, setStorage] = useState<ModelStorage | undefined>(() => initialPrefs.storage);
+  const [idleMinutes, setIdleMinutes] = useState(() => initialPrefs.idleMinutes ?? '');
+  const [runtimeMinutes, setRuntimeMinutes] = useState(() => initialPrefs.runtimeMinutes ?? '');
+  const timeoutsInitialized = useRef(Boolean(initialPrefs.storage && initialPrefs.idleMinutes && initialPrefs.runtimeMinutes));
+
+  useEffect(() => {
+    if (!accounts.length) return;
+    if (account && eligibleAccounts.some(a => a.account_id === account)) return;
+    const fallback = eligibleAccounts[0]?.account_id || '';
+    if (fallback !== account) setAccount(fallback);
+  }, [accounts.length, eligibleAccounts, account]);
+
+  useEffect(() => {
+    const next: NativePrefs = {};
+    if (account) next.account = account;
+    if (spec) next.spec = spec;
+    if (isValidStorage(storage)) next.storage = storage;
+    if (isPositiveIntText(idleMinutes)) next.idleMinutes = idleMinutes;
+    if (isPositiveIntText(runtimeMinutes)) next.runtimeMinutes = runtimeMinutes;
+    saveNativePrefs(next);
+  }, [account, spec, storage, idleMinutes, runtimeMinutes]);
   const key = useRef(crypto.randomUUID());
   const opening = useRef(false);
   const restartDialog = useRef<HTMLDialogElement>(null);
@@ -94,9 +167,9 @@ export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage
         return pending && data.instance_id && observed !== pending.id && observed === pending.previous ? pending : undefined;
       });
       if (!timeoutsInitialized.current) {
-        setStorage(data.model_storage_defaults);
-        setIdleMinutes(String(data.timeouts.defaults.retain_idle_minutes));
-        setRuntimeMinutes(String(data.timeouts.defaults.max_runtime_minutes));
+        setStorage(current => current ?? data.model_storage_defaults);
+        setIdleMinutes(current => current || String(data.timeouts.defaults.retain_idle_minutes));
+        setRuntimeMinutes(current => current || String(data.timeouts.defaults.max_runtime_minutes));
         timeoutsInitialized.current = true;
       }
       if (data.ready && autoOpen) {
@@ -241,14 +314,14 @@ export function NativeComfyPage({ usage, accounts, instances, desktop }: { usage
         {Boolean(status?.events.length) && (() => {
           const events = status?.events || [];
           const hidden = Math.max(0, events.length - EVENTS_COLLAPSED_LIMIT);
-          const shownEvents = showAllEvents || hidden === 0 ? events : events.slice(-EVENTS_COLLAPSED_LIMIT);
+          const shownEvents = showAllEvents || hidden === 0 ? events : events.slice(0, EVENTS_COLLAPSED_LIMIT);
           return <>
+            <ol aria-label="启动进度">{shownEvents.map((event, i) => <li key={i}>{event.message}</li>)}</ol>
             {hidden > 0 && (
               <button type="button" className="button ghost small" onClick={() => setShowAllEvents(v => !v)}>
                 {showAllEvents ? `收起早期事件，仅显示最新 ${EVENTS_COLLAPSED_LIMIT} 条` : `展开更早的 ${hidden} 条启动事件`}
               </button>
             )}
-            <ol aria-label="启动进度">{shownEvents.map((event, i) => <li key={i}>{event.message}</li>)}</ol>
           </>;
         })()}
         {status?.instance_id && <div className="actions">

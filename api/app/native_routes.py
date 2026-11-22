@@ -103,7 +103,7 @@ async def status(request: Request, user=Depends(current_user)):
     events = repo.list("events", user["id"]) if job else []
     can_restart = ready and native_restart.can_restart(repo, lease)
     return ok({"configured": bool(settings.native_comfy_url), "url": settings.native_comfy_url,
-               "timeouts": native.timeout_options(), "model_storage_defaults": native.model_storage(),
+               "timeouts": native.timeout_options(), "model_storage_defaults": native.model_storage_defaults(),
                "model_storage_known": not lease or bool(lease.get("native_model_storage")),
                "model_storage": native.lease_storage(repo, lease) if lease else (
                    native.model_storage(job.get("execution_policy")) if job and job["state"] not in native.TERMINAL else None
@@ -114,7 +114,7 @@ async def status(request: Request, user=Depends(current_user)):
                "reason": RUNTIME_MISSING if reclaimed else None,
                "error": RUNTIME_MISSING_MESSAGE if reclaimed else (job or {}).get("error_message"),
                "events": [{"message": e.get("message"), "state": e.get("state")}
-                          for e in events if e.get("job_id") == (job or {}).get("id")][-30:]}, request)
+                          for e in events if e.get("job_id") == (job or {}).get("id")][:30]}, request)
 
 
 @router.post("/restart", status_code=202)

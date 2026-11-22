@@ -350,10 +350,35 @@ def test_native_status_exposes_timeout_defaults_and_limits(proxy, monkeypatch):
     with TestClient(proxy) as client:
         response = client.get("/api/gpu/native/status", headers={"Authorization": "Bearer api-test-token"})
     assert response.status_code == 200
-    assert response.json()["data"]["timeouts"] == {
+    data = response.json()["data"]
+    assert data["timeouts"] == {
         "defaults": {"retain_idle_minutes": 8, "max_runtime_minutes": 60},
         "limits": {"retain_idle_minutes": None, "max_runtime_minutes": None},
     }
+    assert data["model_storage_defaults"]["model_storage_mode"] == "local"
+
+
+def test_native_status_keeps_latest_30_events_newest_first(proxy):
+    from app.native_routes import router
+
+    proxy.include_router(router)
+    repo = proxy.state.repo
+    repo.lease["native_ready"] = False
+    repo.job = {"id": "job-1", "state": "running", "snapshot": {"native_comfy": True}}
+    repo.lease["owner_job_id"] = "job-1"
+    # Repository lists events newest-first (index 0 is latest).
+    newest_first = [{"job_id": "job-1", "state": "running", "message": f"event-{i}"} for i in range(40, 0, -1)]
+    orig_list = repo.list
+    repo.list = lambda kind, owner=None: (
+        newest_first if kind == "events" else [repo.job] if kind == "jobs" else orig_list(kind, owner)
+    )
+    with TestClient(proxy) as client:
+        response = client.get("/api/gpu/native/status", headers={"Authorization": "Bearer api-test-token"})
+    assert response.status_code == 200
+    messages = [item["message"] for item in response.json()["data"]["events"]]
+    assert len(messages) == 30
+    assert messages[0] == "event-40"
+    assert messages[-1] == "event-11"
 
 
 @pytest.mark.parametrize("storage", ["local", "drive_mount", None])

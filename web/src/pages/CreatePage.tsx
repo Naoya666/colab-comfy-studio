@@ -11,6 +11,7 @@ import { GpuParamForm, splitParams } from '../components/GpuParamForm';
 import { ReferencePicker, supportsReferences } from '../components/ReferencePicker';
 import { RuntimeSelection } from '../components/RuntimeSelection';
 import type { RuntimeSelectionValue } from '../components/RuntimeSelection';
+import { computeLabel } from '../components/WorkflowGpuSelection';
 import type { GpuAccount, GpuInstance } from '../components/AccountDirectory';
 import { Card, InfoTip, Segmented } from '../components/ui';
 import { ConfirmDialog } from '../components/Feedback';
@@ -205,9 +206,11 @@ export function CreatePanel({
 
   const selectedAccountAlias = accounts.find((a) => a.account_id === runtimeChoice.accountId)?.alias || runtimeChoice.accountId;
   const selectedInstanceObj = instances.find((item) => (item.id || item.instance_id) === runtimeChoice.instanceId);
+  const effectiveComputeSpec = computeSpec || (manifest?.compute_spec as Record<string, unknown> | undefined);
   const runtimeSummary = [
     runtime === 'mock' ? '离线模拟' : 'Colab GPU',
     selectedAccountAlias ? `账号 ${selectedAccountAlias}` : '自动账号',
+    ...(runtime === 'colab' ? [computeLabel(effectiveComputeSpec)] : []),
     selectedInstanceObj ? (selectedInstanceObj.instance_label || selectedInstanceObj.label || '指定机器') : '自动分配',
     LIFECYCLE_SHORT[runtimeChoice.lifecycle] + (['smart', 'retain'].includes(runtimeChoice.lifecycle) ? ` ${runtimeChoice.retainIdleMinutes}分` : ''),
   ].join(' · ');
