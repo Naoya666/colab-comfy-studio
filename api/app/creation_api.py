@@ -1,18 +1,33 @@
 """ComfyUI-compatible submission backed by the durable Studio job queue."""
 
+from __future__ import annotations
+
 import copy
 import hashlib
 import json
 import secrets
 import uuid
 from datetime import datetime
-from urllib.parse import urlsplit
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .admission import _account_is_usable, _google_status, admit_job
+from .api_access import (
+    DEFAULT_WEAK_KEY_ID,
+    build_access_urls,
+    check_weak_origin,
+    cors_headers_for,
+    get_or_create_path_code,
+    is_trusted_local_client,
+    match_gateway_route,
+    normalize_origins,
+    peek_path_code,
+    reset_path_code,
+    validate_listen_port,
+)
 from .common import APIError, admin, current_user, get_store, ok
 from .config import settings
 from .db import utc_isoformat, utcnow
@@ -32,12 +47,24 @@ from .gpu.scheduler import ACTIVE_STATES, Scheduler
 from .gpu.specs import spec_key
 from .job_schemas import JobInput, Policy
 from .native_api import MAX_OUTSTANDING, MAX_WORKFLOW_BYTES, RATE_PER_MINUTE, token_digest
+from .port_listeners import probe_port_available
 from .storage import asset_path
 
 admin_router = APIRouter(prefix="/api/gpu/creation-api")
 compat = APIRouter()
 KEYS = "creation_api_keys"
 DEFAULT_GPU = {"variant": "VARIANT_GPU", "accelerator": "L4", "shape": "SHAPE_STANDARD"}
+
+_COMPAT_API_PREFIXES = (
+    "/api/system_stats",
+    "/api/object_info",
+    "/api/models",
+    "/api/prompt",
+    "/api/history/",
+    "/api/view",
+    "/api/interrupt",
+    "/api/queue",
+)
 
 
 class Config(BaseModel):
@@ -48,13 +75,20 @@ class Config(BaseModel):
     lifecycle: str = "save"
     retain_idle_minutes: int = 15
     max_runtime_minutes: int = 30
+    auth_mode: Literal["strict", "url_path", "local_open"] = "strict"
+    allow_lan: bool = False
+    listen_port: int | None = None
+    workflow_scope: Literal["active", "selected"] = "active"
+    workflow_ids: list[str] = Field(default_factory=list)
+    allowed_origins: list[str] = Field(default_factory=list)
 
 
 def config(store, owner):
+    defaults = Config().model_dump()
     saved = store.get("settings", f"creation-api:{owner}", owner)
-    if saved:
-        return saved["policy"]
-    return Config().model_dump()
+    if saved and isinstance(saved.get("policy"), dict):
+        return {**defaults, **saved["policy"]}
+    return defaults
 
 
 def execution_policy(cfg):
@@ -74,11 +108,32 @@ def eligible(repo, owner):
 
 
 def public_workflow(row):
-    return {field: row[field] for field in ("id", "workflow_key", "workflow_version", "model_id")}
+    return {
+        **{field: row[field] for field in ("id", "workflow_key", "workflow_version", "model_id")},
+        "active": bool(row.get("active")),
+    }
 
 
 def public_key(row):
     return {field: row.get(field) for field in ("id", "name", "workflow_ids", "created_at", "revoked_at")}
+
+
+def _weak_virtual_key(store, owner: str = "owner", cfg: dict | None = None) -> dict:
+    cfg = cfg or config(store, owner)
+    rows = eligible(Repository(store), owner)
+    if cfg.get("workflow_scope") == "selected":
+        allowed = set(cfg.get("workflow_ids") or [])
+        wf_ids = [r["id"] for r in rows if r["id"] in allowed]
+    else:
+        active_ids = [r["id"] for r in rows if r.get("active")]
+        wf_ids = active_ids if active_ids else [r["id"] for r in rows]
+    return {
+        "id": DEFAULT_WEAK_KEY_ID,
+        "owner_id": owner,
+        "name": "默认弱鉴权通道",
+        "workflow_ids": wf_ids,
+        "virtual": True,
+    }
 
 
 def require_key(store, token):
@@ -91,8 +146,40 @@ def require_key(store, token):
 
 
 def authorize(request: Request, store=Depends(get_store)):
-    scheme, _, token = request.headers.get("Authorization", "").partition(" ")
-    return require_key(store, token if scheme.lower() == "bearer" else "")
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header:
+        scheme, _, token = auth_header.partition(" ")
+        key = require_key(store, token if scheme.lower() == "bearer" else "")
+        request.state.cors_headers = cors_headers_for(request.headers.get("origin"), wildcard_fallback=True)
+        return key
+
+    owner = "owner"
+    cfg = config(store, owner)
+    route_token = getattr(request.state, "route_token", None)
+
+    if route_token:
+        if cfg["auth_mode"] not in {"url_path", "local_open"}:
+            raise APIError("UNAUTHENTICATED", "当前未启用 URL 路径短码模式", 401)
+        expected = peek_path_code(store, f"creation-api:{owner}", owner)
+        if not expected or not secrets.compare_digest(route_token, expected):
+            raise APIError("UNAUTHENTICATED", "创作 API 路径短码无效或已重置", 401)
+        request.state.cors_headers = check_weak_origin(request.headers, via_token=True)
+        return _weak_virtual_key(store, owner, cfg)
+
+    if cfg["auth_mode"] != "local_open":
+        raise APIError("UNAUTHENTICATED", "创作 API Key 无效或已撤销", 401)
+    if not is_trusted_local_client(request.scope, request.headers, allow_lan=bool(cfg.get("allow_lan"))):
+        raise APIError(
+            "UNAUTHENTICATED",
+            "当前仅允许本机免密访问；局域网/容器互通请开启「允许局域网/容器私网访问」或改用 URL 路径短 Token 模式",
+            401,
+        )
+    request.state.cors_headers = check_weak_origin(
+        request.headers,
+        via_token=False,
+        allowed_origins=cfg.get("allowed_origins"),
+    )
+    return _weak_virtual_key(store, owner, cfg)
 
 
 async def json_body(request: Request):
@@ -251,6 +338,7 @@ def submit(store, owner, workflow, params, *, key=None, idem=None, graph_hash=No
     cfg = config(store, owner)
     warmup = key is None
     key_id = key["id"] if key else None
+    is_virtual_key = bool(key and key.get("virtual"))
     existing_only = not warmup and not cfg["auto_start"]
     key_value = "creation:" + key_id + ":" + hashlib.sha256(idem.encode()).hexdigest() if idem else (
         "creation:" + uuid.uuid4().hex
@@ -281,9 +369,17 @@ def submit(store, owner, workflow, params, *, key=None, idem=None, graph_hash=No
                         and (is_active(row) or warm_status(repo, row)["ready"])):
                     return row
             return None
-        current = store.get(KEYS, key_id, owner)
-        if not current or current.get("revoked_at") or workflow["id"] not in current["workflow_ids"]:
-            raise APIError("WORKFLOW_FORBIDDEN", "Key 的工作流授权已撤销", 403)
+        if is_virtual_key:
+            fresh_cfg = config(store, owner)
+            if fresh_cfg["auth_mode"] not in {"url_path", "local_open"}:
+                raise APIError("UNAUTHENTICATED", "弱鉴权接入已关闭", 401)
+            virtual = _weak_virtual_key(store, owner, fresh_cfg)
+            if workflow["id"] not in virtual["workflow_ids"]:
+                raise APIError("WORKFLOW_FORBIDDEN", "该工作流版本未在弱鉴权通道开放", 403)
+        else:
+            current = store.get(KEYS, key_id, owner)
+            if not current or current.get("revoked_at") or workflow["id"] not in current["workflow_ids"]:
+                raise APIError("WORKFLOW_FORBIDDEN", "Key 的工作流授权已撤销", 403)
         relevant = [row for row in rows if row.get("creation_key_id") == key_id]
         for row in relevant:
             if row.get("idempotency_key") == key_value:
@@ -316,11 +412,35 @@ def submit(store, owner, workflow, params, *, key=None, idem=None, graph_hash=No
         raise APIError("INVALID_WORKFLOW_PARAMETERS", str(exc)) from exc
 
 
+def _listener_status(app):
+    mgr = getattr(app.state, "port_listeners", None)
+    return mgr.status("creation") if mgr else {"active": False, "host": None, "port": None, "error": None}
+
+
+def _access_metadata(store, owner: str, cfg: dict) -> tuple[str | None, dict]:
+    code = (
+        get_or_create_path_code(store, f"creation-api:{owner}", owner)
+        if cfg.get("auth_mode") in {"url_path", "local_open"}
+        else peek_path_code(store, f"creation-api:{owner}", owner)
+    )
+    urls = build_access_urls(
+        kind="creation",
+        auth_mode=cfg.get("auth_mode", "strict"),
+        path_code=code,
+        listen_port=cfg.get("listen_port"),
+        dedicated_url=settings.creation_comfy_url,
+        allow_lan=bool(cfg.get("allow_lan")),
+    )
+    return code, urls
+
+
 @admin_router.get("")
 def admin_status(request: Request, user=Depends(current_user), store=Depends(get_store)):
     admin(user)
     owner = user["id"]
     repo = Repository(store)
+    cfg = config(store, owner)
+    path_code, urls = _access_metadata(store, owner, cfg)
     warmups = []
     for row in repo.list("jobs", owner):
         if not row.get("warmup"):
@@ -331,10 +451,35 @@ def admin_status(request: Request, user=Depends(current_user), store=Depends(get
         warmups.append(status)
         if len(warmups) >= 20:
             break
-    return ok({"url": settings.creation_comfy_url, "config": config(store, owner),
-               "keys": [public_key(row) for row in store.list(KEYS, owner)],
-               "workflows": [public_workflow(row) for row in eligible(repo, owner)],
-               "warmups": warmups}, request)
+    return ok({
+        "url": settings.creation_comfy_url,
+        "path_code": path_code,
+        "urls": urls,
+        "listener": _listener_status(request.app),
+        "config": cfg,
+        "keys": [public_key(row) for row in store.list(KEYS, owner)],
+        "workflows": [public_workflow(row) for row in eligible(repo, owner)],
+        "warmups": warmups,
+    }, request)
+
+
+@admin_router.post("/reset-code")
+def rotate_path_code(request: Request, user=Depends(current_user), store=Depends(get_store)):
+    admin(user)
+    owner = user["id"]
+    cfg = config(store, owner)
+    code = reset_path_code(store, f"creation-api:{owner}", owner)
+    urls = build_access_urls(
+        kind="creation",
+        auth_mode=cfg.get("auth_mode", "strict"),
+        path_code=code,
+        listen_port=cfg.get("listen_port"),
+        dedicated_url=settings.creation_comfy_url,
+        allow_lan=bool(cfg.get("allow_lan")),
+    )
+    response = ok({"path_code": code, "urls": urls}, request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @admin_router.post("/warmups/clear")
@@ -355,7 +500,7 @@ def clear_warmups(request: Request, user=Depends(current_user), store=Depends(ge
 
 
 @admin_router.put("/config")
-def save_config(body: Config, request: Request, user=Depends(current_user), store=Depends(get_store)):
+async def save_config(body: Config, request: Request, user=Depends(current_user), store=Depends(get_store)):
     admin(user)
     owner = user["id"]
     cfg = body.model_dump()
@@ -367,18 +512,37 @@ def save_config(body: Config, request: Request, user=Depends(current_user), stor
         execution_policy(cfg)
     except (ValidationError, ValueError) as exc:
         raise APIError("CREATION_CONFIG_INVALID", str(exc)) from exc
+    cfg["listen_port"] = validate_listen_port(cfg["listen_port"], kind="creation", store=store, owner=owner)
+    cfg["allowed_origins"] = normalize_origins(cfg["allowed_origins"])
+    cfg["workflow_ids"] = list(dict.fromkeys(cfg["workflow_ids"]))
+    if len(cfg["workflow_ids"]) > 100:
+        raise APIError("CREATION_CONFIG_INVALID", "选择的发布版本数量过多")
+    eligible_ids = {row["id"] for row in eligible(repo, owner)}
+    if set(cfg["workflow_ids"]) - eligible_ids:
+        raise APIError("WORKFLOW_FORBIDDEN", "只能授权仍可执行且通过真实冒烟的发布版本", 409)
     if cfg["account_id"]:
         account = repo.get("accounts", cfg["account_id"], owner)
         if not account or not _account_is_usable(account) or not _google_status(repo, owner, cfg["account_id"])["colab"]["connected"]:
             raise APIError("ACCOUNT_UNAVAILABLE", "请选择已经授权且允许分配的 Colab 账号", 409)
+
+    mgr = getattr(request.app.state, "port_listeners", None)
+    if mgr is not None:
+        await mgr.apply("creation", cfg["listen_port"], allow_lan=cfg["allow_lan"], strict=True)
+    elif cfg["listen_port"] is not None:
+        probe_port_available(cfg["listen_port"], allow_lan=cfg["allow_lan"])
+
     ident = f"creation-api:{owner}"
     with store.admission_lock() as acquired:
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "正在保存运行设置，请重试", 503)
-        if store.get("settings", ident, owner):
-            store.update("settings", ident, {"policy": cfg}, owner)
+        existing = store.get("settings", ident, owner)
+        patch = {"policy": cfg}
+        if cfg["auth_mode"] in {"url_path", "local_open"} and not (existing and existing.get("path_code")):
+            patch["path_code"] = secrets.token_urlsafe(18)
+        if existing:
+            store.update("settings", ident, patch, owner)
         else:
-            store.create("settings", owner, {"policy": cfg}, record_id=ident)
+            store.create("settings", owner, patch, record_id=ident)
     return ok(cfg, request)
 
 
@@ -430,8 +594,12 @@ def inspect_workflow(request: Request, user=Depends(current_user), store=Depends
     admin(user)
     owner = user["id"]
     rows = eligible(Repository(store), owner)
-    if body.get("key_id"):
-        key = store.get(KEYS, body["key_id"], owner)
+    target_key_id = body.get("key_id")
+    if target_key_id == DEFAULT_WEAK_KEY_ID:
+        allowed_ids = set(_weak_virtual_key(store, owner)["workflow_ids"])
+        rows = [row for row in rows if row["id"] in allowed_ids]
+    elif target_key_id:
+        key = store.get(KEYS, target_key_id, owner)
         if not key or key.get("revoked_at"):
             raise APIError("NOT_FOUND", "接入 Key 不存在或已撤销", 404)
         rows = [row for row in rows if row["id"] in key["workflow_ids"]]
@@ -515,6 +683,50 @@ def models(folder: str | None = None, store=Depends(get_store), key=Depends(auth
     return sorted(inventory.get(folder, [])) if folder else sorted(inventory)
 
 
+@compat.get("/queue")
+def queue_status(store=Depends(get_store), key=Depends(authorize)):
+    repo = Repository(store)
+    allowed_wf = set(key["workflow_ids"])
+    rows = [
+        row for row in repo.list("jobs", key["owner_id"])
+        if row.get("creation_key_id") == key["id"] and row.get("creation_workflow_id") in allowed_wf and is_active(row)
+    ]
+    rows.sort(key=lambda r: r.get("created_at") or "")
+    running, pending = [], []
+    for index, row in enumerate(rows):
+        entry = [index, row["id"]]
+        if row["state"] == "running":
+            running.append(entry)
+        else:
+            pending.append(entry)
+    return {"queue_running": running, "queue_pending": pending}
+
+
+@compat.post("/queue")
+async def queue_manage(request: Request, store=Depends(get_store), key=Depends(authorize)):
+    raw = await request.body()
+    if not raw:
+        return {}
+    if len(raw) > 65536:
+        raise APIError("PAYLOAD_TOO_LARGE", "队列请求过大", 413)
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise APIError("INVALID_JSON", "队列请求必须为有效 JSON") from exc
+    deletes = payload.get("delete") if isinstance(payload, dict) else None
+    if isinstance(deletes, list):
+        repo = Repository(store)
+        sched = Scheduler(store)
+        allowed_wf = set(key["workflow_ids"])
+        for pid in deletes[:20]:
+            if isinstance(pid, str):
+                job = repo.get("jobs", pid, key["owner_id"])
+                if (job and job.get("creation_key_id") == key["id"]
+                        and job.get("creation_workflow_id") in allowed_wf and is_active(job)):
+                    sched.cancel(key["owner_id"], job["id"])
+    return {}
+
+
 @compat.post("/prompt")
 def prompt(request: Request, store=Depends(get_store), key=Depends(authorize), body=Depends(json_body)):
     graph = body.get("prompt")
@@ -532,8 +744,8 @@ def prompt(request: Request, store=Depends(get_store), key=Depends(authorize), b
         raise APIError("INVALID_GRAPH", "工作流包含无效的 JSON 值") from exc
     if result["status"] != "matched":
         raise APIError("WORKFLOW_MATCH_" + result["status"].upper(),
-                       "工作流匹配存在歧义，请检查 Key 的授权版本" if result["matches"]
-                       else "工作流与该 Key 授权的发布版本不匹配", 422)
+                       "工作流匹配存在歧义，请检查授权版本范围" if result["matches"]
+                       else "工作流与已开放的发布版本不匹配", 422)
     match = result["matches"][0]
     row = next(row for row in rows if row["id"] == match["workflow"]["id"])
     job = submit(store, key["owner_id"], row, match["params"], key=key, idem=idem, graph_hash=graph_hash)
@@ -586,50 +798,132 @@ def view(filename: str, subfolder: str = "", type: str = "output", store=Depends
 
 
 @compat.post("/interrupt")
-def interrupt(prompt_id: str | None = None, store=Depends(get_store), key=Depends(authorize)):
+async def interrupt(request: Request, prompt_id: str | None = None, store=Depends(get_store), key=Depends(authorize)):
     repo = Repository(store)
     if not prompt_id:
-        # Tavern sends no prompt ID. A shared Key cannot safely identify the disconnected request.
+        raw = await request.body()
+        if raw and len(raw) <= 8192:
+            try:
+                payload = json.loads(raw)
+                if isinstance(payload, dict) and isinstance(payload.get("prompt_id"), str):
+                    prompt_id = payload["prompt_id"].strip()
+            except ValueError:
+                pass
+    if not prompt_id:
+        # Tavern 1.19 legacy disconnect sends no prompt ID; BaiBai sends {"prompt_id": "..."}.
         raise APIError("PROMPT_ID_REQUIRED", "取消任务需要明确的 prompt_id", 409)
     job = own_job(repo, key, prompt_id)
     Scheduler(store).cancel(key["owner_id"], job["id"])
     return {}
 
 
+def _strip_optional_compat_api_prefix(scope: dict) -> dict:
+    path = scope.get("path", "")
+    if any(path == p or path.startswith(p + "/") for p in _COMPAT_API_PREFIXES):
+        updated = dict(scope)
+        updated["path"] = path.removeprefix("/api")
+        raw_path = scope.get("raw_path")
+        if isinstance(raw_path, bytes) and raw_path.startswith(b"/api/"):
+            updated["raw_path"] = raw_path[4:]
+        return updated
+    return scope
+
+
+def _preflight_cors_headers(request: Request, store) -> dict[str, str]:
+    origin = request.headers.get("origin")
+    req_headers = request.headers.get("access-control-request-headers", "").lower()
+    if "authorization" in req_headers:
+        return cors_headers_for(origin, wildcard_fallback=True)
+    cfg = config(store, "owner")
+    route_token = getattr(request.state, "route_token", None)
+    if route_token and cfg["auth_mode"] in {"url_path", "local_open"}:
+        expected = peek_path_code(store, "creation-api:owner", "owner")
+        if expected and secrets.compare_digest(route_token, expected):
+            return check_weak_origin(request.headers, via_token=True)
+    if cfg["auth_mode"] == "local_open" and is_trusted_local_client(
+        request.scope, request.headers, allow_lan=bool(cfg.get("allow_lan"))
+    ):
+        return check_weak_origin(request.headers, via_token=False, allowed_origins=cfg.get("allowed_origins"))
+    return {}
+
+
+def _get_compat_app(studio_app):
+    cached = getattr(studio_app.state, "_creation_compat_app", None)
+    if cached is not None:
+        return cached
+    from fastapi import FastAPI
+
+    sub = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    sub.state = studio_app.state
+
+    @sub.exception_handler(APIError)
+    async def error(request: Request, exc: APIError):
+        headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+        cors = getattr(request.state, "cors_headers", None)
+        if cors:
+            headers.update(cors)
+        return JSONResponse(
+            {"error": {"type": exc.code, "message": exc.message}, "node_errors": {}},
+            status_code=exc.status,
+            headers=headers,
+        )
+
+    @sub.middleware("http")
+    async def private(request: Request, call_next):
+        if request.method == "OPTIONS":
+            try:
+                cors = _preflight_cors_headers(request, studio_app.state.store)
+            except APIError as exc:
+                return JSONResponse(
+                    {"error": {"type": exc.code, "message": exc.message}, "node_errors": {}},
+                    status_code=exc.status,
+                    headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+                )
+            headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", **cors}
+            return Response(status_code=204 if cors else 403, headers=headers)
+        response = await call_next(request)
+        response.headers.update({"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+        cors = getattr(request.state, "cors_headers", None)
+        if cors:
+            response.headers.update(cors)
+        return response
+
+    sub.include_router(compat)
+    studio_app.state._creation_compat_app = sub
+    return sub
+
+
+async def dispatch_creation_scope(studio_app, scope, receive, send, *, dedicated_port: bool = False) -> bool:
+    matched = match_gateway_route(
+        scope,
+        kind="creation",
+        dedicated_host_url=settings.creation_comfy_url,
+        dedicated_port=dedicated_port,
+    )
+    if matched is None:
+        return False
+    if scope["type"] == "websocket":
+        await send({"type": "websocket.close", "code": 1008})
+        return True
+    if scope["type"] != "http":
+        return False
+    rewritten = _strip_optional_compat_api_prefix(matched["scope"])
+    state = dict(rewritten.get("state") or {})
+    state["route_token"] = matched["route_token"]
+    rewritten = {**rewritten, "state": state}
+    compat_app = _get_compat_app(studio_app)
+    await compat_app(rewritten, receive, send)
+    return True
+
+
 class CreationHostMiddleware:
     def __init__(self, app, studio_app):
         self.app = app
         self.studio_app = studio_app
-        self.compat_app = None
 
     async def __call__(self, scope, receive, send):
-        host = next((value.decode("latin1").lower() for name, value in scope.get("headers", [])
-                     if name == b"host"), "")
-        target = urlsplit(settings.creation_comfy_url).netloc.lower()
-        if not target or host != target:
-            return await self.app(scope, receive, send)
-        if scope["type"] == "websocket":
-            await send({"type": "websocket.close", "code": 1008})
-            return
-        if scope["type"] != "http":
-            return await self.app(scope, receive, send)
-        if self.compat_app is None:
-            from fastapi import FastAPI
-
-            app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-            app.state = self.studio_app.state
-
-            @app.exception_handler(APIError)
-            async def error(request, exc):
-                return JSONResponse({"error": {"type": exc.code, "message": exc.message}, "node_errors": {}},
-                                    status_code=exc.status)
-
-            @app.middleware("http")
-            async def private(request, call_next):
-                response = await call_next(request)
-                response.headers.update({"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
-                return response
-
-            app.include_router(compat)
-            self.compat_app = app
-        await self.compat_app(scope, receive, send)
+        if scope["type"] in {"http", "websocket"}:
+            handled = await dispatch_creation_scope(self.studio_app, scope, receive, send, dedicated_port=False)
+            if handled:
+                return
+        await self.app(scope, receive, send)

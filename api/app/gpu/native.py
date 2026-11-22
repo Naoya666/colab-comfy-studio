@@ -165,8 +165,8 @@ def admit(repo, owner, body, key, *, api_key_id=None):
             raise APIError("NATIVE_INPUT", f"{field} 必须为正整数（分钟）", 422)
         timeouts[field] = value
     storage = model_storage(body, validate=True)
-    if not settings.native_comfy_url or not cfg.real_enabled:
-        raise APIError("NATIVE_DISABLED", "请先配置原生 ComfyUI 域名并启用真实 GPU", 503)
+    if (not settings.native_comfy_url and not settings.native_comfy_backend_url) or not cfg.real_enabled:
+        raise APIError("NATIVE_DISABLED", "请先配置原生 ComfyUI 隧道并启用真实 GPU", 503)
     backend()
     secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
     commit = os.getenv("NATIVE_COMFY_COMMIT", "")

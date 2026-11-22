@@ -4,9 +4,13 @@
 
 ## 部署与连接
 
-1. 将创作 API 域名的 DNS 指向 Studio VPS。设置 `CREATION_COMFY_URL=https://comfy-api.example.com`，给该域名配置 TLS，保留转发时的 `Host`，将请求代理给 Studio API。
-2. 运行数据库迁移并重启 Studio API、Worker 和 watchdog。管理员在创作页保存 Colab 账号、GPU、实例策略和超时。
-3. SillyTavern 1.19.0 的生成、轮询、取图和探测请求需要通过注入 Bearer Key 的私网中继。将 [nginx 中继示例](deploy/sillytavern-creation.nginx.conf.example) 部署到酒馆可达的位置，再把中继地址填入酒馆的 ComfyUI 设置。普通 HTTP 客户端可以直接请求创作 API 域名，在每次请求中带专用 Key。
+创作 API 在「创作 → API 设置」提供三档并存的鉴权模式（切换弱鉴权后，既有专用 Key 仍可按各自权限独立使用）：
+
+1. **强鉴权（默认，专用 API Key）**：客户端携带 `Authorization: Bearer <专用 Key>` 访问独立域名或同端口子路径 `<SITE_URL>/comfy/creation`。
+2. **弱鉴权（URL 路径短码，免中继直连推荐）**：直接将短码嵌入接入地址（同端口子路径 `<SITE_URL>/comfy/c/<短码>` 或独立域名 `<CREATION_COMFY_URL>/t/<短码>`）。SillyTavern、柏宝绘等不支持自定义请求头的客户端只需填写该 URL 即可浏览器直连或服务端转发，无需部署 Nginx 中继；支持随时一键重置路径短码。
+3. **免鉴权（本机 / 受信内网直连）**：直接使用 `<SITE_URL>/comfy/creation` 或独立监听端口（如 `http://127.0.0.1:8189`）免密直连，默认仅放行本机回环源 IP（可按需勾选允许局域网/容器私网，并支持配置前端 Origin 白名单）。
+
+默认可通过 Studio 同端口子路径直接接入，无需配置独立域名；遇到不允许填子路径的客户端插件时，可在「创作 → API 设置」填写 `1024–65535` 独立监听端口。弱鉴权通道默认自动开放所有当前激活（`active`）的发布版本，也可切换为仅开放手动勾选的版本。
 
 ## 提交与预热
 

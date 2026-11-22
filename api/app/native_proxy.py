@@ -1,4 +1,4 @@
-"""Full host reverse proxy adapted from FireTable/comfy-colab-kit apps/gate/proxy.py.
+"""Full host and subpath/port reverse proxy adapted from FireTable/comfy-colab-kit apps/gate/proxy.py.
 
 MIT design attribution: docs/licenses/comfy-colab-kit.txt. FastAPI/httpx adapter;
 no frontend rewriting, raw encoded paths, streamed bodies, binary WebSockets.
@@ -10,16 +10,24 @@ import json
 import secrets
 import time
 import uuid
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode
 
 import httpx
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
+from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake
 
 from . import native_api, native_model_api
+from .api_access import (
+    check_weak_origin,
+    cors_headers_for,
+    is_native_blocked_path,
+    is_trusted_local_client,
+    match_gateway_route,
+    peek_path_code,
+)
 from .common import APIError
 from .config import settings
 from .gpu import native
@@ -62,7 +70,7 @@ def identity(headers, cookies):
     if auth.startswith("Bearer ") and settings.studio_api_token and secrets.compare_digest(auth[7:], settings.studio_api_token):
         return "owner"
     value = read_session(cookies.get("studio_native", ""))
-    if value and value.get("purpose") == "native-session" and value.get("aud") == settings.native_comfy_url.rstrip("/"):
+    if settings.native_comfy_url and value and value.get("purpose") == "native-session" and value.get("aud") == settings.native_comfy_url.rstrip("/"):
         return value.get("uid")
     return None
 
@@ -73,9 +81,8 @@ def check_origin(headers):
         raise APIError("CSRF_ORIGIN", "跨站请求被拒绝", 403)
 
 
-class NativeHostMiddleware:
-    def __init__(self, app, studio_app):
-        self.app = app
+class NativeGateway:
+    def __init__(self, studio_app):
         self.studio_app = studio_app
         self._http_client = None
 
@@ -87,24 +94,51 @@ class NativeHostMiddleware:
             )
         return self._http_client
 
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "lifespan":
-            try:
-                return await self.app(scope, receive, send)
-            finally:
-                if self._http_client is not None:
-                    await self._http_client.aclose()
-                    self._http_client = None
-        if scope["type"] not in {"http", "websocket"} or not settings.native_comfy_url:
-            return await self.app(scope, receive, send)
-        headers = httpx.Headers(scope["headers"])
-        if headers.get("host", "").lower() != urlsplit(settings.native_comfy_url).netloc.lower():
-            return await self.app(scope, receive, send)
+    async def close(self):
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
+
+    def _resolve_weak_access(self, repo, scope, headers, route_token: str | None) -> tuple[str, dict, dict[str, str]]:
+        owner = "owner"
+        pol = native_api.policy(repo.store, owner)
+        if route_token:
+            if pol["auth_mode"] not in {"url_path", "local_open"}:
+                raise APIError("UNAUTHENTICATED", "当前未启用原生 ComfyUI 路径短码模式", 401)
+            expected = peek_path_code(repo.store, f"native-api:{owner}", owner)
+            if not expected or not secrets.compare_digest(route_token, expected):
+                raise APIError("UNAUTHENTICATED", "原生 ComfyUI 路径短码无效或已重置", 401)
+            cors = check_weak_origin(headers, via_token=True)
+            return owner, pol, cors
+
+        if pol["auth_mode"] != "local_open":
+            raise APIError("UNAUTHENTICATED", "请从 Studio 的原生 ComfyUI 入口登录，API 使用 Bearer Token", 401)
+        if not is_trusted_local_client(scope, headers, allow_lan=bool(pol.get("allow_lan"))):
+            raise APIError(
+                "UNAUTHENTICATED",
+                "当前仅允许本机免密访问；局域网/容器互通请开启「允许局域网/容器私网访问」或改用 URL 路径短 Token 模式",
+                401,
+            )
+        cors = check_weak_origin(headers, via_token=False, allowed_origins=pol.get("allowed_origins"))
+        return owner, pol, cors
+
+    def _preflight_cors(self, repo, scope, headers, route_token: str | None) -> dict[str, str]:
+        req_headers = headers.get("access-control-request-headers", "").lower()
+        if "authorization" in req_headers:
+            return cors_headers_for(headers.get("origin"), wildcard_fallback=True)
+        _, _, cors = self._resolve_weak_access(repo, scope, headers, route_token)
+        return cors
+
+    async def handle(self, scope, receive, send, *, entry: str, route_token: str | None):
         if scope["type"] == "websocket":
-            return await self.websocket(scope, receive, send)
+            return await self.websocket(scope, receive, send, route_token=route_token)
+        headers = httpx.Headers(scope["headers"])
         request = Request(scope, receive)
+        cors_headers: dict[str, str] = {}
         try:
             if scope["path"] == "/_studio/session":
+                if entry != "host" or not settings.native_comfy_url:
+                    raise APIError("NOT_FOUND", "接口不存在", 404)
                 if request.method != "POST" or headers.get("origin", "").rstrip("/") != settings.site_url.rstrip("/"):
                     raise APIError("CSRF_ORIGIN", "请从 Studio 打开原生 ComfyUI", 403)
                 raw = await request.body()
@@ -118,24 +152,52 @@ class NativeHostMiddleware:
                 token = sign_session({"uid": ticket["uid"], "aud": ticket["aud"], "purpose": "native-session",
                                       "iat": now, "exp": now + 43200})
                 response = RedirectResponse("/", status_code=303)
-                response.set_cookie("studio_native", token, max_age=43200, secure=True, httponly=True, samesite="strict")
+                is_https = settings.native_comfy_url.startswith("https://")
+                response.set_cookie("studio_native", token, max_age=43200, secure=is_https, httponly=True, samesite="strict")
                 response.headers["Cache-Control"] = "no-store"
                 return await response(scope, receive, send)
+
             repo = self.studio_app.state.repo
+            if request.method == "OPTIONS" and headers.get("access-control-request-method"):
+                cors_headers = self._preflight_cors(repo, scope, headers, route_token)
+                return await Response(
+                    status_code=204 if cors_headers else 403,
+                    headers={"Cache-Control": "no-store", **cors_headers},
+                )(scope, receive, send)
+
             auth = headers.get("authorization", "")
             key = None
+            weak_policy = None
             if auth.startswith("Bearer nca_") and not (
                 settings.studio_api_token and secrets.compare_digest(auth[7:], settings.studio_api_token)
             ):
                 key = await asyncio.to_thread(native_api.authenticate, repo.store, auth[7:])
+                cors_headers = cors_headers_for(headers.get("origin"), wildcard_fallback=True)
             owner = key["owner_id"] if key else identity(headers, request.cookies)
             if not owner:
-                raise APIError("UNAUTHENTICATED", "请从 Studio 的原生 ComfyUI 入口登录，API 使用 Bearer Token", 401)
+                owner, weak_policy, cors_headers = await asyncio.to_thread(
+                    self._resolve_weak_access, repo, scope, headers, route_token
+                )
+
             internal_path = scope["path"].removeprefix("/api").rstrip("/")
             if internal_path == "/studio_native/index" or internal_path.startswith("/studio_native/models"):
                 raise APIError("NOT_FOUND", "接口不存在", 404)
-            if request.method not in {"GET", "HEAD", "OPTIONS"}:
-                check_origin(headers)
+
+            if weak_policy is not None:
+                if scope["path"] == "/_studio/api/status":
+                    lease = await asyncio.to_thread(native.active_lease, repo, owner)
+                    return await JSONResponse(
+                        {"ready": bool(lease and lease.get("native_ready") and not native.restart_active(lease))},
+                        headers={"Cache-Control": "no-store", **cors_headers},
+                    )(scope, receive, send)
+                if is_native_blocked_path(scope["path"], scope.get("raw_path")):
+                    raise APIError("NATIVE_API_FORBIDDEN", "弱鉴权模式禁止访问 ComfyUI-Manager 与节点管理接口", 403)
+            elif request.method not in {"GET", "HEAD", "OPTIONS"}:
+                if key:
+                    cors_headers = cors_headers_for(headers.get("origin"), wildcard_fallback=True)
+                else:
+                    check_origin(headers)
+
             path, file, payload = None, None, None
             if key:
                 path = native_api.scope_path(scope["path"], request.method, scope["query_string"])
@@ -144,27 +206,42 @@ class NativeHostMiddleware:
             if (path or scope["path"]) == "/_studio/api/status":
                 return await JSONResponse(
                     {"ready": bool(lease and lease.get("native_ready") and not native.restart_active(lease))},
-                    headers={"Cache-Control": "no-store"},
+                    headers={"Cache-Control": "no-store", **cors_headers},
                 )(scope, receive, send)
+
             submit = request.method == "POST" and scope["path"] in {"/prompt", "/api/prompt"}
             if key and submit:
                 _, graph = await self.read_prompt(request)
                 payload = json.dumps(native_api.submission(key, graph), allow_nan=False).encode()
+            elif weak_policy is not None and submit and weak_policy.get("weak_workflow_mode") == "approved":
+                _, graph = await self.read_prompt(request)
+                payload = json.dumps(native_api.weak_submission(weak_policy, graph), allow_nan=False).encode()
+
             if lease and submit and not lease.get("native_ready"):
                 await self.check_stopping(repo, lease, owner)
             if not lease or not lease.get("native_ready"):
-                if not submit or (not key and not (
+                is_admin_token = bool(
                     settings.studio_api_token and auth.startswith("Bearer ")
                     and secrets.compare_digest(auth[7:], settings.studio_api_token)
-                )):
+                )
+                if not submit or (not key and not is_admin_token and weak_policy is None):
                     raise APIError("NATIVE_NOT_READY", "请在 Studio 启动原生 ComfyUI", 503)
                 if not key:
-                    values = await asyncio.to_thread(native_api.policy, repo.store, owner)
+                    values = weak_policy or await asyncio.to_thread(native_api.policy, repo.store, owner)
                     if not values["auto_start"]:
                         raise APIError("NATIVE_NOT_READY", "请在 Studio 启动原生 ComfyUI", 503)
-                    payload, graph = await self.read_prompt(request)
-                    native_api.submission({"mode": "trusted"}, graph)
-                lease = await self.wait_for_start(request, repo, owner, key)
+                    if payload is None:
+                        raw_bytes, graph = await self.read_prompt(request)
+                        if weak_policy is not None:
+                            native_api.weak_submission(weak_policy, graph)
+                            payload = raw_bytes
+                        else:
+                            native_api.submission({"mode": "trusted"}, graph)
+                            payload = raw_bytes
+                lease = await self.wait_for_start(
+                    request, repo, owner, key,
+                    api_key_label="weak-api" if weak_policy is not None else None,
+                )
             if request.method not in {"GET", "HEAD", "OPTIONS"} and scope["path"] not in {"/interrupt", "/api/interrupt", "/queue", "/api/queue"}:
                 await self.check_stopping(repo, lease, owner)
             if key:
@@ -189,12 +266,18 @@ class NativeHostMiddleware:
                 local = storage["model_storage_mode"] == "local"
             if local and submit and payload is None:
                 payload, _ = await self.read_prompt(request, limit=16 * 1024**2)
-            return await self.http(request, lease, scope, receive, send, key=key, path=path, file=file,
-                                   payload=payload, local=local)
+            return await self.http(
+                request, lease, scope, receive, send,
+                key=key, path=path, file=file, payload=payload, local=local, cors_headers=cors_headers,
+            )
         except APIError as exc:
+            err_headers = {
+                "Cache-Control": "no-store",
+                **({"Retry-After": "5"} if exc.code == "NATIVE_STARTING" else {}),
+                **cors_headers,
+            }
             return await JSONResponse(
-                {"error": exc.code, "message": exc.message}, status_code=exc.status,
-                headers={"Cache-Control": "no-store", **({"Retry-After": "5"} if exc.code == "NATIVE_STARTING" else {})},
+                {"error": exc.code, "message": exc.message}, status_code=exc.status, headers=err_headers,
             )(scope, receive, send)
 
     @staticmethod
@@ -220,12 +303,17 @@ class NativeHostMiddleware:
             raise APIError("NATIVE_API_INPUT", "请求必须为有效的 JSON 工作流", 400) from exc
         return bytes(body), data
 
-    async def wait_for_start(self, request, repo, owner, key):
+    async def wait_for_start(self, request, repo, owner, key, *, api_key_label=None):
         deadline = time.monotonic() + native_api.START_WAIT_SECONDS
         admission_deadline = min(deadline, time.monotonic() + 2)
         while True:
             try:
-                job = await asyncio.to_thread(native_api.request_start, repo, owner, key)
+                if api_key_label:
+                    job = await asyncio.to_thread(
+                        native_api.request_start, repo, owner, key, api_key_label=api_key_label
+                    )
+                else:
+                    job = await asyncio.to_thread(native_api.request_start, repo, owner, key)
                 break
             except APIError as exc:
                 if exc.code != "SCHEDULER_BUSY" or time.monotonic() >= admission_deadline:
@@ -258,7 +346,11 @@ class NativeHostMiddleware:
         query = scope.get("query_string", b"").decode("ascii")
         return base + raw + ("?" + query if query else ""), base, auth
 
-    async def http(self, request, lease, scope, receive, send, *, key=None, path=None, file=None, payload=None, local=False):
+    async def http(
+        self, request, lease, scope, receive, send,
+        *, key=None, path=None, file=None, payload=None, local=False, cors_headers=None,
+    ):
+        cors_headers = cors_headers or {}
         url, base, auth = self.target(scope)
         if key:
             url = base + quote(path, safe="/")
@@ -321,7 +413,7 @@ class NativeHostMiddleware:
                             f"{r['category']}/{r['name']} · {r['error']}" for r in failures
                         )[:3000]
                         problem = {**model_problem(message), "models": state["models"]}
-                        return await JSONResponse(problem, status_code=422)(scope, receive, send)
+                        return await JSONResponse(problem, status_code=422, headers=cors_headers)(scope, receive, send)
                     if await request.is_disconnected():
                         return
                     fresh = await asyncio.to_thread(native.active_lease, repo, lease["owner_id"])
@@ -373,11 +465,16 @@ class NativeHostMiddleware:
                         item = data.get(prompt_id)
                         await asyncio.to_thread(native_api.register_outputs, repo.store, key, lease, item)
                         data = {prompt_id: item} if item is not None else {}
-                    return await JSONResponse(data, status_code=response.status_code, headers={"Cache-Control": "no-store"})(scope, receive, send)
+                    return await JSONResponse(
+                        data, status_code=response.status_code, headers={"Cache-Control": "no-store", **cors_headers}
+                    )(scope, receive, send)
                 response_headers = clean_headers(response.headers)
-                response_headers = [(k, v.replace(base, settings.native_comfy_url.rstrip("/")) if k.lower() == "location" else v)
+                public_origin = (settings.native_comfy_url or settings.site_url).rstrip("/")
+                response_headers = [(k, v.replace(base, public_origin) if k.lower() == "location" else v)
                                     for k, v in response_headers]
                 response_headers += [("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")]
+                for ck, cv in cors_headers.items():
+                    response_headers.append((ck, cv))
                 downstream = StreamingResponse(response.aiter_raw(), status_code=response.status_code)
                 downstream.raw_headers = [(k.lower().encode("latin1"), _header_bytes(k, v)) for k, v in response_headers]
                 downstream_started = True
@@ -387,7 +484,9 @@ class NativeHostMiddleware:
         except httpx.HTTPError:
             # Never include backend URLs/service credentials in browser-visible errors.
             if not downstream_started:
-                await JSONResponse({"error": "NATIVE_UPSTREAM_UNAVAILABLE"}, status_code=502)(scope, receive, send)
+                await JSONResponse(
+                    {"error": "NATIVE_UPSTREAM_UNAVAILABLE"}, status_code=502, headers=cors_headers
+                )(scope, receive, send)
         finally:
             stop_heartbeat.set()
             if heartbeat:
@@ -431,12 +530,20 @@ class NativeHostMiddleware:
             raise APIError("NATIVE_API_CONCURRENCY", "已达到此 Key 的并行任务上限，请等待任务完成", 429)
         return reservation
 
-    async def websocket(self, scope, receive, send):
+    async def websocket(self, scope, receive, send, *, route_token: str | None = None):
         ws = WebSocket(scope, receive, send)
         try:
+            repo = self.studio_app.state.repo
             owner = identity(ws.headers, ws.cookies)
-            check_origin(ws.headers)
-            lease = await asyncio.to_thread(native.active_lease, self.studio_app.state.repo, owner) if owner else None
+            if owner:
+                check_origin(ws.headers)
+            else:
+                if is_native_blocked_path(scope["path"], scope.get("raw_path")):
+                    return await ws.close(code=1008)
+                owner, _, _ = await asyncio.to_thread(
+                    self._resolve_weak_access, repo, scope, ws.headers, route_token
+                )
+            lease = await asyncio.to_thread(native.active_lease, repo, owner) if owner else None
             if not lease or not lease.get("native_ready"):
                 return await ws.close(code=1008)
             url, base, auth = self.target(scope)
@@ -469,7 +576,66 @@ class NativeHostMiddleware:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
         except (APIError, OSError, TimeoutError, ConnectionClosed, InvalidHandshake, WebSocketDisconnect):
-            pass
+            if ws.application_state.name == "CONNECTING":
+                await ws.close(code=1008)
         finally:
             if ws.application_state.name != "DISCONNECTED":
                 await ws.close(code=1011)
+
+
+def get_native_gateway(studio_app) -> NativeGateway:
+    gateway = getattr(studio_app.state, "_native_gateway", None)
+    if gateway is None:
+        gateway = NativeGateway(studio_app)
+        studio_app.state._native_gateway = gateway
+    return gateway
+
+
+async def dispatch_native_scope(studio_app, scope, receive, send, *, dedicated_port: bool = False) -> bool:
+    matched = match_gateway_route(
+        scope,
+        kind="native",
+        dedicated_host_url=settings.native_comfy_url,
+        dedicated_port=dedicated_port,
+    )
+    if matched is None:
+        return False
+    gateway = get_native_gateway(studio_app)
+    await gateway.handle(
+        matched["scope"], receive, send, entry=matched["entry"], route_token=matched["route_token"]
+    )
+    return True
+
+
+class NativeHostMiddleware:
+    def __init__(self, app, studio_app):
+        self.app = app
+        self.studio_app = studio_app
+
+    @property
+    def _http_client(self):
+        gateway = getattr(self.studio_app.state, "_native_gateway", None)
+        return gateway._http_client if gateway is not None else None
+
+    @_http_client.setter
+    def _http_client(self, value):
+        gateway = getattr(self.studio_app.state, "_native_gateway", None)
+        if gateway is not None:
+            gateway._http_client = value
+
+    def http_client(self):
+        return get_native_gateway(self.studio_app).http_client()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                gateway = getattr(self.studio_app.state, "_native_gateway", None)
+                if gateway is not None:
+                    await gateway.close()
+        if scope["type"] in {"http", "websocket"}:
+            handled = await dispatch_native_scope(self.studio_app, scope, receive, send, dedicated_port=False)
+            if handled:
+                return
+        return await self.app(scope, receive, send)

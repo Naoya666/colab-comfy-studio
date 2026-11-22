@@ -9,6 +9,7 @@ import time
 import uuid
 from urllib.parse import parse_qsl
 
+from .api_access import AUTH_MODES, normalize_origins, validate_listen_port
 from .common import APIError
 from .db import utc_isoformat, utcnow
 from .gpu import native
@@ -19,6 +20,7 @@ KEYS = "native_api_keys"
 PROMPTS = "native_api_prompts"
 KEY_PATTERN = re.compile(r"nca_([0-9a-f]{32})\.[A-Za-z0-9_-]{43}")
 PROMPT_ID = re.compile(r"[a-zA-Z0-9_-]{1,64}")
+CLIENT_ID = re.compile(r"[a-zA-Z0-9_.:-]{1,128}")
 MAX_WORKFLOW_BYTES = 1024 * 1024
 START_WAIT_SECONDS = 25
 RATE_PER_MINUTE = 20
@@ -29,23 +31,58 @@ NUMBER_MARKERS = {"%seed%": (0, 2**53 - 1), "%width%": (64, 2048), "%height%": (
 
 
 def policy(store, owner):
-    row = store.get("settings", f"native-api:{owner}", owner) or {}
-    return {"auto_start": False, "account_id": None, "gpu": None,
-            **native.timeout_options()["defaults"], **native.model_storage(), **row.get("policy", {})}
+    try:
+        row = store.get("settings", f"native-api:{owner}", owner) or {}
+    except TypeError:
+        row = store.get("settings", f"native-api:{owner}") or {}
+    saved = row.get("policy", {}) if isinstance(row, dict) and isinstance(row.get("policy"), dict) else {}
+    return {
+        "auto_start": False,
+        "account_id": None,
+        "gpu": None,
+        "auth_mode": "strict",
+        "allow_lan": False,
+        "listen_port": None,
+        "weak_workflow_mode": "trusted",
+        "weak_workflow": None,
+        "allowed_origins": [],
+        **native.timeout_options()["defaults"],
+        **native.model_storage(),
+        **saved,
+    }
 
 
-def save_policy(repo, owner, body):
+def validate_policy(repo, owner, body):
     previous = policy(repo.store, owner)
-    if set(body) - set(previous) or type(body.get("auto_start")) is not bool:
+    if set(body) - set(previous):
         raise APIError("NATIVE_API_INPUT", "API 启动设置无效")
+    merged = {**previous, **body}
+    if type(merged.get("auto_start")) is not bool:
+        raise APIError("NATIVE_API_INPUT", "API 启动设置无效")
+    if merged.get("auth_mode") not in AUTH_MODES:
+        raise APIError("NATIVE_API_INPUT", "鉴权模式无效")
+    if type(merged.get("allow_lan")) is not bool:
+        raise APIError("NATIVE_API_INPUT", "局域网开关必须为布尔值")
+    listen_port = validate_listen_port(merged.get("listen_port"), kind="native", store=repo.store, owner=owner)
+    allowed_origins = normalize_origins(merged.get("allowed_origins"))
+    weak_mode = merged.get("weak_workflow_mode")
+    weak_graph = merged.get("weak_workflow")
+    if weak_mode not in ("trusted", "approved"):
+        raise APIError("NATIVE_API_INPUT", "弱鉴权工作流权限模式无效")
+    if weak_mode == "approved":
+        if not is_graph(weak_graph):
+            raise APIError("NATIVE_API_INPUT", "限定工作流模式下必须提供有效的 ComfyUI API 格式模板")
+    else:
+        weak_graph = None
+
     timeouts = native.timeout_options()["defaults"]
     for field in timeouts:
-        value = body.get(field)
+        value = merged.get(field)
         if type(value) is not int or not 1 <= value <= 2**31 - 1:
             raise APIError("NATIVE_API_INPUT", f"{field} 必须为正整数（分钟）")
         timeouts[field] = value
-    account, gpu = body.get("account_id"), body.get("gpu")
-    if body["auto_start"]:
+    account, gpu = merged.get("account_id"), merged.get("gpu")
+    if merged["auto_start"]:
         from .compute_routes import _require_account
 
         if not account:
@@ -59,18 +96,40 @@ def save_policy(repo, owner, body):
             raise APIError("NATIVE_API_INPUT", str(exc)) from exc
     else:
         account, gpu = previous["account_id"], previous["gpu"]
-    values = {"auto_start": body["auto_start"], "account_id": account or None,
-              "gpu": gpu or None, **timeouts, **native.model_storage({**previous, **body}, validate=True)}
-    store = repo.store
+    return {
+        "auto_start": merged["auto_start"],
+        "account_id": account or None,
+        "gpu": gpu or None,
+        "auth_mode": merged["auth_mode"],
+        "allow_lan": merged["allow_lan"],
+        "listen_port": listen_port,
+        "weak_workflow_mode": weak_mode,
+        "weak_workflow": weak_graph,
+        "allowed_origins": allowed_origins,
+        **timeouts,
+        **native.model_storage(merged, validate=True),
+    }
+
+
+def persist_policy(store, owner, values):
     record_id = f"native-api:{owner}"
     with store.admission_lock() as acquired:
         if not acquired:
             raise APIError("NATIVE_API_BUSY", "API 设置正在保存，请重试", 503)
-        if store.get("settings", record_id, owner):
-            store.update("settings", record_id, {"policy": values}, owner)
+        existing = store.get("settings", record_id, owner)
+        patch = {"policy": values}
+        if values["auth_mode"] in {"url_path", "local_open"} and not (existing and existing.get("path_code")):
+            patch["path_code"] = secrets.token_urlsafe(18)
+        if existing:
+            store.update("settings", record_id, patch, owner)
         else:
-            store.create("settings", owner, {"policy": values}, record_id=record_id)
+            store.create("settings", owner, patch, record_id=record_id)
     return values
+
+
+def save_policy(repo, owner, body):
+    values = validate_policy(repo, owner, body)
+    return persist_policy(repo.store, owner, values)
 
 
 def public_key(row):
@@ -183,6 +242,18 @@ def submission(key, body):
             raise APIError("NATIVE_WORKFLOW_DENIED", "提交的工作流与此 Key 的获准模板不匹配", 403)
     # Queue priority and extra_data are reserved for native UI and admin clients.
     return {"prompt": graph}
+
+
+def weak_submission(pol, body):
+    """Validate prompt payload for weak/no-auth mode while preserving optional client_id for /ws tracking."""
+    result = submission(
+        {"mode": pol.get("weak_workflow_mode", "trusted"), "workflow": pol.get("weak_workflow")},
+        body,
+    )
+    client_id = body.get("client_id") if isinstance(body, dict) else None
+    if isinstance(client_id, str) and CLIENT_ID.fullmatch(client_id):
+        result["client_id"] = client_id
+    return result
 
 
 def scope_path(path, method, query):
@@ -298,7 +369,7 @@ def register_outputs(store, key, lease, item):
                 store.create(PROMPTS, key["owner_id"], {"lease_id": lease["id"]}, project_id=key["id"], record_id=ident)
 
 
-def request_start(repo, owner, key):
+def request_start(repo, owner, key, *, api_key_label=None):
     if key is not None:
         key = live_key(repo.store, key)
         if not key.get("auto_start"):
@@ -309,4 +380,4 @@ def request_start(repo, owner, key):
     body = {"account_id": values["account_id"], "spec": {"key": values["gpu"]},
             "retain_idle_minutes": values["retain_idle_minutes"], "max_runtime_minutes": values["max_runtime_minutes"], **native.model_storage(values)}
     return native.admit(repo, owner, body, f"native-api-start:{uuid.uuid4().hex}",
-                        api_key_id=key["id"] if key else "admin")
+                        api_key_id=key["id"] if key else (api_key_label or "admin"))

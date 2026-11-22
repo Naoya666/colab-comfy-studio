@@ -120,11 +120,13 @@ AI-Studio/<owner>/
 
 ## SillyTavern
 
-核查了实际克隆的 [SillyTavern/src/endpoints/stable-diffusion.js](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/src/endpoints/stable-diffusion.js)，其中 ComfyUI 的 ping、object_info、prompt、history、view 等 fetch 多数不带 Authorization；仅部分取消请求带 auth。因此不能要求其现有 ComfyUI 页面完成本站网页登录，或声称在一个 auth 输入框里填 Bearer 就都能成功。
+在「原生 ComfyUI → API 设置」支持三档并存的鉴权模式，并可配置同端口子路径或独立监听端口：
 
-在「原生 ComfyUI → API 设置」为自管的酒馆创建专用接入 Key，并按需启用开机权限。用 [同机中继配置](deploy/sillytavern-comfy.nginx.conf.example) 让中继监听 `127.0.0.1:8189` 并转发至本机 Studio API 端口。固定 `Host` 为原生 ComfyUI 域名，网关据此选择原生代理。把 Key 放到权限受限的 nginx include 文件，并在柏宝绘填写 `http://127.0.0.1:8189`。如果酒馆在另一台服务器，在那里运行中继并通过 HTTPS 请求原生域名。容器场景应使用仅酒馆容器可访问的私网中继。
+- **强鉴权（默认，专用 Key）**：客户端携带 `Authorization: Bearer <专用 Key>` 请求独立域名或 `<SITE_URL>/comfy/native`（仍可配合 [同机中继配置](deploy/sillytavern-comfy.nginx.conf.example) 为不支持请求头的旧客户端注入 Key）。
+- **弱鉴权（URL 路径短码，免中继推荐）**：使用 `<SITE_URL>/comfy/n/<短码>`（或独立域名 `<NATIVE_COMFY_URL>/t/<短码>`）。酒馆柏宝绘等插件无需部署 Nginx 中继，仅填写该 URL 即可完成探测、模型读取、排队、轮询与取图；支持一键重置短码。
+- **免鉴权（本机 / 受信内网直连）**：使用 `<SITE_URL>/comfy/native` 或在设置中启用的独立本地端口（如 `http://127.0.0.1:8188`），默认仅放行本机源 IP，可按需开启局域网/容器私网访问与前端 Origin 白名单。
 
-实际酒馆生成、轮询和取图仍需真实环境验证。离线测试覆盖管理员透明转发、专用 Key 的任务和产物归属，以及 API 冷启动等待超时。
+弱鉴权与免鉴权模式放开标准 ComfyUI 完整推理接口（含 `/ws` WebSocket 实时预览与进度、`/upload/image` 传图、`/queue`、`/interrupt`），同时硬性封禁 `/manager/*`、`/v2/manager/*`、`/customnode/*` 等节点管理与重启高危接口。
 
 ## 专用 API 接入
 

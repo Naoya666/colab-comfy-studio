@@ -62,8 +62,8 @@ uv run python scripts/offline_server.py --port 18788
 | 接口 | 用途 | 文档 |
 | --- | --- | --- |
 | Studio API | 上传素材、提交单任务或批次、查询进度、下载产物 | [调用文档](docs/API调用文档.md) · [Python 示例](docs/examples/studio_api_example.py) |
-| 创作 API | 使用专用 Key 切换已授权的发布工作流，可提前在 Colab 上预热，再由 SillyTavern 生成与取图 | [创作 API 接入](docs/CREATION_API.md) |
-| 原生 ComfyUI API | 使用专用 Key 调用 `/prompt`、`/history/{prompt_id}` 和 `/view`，支持自管的 SillyTavern 接入 | [专用 API 接入](docs/NATIVE_COMFYUI.md#专用-api-接入) · [SillyTavern 配置](docs/NATIVE_COMFYUI.md#sillytavern) |
+| 创作 API | 支持强 Key、URL 路径短码免中继、本机免密三档并存；可通过同端口子路径或独立监听端口由酒馆/柏宝绘直连出图 | [创作 API 接入](docs/CREATION_API.md) |
+| 原生 ComfyUI API | 支持三档鉴权、同端口子路径与独立监听端口；弱鉴权放开 `/ws` 与 `/upload/image` 等完整生成接口并隔离节点管理 | [专用 API 接入](docs/NATIVE_COMFYUI.md#专用-api-接入) · [SillyTavern 配置](docs/NATIVE_COMFYUI.md#sillytavern) |
 
 ## 开发与验证
 

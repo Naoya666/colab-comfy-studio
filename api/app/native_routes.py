@@ -1,4 +1,4 @@
-"""Studio control plane for native ComfyUI. Data plane lives on its own host."""
+"""Studio control plane for native ComfyUI. Data plane lives on its own host, subpath, or port."""
 import asyncio
 import re
 import time
@@ -9,13 +9,37 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 
 from . import native_api, native_model_api
+from .api_access import build_access_urls, get_or_create_path_code, peek_path_code, reset_path_code
 from .common import APIError, admin, current_user, ok
 from .config import settings
 from .gpu import native, native_restart
 from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
+from .port_listeners import probe_port_available
 from .security import sign_session
 
 router = APIRouter(prefix="/api/gpu/native")
+
+
+def _listener_status(app):
+    mgr = getattr(app.state, "port_listeners", None)
+    return mgr.status("native") if mgr else {"active": False, "host": None, "port": None, "error": None}
+
+
+def _access_metadata(store, owner: str, pol: dict) -> tuple[str | None, dict]:
+    code = (
+        get_or_create_path_code(store, f"native-api:{owner}", owner)
+        if pol.get("auth_mode") in {"url_path", "local_open"}
+        else peek_path_code(store, f"native-api:{owner}", owner)
+    )
+    urls = build_access_urls(
+        kind="native",
+        auth_mode=pol.get("auth_mode", "strict"),
+        path_code=code,
+        listen_port=pol.get("listen_port"),
+        dedicated_url=settings.native_comfy_url,
+        allow_lan=bool(pol.get("allow_lan")),
+    )
+    return code, urls
 
 
 @router.get("/api-settings")
@@ -23,11 +47,16 @@ def api_settings(request: Request, user=Depends(current_user)):
     admin(user)
     owner = user["id"]
     repo = request.app.state.repo
+    pol = native_api.policy(repo.store, owner)
+    path_code, urls = _access_metadata(repo.store, owner, pol)
     keys = repo.store.list(native_api.KEYS, owner)
     starts = [job for job in repo.list("jobs", owner) if job.get("native_api_key_id")]
     return ok({
-        "policy": native_api.policy(repo.store, owner),
+        "policy": pol,
         "url": settings.native_comfy_url.rstrip("/"),
+        "path_code": path_code,
+        "urls": urls,
+        "listener": _listener_status(request.app),
         "keys": [native_api.public_key(row) for row in keys],
         "recent_starts": [{"job_id": job["id"], "key_id": job["native_api_key_id"],
                            "state": job["state"], "created_at": job["created_at"]} for job in starts[:10]],
@@ -35,9 +64,38 @@ def api_settings(request: Request, user=Depends(current_user)):
 
 
 @router.put("/api-settings")
-def update_api_settings(body: dict, request: Request, user=Depends(current_user)):
+async def update_api_settings(body: dict, request: Request, user=Depends(current_user)):
     admin(user)
-    return ok(native_api.save_policy(request.app.state.repo, user["id"], body), request)
+    owner = user["id"]
+    repo = request.app.state.repo
+    values = await asyncio.to_thread(native_api.validate_policy, repo, owner, body)
+    mgr = getattr(request.app.state, "port_listeners", None)
+    if mgr is not None:
+        await mgr.apply("native", values["listen_port"], allow_lan=values["allow_lan"], strict=True)
+    elif values["listen_port"] is not None:
+        probe_port_available(values["listen_port"], allow_lan=values["allow_lan"])
+    saved = await asyncio.to_thread(native_api.persist_policy, repo.store, owner, values)
+    return ok(saved, request)
+
+
+@router.post("/api-settings/reset-code")
+def rotate_native_path_code(request: Request, user=Depends(current_user)):
+    admin(user)
+    owner = user["id"]
+    store = request.app.state.repo.store
+    pol = native_api.policy(store, owner)
+    code = reset_path_code(store, f"native-api:{owner}", owner)
+    urls = build_access_urls(
+        kind="native",
+        auth_mode=pol.get("auth_mode", "strict"),
+        path_code=code,
+        listen_port=pol.get("listen_port"),
+        dedicated_url=settings.native_comfy_url,
+        allow_lan=bool(pol.get("allow_lan")),
+    )
+    response = ok({"path_code": code, "urls": urls}, request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @router.post("/api-keys", status_code=201)
@@ -102,7 +160,7 @@ async def status(request: Request, user=Depends(current_user)):
             pass
     events = repo.list("events", user["id"]) if job else []
     can_restart = ready and native_restart.can_restart(repo, lease)
-    return ok({"configured": bool(settings.native_comfy_url), "url": settings.native_comfy_url,
+    return ok({"configured": bool(settings.native_comfy_url or settings.native_comfy_backend_url), "url": settings.native_comfy_url,
                "timeouts": native.timeout_options(), "model_storage_defaults": native.model_storage_defaults(),
                "model_storage_known": not lease or bool(lease.get("native_model_storage")),
                "model_storage": native.lease_storage(repo, lease) if lease else (
@@ -247,8 +305,10 @@ async def model_preparation(ident: str, request: Request, user=Depends(current_u
 def ticket(request: Request, user=Depends(current_user)):
     url = settings.native_comfy_url.rstrip("/")
     parsed = urlsplit(url)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.path or parsed.query or parsed.fragment:
-        raise APIError("NATIVE_CONFIG", "NATIVE_COMFY_URL 必须为独立 HTTPS 源地址", 503)
+    host = (parsed.hostname or "").lower()
+    is_local_http = parsed.scheme == "http" and (host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".localhost"))
+    if (parsed.scheme != "https" and not is_local_http) or not parsed.netloc or parsed.path or parsed.query or parsed.fragment:
+        raise APIError("NATIVE_CONFIG", "NATIVE_COMFY_URL 必须为独立 HTTPS 源地址（或本机 http://*.localhost 地址）", 503)
     now = int(time.time())
     return ok({"url": url + "/_studio/session",
                "ticket": sign_session({"uid": user["id"], "aud": url, "purpose": "native-handoff",

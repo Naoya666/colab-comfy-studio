@@ -78,7 +78,14 @@ async def lifespan(app):
         repo=app.state.repo, registry=Registry(app.state.repo), admit_job=admit_workbench
     )
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    yield
+    from .port_listeners import PortListenerManager
+
+    app.state.port_listeners = PortListenerManager(app)
+    await app.state.port_listeners.start_from_store(app.state.store)
+    try:
+        yield
+    finally:
+        await app.state.port_listeners.shutdown()
 
 
 app = FastAPI(title="Colab GPU Studio", version=__version__, lifespan=lifespan)
