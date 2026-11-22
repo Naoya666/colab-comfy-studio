@@ -557,20 +557,28 @@ def daily_spend(session, owner, date):
     return round(spent or 0, 6)
 
 
-def sessions(repo, owner, *, date=None, kind="all", limit=30, offset=0, active=False):
+def sessions_page(repo, owner, *, date=None, start_date=None, end_date=None, kind="all", limit=10, offset=0, active=False):
     now = time.time()
     model = GpuInstanceUsageSegmentRow
     kind_col = model.data["session_kind"].as_string()
+    day_col = model.data["local_date"].as_string()
     conditions = [
         model.owner_id == owner, kind_col.is_not(None),
         model.state.in_(("open",) if active else ("closed", "reconciling")),
     ]
     if date:
-        conditions.append(model.data["local_date"].as_string() == date)
+        conditions.append(day_col == date)
+    if start_date:
+        conditions.append(day_col >= start_date)
+    if end_date:
+        conditions.append(day_col <= end_date)
     if kind != "all":
         conditions.append(kind_col == kind)
     with repo.store.db_lock(), repo.store.Session() as session:
-        total = session.scalar(select(func.count()).select_from(model).where(*conditions))
+        total, total_actual = session.execute(
+            select(func.count(), func.coalesce(func.sum(model.data["actual_cu"].as_float()), 0.0))
+            .select_from(model).where(*conditions)
+        ).one()
         query = select(model).where(*conditions).order_by(
             model.data["started_at"].as_float().desc(), model.instance_id.desc(),
         ).limit(limit).offset(offset)
@@ -582,16 +590,24 @@ def sessions(repo, owner, *, date=None, kind="all", limit=30, offset=0, active=F
             values.append({**data, "instance_id": row.instance_id, "account_id": row.account_id, "state": row.state,
                            "elapsed_minutes": elapsed, "draining": bool(instance and instance.data.get("native_draining")),
                            "estimated_cu": round(elapsed * data["unit_rate"], 6) if data.get("unit_rate") is not None else None})
-    return values, total
+    return {
+        "sessions": values,
+        "total": int(total or 0),
+        "total_actual_cu": round(float(total_actual or 0.0), 6),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
-def usage_summary(repo, owner):
-    from .cu_guard import CuGuardService
+def sessions(repo, owner, *, date=None, start_date=None, end_date=None, kind="all", limit=10, offset=0, active=False):
+    page = sessions_page(
+        repo, owner, date=date, start_date=start_date, end_date=end_date,
+        kind=kind, limit=limit, offset=offset, active=active,
+    )
+    return page["sessions"], page["total"]
 
-    moment = time.time()
-    date = local_date(moment)
-    rows = repo.list("usage", owner)
-    values = snapshots(repo, owner)
+
+def _collect_daily_entries(session, rows, owner, *, today=None, start_date=None, end_date=None):
     daily = {}
     by_account = {}
 
@@ -601,55 +617,106 @@ def usage_summary(repo, owner):
         if account:
             totals = by_account.setdefault(account, {"today_actual_cu": 0.0, "history_actual_cu": 0.0})
             totals["history_actual_cu"] += units
-            if day == date:
+            if today and day == today:
                 totals["today_actual_cu"] += units
 
-    guard_service = CuGuardService(repo, lambda: moment)
-    with repo.store.db_lock(), repo.store.Session() as session:
-        cutover = setting(session, "cu-ledger-cutover").get("epoch")
-        anomalies = setting(session, f"cu-anomalies:{owner}").get("items", [])
-        ledger = GpuCcuLedgerRow
-        totals = select(ledger.local_date, ledger.account_id, func.sum(ledger.data["delta_spent"].as_float())).where(
-            ledger.owner_id == owner, ledger.state == "spend",
-        ).group_by(ledger.local_date, ledger.account_id)
-        for day, account, units in session.execute(totals):
-            add(day, account, units)
-        guard = guard_service.state_in(session, owner, today=round(daily.get(date, {}).get("actual_cu", 0), 6))
-        segments = GpuInstanceUsageSegmentRow
-        day_col = segments.data["local_date"].as_string()
-        counts = select(day_col, func.count()).where(
-            segments.owner_id == owner, segments.data["session_kind"].as_string().is_not(None),
-        ).group_by(day_col)
-        for day, count in session.execute(counts):
-            daily.setdefault(day, {"date": day, "actual_cu": 0.0, "sessions": 0})["sessions"] = count
-        active_count = session.scalar(select(func.count()).select_from(GpuLeaseRow).where(
-            GpuLeaseRow.owner_id == owner, GpuLeaseRow.state != "deleted",
-        ))
+    cutover = setting(session, "cu-ledger-cutover").get("epoch")
+    ledger = GpuCcuLedgerRow
+    ledger_conds = [ledger.owner_id == owner, ledger.state == "spend"]
+    if start_date:
+        ledger_conds.append(ledger.local_date >= start_date)
+    if end_date:
+        ledger_conds.append(ledger.local_date <= end_date)
+    totals = select(ledger.local_date, ledger.account_id, func.sum(ledger.data["delta_spent"].as_float())).where(
+        *ledger_conds,
+    ).group_by(ledger.local_date, ledger.account_id)
+    for day, account, units in session.execute(totals):
+        add(day, account, units)
+
+    segments = GpuInstanceUsageSegmentRow
+    day_col = segments.data["local_date"].as_string()
+    seg_conds = [segments.owner_id == owner, segments.data["session_kind"].as_string().is_not(None)]
+    if start_date:
+        seg_conds.append(day_col >= start_date)
+    if end_date:
+        seg_conds.append(day_col <= end_date)
+    counts = select(day_col, func.count()).where(*seg_conds).group_by(day_col)
+    for day, count in session.execute(counts):
+        if day:
+            daily.setdefault(day, {"date": day, "actual_cu": 0.0, "sessions": 0})["sessions"] = int(count or 0)
+
     legacy_measured = []
     for row in rows:
         if row.get("mock") or row.get("simulated") or row.get("provider") == "mock" or row.get("units_actual") is None:
             continue
-        moment = row.get("created_epoch") or row.get("stopped_at")
-        if moment is None:
-            moment = datetime.fromisoformat(row["created_at"]).timestamp()
-        if cutover is None or moment < cutover:
+        row_moment = row.get("created_epoch") or row.get("stopped_at")
+        if row_moment is None:
+            row_moment = datetime.fromisoformat(row["created_at"]).timestamp()
+        if cutover is None or row_moment < cutover:
             # Legacy usage contributes to history. The daily fuse uses only account ledger debits.
-            bucket = daily.setdefault(local_date(moment), {"date": local_date(moment), "actual_cu": 0.0, "sessions": 0})
-            bucket["legacy_actual_cu"] = bucket.get("legacy_actual_cu", 0.0) + row["units_actual"]
+            day = local_date(row_moment)
+            if start_date and day < start_date:
+                continue
+            if end_date and day > end_date:
+                continue
+            bucket = daily.setdefault(day, {"date": day, "actual_cu": 0.0, "sessions": 0})
+            bucket["legacy_actual_cu"] = round(bucket.get("legacy_actual_cu", 0.0) + row["units_actual"], 6)
             legacy_measured.append(row)
-    active, _ = sessions(repo, owner, active=True, limit=100)
-    recent, recent_count = sessions(repo, owner)
-    below = {row["account_id"] for row in guard["hard_tripped_accounts"]}
-    daily_history = [
+
+    entries = [
         {**entry, "actual_cu": round(entry["actual_cu"] + entry.get("legacy_actual_cu", 0), 6)}
         for _, entry in sorted(daily.items(), reverse=True)
     ]
+    today_ledger_cu = round(daily.get(today, {}).get("actual_cu", 0), 6) if today else 0.0
+    return entries, by_account, legacy_measured, today_ledger_cu
+
+
+def daily_history_page(repo, owner, *, start_date=None, end_date=None, limit=10, offset=0):
+    rows = repo.list("usage", owner)
+    with repo.store.db_lock(), repo.store.Session() as session:
+        entries, _, _, _ = _collect_daily_entries(
+            session, rows, owner, start_date=start_date, end_date=end_date,
+        )
+    total = len(entries)
+    return {
+        "days": entries[offset : offset + limit],
+        "total": total,
+        "total_actual_cu": round(sum(entry["actual_cu"] for entry in entries), 6),
+        "total_sessions": sum(int(entry.get("sessions") or 0) for entry in entries),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+def usage_summary(repo, owner):
+    from .cu_guard import CuGuardService
+
+    moment = time.time()
+    date = local_date(moment)
+    rows = repo.list("usage", owner)
+    values = snapshots(repo, owner)
+    guard_service = CuGuardService(repo, lambda: moment)
+    with repo.store.db_lock(), repo.store.Session() as session:
+        anomalies = setting(session, f"cu-anomalies:{owner}").get("items", [])
+        daily_history, by_account, legacy_measured, today_ledger_cu = _collect_daily_entries(
+            session, rows, owner, today=date,
+        )
+        guard = guard_service.state_in(session, owner, today=today_ledger_cu)
+        active_count = session.scalar(select(func.count()).select_from(GpuLeaseRow).where(
+            GpuLeaseRow.owner_id == owner, GpuLeaseRow.state != "deleted",
+        ))
+    active, _ = sessions(repo, owner, active=True, limit=100)
+    recent_page = sessions_page(repo, owner)
+    recent = recent_page["sessions"]
+    recent_count = recent_page["total"]
+    below = {row["account_id"] for row in guard["hard_tripped_accounts"]}
     history = round(sum(entry["actual_cu"] for entry in daily_history), 6)
     return {
         "timezone": settings.studio_timezone, "local_date": date,
         "today_actual_cu": guard["today_actual_cu"], "history_actual_cu": history,
         "daily_history": daily_history,
-        "active_sessions": active, "recent_sessions": recent, "recent_sessions_count": recent_count, "active_runtimes": active_count,
+        "active_sessions": active, "recent_sessions": recent, "recent_sessions_count": recent_count,
+        "recent_sessions_actual_cu": recent_page["total_actual_cu"], "active_runtimes": active_count,
         "guard": guard,
         "accounts": [{
             "account_id": key, "alias": value.get("alias"), "balance": value.get("balance"),

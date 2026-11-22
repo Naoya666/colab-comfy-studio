@@ -46,19 +46,61 @@ def put_cu_guard(body: dict, request: Request, user=Depends(current_user), st=De
     return ok(state, request)
 
 
+def _validate_date_range(start_date: LocalDate | None, end_date: LocalDate | None) -> tuple[str | None, str | None]:
+    if start_date and end_date and start_date > end_date:
+        raise APIError("INVALID_DATE_RANGE", "起始日期不能晚于终止日期", 422)
+    return (
+        start_date.isoformat() if start_date else None,
+        end_date.isoformat() if end_date else None,
+    )
+
+
 @router.get("/cu/sessions")
 def get_cu_sessions(
     request: Request,
     date: LocalDate | None = None,
+    start_date: LocalDate | None = None,
+    end_date: LocalDate | None = None,
     kind: Literal["all", "single_job", "smart_reuse", "native_comfy", "prep", "smoke"] = "all",
-    limit: int = Query(30, ge=1, le=100),
+    limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
     user=Depends(current_user),
     st=Depends(get_store),
 ):
-    rows, total = ccu.sessions(Repository(st), user["id"], date=date.isoformat() if date else None,
-                               kind=kind, limit=limit, offset=offset)
-    return ok({"sessions": rows, "total": total, "limit": limit, "offset": offset}, request)
+    start, end = _validate_date_range(start_date, end_date)
+    page = ccu.sessions_page(
+        Repository(st),
+        user["id"],
+        date=date.isoformat() if date else None,
+        start_date=start,
+        end_date=end,
+        kind=kind,
+        limit=limit,
+        offset=offset,
+    )
+    return ok(page, request)
+
+
+@router.get("/cu/daily")
+def get_cu_daily(
+    request: Request,
+    start_date: LocalDate | None = None,
+    end_date: LocalDate | None = None,
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
+    start, end = _validate_date_range(start_date, end_date)
+    page = ccu.daily_history_page(
+        Repository(st),
+        user["id"],
+        start_date=start,
+        end_date=end,
+        limit=limit,
+        offset=offset,
+    )
+    return ok(page, request)
 
 
 def _require_account(repo, owner_id: str, account_id: str | None, *, require_allocation: bool = True) -> dict | None:

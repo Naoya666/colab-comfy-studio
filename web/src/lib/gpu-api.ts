@@ -125,6 +125,27 @@ export interface CuSession {
   draining: boolean;
   jobs: { job_id: string; workflow_key?: string | null; state: string; execution_seconds: number; actual_cu: number }[];
 }
+export interface CuDailyEntry {
+  date: string;
+  actual_cu: number;
+  legacy_actual_cu?: number;
+  sessions: number;
+}
+export interface CuSessionsPage {
+  sessions: CuSession[];
+  total: number;
+  total_actual_cu: number;
+  limit: number;
+  offset: number;
+}
+export interface CuDailyPage {
+  days: CuDailyEntry[];
+  total: number;
+  total_actual_cu: number;
+  total_sessions: number;
+  limit: number;
+  offset: number;
+}
 export interface CcuBalance {
   total_balance: number | null;
   snapshots: Record<string, CcuSnapshot>;
@@ -139,10 +160,11 @@ export interface GpuUsage {
   active_runtimes?: number;
   guard?: CuGuard;
   accounts?: CuAccount[];
-  daily_history?: { date: string; actual_cu: number; legacy_actual_cu?: number; sessions: number }[];
+  daily_history?: CuDailyEntry[];
   active_sessions?: CuSession[];
   recent_sessions?: CuSession[];
   recent_sessions_count?: number;
+  recent_sessions_actual_cu?: number;
   ccu?: {
     total_balance?: number | null;
     sampled_at?: number | null;
@@ -304,10 +326,42 @@ export const getGpuGallery = (projectId: string) => apiFetch<GalleryAsset[]>(`/a
 export const getGpuUsage = () => apiFetch<GpuUsage>('/api/gpu/usage', { cache: 'no-store' });
 export const saveCuGuard = (limits: Pick<CuGuard, 'daily_limit_cu' | 'min_balance_cu'>) =>
   apiFetch<CuGuard>('/api/gpu/cu/guard', { method: 'PUT', body: JSON.stringify(limits) });
-export function getCuSessions({ kind, date, limit, offset }: { kind: CuSessionKind | 'all'; date: string; limit: number; offset: number }) {
+export function getCuSessions({
+  kind,
+  date,
+  startDate,
+  endDate,
+  limit,
+  offset,
+}: {
+  kind: CuSessionKind | 'all';
+  date?: string;
+  startDate?: string;
+  endDate?: string;
+  limit: number;
+  offset: number;
+}) {
   const query = new URLSearchParams({ kind, limit: String(limit), offset: String(offset) });
   if (date) query.set('date', date);
-  return apiFetch<{ sessions: CuSession[]; total: number }>(`/api/gpu/cu/sessions?${query}`, { cache: 'no-store' });
+  if (startDate) query.set('start_date', startDate);
+  if (endDate) query.set('end_date', endDate);
+  return apiFetch<CuSessionsPage>(`/api/gpu/cu/sessions?${query}`, { cache: 'no-store' });
+}
+export function getCuDaily({
+  startDate,
+  endDate,
+  limit,
+  offset,
+}: {
+  startDate?: string;
+  endDate?: string;
+  limit: number;
+  offset: number;
+}) {
+  const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (startDate) query.set('start_date', startDate);
+  if (endDate) query.set('end_date', endDate);
+  return apiFetch<CuDailyPage>(`/api/gpu/cu/daily?${query}`, { cache: 'no-store' });
 }
 export const queryCcuBalance = () => apiFetch<CcuBalance>('/api/gpu/compute/cu-balance', { cache: 'no-store' }, 60000);
 export const getGpuSettings = () => apiFetch<GpuSettings>('/api/gpu/settings');

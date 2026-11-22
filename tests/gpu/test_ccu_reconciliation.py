@@ -313,3 +313,93 @@ def test_cu_guard_http_validates_and_persists_owner_limits(tmp_path, monkeypatch
     assert client.put(path, json={"daily_limit_cu": None}).status_code == 403
     user["role"] = "admin"
     assert client.put(path, json={"daily_limit_cu": None, "min_balance_cu": None}).json()["data"]["status"] == "ok"
+
+
+def test_cu_sessions_and_daily_pagination_and_date_range(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from app.common import current_user, get_store
+    from app.config import settings
+    from app.main import app
+    from fastapi.testclient import TestClient
+
+    repo = make_repo(tmp_path)
+    monkeypatch.setattr(settings, "studio_timezone", "Asia/Shanghai")
+    monkeypatch.setattr(ccu, "sampling_enabled", lambda: False)
+    repo.create("accounts", OWNER, {"enabled": True}, record_id="acc-1")
+
+    tz = ZoneInfo("Asia/Shanghai")
+    base_day = datetime(2026, 11, 1, 10, 0, tzinfo=tz)
+    balance = 100.0
+    sample(repo, balance, (base_day - timedelta(days=1)).timestamp())
+
+    # Create 12 distinct days, each with 1 closed session (alternating kind) and 1.0 CU debit.
+    for idx in range(12):
+        ts = (base_day + timedelta(days=idx)).timestamp()
+        kind = "native_comfy" if idx % 2 == 0 else "single_job"
+        open_session(repo, f"inst-{idx:02d}", kind, ts)
+        balance = round(balance - 1.0, 6)
+        sample(repo, balance, ts + 60)
+        ccu.close_instance_session(repo, OWNER, f"inst-{idx:02d}", ts + 120, "confirmed_delete")
+
+    monkeypatch.setitem(app.dependency_overrides, current_user, lambda: {"id": OWNER})
+    monkeypatch.setitem(app.dependency_overrides, get_store, lambda: repo.store)
+    client = TestClient(app)
+
+    # /api/gpu/usage defaults recent_sessions to 10 items while reporting full count & actual total.
+    usage = client.get("/api/gpu/usage").json()["data"]
+    assert len(usage["recent_sessions"]) == 10
+    assert usage["recent_sessions_count"] == 12
+    assert usage["recent_sessions_actual_cu"] == pytest.approx(12.0)
+
+    # /api/gpu/cu/sessions defaults to limit=10 and supports offset pagination.
+    p1 = client.get("/api/gpu/cu/sessions").json()["data"]
+    assert p1["limit"] == 10 and p1["offset"] == 0
+    assert len(p1["sessions"]) == 10 and p1["total"] == 12
+    assert p1["total_actual_cu"] == pytest.approx(12.0)
+
+    p2 = client.get("/api/gpu/cu/sessions", params={"offset": 10}).json()["data"]
+    assert len(p2["sessions"]) == 2 and p2["total"] == 12
+    assert {row["instance_id"] for row in p1["sessions"]}.isdisjoint({row["instance_id"] for row in p2["sessions"]})
+
+    # Date range + kind filtering on sessions.
+    filtered = client.get(
+        "/api/gpu/cu/sessions",
+        params={"start_date": "2026-11-03", "end_date": "2026-11-07", "kind": "native_comfy"},
+    ).json()["data"]
+    assert filtered["total"] == 3  # Nov 3 (idx 2), Nov 5 (idx 4), Nov 7 (idx 6)
+    assert filtered["total_actual_cu"] == pytest.approx(3.0)
+    assert [row["local_date"] for row in filtered["sessions"]] == ["2026-11-07", "2026-11-05", "2026-11-03"]
+
+    # Invalid date range returns 422 on both endpoints.
+    assert client.get(
+        "/api/gpu/cu/sessions",
+        params={"start_date": "2026-11-10", "end_date": "2026-11-05"},
+    ).status_code == 422
+    assert client.get(
+        "/api/gpu/cu/daily",
+        params={"start_date": "2026-11-10", "end_date": "2026-11-05"},
+    ).status_code == 422
+
+    # /api/gpu/cu/daily defaults to 10 days per page with full range totals.
+    d1 = client.get("/api/gpu/cu/daily").json()["data"]
+    assert d1["limit"] == 10 and d1["offset"] == 0
+    assert len(d1["days"]) == 10 and d1["total"] == 12
+    assert d1["total_actual_cu"] == pytest.approx(12.0)
+    assert d1["total_sessions"] == 12
+    assert d1["days"][0]["date"] == "2026-11-12"
+
+    d2 = client.get("/api/gpu/cu/daily", params={"offset": 10}).json()["data"]
+    assert [day["date"] for day in d2["days"]] == ["2026-11-02", "2026-11-01"]
+    assert d2["total"] == 12
+
+    # Date range filtering on daily summary.
+    dr = client.get(
+        "/api/gpu/cu/daily",
+        params={"start_date": "2026-11-04", "end_date": "2026-11-06"},
+    ).json()["data"]
+    assert [day["date"] for day in dr["days"]] == ["2026-11-06", "2026-11-05", "2026-11-04"]
+    assert dr["total"] == 3
+    assert dr["total_actual_cu"] == pytest.approx(3.0)
+    assert dr["total_sessions"] == 3

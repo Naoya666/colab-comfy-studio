@@ -638,3 +638,48 @@
 }
 
 .cuSessionTiming { display: block; font-size: .8rem; color: var(--muted); }
+.cuSectionHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cuSectionHead h3 { font-size: 0.92rem; font-weight: 600; }
+.cuFilters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  align-items: end;
+}
+.cuRangeSummary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+.cuRangeSummary strong { font-weight: 600; color: var(--text); }
+.cuRangeMetrics {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--text-2);
+}
+.cuPager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
