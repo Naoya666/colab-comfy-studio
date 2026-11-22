@@ -375,6 +375,21 @@ def test_zero_gpu_diagnose_detects_pass_leak_bad_token_and_proxy(env_app, monkey
     assert "Service Token" in by_id3["backend_access"]["detail"]
     assert by_id3["public_web_url"]["status"] == "fail"
 
+    # Case 4: Nginx IP whitelist returns 403 HTML to VPS loopback probe -> warning (not hard failure)
+    def ip_whitelist_handler(req: httpx.Request) -> httpx.Response:
+        if req.url.host == "backend.example.test":
+            if req.headers.get("CF-Access-Client-Secret") == "csec-valid":
+                return httpx.Response(530)
+            return httpx.Response(302)
+        return httpx.Response(403, text="<html>403 Forbidden</html>", headers={"Content-Type": "text/html"})
+
+    with httpx.Client(transport=httpx.MockTransport(ip_whitelist_handler)) as mock_client:
+        res4 = native_config.diagnose_setup(repo, "owner", client=mock_client)
+    assert res4["ok"] is True
+    assert res4["has_warnings"] is True
+    by_id4 = {c["id"]: c for c in res4["checks"]}
+    assert by_id4["public_web_url"]["status"] == "warn"
+
 
 def test_admit_succeeds_with_db_only_credentials(env_app):
     _, repo, _ = env_app

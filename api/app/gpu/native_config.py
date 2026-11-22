@@ -823,13 +823,15 @@ def diagnose_setup(repo, owner: str, *, client: httpx.Client | None = None) -> d
             headers = {
                 "CF-Access-Client-Id": cfg.access_client_id,
                 "CF-Access-Client-Secret": cfg.access_client_secret,
+                "User-Agent": "colab-gpu-studio-proxy/1.0",
             }
+            probe_ua = {"User-Agent": "colab-gpu-studio-proxy/1.0"}
             owns = client is None
             http = httpx.Client(timeout=8, follow_redirects=False) if owns else client
             try:
                 with ThreadPoolExecutor(max_workers=6) as pool:
                     unauth_futures = [
-                        (path, pool.submit(http.get, cfg.native_comfy_backend_url + path))
+                        (path, pool.submit(http.get, cfg.native_comfy_backend_url + path, headers=probe_ua))
                         for path in UNAUTHENTICATED_TUNNEL_PROBES
                     ]
                     auth_future = pool.submit(
@@ -932,7 +934,7 @@ def diagnose_setup(repo, owner: str, *, client: httpx.Client | None = None) -> d
                 owns = client is None
                 http = httpx.Client(timeout=8, follow_redirects=False) if owns else client
                 try:
-                    probe_headers = {}
+                    probe_headers = {"User-Agent": "colab-gpu-studio-proxy/1.0"}
                     if settings.studio_api_token:
                         probe_headers["Authorization"] = f"Bearer {settings.studio_api_token}"
                     resp = http.get(cfg.native_comfy_url + "/_studio/api/status", headers=probe_headers)
@@ -964,6 +966,14 @@ def diagnose_setup(repo, owner: str, *, client: httpx.Client | None = None) -> d
                         "status": "pass",
                         "detail": f"{cfg.native_comfy_url} DNS、HTTPS 与反向代理 Host 透传验证通过",
                     })
+                elif resp.status_code in {401, 403, 302, 307}:
+                    checks.append({
+                        "id": "public_web_url",
+                        "label": "原生网页反代域名",
+                        "status": "warn",
+                        "detail": f"DNS 与 HTTPS 正常，但服务端本机回连 {cfg.native_comfy_url} 返回 HTTP {resp.status_code}（可能被反代 IP 白名单、WAF 或前置认证网关拦截）",
+                        "hint": "若你在反代前配置了 IP 白名单、防火墙或外部登录网关，此提示属正常现象；请在你的受信浏览器中直接访问验证。若未配置前置限制，请核对 Nginx/Caddy 规则。",
+                    })
                 else:
                     checks.append({
                         "id": "public_web_url",
@@ -988,7 +998,7 @@ def diagnose_setup(repo, owner: str, *, client: httpx.Client | None = None) -> d
                     "hint": "可能是反向代理/TLS 尚未就绪，或云主机存在 NAT 回环限制；请先确认 Nginx/Caddy 配置已重载。",
                 })
 
-    ok_all = all(item["status"] in {"pass", "skip"} for item in checks)
+    ok_all = all(item["status"] != "fail" for item in checks)
     has_warnings = any(item["status"] == "warn" for item in checks)
     return {
         "ok": ok_all,
