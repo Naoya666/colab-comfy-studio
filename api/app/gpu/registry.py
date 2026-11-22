@@ -60,6 +60,10 @@ _PUBLISH_NODE_ALLOWLIST = {
     "MiniMaxH3ReferenceToVideo",
     "MiniMaxH3SigmaShift",
     "ConditioningKrea2Rebalance",
+    # Added for the Anima Aesthetic two-pass workflow (core nodes in ComfyUI v0.43.2).
+    "KSamplerAdvanced",
+    "ImageUpscaleWithModel",
+    "ImageScaleBy",
 }
 
 

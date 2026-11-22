@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import io
 import json
@@ -197,3 +198,66 @@ def test_standalone_queue_receives_only_verified_local_weights(tmp_path, monkeyp
     monkeypatch.setattr(worker, "_http_json", api)
     worker._run_comfy(root, {"snapshot": {}}, {**MANIFEST, "weight_files": [HF]}, {}, worker._Stages(root))
     assert [url.rsplit("/", 1)[-1] for url in calls] == ["system_stats", "prompt", "simulated"]
+
+
+def test_check_loras_and_restore_weights_support_chained_lora_loaders_and_upscale_pt(tmp_path, monkeypatch):
+    cache, calls = fake_sources(monkeypatch)
+    lora_names = [
+        "kazutake-hazano_v2_epoch28.safetensors",
+        "ningenmame_v1_epoch22.safetensors",
+        "748cm_TA_EP4 (1).safetensors",
+        "kazueru style for Anima.safetensors",
+        "p1ct01_v1_epoch20.safetensors",
+        "Anima_in_real_update_v2_epoch_20.safetensors",
+        "kiriaina_anima_style-000030.safetensors",
+        "luozhou_v1_epoch14.safetensors",
+        "anima-turbo-lora-v0.2.safetensors",
+    ]
+    weights = [
+        {"target": f"loras/{name}", "source": "drive", "drive_file_id": FILE_ID, "sha256": SHA, "size": len(DATA)}
+        for name in lora_names
+    ] + [
+        {"target": "upscale_models/4xUltrasharp_4xUltrasharpV10.pt", "source": "drive", "drive_file_id": FILE_ID, "sha256": SHA, "size": len(DATA)}
+    ]
+    graph = {
+        str(10 + idx): {
+            "class_type": "LoraLoader",
+            "inputs": {"lora_name": name, "strength_model": 0.5, "strength_clip": 0.5},
+        }
+        for idx, name in enumerate(lora_names)
+    }
+    graph["50"] = {"class_type": "UpscaleModelLoader", "inputs": {"model_name": "4xUltrasharp_4xUltrasharpV10.pt"}}
+    manifest = {"weight_files": weights}
+
+    worker._check_loras(graph, manifest, [])
+    with pytest.raises(worker.WorkerError, match="LoRA"):
+        worker._check_loras(graph, {"weight_files": weights[:-2]}, [])
+
+    records = worker._restore_weights(tmp_path, manifest, 60, cache, prep=False, use_drive_cache=False)
+    assert len(records) == 10
+    assert (tmp_path / "models/upscale_models/4xUltrasharp_4xUltrasharpV10.pt").read_bytes() == DATA
+    assert (tmp_path / "models/loras/748cm_TA_EP4 (1).safetensors").read_bytes() == DATA
+    assert (tmp_path / "models/loras/kazueru style for Anima.safetensors").read_bytes() == DATA
+
+    from app.gpu import model_dependencies as deps
+
+    scanned = deps.scan({"api_graph": graph, "manifest": manifest})
+    assert len(scanned) == 10
+    assert any(d["model_type"] == "upscale_models" and d["reference"] == "4xUltrasharp_4xUltrasharpV10.pt" for d in scanned)
+    lib_models = [
+        {
+            "id": f"m{idx}",
+            "model_type": "upscale_models" if item["target"].startswith("upscale_models/") else "loras",
+            "filename": Path(item["target"]).name,
+            "state": "ready",
+            "sha256": SHA,
+            "size": len(DATA),
+            "drive_file_id": FILE_ID,
+        }
+        for idx, item in enumerate(weights)
+    ]
+    matched = deps.match(scanned, lib_models)
+    assert all(d["status"] == "matched" for d in matched)
+    snapshot = {"manifest": copy.deepcopy(manifest), "bound_graph": copy.deepcopy(graph)}
+    out = deps.runtime_copy(snapshot, matched, lib_models)
+    assert len(out["manifest"]["weight_files"]) == 10

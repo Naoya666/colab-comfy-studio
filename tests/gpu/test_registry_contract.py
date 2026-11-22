@@ -261,3 +261,151 @@ def test_registry_bootstrap_is_idempotent_under_concurrency(tmp_path):
     registry = Registry(repo)
     assert len([row for row in registry.models("owner") if row["model_id"] == "demo-mock"]) == 1
     assert len([row for row in registry.workflows("owner") if row["workflow_key"] == "demo-mock"]) == 1
+
+
+def _publish_fixture_with_graph(tmp_path, graph, info, key="anima-hires"):
+    from app import review_routes
+
+    repo = Repository(_store(tmp_path))
+    registry = Registry(repo)
+    repo.create(
+        "models",
+        "owner",
+        {
+            "model_id": "real",
+            "revision": "b" * 40,
+            "enabled": True,
+            "is_mock": False,
+            "license_status": "approved",
+        },
+    )
+    manifest = {
+        "workflow_key": key,
+        "model_id": "real",
+        "version": "1.0.0",
+        "parameters": {
+            "prompt": {"type": "string", "binding": {"node": "20", "input": "text"}, "default": "demo"},
+            "seed": {"type": "integer", "binding": {"node": "40", "input": "noise_seed"}, "default": 1, "min": 0, "max": 9999},
+        },
+        "dependencies": {
+            "comfyui_commit": "a" * 40,
+            "custom_nodes": [],
+            "weight_files": [],
+        },
+    }
+    row = repo.create(
+        "workflows",
+        "owner",
+        {
+            "workflow_key": key,
+            "workflow_version": "1.0.0",
+            "model_id": "real",
+            "manifest": manifest,
+            "api_graph": graph,
+            "object_info": info,
+            "state": "draft",
+        },
+    )
+    registry.validate("owner", row["id"])
+    row = repo.get("workflows", row["id"], "owner")
+    repo.update(
+        "workflows",
+        row["id"],
+        {"review_approved": True, "smoke_test_passed": True, "smoke_test_kind": "real"},
+        "owner",
+    )
+    row = repo.get("workflows", row["id"], "owner")
+    signature = review_routes._smoke_compatibility_signature(row["id"], row, "b" * 40)
+    job, _ = repo.create_job("owner", {"workflow_smoke": True}, f"real-smoke-{key}")
+    repo.update(
+        "jobs",
+        job["id"],
+        {
+            "state": "completed",
+            "provider": "colab",
+            "workflow_smoke": True,
+            "target_workflow_id": row["id"],
+            "target_model_id": "real",
+            "workflow_key": key,
+            "workflow_version": "1.0.0",
+            "smoke_compatibility_signature": signature,
+            "smoke_accepted": True,
+            "acceptance_state": "accepted",
+        },
+        "owner",
+    )
+    repo.update("workflows", row["id"], {"smoke_job_id": job["id"]}, "owner")
+    return registry, row["id"]
+
+
+def test_registry_allows_core_two_pass_upscale_nodes_and_rejects_glsl_and_custom_nodes(tmp_path):
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "m.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors", "type": "stable_diffusion", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "v.safetensors"}},
+        "10": {"class_type": "LoraLoader", "inputs": {"model": ["1", 0], "clip": ["2", 0], "lora_name": "l1.safetensors", "strength_model": 0.5, "strength_clip": 0.5}},
+        "20": {"class_type": "CLIPTextEncode", "inputs": {"text": "demo", "clip": ["10", 1]}},
+        "21": {"class_type": "CLIPTextEncode", "inputs": {"text": "bad", "clip": ["10", 1]}},
+        "30": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1536, "batch_size": 1}},
+        "40": {
+            "class_type": "KSamplerAdvanced",
+            "inputs": {
+                "model": ["10", 0], "add_noise": "enable", "noise_seed": 1, "steps": 12, "cfg": 1.0,
+                "sampler_name": "er_sde", "scheduler": "simple", "positive": ["20", 0], "negative": ["21", 0],
+                "latent_image": ["30", 0], "start_at_step": 1, "end_at_step": 100, "return_with_leftover_noise": "disable",
+            },
+        },
+        "41": {"class_type": "VAEDecode", "inputs": {"samples": ["40", 0], "vae": ["3", 0]}},
+        "50": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": "4xUltrasharp_4xUltrasharpV10.pt"}},
+        "51": {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["50", 0], "image": ["41", 0]}},
+        "52": {"class_type": "ImageScaleBy", "inputs": {"image": ["51", 0], "upscale_method": "lanczos", "scale_by": 0.38}},
+        "53": {"class_type": "VAEEncode", "inputs": {"pixels": ["52", 0], "vae": ["3", 0]}},
+        "60": {
+            "class_type": "KSamplerAdvanced",
+            "inputs": {
+                "model": ["10", 0], "add_noise": "enable", "noise_seed": 2, "steps": 12, "cfg": 1.0,
+                "sampler_name": "euler_ancestral", "scheduler": "karras", "positive": ["20", 0], "negative": ["21", 0],
+                "latent_image": ["53", 0], "start_at_step": 7, "end_at_step": 100, "return_with_leftover_noise": "disable",
+            },
+        },
+        "61": {"class_type": "VAEDecode", "inputs": {"samples": ["60", 0], "vae": ["3", 0]}},
+        "62": {"class_type": "SaveImage", "inputs": {"images": ["61", 0], "filename_prefix": "Anima-HiRes"}},
+    }
+    info = {
+        "UNETLoader": {"input": {"required": {"unet_name": [["m.safetensors"]], "weight_dtype": [["default"]]}}, "output": ["MODEL"]},
+        "CLIPLoader": {"input": {"required": {"clip_name": [["c.safetensors"]], "type": [["stable_diffusion"]]}, "optional": {"device": [["default"]]}}, "output": ["CLIP"]},
+        "VAELoader": {"input": {"required": {"vae_name": [["v.safetensors"]]}}, "output": ["VAE"]},
+        "LoraLoader": {"input": {"required": {"model": ["MODEL"], "clip": ["CLIP"], "lora_name": [["l1.safetensors"]], "strength_model": ["FLOAT"], "strength_clip": ["FLOAT"]}}, "output": ["MODEL", "CLIP"]},
+        "CLIPTextEncode": {"input": {"required": {"text": ["STRING"], "clip": ["CLIP"]}}, "output": ["CONDITIONING"]},
+        "EmptyLatentImage": {"input": {"required": {"width": ["INT"], "height": ["INT"], "batch_size": ["INT"]}}, "output": ["LATENT"]},
+        "KSamplerAdvanced": {
+            "input": {
+                "required": {
+                    "model": ["MODEL"], "add_noise": [["enable", "disable"]], "noise_seed": ["INT"],
+                    "steps": ["INT"], "cfg": ["FLOAT"], "sampler_name": [["er_sde", "euler_ancestral"]],
+                    "scheduler": [["simple", "karras"]], "positive": ["CONDITIONING"], "negative": ["CONDITIONING"],
+                    "latent_image": ["LATENT"], "start_at_step": ["INT"], "end_at_step": ["INT"],
+                    "return_with_leftover_noise": [["disable", "enable"]],
+                }
+            },
+            "output": ["LATENT"],
+        },
+        "VAEDecode": {"input": {"required": {"samples": ["LATENT"], "vae": ["VAE"]}}, "output": ["IMAGE"]},
+        "UpscaleModelLoader": {"input": {"required": {"model_name": [["4xUltrasharp_4xUltrasharpV10.pt"]]}}, "output": ["UPSCALE_MODEL"]},
+        "ImageUpscaleWithModel": {"input": {"required": {"upscale_model": ["UPSCALE_MODEL"], "image": ["IMAGE"]}}, "output": ["IMAGE"]},
+        "ImageScaleBy": {"input": {"required": {"image": ["IMAGE"], "upscale_method": [["lanczos"]], "scale_by": ["FLOAT"]}}, "output": ["IMAGE"]},
+        "VAEEncode": {"input": {"required": {"pixels": ["IMAGE"], "vae": ["VAE"]}}, "output": ["LATENT"]},
+        "SaveImage": {"input": {"required": {"images": ["IMAGE"], "filename_prefix": ["STRING"]}}, "output": ["IMAGE"]},
+    }
+    registry, wf_id = _publish_fixture_with_graph(tmp_path / "ok", graph, info, key="anima-hires")
+    published = registry.publish("owner", wf_id, confirmed=True)
+    assert published["state"] == "published"
+
+    for disallowed_class in ("GLSLShader", "Lora Loader Stack (rgthree)"):
+        bad_graph = copy.deepcopy(graph)
+        bad_info = copy.deepcopy(info)
+        bad_graph["99"] = {"class_type": disallowed_class, "inputs": {"image": ["61", 0]}}
+        bad_info[disallowed_class] = {"input": {"required": {"image": ["IMAGE"]}}, "output": ["IMAGE"]}
+        bad_reg, bad_id = _publish_fixture_with_graph(tmp_path / disallowed_class.replace(" ", "_"), bad_graph, bad_info, key="bad")
+        with pytest.raises(ValueError, match="allowlist"):
+            bad_reg.publish("owner", bad_id, confirmed=True)

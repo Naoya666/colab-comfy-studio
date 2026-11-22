@@ -1137,7 +1137,7 @@ def _check_loras(graph: dict, manifest: dict, user_files: list[dict]) -> None:
         raise WorkerError("用户 LoRA 与工作流模型绑定在同一本地路径")
     have |= {f.get("target") for f in user_files}
     for node in graph.values():
-        if isinstance(node, dict) and node.get("class_type") == "LoraLoaderModelOnly":
+        if isinstance(node, dict) and node.get("class_type") in {"LoraLoader", "LoraLoaderModelOnly"}:
             name = node.get("inputs", {}).get("lora_name")
             if name not in have:
                 raise WorkerError(f"LoRA 文件没有随任务下发：{name}")
