@@ -1,9 +1,21 @@
 import { useCallback, useEffect, useId, useState } from 'react';
+import { FileSearch } from 'lucide-react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
-import { bytesLabel, libraryApi, modelStatus, uploadModel, type Catalog, type LibraryModel, type ModelTask } from '../lib/model-library';
+import {
+  bytesLabel,
+  libraryApi,
+  modelStatus,
+  readStoredWorkflowInspect,
+  uploadModel,
+  writeStoredWorkflowInspect,
+  type Catalog,
+  type LibraryModel,
+  type ModelTask,
+} from '../lib/model-library';
 import { useSmartPoll } from '../lib/smart-poll';
 import { ConfirmDialog } from '../components/Feedback';
 import { ModelStorageBreakdown } from '../components/ModelStorageBreakdown';
+import { WorkflowDependencyInspector } from '../components/WorkflowDependencyInspector';
 import styles from '../gpu.module.css';
 
 export function ModelSourceSettings({ id, defaultOpen = false }: { id?: string; defaultOpen?: boolean } = {}) {
@@ -54,6 +66,15 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState('');
+  const [inspector, setInspector] = useState(() => readStoredWorkflowInspect());
+
+  const updateInspector = useCallback((patch: Partial<typeof inspector>) => {
+    setInspector((curr) => {
+      const next = { ...curr, ...patch };
+      writeStoredWorkflowInspect(next);
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -74,16 +95,57 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
     await libraryApi(`/${model.id}/prepare`, {});
     setChoices([]); setProgress('模型已入库并加入准备队列');
   }
+  const availableTypes = Object.keys(catalog?.types || {
+    checkpoints: '',
+    loras: '',
+    vae: '',
+    diffusion_models: '',
+    text_encoders: '',
+    clip_vision: '',
+    controlnet: '',
+    upscale_models: '',
+    embeddings: '',
+  });
+  const inspectCount = inspector.result?.dependencies.length || 0;
   const items = (catalog?.items || []).filter(m => (!query || `${m.display_name} ${m.filename}`.toLowerCase().includes(query.toLowerCase())) && (!category || m.model_type === category) && (!state || m.state === state) && (!architectureFilter || m.architecture === architectureFilter));
   return <div className={styles.stack}>
     <div className={styles.pageTitle}>
       <h2>统一模型库</h2>
       <div className={styles.titleActions}>
+        <button
+          className={`button ${inspector.open ? '' : 'secondary'} small`}
+          type="button"
+          aria-expanded={inspector.open}
+          onClick={() => updateInspector({ open: !inspector.open })}
+        >
+          <FileSearch size={14} strokeWidth={1.8} aria-hidden />
+          检测工作流模型
+          {inspectCount > 0 && !inspector.open && <span className={styles.depBtnCount}>{inspectCount}</span>}
+        </button>
         {onOpenSettings && <button className="button ghost small" type="button" onClick={onOpenSettings}>存储与下载源设置</button>}
         <button className="button secondary small" onClick={() => void action(refresh)}>刷新</button>
       </div>
     </div>
     <p className="muted small">{catalog?.statistics.count || 0} 个模型 · Drive 已索引 {bytesLabel(catalog?.statistics.bytes)}。下载与校验由独立模型进程执行，无需启动 GPU。</p>
+    <WorkflowDependencyInspector
+      open={inspector.open}
+      fileName={inspector.fileName}
+      result={inspector.result}
+      importedMap={inspector.importedMap}
+      models={catalog?.items || []}
+      tasks={tasks}
+      availableTypes={availableTypes}
+      onStateChange={updateInspector}
+      onClose={() => updateInspector({ open: false })}
+      onRefreshLibrary={refresh}
+      onLocateModel={(model) => {
+        setQuery(model.filename);
+        setCategory('');
+        setState('');
+        setArchitectureFilter('');
+        setDetailId(model.id);
+      }}
+    />
     <ModelStorageBreakdown
       catalog={catalog}
       selectedCategory={category}

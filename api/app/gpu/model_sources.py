@@ -744,11 +744,36 @@ class Sources:
             raise ModelError("该目录下没有符合当前分类安全策略的受支持模型文件（目录链接需选择具体权重文件）")
         return files
 
-    def search(self, query):
+    def search_with_warnings(self, query):
         if not isinstance(query, str) or not 1 <= len(query) <= 200:
             raise ModelError("搜索名称需为 1–200 字符")
-        data = self.http.json("https://civitai.com/api/v1/models?" + urlencode({"query": query, "limit": 20}))
-        civitai = [{"name": m["name"], "source": "civitai", "url": f"https://civitai.com/models/{m['id']}"}
-                   for m in data.get("items") or []]
-        hf = self.http.json("https://huggingface.co/api/models?" + urlencode({"search": query, "limit": 20}))
-        return civitai + [{"name": m["id"], "source": "huggingface", "url": "https://huggingface.co/" + m["id"]} for m in hf]
+        candidates = []
+        warnings = []
+        errors = []
+        try:
+            data = self.http.json("https://civitai.com/api/v1/models?" + urlencode({"query": query, "limit": 20}))
+            candidates.extend(
+                {"name": m["name"], "source": "civitai", "url": f"https://civitai.com/models/{m['id']}"}
+                for m in data.get("items") or []
+                if isinstance(m, dict) and m.get("id") is not None and m.get("name")
+            )
+        except ModelError as exc:
+            errors.append(str(exc))
+            warnings.append(f"Civitai 暂不可用：{exc}")
+        try:
+            hf = self.http.json("https://huggingface.co/api/models?" + urlencode({"search": query, "limit": 20}))
+            candidates.extend(
+                {"name": m["id"], "source": "huggingface", "url": "https://huggingface.co/" + m["id"]}
+                for m in (hf if isinstance(hf, list) else [])
+                if isinstance(m, dict) and m.get("id")
+            )
+        except ModelError as exc:
+            errors.append(str(exc))
+            warnings.append(f"Hugging Face 暂不可用：{exc}")
+        if len(errors) == 2:
+            raise ModelError(errors[0])
+        return candidates, warnings
+
+    def search(self, query):
+        candidates, _ = self.search_with_warnings(query)
+        return candidates

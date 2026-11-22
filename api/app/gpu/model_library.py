@@ -336,6 +336,9 @@ class ModelLibrary:
             raise ModelError("Drive 分块上传会话创建失败，请重新授权 Drive 后重试")
         return {"upload_url": location, "chunk_size": 8 * 1024 * 1024}
 
+    def inspect_workflow(self, payload):
+        return deps.inspect_workflow(payload, self.models())
+
     def dependency_record(self, workflow_id, *, rescan=False):
         workflow = self.repo.get("workflows", workflow_id, self.owner)
         if not workflow:

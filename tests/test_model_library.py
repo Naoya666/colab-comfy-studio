@@ -1075,3 +1075,123 @@ def test_weight_file_validation_blocks_spoofing_malicious_pickle_and_corruption(
     failed = lib.get(row["id"])
     assert failed["state"] == "failed" and drive.uploads == 0
     assert failed["error"]
+
+
+def test_inspect_workflow_supports_fallbacks_metadata_and_unknown_type_matching(repo):
+    sha_ready = "a" * 64
+    lib = ModelLibrary(repo, "owner", drive=FakeDrive())
+    ready_model = lib.add({
+        "filename": "krea2_turbo_fp8.safetensors",
+        "model_type": "diffusion_models",
+        "source": "https",
+        "download_url": "https://huggingface.co/org/krea2/resolve/main/krea2_turbo_fp8.safetensors",
+        "expected_sha256": sha_ready,
+    })
+    lib.update(ready_model["id"], state="ready", sha256=sha_ready, size=1024)
+    same_name_model = lib.add({
+        "filename": "custom_adapter.safetensors",
+        "model_type": "loras",
+        "source": "https",
+        "download_url": "https://example.com/custom_adapter.safetensors",
+    })
+    lib.update(same_name_model["id"], state="ready", size=512)
+
+    visual_workflow = {
+        "nodes": [
+            {
+                "id": 10,
+                "type": "UNETLoader",
+                "widgets_values": ["krea2_turbo_fp8.safetensors", "default"],
+                "properties": {
+                    "models": [
+                        {
+                            "name": "krea2_turbo_fp8.safetensors",
+                            "url": "https://huggingface.co/org/krea2/resolve/main/krea2_turbo_fp8.safetensors",
+                            "directory": "diffusion_models",
+                            "sha256": sha_ready,
+                            "size": 1024,
+                        }
+                    ]
+                },
+            },
+            {
+                "id": 20,
+                "type": "CustomFluxModelPatchLoader",
+                "widgets_values": ["flux_patch_v2.safetensors"],
+                "properties": {
+                    "models": [
+                        {
+                            "name": "flux_patch_v2.safetensors",
+                            "url": "https://huggingface.co/org/patch/resolve/main/flux_patch_v2.safetensors",
+                            "directory": "models/loras",
+                            "size": 2048,
+                        }
+                    ]
+                },
+            },
+            {
+                "id": 30,
+                "type": "CustomAdapterLoader",
+                "widgets_values": ["custom_adapter.safetensors", 0.8],
+            },
+            {
+                "id": 40,
+                "type": "CLIPTextEncode",
+                "widgets_values": ["prompt mentioning fake.safetensors"],
+            },
+            {
+                "id": 50,
+                "type": "SaveImage",
+                "widgets_values": ["output.safetensors"],
+            },
+        ],
+        "links": [],
+    }
+
+    # Strict scan still obeys original non-heuristic contract.
+    strict = deps.scan({"editable_graph": visual_workflow})
+    assert any(d["node_id"] == "20" and d["status"] == "manual_review" for d in strict)
+    assert any(d["node_id"] == "30" and d["status"] == "manual_review" for d in strict)
+
+    # Stateless model-library inspection extracts metadata + heuristic clues and ignores prompts/saves.
+    inspected = lib.inspect_workflow(visual_workflow)
+    assert inspected["format"] == "visual"
+    assert inspected["node_count"] == 5
+    by_ref = {d["reference"]: d for d in inspected["dependencies"]}
+    assert set(by_ref) == {"krea2_turbo_fp8.safetensors", "flux_patch_v2.safetensors", "custom_adapter.safetensors"}
+    assert "fake.safetensors" not in by_ref and "output.safetensors" not in by_ref
+
+    assert by_ref["krea2_turbo_fp8.safetensors"]["status"] == "matched"
+    assert by_ref["krea2_turbo_fp8.safetensors"]["model_id"] == ready_model["id"]
+    assert by_ref["krea2_turbo_fp8.safetensors"]["source_hint"] == "https://huggingface.co/org/krea2/resolve/main/krea2_turbo_fp8.safetensors"
+
+    patch_dep = by_ref["flux_patch_v2.safetensors"]
+    assert patch_dep["detected_via"] == "metadata"
+    assert patch_dep["model_type"] == "loras"
+    assert patch_dep["source_hint"] == "https://huggingface.co/org/patch/resolve/main/flux_patch_v2.safetensors"
+    assert patch_dep["expected_size"] == 2048
+
+    clue_dep = by_ref["custom_adapter.safetensors"]
+    assert clue_dep["detected_via"] == "heuristic"
+    assert clue_dep["model_type"] == "unknown"
+    assert clue_dep["status"] == "needs_confirmation"
+    assert same_name_model["id"] in clue_dep["candidates"]
+
+    # Does not create any workflow draft in repository.
+    assert repo.list("workflows", "owner") == []
+
+
+def test_search_with_warnings_tolerates_single_upstream_failure():
+    def civitai_down_handler(request):
+        if request.headers.get("host") == "civitai.com":
+            return httpx.Response(503)
+        return httpx.Response(200, json=[{"id": "org/krea2-turbo"}])
+
+    sources = Sources(source_http(civitai_down_handler))
+    candidates, warnings = sources.search_with_warnings("krea2")
+    assert candidates == [{"name": "org/krea2-turbo", "source": "huggingface", "url": "https://huggingface.co/org/krea2-turbo"}]
+    assert len(warnings) == 1 and "Civitai" in warnings[0]
+
+    both_down = Sources(source_http(lambda _r: httpx.Response(503)))
+    with pytest.raises(ModelError):
+        both_down.search_with_warnings("krea2")

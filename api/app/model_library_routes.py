@@ -51,7 +51,14 @@ def resolve(body: dict, user=Depends(current_user), st=Depends(get_store)):
 @router.get("/model-library/search")
 def search(q: str, user=Depends(current_user), st=Depends(get_store)):
     with library(st, user) as lib:
-        return ok({"candidates": Sources(lib.http).search(q), "requires_confirmation": True})
+        candidates, warnings = Sources(lib.http).search_with_warnings(q)
+        return ok({"candidates": candidates, "warnings": warnings, "requires_confirmation": True})
+
+
+@router.post("/model-library/inspect-workflow")
+def inspect_workflow(body: dict, user=Depends(current_user), st=Depends(get_store)):
+    with library(st, user) as lib:
+        return ok(lib.inspect_workflow(body))
 
 
 @router.get("/model-library/drive-usage")

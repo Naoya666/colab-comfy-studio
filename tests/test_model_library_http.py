@@ -145,3 +145,70 @@ def test_http_upscale_pt_and_pth_controlled_import(client, monkeypatch):
     assert gh_item["expected_size"] == 17938799
     gh_added = c.post("/api/gpu/model-library", json={**gh_item, "model_type": "upscale_models"})
     assert gh_added.status_code == 201, gh_added.text
+
+
+def test_http_inspect_workflow_stateless_and_search_warnings(client, monkeypatch):
+    import httpx
+    from app.gpu.model_sources import SourceHTTP
+
+    c, _repo = client
+
+    raw_workflow = {
+        "nodes": [
+            {
+                "id": 1,
+                "type": "UNETLoader",
+                "widgets_values": ["flux_dev_fp8.safetensors", "fp8_e4m3fn"],
+                "properties": {
+                    "models": [
+                        {
+                            "name": "flux_dev_fp8.safetensors",
+                            "url": "https://huggingface.co/Comfy-Org/flux1-dev/resolve/main/flux_dev_fp8.safetensors",
+                            "directory": "diffusion_models",
+                        }
+                    ]
+                },
+            },
+            {
+                "id": 2,
+                "type": "LoraLoaderModelOnly",
+                "widgets_values": ["cinema_lora.safetensors", 0.75],
+            },
+        ],
+        "links": [],
+    }
+
+    before_wf = c.get("/api/gpu/workflows").json()["data"]
+    resp = c.post("/api/gpu/model-library/inspect-workflow", json=raw_workflow)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["format"] == "visual"
+    assert data["summary"]["total"] == 2
+    assert data["summary"]["with_source_hint"] == 1
+    by_ref = {d["reference"]: d for d in data["dependencies"]}
+    assert by_ref["flux_dev_fp8.safetensors"]["source_hint"] == "https://huggingface.co/Comfy-Org/flux1-dev/resolve/main/flux_dev_fp8.safetensors"
+    assert not by_ref["cinema_lora.safetensors"].get("source_hint")
+
+    # Confirm zero workflows/drafts were created.
+    after_wf = c.get("/api/gpu/workflows").json()["data"]
+    assert len(after_wf) == len(before_wf)
+
+    # Invalid payload returns 422.
+    bad = c.post("/api/gpu/model-library/inspect-workflow", json={"foo": "bar"})
+    assert bad.status_code == 422
+
+    # Search tolerates one upstream outage and returns warnings.
+    def handler(request):
+        if request.headers.get("host") == "civitai.com":
+            return httpx.Response(502)
+        return httpx.Response(200, json=[{"id": "Comfy-Org/flux1-dev"}])
+
+    monkeypatch.setattr(
+        "app.gpu.model_library.SourceHTTP",
+        lambda tokens=None: SourceHTTP(tokens, client=httpx.Client(transport=httpx.MockTransport(handler)), resolver=lambda _h: ["8.8.8.8"]),
+    )
+    search_resp = c.get("/api/gpu/model-library/search?q=flux")
+    assert search_resp.status_code == 200, search_resp.text
+    search_data = search_resp.json()["data"]
+    assert search_data["candidates"] == [{"name": "Comfy-Org/flux1-dev", "source": "huggingface", "url": "https://huggingface.co/Comfy-Org/flux1-dev"}]
+    assert len(search_data["warnings"]) == 1
