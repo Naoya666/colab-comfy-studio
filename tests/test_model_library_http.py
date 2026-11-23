@@ -238,3 +238,34 @@ def test_inspector_recovers_valid_visual_graph_from_bundle(client):
     assert result["warnings"]
     assert result["dependencies"][0]["reference"] == "v.safetensors"
     assert result["models_ready"] is False
+
+
+def test_catalog_items_include_workflow_reference_counts(client):
+    c, repo = client
+    owner = "library-http-owner"
+    m1 = repo.create("model_library", owner, {
+        "display_name": "Shared VAE", "filename": "ae.safetensors", "model_type": "vae",
+        "architecture": "FLUX", "state": "ready", "size": 1024, "managed_file": True,
+    })
+    m2 = repo.create("model_library", owner, {
+        "display_name": "Unused LoRA", "filename": "unused.safetensors", "model_type": "loras",
+        "architecture": "FLUX", "state": "ready", "size": 2048, "managed_file": False,
+    })
+    # Referenced twice in workflow A (counts as 1 workflow) and once in workflow B (total 2 workflows)
+    repo.create("model_dependencies", owner, {
+        "workflow_id": "wf-a",
+        "dependencies": [
+            {"id": "d1", "node_id": "1", "model_id": m1["id"]},
+            {"id": "d2", "node_id": "2", "model_id": m1["id"]},
+        ],
+    })
+    repo.create("model_dependencies", owner, {
+        "workflow_id": "wf-b",
+        "dependencies": [{"id": "d3", "node_id": "3", "model_id": m1["id"]}],
+    })
+
+    items = {item["id"]: item for item in c.get("/api/gpu/model-library").json()["data"]["items"]}
+    assert items[m1["id"]]["reference_count"] == 2
+    assert items[m1["id"]]["managed_file"] is True
+    assert items[m2["id"]]["reference_count"] == 0
+    assert items[m2["id"]]["managed_file"] is False

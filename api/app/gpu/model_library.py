@@ -260,6 +260,14 @@ class ModelLibrary:
                 for row in self.repo.list("model_dependencies", self.owner)
                 if any(d.get("model_id") == ident for d in row["dependencies"])]
 
+    def reference_counts(self):
+        counts = {}
+        for row in self.repo.list("model_dependencies", self.owner):
+            seen = {d.get("model_id") for d in (row.get("dependencies") or []) if d.get("model_id")}
+            for model_id in seen:
+                counts[model_id] = counts.get(model_id, 0) + 1
+        return counts
+
     def enqueue(self, ident, action="prepare"):
         model = self.get(ident)
         if action not in {"prepare", "verify"}:

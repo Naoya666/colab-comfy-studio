@@ -32,11 +32,12 @@ def public_task(task):
 def list_models(q: str = "", model_type: str = "", architecture: str = "", state: str = "", user=Depends(current_user), st=Depends(get_store)):
     with library(st, user) as lib:
         models = lib.models()
+        ref_counts = lib.reference_counts()
         visible = [m for m in models if (not q or q.lower() in f"{m['display_name']} {m['filename']}".lower())
                    and (not model_type or m["model_type"] == model_type)
                    and (not architecture or m["architecture"] == architecture) and (not state or m["state"] == state)]
         physical = {m["drive_file_id"]: m.get("size") or 0 for m in models if m.get("drive_file_id")}
-        return ok({"items": [{**m, "external_source": external_source(m)} for m in visible], "types": directories(), "statistics": {"count": len(models), "bytes": sum(physical.values()),
+        return ok({"items": [{**m, "external_source": external_source(m), "reference_count": ref_counts.get(m["id"], 0)} for m in visible], "types": directories(), "statistics": {"count": len(models), "bytes": sum(physical.values()),
                    "by_type": {t: {"count": sum(m["model_type"] == t for m in models),
                                   "bytes": sum({m["drive_file_id"]: m.get("size") or 0 for m in models if m["model_type"] == t and m.get("drive_file_id")}.values())}
                                for t in directories()}}})

@@ -17,7 +17,7 @@
 .cardHead h2 svg { color: var(--text-2); }
 .cardAside { display: flex; align-items: center; gap: 8px; }
 
-.pageTitle { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pageTitle { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .pageTitle h2, .pageHead h2, .subHead h2 { display: flex; align-items: center; gap: 8px; font-size: 1.15rem; font-weight: 650; }
 .pageTitle h2 .pill { margin-left: 4px; font-weight: 400; }
 .pageHead { display: grid; gap: 4px; }
@@ -2041,4 +2041,815 @@
   gap: 8px;
   padding-top: 6px;
   border-top: 1px solid var(--line);
+}
+
+/* ───── 模型库紧凑资产表格、批量清理栏、添加弹窗 & 右侧抽屉 ───── */
+.modelNoticeRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--card);
+  color: var(--text-2);
+  font-size: 0.84rem;
+}
+.modelNoticeRow[data-tone="error"] {
+  border-color: var(--danger-line);
+  color: var(--danger);
+}
+
+.modelInventoryCard {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--card);
+  min-width: 0;
+}
+
+.modelToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 12px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.modelToolbarLeft {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 260px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.modelToolbarRight {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.modelSearchBox {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 200px;
+  max-width: 340px;
+  min-width: 0;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  color: var(--muted);
+  transition: border-color 0.12s;
+}
+.modelSearchBox:focus-within {
+  border-color: var(--text);
+  color: var(--text-2);
+}
+.modelSearchBox input {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  min-height: 34px;
+  font-size: 0.84rem;
+}
+.modelSearchBox input:focus {
+  border: 0;
+}
+.modelSearchClear {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  flex: none;
+}
+.modelSearchClear:hover {
+  background: var(--card-2);
+  color: var(--text);
+}
+.modelActiveCategoryChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--text);
+  border-radius: var(--r-full);
+  background: var(--card-2);
+  color: var(--text);
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+.modelCountHint {
+  margin-left: 4px;
+  font-size: 0.74rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.modelBatchBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line-strong);
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  background: var(--card-2);
+}
+.modelBatchInfo {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 0.86rem;
+}
+.modelBatchBytes {
+  padding: 2px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-full);
+  background: var(--bg);
+  font-size: 0.74rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+.modelBatchActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.modelEmptyState {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 40px 16px;
+  text-align: center;
+}
+.modelEmptyState strong {
+  font-size: 0.94rem;
+  font-weight: 600;
+}
+
+.modelTable {
+  display: grid;
+  min-width: 0;
+}
+.modelTableHead,
+.modelRow {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 172px 66px 88px 104px 96px;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+  min-width: 0;
+}
+.modelTableHead {
+  min-height: 36px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.73rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  background: var(--bg);
+}
+.modelSortColBtn {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: right;
+}
+.modelSortColBtn:hover {
+  color: var(--text);
+}
+.modelTableBody {
+  display: grid;
+  min-width: 0;
+}
+.modelRow {
+  position: relative;
+  min-height: 54px;
+  padding-top: 9px;
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+.modelRow:last-child {
+  border-bottom: 0;
+  border-radius: 0 0 var(--r-lg) var(--r-lg);
+}
+.modelRow:hover {
+  background: var(--bg);
+}
+.modelRow[data-selected="true"] {
+  background: var(--card-2);
+}
+.modelRow[data-inspected="true"] {
+  background: var(--bg);
+  box-shadow: inset 3px 0 0 var(--text);
+}
+.modelRow[data-menu-open="true"] {
+  z-index: 15;
+}
+
+.modelCheckWrap {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+}
+.modelRow .modelColCheck input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  min-height: 15px;
+  opacity: 0.42;
+  transition: opacity 0.12s ease;
+}
+.modelRow:hover .modelColCheck input[type="checkbox"],
+.modelRow[data-selected="true"] .modelColCheck input[type="checkbox"],
+.modelRow[data-selecting="true"] .modelColCheck input[type="checkbox"],
+.modelRow .modelColCheck input[type="checkbox"]:focus-visible {
+  opacity: 1;
+}
+.modelTableHead input[type="checkbox"],
+.modelBatchBar input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  min-height: 15px;
+}
+
+.modelColCheck {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.modelColName {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.modelTitleLine {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.modelPrimaryName {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.modelVerifiedIcon {
+  display: inline-flex;
+  color: var(--workspace-accent);
+  flex: none;
+}
+.modelSubLine {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 16px;
+  min-width: 0;
+}
+.modelSubPath {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.modelSubWarn {
+  font-size: 0.69rem;
+  color: var(--warning);
+  white-space: nowrap;
+  flex: none;
+}
+.modelRowProgress {
+  display: grid;
+  gap: 4px;
+  padding-left: 16px;
+  margin-top: 3px;
+  max-width: 380px;
+}
+.modelRowProgress small {
+  font-size: 0.71rem;
+  font-variant-numeric: tabular-nums;
+}
+.modelRowError {
+  padding-left: 16px;
+  font-size: 0.74rem;
+  color: var(--danger);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelColType {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.modelTypeChip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-2);
+  font-size: 0.73rem;
+  line-height: 1.4;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.modelTypeChip:hover,
+.modelTypeChip[data-active="true"] {
+  border-color: var(--text);
+  color: var(--text);
+}
+.modelArchTag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--card-2);
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.modelColRef {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-width: 0;
+}
+.modelRefBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  background: var(--bg);
+  color: var(--text-2);
+  font-size: 0.71rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.modelMutedDash {
+  color: var(--muted);
+  opacity: 0.55;
+  font-size: 0.8rem;
+}
+
+.modelColStatus {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.modelStatusReady {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.modelStatusReady i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--workspace-accent);
+  flex: none;
+}
+
+.modelColSize {
+  display: grid;
+  justify-items: end;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.modelSizeText {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.modelSizeTrack {
+  display: block;
+  width: 68px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--card-3);
+  overflow: hidden;
+}
+.modelSizeTrack i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--text);
+  opacity: 0.72;
+}
+.modelSizeTrack i[data-slot="1"] { opacity: 0.58; }
+.modelSizeTrack i[data-slot="2"] { opacity: 0.44; }
+.modelSizeTrack i[data-slot="3"] {
+  background: repeating-linear-gradient(-45deg, var(--text) 0 2px, var(--card-2) 2px 4px);
+  opacity: 0.75;
+}
+.modelSizeTrack i[data-slot="4"] { opacity: 0.34; }
+.modelSizeTrack i[data-slot="5"] { background: var(--muted); opacity: 0.5; }
+
+.modelColActions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  min-width: 36px;
+}
+.rowMenuWrap {
+  position: relative;
+}
+.rowMenuPopover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 30;
+  min-width: 158px;
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+}
+.rowMenuPopover[data-up="true"] {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+.rowMenuPopover button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.8rem;
+  text-align: left;
+  white-space: nowrap;
+}
+.rowMenuPopover button:hover:not(:disabled) {
+  background: var(--card-2);
+}
+.rowMenuPopover button:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+.rowMenuPopover button[data-danger="true"] {
+  color: var(--danger);
+}
+.rowMenuPopover hr {
+  margin: 4px 2px;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.modelMobileOnly {
+  display: none;
+}
+
+@media (max-width: 960px) {
+  .modelMobileOnly {
+    display: inline-flex;
+    align-items: center;
+  }
+  .modelTableHead {
+    display: none;
+  }
+  .modelRow {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "check name actions"
+      "check meta size";
+    align-items: start;
+    row-gap: 6px;
+    column-gap: 10px;
+    padding: 11px 12px;
+  }
+  .modelColCheck {
+    grid-area: check;
+    padding-top: 2px;
+  }
+  .modelRow .modelColCheck input[type="checkbox"] {
+    opacity: 0.7;
+  }
+  .modelColName {
+    grid-area: name;
+  }
+  .modelColType {
+    grid-area: meta;
+    padding-left: 16px;
+  }
+  .modelColRef,
+  .modelColStatus {
+    display: none;
+  }
+  .modelColSize {
+    grid-area: size;
+    align-self: center;
+  }
+  .modelColActions {
+    grid-area: actions;
+  }
+  .modelSizeTrack {
+    display: none;
+  }
+}
+
+/* 添加模型弹窗 & 重复检测提示 */
+.modelAddDialog {
+  max-width: min(640px, calc(100vw - 32px));
+}
+.modelAddPrimaryGrid {
+  display: grid;
+  gap: 10px;
+}
+@media (min-width: 640px) {
+  .modelAddPrimaryGrid {
+    grid-template-columns: minmax(0, 1.7fr) minmax(150px, 0.9fr);
+    align-items: end;
+  }
+}
+.modelChoiceList {
+  display: grid;
+  gap: 8px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.modelChoiceCard {
+  display: grid;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.modelChoiceCard[data-dup="exact"] {
+  border-color: var(--line-strong);
+}
+.modelChoiceCard[data-dup="name"] {
+  border-color: var(--warning-line);
+}
+.modelChoiceHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.modelChoiceMain {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  flex: 1 1 220px;
+}
+.modelChoiceFooter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.modelDupBox {
+  display: grid;
+  gap: 6px;
+  padding: 9px 10px;
+  border: 1px solid var(--warning-line);
+  border-radius: var(--r-sm);
+  background: var(--warning-bg);
+}
+.modelDupBox[data-level="exact"] {
+  border-color: var(--line-strong);
+  background: var(--card);
+}
+.modelDupHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--warning);
+}
+.modelDupBox[data-level="exact"] .modelDupHead {
+  color: var(--text);
+}
+.modelDupList {
+  display: grid;
+  gap: 4px;
+}
+.modelDupRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.modelDupMeta {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.modelDupName {
+  font-size: 0.8rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 批量删除预览列表 */
+.batchWarnLine {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--warning);
+}
+.batchPreviewList {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.batchPreviewItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+}
+.batchPreviewName {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.batchPreviewName span {
+  font-size: 0.82rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 右侧滑出详情抽屉（窄屏底部弹出） */
+.drawerBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-end;
+  background: var(--overlay);
+  animation: fade 0.14s ease;
+}
+.drawer {
+  width: 100%;
+  max-height: 88dvh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--card);
+  color: var(--text);
+  border-top: 1px solid var(--line-strong);
+  border-radius: 20px 20px 0 0;
+  box-shadow: -12px 0 36px rgba(0, 0, 0, 0.24);
+  animation: rise 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  overflow: hidden;
+}
+@media (min-width: 700px) {
+  .drawerBackdrop {
+    align-items: stretch;
+  }
+  .drawer {
+    width: min(468px, 92vw);
+    max-height: 100dvh;
+    height: 100dvh;
+    border-top: 0;
+    border-left: 1px solid var(--line-strong);
+    border-radius: 0;
+    animation: slideInRight 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
+@keyframes slideInRight {
+  from { transform: translateX(28px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+.drawerHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 16px 16px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.drawerTitleGroup {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+.drawerTitleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.drawerTitleRow h3 {
+  font-size: 1rem;
+  font-weight: 650;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.drawerHeaderActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.drawerBody {
+  overflow-y: auto;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 14px 16px calc(24px + var(--safe-b));
+}
+.drawerQuickBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.drawerSection {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.drawerSection h4 {
+  margin: 0;
+  font-size: 0.82rem;
+  font-weight: 650;
+  color: var(--text-2);
+}
+.drawerDangerSection {
+  border-color: var(--danger-line);
+}
+.drawerCopyVal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+}
+.monoInline {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
 }

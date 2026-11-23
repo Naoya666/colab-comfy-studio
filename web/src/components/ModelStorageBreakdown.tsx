@@ -4,6 +4,7 @@ import { apiMessage } from '../lib/gpu-api';
 import {
   bytesLabel,
   getDriveUsage,
+  orderedTypeSegments,
   type Catalog,
   type DriveUsageReport,
 } from '../lib/model-library';
@@ -33,15 +34,7 @@ export function ModelStorageBreakdown({
   const [loadingDrive, setLoadingDrive] = useState(false);
   const [driveError, setDriveError] = useState('');
 
-  const typeSegments = useMemo(() => {
-    const byType = catalog?.statistics?.by_type || {};
-    const entries = Object.entries(byType)
-      .filter(([, stat]) => stat && (stat.bytes > 0 || stat.count > 0))
-      .map(([type, stat]) => ({ type, count: stat.count, bytes: stat.bytes }))
-      .sort((a, b) => b.bytes - a.bytes || b.count - a.count);
-    const totalBytes = entries.reduce((sum, item) => sum + item.bytes, 0);
-    return { entries, totalBytes };
-  }, [catalog]);
+  const typeSegments = useMemo(() => orderedTypeSegments(catalog), [catalog]);
 
   const driveCategories = useMemo(
     () => (driveReport?.categories || []).filter((item) => item.bytes > 0 || item.count > 0),
@@ -96,7 +89,7 @@ export function ModelStorageBreakdown({
         {typeSegments.totalBytes > 0 ? (
           <>
             <div className={styles.stackedBar} role="img" aria-label="模型库按类型空间分布条">
-              {typeSegments.entries.map((seg, idx) => {
+              {typeSegments.entries.map((seg) => {
                 const pct = (seg.bytes / typeSegments.totalBytes) * 100;
                 if (pct <= 0) return null;
                 return (
@@ -104,7 +97,7 @@ export function ModelStorageBreakdown({
                     key={seg.type}
                     type="button"
                     className={styles.stackedSeg}
-                    data-slot={idx % 6}
+                    data-slot={seg.slot}
                     data-active={selectedCategory === seg.type}
                     style={{ width: `${Math.max(pct, 1.5)}%` }}
                     title={`${seg.type}：${formatBytes(seg.bytes)}（${seg.count} 个，${pct.toFixed(1)}%）`}
@@ -115,7 +108,7 @@ export function ModelStorageBreakdown({
               })}
             </div>
             <div className={styles.legendGrid}>
-              {typeSegments.entries.map((seg, idx) => {
+              {typeSegments.entries.map((seg) => {
                 const pct = typeSegments.totalBytes > 0 ? (seg.bytes / typeSegments.totalBytes) * 100 : 0;
                 const active = selectedCategory === seg.type;
                 return (
@@ -126,7 +119,7 @@ export function ModelStorageBreakdown({
                     data-active={active}
                     onClick={() => onSelectCategory(active ? '' : seg.type)}
                   >
-                    <i className={styles.legendDot} data-slot={idx % 6} aria-hidden />
+                    <i className={styles.legendDot} data-slot={seg.slot} aria-hidden />
                     <span>{seg.type}</span>
                     <small>{formatBytes(seg.bytes)} · {pct.toFixed(0)}%</small>
                   </button>

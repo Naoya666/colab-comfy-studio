@@ -1,22 +1,66 @@
-import { useCallback, useEffect, useId, useState } from 'react';
-import { FileSearch } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  FileSearch,
+  HardDrive,
+  MoreHorizontal,
+  Plus,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  Trash2,
+  X,
+} from 'lucide-react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
 import {
+  ACTIVE_MODEL_STATES,
   bytesLabel,
+  computeCategorySlots,
+  displayModelTitles,
   libraryApi,
   modelStatus,
+  planBatchDeletion,
   readStoredWorkflowInspect,
-  uploadModel,
+  sortModels,
   writeStoredWorkflowInspect,
   type Catalog,
   type LibraryModel,
+  type ModelSortMode,
   type ModelTask,
 } from '../lib/model-library';
 import { useSmartPoll } from '../lib/smart-poll';
 import { ConfirmDialog } from '../components/Feedback';
+import { ModelAddDialog } from '../components/ModelAddDialog';
+import { ModelDetailDrawer } from '../components/ModelDetailDrawer';
 import { ModelStorageBreakdown } from '../components/ModelStorageBreakdown';
 import { WorkflowDependencyInspector } from '../components/WorkflowDependencyInspector';
 import styles from '../gpu.module.css';
+
+const DEFAULT_TYPES: Record<string, string> = {
+  checkpoints: '',
+  loras: '',
+  vae: '',
+  diffusion_models: '',
+  text_encoders: '',
+  clip_vision: '',
+  controlnet: '',
+  upscale_models: '',
+  embeddings: '',
+};
+
+const COMPACT_STATUS_LABEL: Record<string, string> = {
+  pending: '待准备',
+  resolving: '解析中',
+  downloading: '下载中',
+  verifying: '校验中',
+  uploading: '上传中',
+  ready: '已就绪',
+  failed: '失败',
+  missing: '文件缺失',
+  unverified: '待校验',
+  cancelled: '已取消',
+};
 
 export function ModelSourceSettings({ id, defaultOpen = false }: { id?: string; defaultOpen?: boolean } = {}) {
   const [status, setStatus] = useState<Record<string, boolean>>({});
@@ -24,26 +68,26 @@ export function ModelSourceSettings({ id, defaultOpen = false }: { id?: string; 
   const [message, setMessage] = useState('');
   const [open, setOpen] = useState(defaultOpen);
   useEffect(() => { if (defaultOpen) setOpen(true); }, [defaultOpen]);
-  useEffect(() => { void libraryApi<Record<string, boolean>>('/source-settings').then(setStatus).catch(e => setMessage(apiMessage(e))); }, []);
-  return <details id={id} className="foldable" open={open} onToggle={e => setOpen(e.currentTarget.open)}><summary>模型下载源凭据</summary><div className="foldContent">
-    {['huggingface', 'civitai'].map(source => <div key={source} className={styles.stack}>
+  useEffect(() => { void libraryApi<Record<string, boolean>>('/source-settings').then(setStatus).catch((e) => setMessage(apiMessage(e))); }, []);
+  return <details id={id} className="foldable" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}><summary>模型下载源凭据</summary><div className="foldContent">
+    {['huggingface', 'civitai'].map((source) => <div key={source} className={styles.stack}>
       <label className="field">{source === 'huggingface' ? 'Hugging Face Token' : 'Civitai API Key'} · {status[source] ? '已配置（已脱敏）' : '未配置'}
-        <input type="password" autoComplete="new-password" value={values[source] || ''} onChange={e => setValues({...values, [source]:e.target.value})} /></label>
-      <div className="actions"><button className="button secondary small" onClick={async () => {try {setStatus(await libraryApi('/source-settings/' + source, {token:values[source]}, 'PUT')); setValues({...values, [source]:''}); setMessage('凭据已加密保存');} catch(e) {setMessage(apiMessage(e));}}} disabled={!values[source]}>保存凭据</button>
-      <button className="button secondary small" onClick={async () => {try {setStatus(await libraryApi('/source-settings/' + source, {token:''}, 'PUT'));} catch(e) {setMessage(apiMessage(e));}}}>清除</button></div>
+        <input type="password" autoComplete="new-password" value={values[source] || ''} onChange={(e) => setValues({ ...values, [source]: e.target.value })} /></label>
+      <div className="actions"><button className="button secondary small" onClick={async () => { try { setStatus(await libraryApi('/source-settings/' + source, { token: values[source] }, 'PUT')); setValues({ ...values, [source]: '' }); setMessage('凭据已加密保存'); } catch (e) { setMessage(apiMessage(e)); } }} disabled={!values[source]}>保存凭据</button>
+      <button className="button secondary small" onClick={async () => { try { setStatus(await libraryApi('/source-settings/' + source, { token: '' }, 'PUT')); } catch (e) { setMessage(apiMessage(e)); } }}>清除</button></div>
     </div>)}
     {message && <p role="status">{message}</p>}
   </div></details>;
 }
 
 export function ModelStorageSettings({ id, defaultOpen = false }: { id?: string; defaultOpen?: boolean } = {}) {
-  const [accounts, setAccounts] = useState<{id:string; account_id?:string; alias?:string}[]>([]);
+  const [accounts, setAccounts] = useState<{ id: string; account_id?: string; alias?: string }[]>([]);
   const [account, setAccount] = useState('');
   const [message, setMessage] = useState('');
   const [open, setOpen] = useState(defaultOpen);
   useEffect(() => { if (defaultOpen) setOpen(true); }, [defaultOpen]);
-  useEffect(() => {void Promise.all([apiFetch<{id:string;account_id?:string;alias?:string}[]>('/api/gpu/accounts'), libraryApi<{account_id?:string}>('/storage-settings')]).then(([a,s]) => {setAccounts(a);setAccount(s.account_id || '');}).catch(e => setMessage(apiMessage(e)));}, []);
-  return <details id={id} className="foldable" open={open} onToggle={e => setOpen(e.currentTarget.open)}><summary>模型库 Drive 存储账号</summary><div className="foldContent"><label className="field">长期存储账号<select value={account} onChange={e => setAccount(e.target.value)}><option value="">历史默认 Drive 账号</option>{accounts.map(a => <option key={a.id} value={a.account_id || a.id}>{a.alias || a.account_id || a.id}</option>)}</select></label><div className="actions"><button className="button secondary small" onClick={async () => {try {await libraryApi('/storage-settings', {account_id:account || null}, 'PUT'); setMessage('存储账号已保存');} catch(e) {setMessage(apiMessage(e));}}}>保存存储账号</button></div><p className="muted small">所有 GPU 账号共享此模型库。已有模型后禁止直接切换存储账号，防止索引指向另一块 Drive。</p>{message && <p role="status">{message}</p>}</div></details>;
+  useEffect(() => { void Promise.all([apiFetch<{ id: string; account_id?: string; alias?: string }[]>('/api/gpu/accounts'), libraryApi<{ account_id?: string }>('/storage-settings')]).then(([a, s]) => { setAccounts(a); setAccount(s.account_id || ''); }).catch((e) => setMessage(apiMessage(e))); }, []);
+  return <details id={id} className="foldable" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}><summary>模型库 Drive 存储账号</summary><div className="foldContent"><label className="field">长期存储账号<select value={account} onChange={(e) => setAccount(e.target.value)}><option value="">历史默认 Drive 账号</option>{accounts.map((a) => <option key={a.id} value={a.account_id || a.id}>{a.alias || a.account_id || a.id}</option>)}</select></label><div className="actions"><button className="button secondary small" onClick={async () => { try { await libraryApi('/storage-settings', { account_id: account || null }, 'PUT'); setMessage('存储账号已保存'); } catch (e) { setMessage(apiMessage(e)); } }}>保存存储账号</button></div><p className="muted small">所有 GPU 账号共享此模型库。已有模型后禁止直接切换存储账号，防止索引指向另一块 Drive。</p>{message && <p role="status">{message}</p>}</div></details>;
 }
 
 export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => void }) {
@@ -52,21 +96,20 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState('');
   const [architectureFilter, setArchitectureFilter] = useState('');
-  const [state, setState] = useState('');
-  const [url, setUrl] = useState('');
-  const [name, setName] = useState('');
-  const [relativePath, setRelativePath] = useState('');
-  const [type, setType] = useState('checkpoints');
-  const [architecture, setArchitecture] = useState('unknown');
-  const [expected, setExpected] = useState('');
-  const [driveId, setDriveId] = useState('');
-  const [choices, setChoices] = useState<Record<string, unknown>[]>([]);
+  const [stateFilter, setStateFilter] = useState('');
+  const [unreferencedOnly, setUnreferencedOnly] = useState(false);
+  const [sortMode, setSortMode] = useState<ModelSortMode>('smart');
   const [detailId, setDetailId] = useState<string | null>(null);
-  const detailPanelId = useId();
+  const [addOpen, setAddOpen] = useState(false);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchDeleteMode, setBatchDeleteMode] = useState<'remove_index' | 'delete_file' | null>(null);
+  const [singleDeleteTarget, setSingleDeleteTarget] = useState<{ model: LibraryModel; deleteFile: boolean } | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState('');
   const [inspector, setInspector] = useState(() => readStoredWorkflowInspect());
+  const selectAllRef = useRef<HTMLInputElement>(null);
 
   const updateInspector = useCallback((patch: Partial<typeof inspector>) => {
     setInspector((curr) => {
@@ -86,162 +129,50 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
     }
   }, []);
 
-  const hasActiveTasks = tasks.some(t => ['pending', 'downloading', 'verifying', 'uploading'].includes(t.state));
+  const hasActiveTasks = tasks.some((t) => ACTIVE_MODEL_STATES.has(t.state));
   useSmartPoll(refresh, { enabled: true, active: hasActiveTasks, activeMs: 3000, idleMs: 30000 });
 
-  async function action(fn: () => Promise<unknown>) {setBusy(true); setError(''); try {await fn(); await refresh();} catch(e) {setError(apiMessage(e));} finally {setBusy(false);}}
-  async function add(data: Record<string, unknown>) {
-    const model = await libraryApi<LibraryModel>('', {...data, relative_path: relativePath.trim() || undefined, model_type: data.model_type === 'unknown' || !data.model_type ? type : data.model_type, architecture: data.architecture === 'unknown' || !data.architecture ? architecture : data.architecture});
-    await libraryApi(`/${model.id}/prepare`, {});
-    setChoices([]); setProgress('模型已入库并加入准备队列');
-  }
-  const availableTypes = Object.keys(catalog?.types || {
-    checkpoints: '',
-    loras: '',
-    vae: '',
-    diffusion_models: '',
-    text_encoders: '',
-    clip_vision: '',
-    controlnet: '',
-    upscale_models: '',
-    embeddings: '',
-  });
-  const inspectCount = inspector.result?.dependencies.length || 0;
-  const items = (catalog?.items || []).filter(m => (!query || `${m.display_name} ${m.filename}`.toLowerCase().includes(query.toLowerCase())) && (!category || m.model_type === category) && (!state || m.state === state) && (!architectureFilter || m.architecture === architectureFilter));
-  return <div className={styles.stack}>
-    <div className={styles.pageTitle}>
-      <h2>统一模型库</h2>
-      <div className={styles.titleActions}>
-        <button
-          className={`button ${inspector.open ? '' : 'secondary'} small`}
-          type="button"
-          aria-expanded={inspector.open}
-          onClick={() => updateInspector({ open: !inspector.open })}
-        >
-          <FileSearch size={14} strokeWidth={1.8} aria-hidden />
-          检测工作流模型
-          {inspectCount > 0 && !inspector.open && <span className={styles.depBtnCount}>{inspectCount}</span>}
-        </button>
-        {onOpenSettings && <button className="button ghost small" type="button" onClick={onOpenSettings}>存储与下载源设置</button>}
-        <button className="button secondary small" onClick={() => void action(refresh)}>刷新</button>
-      </div>
-    </div>
-    <p className="muted small">{catalog?.statistics.count || 0} 个模型 · Drive 已索引 {bytesLabel(catalog?.statistics.bytes)}。下载与校验由独立模型进程执行，无需启动 GPU。</p>
-    <WorkflowDependencyInspector
-      open={inspector.open}
-      fileName={inspector.fileName}
-      result={inspector.result}
-      importedMap={inspector.importedMap}
-      models={catalog?.items || []}
-      tasks={tasks}
-      availableTypes={availableTypes}
-      onStateChange={updateInspector}
-      onClose={() => updateInspector({ open: false })}
-      onRefreshLibrary={refresh}
-      onLocateModel={(model) => {
-        setQuery(model.filename);
-        setCategory('');
-        setState('');
-        setArchitectureFilter('');
-        setDetailId(model.id);
-      }}
-    />
-    <ModelStorageBreakdown
-      catalog={catalog}
-      selectedCategory={category}
-      onSelectCategory={setCategory}
-    />
-    <details className="foldable"><summary>添加模型 / 上传 / 导入 Drive</summary><div className="foldContent">
-      <div className={styles.grid2}>
-        <label className="field">模型类型<select value={type} onChange={e => setType(e.target.value)}>{Object.keys(catalog?.types || {checkpoints:''}).map(t => <option key={t}>{t}</option>)}</select></label>
-        <label className="field">模型架构<input value={architecture} onChange={e => setArchitecture(e.target.value)} placeholder="unknown" /></label>
-        <label className="field">文件名（通用链接 / Drive）<input value={name} onChange={e => setName(e.target.value)} placeholder="model.safetensors" /></label>
-        <label className="field">预期 SHA-256（可选）<input value={expected} onChange={e => setExpected(e.target.value)} /></label>
-      </div>
-      <label className="field">工作流引用的相对路径（可选）<input value={relativePath} onChange={e => setRelativePath(e.target.value)} placeholder="子目录/model.safetensors" /></label>
-      <label className="field">模型页面或 HTTPS 下载链接<input value={url} onChange={e => setUrl(e.target.value)} /></label>
-      <p className="muted small">{type === 'upscale_models'
-        ? '超分模型（upscale_models）支持 safetensors、gguf、onnx，以及来自 Hugging Face / 受信任 GitHub Release 的受控 .pt/.pth（仅做字节与安全结构校验，不执行反序列化）。'
-        : '当前分类仅允许 safetensors、gguf、onnx；若要导入超分模型 .pt/.pth，请先将模型类型切换为 upscale_models。'}</p>
-      <button disabled={busy || !url.trim()} className="button secondary" onClick={() => void action(async () => {setChoices([]); setProgress(''); const resolved = await libraryApi<{files:Record<string, unknown>[]}>('/resolve', {url:url.trim(), filename:name.trim() || undefined, model_type:type, architecture, expected_sha256:expected.trim() || undefined}); setChoices(resolved.files); if (!resolved.files.length) setProgress('该来源未返回受支持的模型文件');})}>解析来源并选择文件</button>
-      {choices.map((c, i) => <div key={i} className={styles.card}><strong>{String(c.filename)}</strong><p>{String(c.model_type && c.model_type !== 'unknown' ? c.model_type : type)} · {String(c.version_name || c.source || '')} · {String(c.architecture)} · {bytesLabel(Number(c.expected_size || c.reported_size))}</p>{typeof c.expected_sha256 === 'string' && c.expected_sha256 && <p className="muted small">SHA-256：{c.expected_sha256}</p>}<button disabled={busy} className="button small" onClick={() => void action(() => add(c))}>选择此文件并准备</button></div>)}
-      <label className="field">已有 Drive 文件 ID<input value={driveId} onChange={e => setDriveId(e.target.value)} /></label>
-      <button disabled={busy || !driveId || !name} className="button secondary" onClick={() => void action(() => add({source:'drive', drive_file_id:driveId, filename:name, model_type:type, architecture, expected_sha256:expected || undefined}))}>导入已有文件并校验</button>
-      <label className="field">本地模型（直接分块上传到 Drive）<input disabled={busy} type="file" accept=".safetensors,.gguf,.onnx" onChange={e => {const f = e.target.files?.[0]; if(f) void action(async () => {const id = await uploadModel(f, n => setProgress(`上传 ${Math.round(n / f.size * 100)}%`)); await add({source:'upload', drive_file_id:id, filename:f.name, model_type:type, architecture, expected_sha256:expected || undefined});});}} /></label>
-      <p className="muted small">Drive OAuth 的 drive.file 权限仅可读取应用可见文件。上传失败会在当前页面重试分块；刷新页面后需重新上传。</p>
-    </div></details>
-    <div className={`${styles.grid2} ${styles.modelFilters}`}>
-      <label className="field">搜索名称 / 文件名<input value={query} onChange={e => setQuery(e.target.value)} /></label>
-      <label className="field">类型<select value={category} onChange={e => setCategory(e.target.value)}><option value="">全部类型</option>{Object.keys(catalog?.types || {}).map(t => <option key={t}>{t}</option>)}</select></label>
-      <label className="field">状态<select value={state} onChange={e => setState(e.target.value)}><option value="">全部状态</option>{['pending','downloading','verifying','uploading','ready','failed','missing','unverified'].map(s => <option key={s} value={s}>{modelStatus[s]}</option>)}</select></label>
-      <label className="field">架构<select value={architectureFilter} onChange={e => setArchitectureFilter(e.target.value)}><option value="">全部架构</option>{[...new Set(catalog?.items.map(m => m.architecture))].map(s => <option key={s}>{s}</option>)}</select></label>
-    </div>
-    {error && <p className="status error" role="alert">{error}</p>}{progress && <p role="status">{progress}</p>}
-    {!items.length && <p className="muted">暂无符合条件的模型。添加来源链接、上传文件或从工作流迁移旧缓存。</p>}
-    {!!items.length && <div className={`${styles.stack} ${styles.workspaceGrid}`}>
-    {items.map(m => { const task = tasks.find(t => t.model_id === m.id); return <article className={`${styles.card} ${detailId === m.id ? styles.workspaceWide : ''}`} key={m.id}>
-      <h3>{m.display_name}</h3><p>{m.relative_path || m.filename} · {m.model_type} · {m.architecture}</p><p>{modelStatus[m.state] || m.state} · {bytesLabel(m.size)} · {m.external_source ? (m.external_source.status === 'verified' ? '外部来源已验证' : '外部来源待验证') : '无外部来源'}</p>
-      {task && ['pending','downloading','verifying','uploading'].includes(task.state) && <div>
-        <progress aria-label="模型准备进度" max={task.total || 1} value={task.total ? task.bytes : undefined} />
-        <p>{modelStatus[task.state]} · {task.bytes ? bytesLabel(task.bytes) : '0 B'} / {bytesLabel(task.total)} · {task.speed ? `${(task.speed / 1024**2).toFixed(1)} MB/s` : '等待进度'}</p>
-        {!!task.attempt && task.attempt > 1 && <p className="muted small">第 {task.attempt} 次尝试
-          {task.resume_phase && task.resume_offset !== undefined
-            && ` · ${modelStatus[task.resume_phase]}从 ${task.resume_offset.toLocaleString()} 字节继续`}
-        </p>}
-        {task.restart_reason && <p className="muted small">{task.restart_reason}</p>}
-        <button className="button secondary small" onClick={() => void action(() => libraryApi(`/tasks/${task.id}/cancel`, {}))}>取消准备</button>
-      </div>}
-      {m.error && <p className="status error">{m.error}</p>}
-      <div className="actions"><button className="button secondary small" aria-expanded={detailId === m.id}
-        aria-controls={detailId === m.id ? detailPanelId : undefined}
-        onClick={() => setDetailId(detailId === m.id ? null : m.id)}>详情与引用</button>
-        <button disabled={busy} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/prepare`, {action:'prepare'}))}>准备 / 重试</button>
-        <button disabled={busy || !m.drive_file_id} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/prepare`, {action:'verify'}))}>重新校验</button>
-        <button disabled={busy || !m.drive_file_id} className="button secondary small" onClick={() => void action(() => libraryApi(`/${m.id}/check`, {}))}>检查 Drive 文件</button>
-      </div>
-      {detailId === m.id && <ModelDetail modelId={m.id} panelId={detailPanelId} refresh={refresh}
-        onClose={() => setDetailId(current => current === m.id ? null : current)} onProgress={setProgress} />}
-    </article>;})}
-    </div>}
-  </div>;
-}
-
-type LibraryModelDetail = LibraryModel & {references?: {workflow_id: string}[]};
-
-function ModelDetail({modelId, panelId, refresh, onClose, onProgress}: {
-  modelId: string;
-  panelId: string;
-  refresh: () => Promise<void>;
-  onClose: () => void;
-  onProgress: (message: string) => void;
-}) {
-  const [detail, setDetail] = useState<LibraryModelDetail | null>(null);
-  const [externalSource, setExternalSource] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<'remove_index' | 'delete_file' | null>(null);
-  const [registerOpen, setRegisterOpen] = useState(false);
-  const [regKey, setRegKey] = useState('');
-  const [regLicense, setRegLicense] = useState('');
-  const [regVram, setRegVram] = useState('');
-  const [regError, setRegError] = useState('');
-
+  // Prune selection when catalog changes (e.g. models deleted).
   useEffect(() => {
-    let active = true;
-    void libraryApi<LibraryModelDetail>('/' + modelId).then(model => {
-      if (!active) return;
-      setDetail(model);
-      setExternalSource(model.external_source?.url || '');
-    }).catch(e => { if (active) setError(apiMessage(e)); });
-    return () => { active = false; };
-  }, [modelId]);
+    if (!catalog) return;
+    const valid = new Set(catalog.items.map((m) => m.id));
+    setSelectedIds((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (valid.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [catalog]);
 
-  async function action(fn: () => Promise<unknown>) {
+  // Close row overflow menu on outside click or Escape.
+  useEffect(() => {
+    if (!openMenuId) return;
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-row-menu="true"]')) return;
+      setOpenMenuId(null);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpenMenuId(null);
+    };
+    window.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [openMenuId]);
+
+  async function runAction(fn: () => Promise<unknown>, successMessage?: string) {
     setBusy(true);
     setError('');
     try {
       await fn();
       await refresh();
+      if (successMessage) setProgress(successMessage);
     } catch (e) {
       setError(apiMessage(e));
     } finally {
@@ -249,104 +180,925 @@ function ModelDetail({modelId, panelId, refresh, onClose, onProgress}: {
     }
   }
 
-  async function submitRegister() {
-    if (!detail) return;
-    const key = regKey.trim();
-    const license = regLicense.trim();
-    const vram = Number(regVram);
-    if (!key) { setRegError('请输入唯一模型标识（字母、数字、短横线）。'); return; }
-    if (!license) { setRegError('请输入模型的实际许可证名称。'); return; }
-    if (!Number.isFinite(vram) || vram <= 0) { setRegError('请输入有效的显存 GB 正数。'); return; }
-    setRegError('');
-    await action(async () => {
-      await libraryApi(`/${detail.id}/workflow-model`, { model_key: key, license, resource_profile: { vram_gb: vram } });
-      setRegisterOpen(false);
-      setRegKey('');
-      setRegLicense('');
-      setRegVram('');
-      onProgress('已登记为未启用模型，请在工作流配置中关联该标识并完成审核与真实 GPU 验证');
+  const allItems = catalog?.items || [];
+  const availableTypes = useMemo(() => Object.keys(catalog?.types || DEFAULT_TYPES), [catalog]);
+  const categorySlots = useMemo(() => computeCategorySlots(catalog), [catalog]);
+
+  const architectures = useMemo(() => {
+    const uniq = [...new Set(allItems.map((m) => m.architecture).filter(Boolean))];
+    return uniq.sort((a, b) => {
+      if (a === 'unknown') return 1;
+      if (b === 'unknown') return -1;
+      return a.localeCompare(b);
+    });
+  }, [allItems]);
+
+  const taskByModelId = useMemo(() => {
+    const map = new Map<string, ModelTask>();
+    for (const t of tasks) {
+      const existing = map.get(t.model_id);
+      if (!existing || ACTIVE_MODEL_STATES.has(t.state)) {
+        map.set(t.model_id, t);
+      }
+    }
+    return map;
+  }, [tasks]);
+
+  const visibleItems = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const filtered = allItems.filter((m) => {
+      if (q) {
+        const hay = `${m.display_name} ${m.filename} ${m.relative_path || ''} ${(m.tags || []).join(' ')}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      if (category && m.model_type !== category) return false;
+      if (stateFilter && m.state !== stateFilter) return false;
+      if (architectureFilter && m.architecture !== architectureFilter) return false;
+      if (unreferencedOnly && (m.reference_count || 0) > 0) return false;
+      return true;
+    });
+    return sortModels(filtered, tasks, sortMode);
+  }, [allItems, query, category, stateFilter, architectureFilter, unreferencedOnly, sortMode, tasks]);
+
+  const maxVisibleSize = useMemo(
+    () => visibleItems.reduce((max, item) => Math.max(max, item.size || 0), 0),
+    [visibleItems],
+  );
+
+  const selectedModels = useMemo(
+    () => allItems.filter((m) => selectedIds.has(m.id)),
+    [allItems, selectedIds],
+  );
+
+  const selectedBytes = useMemo(() => {
+    const seen = new Set<string>();
+    let total = 0;
+    for (const m of selectedModels) {
+      const key = m.drive_file_id || m.id;
+      if (!seen.has(key)) {
+        seen.add(key);
+        total += m.size || 0;
+      }
+    }
+    return total;
+  }, [selectedModels]);
+
+  const visibleSelectedCount = useMemo(
+    () => visibleItems.filter((m) => selectedIds.has(m.id)).length,
+    [visibleItems, selectedIds],
+  );
+  const allVisibleSelected = visibleItems.length > 0 && visibleSelectedCount === visibleItems.length;
+  const someVisibleSelected = visibleSelectedCount > 0 && !allVisibleSelected;
+
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = someVisibleSelected;
+    }
+  }, [someVisibleSelected]);
+
+  const batchPlan = useMemo(
+    () => (batchDeleteMode ? planBatchDeletion(selectedModels, allItems, tasks, batchDeleteMode) : null),
+    [batchDeleteMode, selectedModels, allItems, tasks],
+  );
+
+  const activeDetailIndex = useMemo(
+    () => (detailId ? visibleItems.findIndex((m) => m.id === detailId) : -1),
+    [detailId, visibleItems],
+  );
+  const inspectedModel = useMemo(
+    () => (detailId ? allItems.find((m) => m.id === detailId) || null : null),
+    [detailId, allItems],
+  );
+
+  const hasFilters = Boolean(query.trim() || category || stateFilter || architectureFilter || unreferencedOnly);
+  const inspectCount = inspector.result?.dependencies.length || 0;
+
+  function toggleRowSelection(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
     });
   }
 
-  return <section id={panelId} className={styles.inlinePanel} aria-label="模型详情">
-    {error && <p className="status error" role="alert">{error}</p>}
-    {!detail && !error && <p role="status">正在加载模型详情…</p>}
-    {detail && <><h3>{detail.display_name}</h3><p>SHA-256：{detail.sha256 || '未计算'}</p><p>来源：{detail.source} · 版本：{detail.version_name || '未知'}</p><p>预期 SHA-256：{detail.expected_sha256 || '未提供；计算 Hash 不代表来源可信'}</p><p>触发词：{detail.trigger_words?.join(', ') || '无'}</p><p>引用工作流：{detail.references?.length || 0}</p>{detail.references?.map(r => <p key={r.workflow_id}>{r.workflow_id}</p>)}
-      <label className="field">外部来源链接<input type="url" value={externalSource} onChange={e => setExternalSource(e.target.value)} /></label>
-      <p className="muted small">可填写无凭据的 HTTPS 来源链接，凭据在「设置 › 模型下载源凭据」中配置。留空并保存可移除绑定。</p>
-      <button className="button secondary small" disabled={busy} onClick={() => void action(async () => {
-        const updated = await libraryApi<LibraryModel>('/' + detail.id, { external_source_url: externalSource.trim() || null }, 'PATCH');
-        setDetail({ ...detail, external_source: updated.external_source }); setExternalSource(updated.external_source?.url || '');
-      })}>保存外部来源</button>
-      <label className="field">显示名称<input value={detail.display_name} onChange={e => setDetail({...detail, display_name:e.target.value})} /></label>
-      <label className="field">架构<input value={detail.architecture} onChange={e => setDetail({...detail, architecture:e.target.value})} /></label>
-      <label className="field">标签（逗号分隔）<input value={detail.tags?.join(', ') || ''} onChange={e => setDetail({...detail, tags:e.target.value.split(',').map(s => s.trim())})} /></label>
-      <div className="actions"><button className="button small" disabled={busy} onClick={() => void action(() => libraryApi('/' + detail.id, {display_name:detail.display_name, architecture:detail.architecture, tags:detail.tags}, 'PATCH'))}>保存信息</button>
-      <button className="button danger small" disabled={busy} onClick={() => setConfirmAction('remove_index')}>移除索引</button>
-      <button className="button danger small" disabled={busy} onClick={() => setConfirmAction('delete_file')}>删除 Drive 文件</button>
-      <button className="button secondary small" disabled={busy || detail.state !== 'ready'} onClick={() => { setRegError(''); setRegisterOpen(true); }}>登记为工作流模型</button>
-      </div>
-    </>}
-    <div className="actions"><button className="button secondary small" disabled={busy} onClick={onClose}>关闭详情</button></div>
+  function toggleSelectAllVisible() {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) {
+        for (const m of visibleItems) next.delete(m.id);
+      } else {
+        for (const m of visibleItems) next.add(m.id);
+      }
+      return next;
+    });
+  }
 
-    <ConfirmDialog
-      open={confirmAction === 'remove_index'}
-      title="移除模型索引？"
-      description={`当前有 ${detail?.references?.length || 0} 个工作流引用此模型，移除后相关依赖将失效（不会删除 Drive 物理文件）。`}
-      confirmLabel="确认移除"
-      danger
-      busy={busy}
-      onCancel={() => setConfirmAction(null)}
-      onConfirm={() => {
-        if (!detail) return;
-        setConfirmAction(null);
-        void action(async () => {
-          await libraryApi(`/${detail.id}?confirm_references=true`, undefined, 'DELETE');
-          onClose();
-        });
-      }}
-    />
+  function locateModel(model: LibraryModel) {
+    setQuery('');
+    setCategory('');
+    setStateFilter('');
+    setArchitectureFilter('');
+    setUnreferencedOnly(false);
+    setDetailId(model.id);
+  }
 
-    <ConfirmDialog
-      open={confirmAction === 'delete_file'}
-      title="删除 Drive 物理文件并移除索引？"
-      description={`将把 Drive 上的模型文件移至回收站并移除索引，当前引用工作流 ${detail?.references?.length || 0} 个。`}
-      confirmLabel="确认删除"
-      danger
-      busy={busy}
-      onCancel={() => setConfirmAction(null)}
-      onConfirm={() => {
-        if (!detail) return;
-        setConfirmAction(null);
-        void action(async () => {
-          await libraryApi(`/${detail.id}?confirm_references=true&delete_file=true`, undefined, 'DELETE');
-          onClose();
-        });
-      }}
-    />
+  async function executeBatchMaintenance(kind: 'check' | 'verify') {
+    const eligible = selectedModels.filter((m) => {
+      if (!m.drive_file_id) return false;
+      const t = taskByModelId.get(m.id);
+      return !(t && ACTIVE_MODEL_STATES.has(t.state));
+    });
+    if (!eligible.length) {
+      setError('所选模型暂无可执行 Drive 检查或校验的文件（需先准备完成且不处于运行中）。');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    let okCount = 0;
+    const failures: string[] = [];
+    for (let i = 0; i < eligible.length; i++) {
+      const m = eligible[i];
+      setProgress(`${kind === 'check' ? '正在检查 Drive' : '正在加入校验队列'}（${i + 1} / ${eligible.length}）…`);
+      try {
+        if (kind === 'check') {
+          await libraryApi(`/${m.id}/check`, {});
+        } else {
+          await libraryApi(`/${m.id}/prepare`, { action: 'verify' });
+        }
+        okCount += 1;
+      } catch (e) {
+        failures.push(`${displayModelTitles(m).primary}：${apiMessage(e)}`);
+      }
+    }
+    await refresh();
+    setBusy(false);
+    if (failures.length) {
+      setError(`部分失败（成功 ${okCount} / ${eligible.length}）：${failures.slice(0, 2).join('；')}`);
+    } else {
+      setProgress(kind === 'check' ? `已完成 ${okCount} 个模型的 Drive 检查` : `已将 ${okCount} 个模型加入重新校验队列`);
+      setSelectedIds(new Set());
+    }
+  }
 
-    <ConfirmDialog
-      open={registerOpen}
-      title="登记为工作流模型"
-      description="登记后仍需在工作流配置中关联该标识，并完成人工接受许可与真实 GPU 验证。"
-      confirmLabel="提交登记"
-      busy={busy}
-      error={regError}
-      onCancel={() => setRegisterOpen(false)}
-      onConfirm={() => void submitRegister()}
-    >
-      <div className="field">
-        <label htmlFor="reg-model-key">唯一模型标识（字母、数字、短横线）</label>
-        <input id="reg-model-key" value={regKey} placeholder="例如：flux-dev-fp8" onChange={e => setRegKey(e.target.value)} />
+  async function executeBatchDelete() {
+    if (!batchPlan || !batchPlan.deletable.length) {
+      setBatchDeleteMode(null);
+      return;
+    }
+    setBusy(true);
+    setError('');
+    const plan = batchPlan;
+    setBatchDeleteMode(null);
+    let deletedCount = 0;
+    let deletedPhysicalCount = 0;
+    const failures: string[] = [];
+
+    for (let i = 0; i < plan.deletable.length; i++) {
+      const entry = plan.deletable[i];
+      setProgress(`正在清理 ${i + 1} / ${plan.deletable.length}：${displayModelTitles(entry.model).primary}…`);
+      try {
+        const qs = entry.deletePhysical ? '?confirm_references=true&delete_file=true' : '?confirm_references=true';
+        await libraryApi(`/${entry.model.id}${qs}`, undefined, 'DELETE');
+        deletedCount += 1;
+        if (entry.deletePhysical) deletedPhysicalCount += 1;
+        if (detailId === entry.model.id) setDetailId(null);
+      } catch (e) {
+        failures.push(`${displayModelTitles(entry.model).primary}：${apiMessage(e)}`);
+      }
+    }
+
+    await refresh();
+    setSelectedIds(new Set());
+    setBusy(false);
+
+    if (failures.length) {
+      setError(`已清理 ${deletedCount} 项，${failures.length} 项失败：${failures.slice(0, 2).join('；')}`);
+    } else {
+      const extra = plan.mode === 'delete_file' && deletedPhysicalCount > 0
+        ? `（含 ${deletedPhysicalCount} 个 Drive 物理文件${plan.reclaimableBytes > 0 ? `，预计释放 ${bytesLabel(plan.reclaimableBytes)}` : ''}）`
+        : '';
+      const skipped = plan.activeBlocked.length ? `；跳过 ${plan.activeBlocked.length} 个进行中模型` : '';
+      setProgress(`已清理 ${deletedCount} 个模型${extra}${skipped}`);
+    }
+  }
+
+  async function executeSingleDelete() {
+    if (!singleDeleteTarget) return;
+    const { model, deleteFile } = singleDeleteTarget;
+    setSingleDeleteTarget(null);
+    const title = displayModelTitles(model).primary;
+    await runAction(async () => {
+      const qs = deleteFile ? '?confirm_references=true&delete_file=true' : '?confirm_references=true';
+      await libraryApi(`/${model.id}${qs}`, undefined, 'DELETE');
+      if (detailId === model.id) setDetailId(null);
+    }, deleteFile ? `已删除「${title}」及 Drive 物理文件` : `已移除「${title}」索引`);
+  }
+
+  const batchDriveReadyCount = selectedModels.filter((m) => {
+    const t = taskByModelId.get(m.id);
+    return Boolean(m.drive_file_id) && !(t && ACTIVE_MODEL_STATES.has(t.state));
+  }).length;
+
+  return (
+    <div className={styles.stack}>
+      <div className={styles.pageTitle}>
+        <h2>统一模型库</h2>
+        <div className={styles.titleActions}>
+          <button
+            className={`button ${inspector.open ? '' : 'secondary'} small`}
+            type="button"
+            aria-expanded={inspector.open}
+            onClick={() => updateInspector({ open: !inspector.open })}
+          >
+            <FileSearch size={14} strokeWidth={1.8} aria-hidden />
+            检测工作流模型
+            {inspectCount > 0 && !inspector.open && <span className={styles.depBtnCount}>{inspectCount}</span>}
+          </button>
+          <button
+            className="button small"
+            type="button"
+            onClick={() => setAddOpen(true)}
+          >
+            <Plus size={14} strokeWidth={2} aria-hidden />
+            添加模型
+          </button>
+          {onOpenSettings && (
+            <button className="button ghost small" type="button" onClick={onOpenSettings}>
+              存储与下载源设置
+            </button>
+          )}
+          <button className="button secondary small" type="button" disabled={busy} onClick={() => void runAction(refresh)}>
+            刷新
+          </button>
+        </div>
       </div>
-      <div className="field">
-        <label htmlFor="reg-model-license">模型许可证名称</label>
-        <input id="reg-model-license" value={regLicense} placeholder="例如：Apache-2.0 / Non-Commercial" onChange={e => setRegLicense(e.target.value)} />
-      </div>
-      <div className="field">
-        <label htmlFor="reg-model-vram">所需显存（GB）</label>
-        <input id="reg-model-vram" type="number" min={1} step={0.5} value={regVram} placeholder="例如：16" onChange={e => setRegVram(e.target.value)} />
-      </div>
-    </ConfirmDialog>
-  </section>;
+
+      <p className="muted small">
+        {catalog?.statistics.count || 0} 个模型 · Drive 已索引 {bytesLabel(catalog?.statistics.bytes)}。下载与校验由独立模型进程执行，无需启动 GPU。
+      </p>
+
+      <WorkflowDependencyInspector
+        open={inspector.open}
+        fileName={inspector.fileName}
+        result={inspector.result}
+        importedMap={inspector.importedMap}
+        models={allItems}
+        tasks={tasks}
+        availableTypes={availableTypes}
+        onStateChange={updateInspector}
+        onClose={() => updateInspector({ open: false })}
+        onRefreshLibrary={refresh}
+        onLocateModel={locateModel}
+      />
+
+      <ModelStorageBreakdown
+        catalog={catalog}
+        selectedCategory={category}
+        onSelectCategory={setCategory}
+      />
+
+      {error && (
+        <div className={styles.modelNoticeRow} data-tone="error" role="alert">
+          <span>{error}</span>
+          <button type="button" className={styles.iconGhost} aria-label="关闭错误提示" onClick={() => setError('')}>
+            <X size={14} aria-hidden />
+          </button>
+        </div>
+      )}
+      {progress && (
+        <div className={styles.modelNoticeRow} role="status">
+          <span>{progress}</span>
+          <button type="button" className={styles.iconGhost} aria-label="关闭状态提示" onClick={() => setProgress('')}>
+            <X size={14} aria-hidden />
+          </button>
+        </div>
+      )}
+
+      {/* Unified Compact Asset Table Card */}
+      <section className={styles.modelInventoryCard} aria-label="模型清单">
+        {selectedIds.size > 0 ? (
+          <div className={styles.modelBatchBar} role="region" aria-label="批量操作栏">
+            <div className={styles.modelBatchInfo}>
+              <label className={styles.modelCheckWrap}>
+                <input
+                  ref={selectAllRef}
+                  type="checkbox"
+                  aria-label="全选当前筛选结果"
+                  checked={allVisibleSelected}
+                  onChange={toggleSelectAllVisible}
+                />
+              </label>
+              <strong>已选 {selectedIds.size} 项</strong>
+              <span className={styles.modelBatchBytes}>{bytesLabel(selectedBytes)}</span>
+              <button
+                type="button"
+                className="button ghost small"
+                disabled={busy}
+                onClick={() => setSelectedIds(new Set())}
+              >
+                取消选择
+              </button>
+            </div>
+            <div className={styles.modelBatchActions}>
+              <button
+                type="button"
+                className="button secondary small"
+                disabled={busy || batchDriveReadyCount === 0}
+                onClick={() => void executeBatchMaintenance('check')}
+              >
+                <HardDrive size={13} aria-hidden />
+                检查 Drive
+              </button>
+              <button
+                type="button"
+                className="button secondary small"
+                disabled={busy || batchDriveReadyCount === 0}
+                onClick={() => void executeBatchMaintenance('verify')}
+              >
+                <ShieldCheck size={13} aria-hidden />
+                重新校验
+              </button>
+              <button
+                type="button"
+                className="button danger small"
+                disabled={busy}
+                onClick={() => setBatchDeleteMode('remove_index')}
+              >
+                移除索引
+              </button>
+              <button
+                type="button"
+                className="button danger small"
+                disabled={busy}
+                onClick={() => setBatchDeleteMode('delete_file')}
+              >
+                <Trash2 size={13} aria-hidden />
+                删除 Drive 文件
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className={styles.modelToolbar}>
+            <div className={styles.modelToolbarLeft}>
+              <label className={styles.modelSearchBox}>
+                <Search size={15} strokeWidth={1.7} aria-hidden />
+                <input
+                  aria-label="搜索名称 / 文件名"
+                  placeholder="搜索名称、文件名或路径…"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                />
+                {query && (
+                  <button
+                    type="button"
+                    className={styles.modelSearchClear}
+                    aria-label="清空搜索"
+                    onClick={() => setQuery('')}
+                  >
+                    <X size={13} aria-hidden />
+                  </button>
+                )}
+              </label>
+              {category && (
+                <button
+                  type="button"
+                  className={styles.modelActiveCategoryChip}
+                  title="点击清除类别筛选"
+                  onClick={() => setCategory('')}
+                >
+                  <i className={styles.legendDot} data-slot={categorySlots[category] ?? 5} aria-hidden />
+                  <span>{category}</span>
+                  <X size={12} aria-hidden />
+                </button>
+              )}
+            </div>
+
+            <div className={styles.modelToolbarRight}>
+              <button
+                type="button"
+                className={styles.depFilterChip}
+                data-active={unreferencedOnly}
+                aria-pressed={unreferencedOnly}
+                title="仅显示未被任何工作流引用的模型，方便清理空间"
+                onClick={() => setUnreferencedOnly((v) => !v)}
+              >
+                仅未引用
+              </button>
+              <select
+                aria-label="按状态筛选"
+                className={styles.miniSelect}
+                value={stateFilter}
+                onChange={(e) => setStateFilter(e.target.value)}
+              >
+                <option value="">全部状态</option>
+                {['pending', 'downloading', 'verifying', 'uploading', 'ready', 'failed', 'missing', 'unverified'].map((s) => (
+                  <option key={s} value={s}>{modelStatus[s]}</option>
+                ))}
+              </select>
+              <select
+                aria-label="按架构筛选"
+                className={styles.miniSelect}
+                value={architectureFilter}
+                onChange={(e) => setArchitectureFilter(e.target.value)}
+              >
+                <option value="">全部架构</option>
+                {architectures.map((arch) => (
+                  <option key={arch} value={arch}>{arch}</option>
+                ))}
+              </select>
+              <select
+                aria-label="排序方式"
+                className={styles.miniSelect}
+                value={sortMode}
+                onChange={(e) => setSortMode(e.target.value as ModelSortMode)}
+              >
+                <option value="smart">默认排序（体积 ↓）</option>
+                <option value="size_desc">按体积降序</option>
+                <option value="name_asc">按名称 A-Z</option>
+                <option value="status">按状态优先</option>
+              </select>
+              <span className={styles.modelCountHint}>
+                {visibleItems.length === allItems.length
+                  ? `${allItems.length} 项`
+                  : `${visibleItems.length} / ${allItems.length}`}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {visibleItems.length === 0 ? (
+          <div className={styles.modelEmptyState}>
+            <strong>{allItems.length ? '暂无符合条件的模型' : '模型库为空'}</strong>
+            <span className="muted small">
+              {allItems.length
+                ? '可以放宽筛选条件，或清除顶部的类别选中状态。'
+                : '点击右上角「添加模型」解析链接、上传本地权重或导入已有 Drive 文件。'}
+            </span>
+            <div className="actions">
+              {hasFilters ? (
+                <button
+                  type="button"
+                  className="button secondary small"
+                  onClick={() => {
+                    setQuery('');
+                    setCategory('');
+                    setStateFilter('');
+                    setArchitectureFilter('');
+                    setUnreferencedOnly(false);
+                  }}
+                >
+                  重置全部筛选
+                </button>
+              ) : (
+                <button type="button" className="button small" onClick={() => setAddOpen(true)}>
+                  <Plus size={14} aria-hidden />
+                  添加模型
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className={styles.modelTable} role="table" aria-label="模型资产列表">
+            <div className={styles.modelTableHead} role="row">
+              <div className={styles.modelColCheck} role="columnheader">
+                <label className={styles.modelCheckWrap}>
+                  <input
+                    ref={selectedIds.size === 0 ? selectAllRef : undefined}
+                    type="checkbox"
+                    aria-label="全选当前列表"
+                    checked={allVisibleSelected}
+                    onChange={toggleSelectAllVisible}
+                  />
+                </label>
+              </div>
+              <div className={styles.modelColName} role="columnheader">模型</div>
+              <div className={styles.modelColType} role="columnheader">分类 / 架构</div>
+              <div className={styles.modelColRef} role="columnheader">引用</div>
+              <div className={styles.modelColStatus} role="columnheader">状态</div>
+              <div className={styles.modelColSize} role="columnheader">
+                <button
+                  type="button"
+                  className={styles.modelSortColBtn}
+                  onClick={() => setSortMode((curr) => (curr === 'size_desc' ? 'smart' : 'size_desc'))}
+                >
+                  体积{sortMode === 'size_desc' || sortMode === 'smart' ? ' ↓' : ''}
+                </button>
+              </div>
+              <div className={styles.modelColActions} role="columnheader">
+                <span className="muted small">操作</span>
+              </div>
+            </div>
+
+            <div className={styles.modelTableBody} role="rowgroup">
+              {visibleItems.map((m, idx) => {
+                const task = taskByModelId.get(m.id);
+                const isActive = Boolean(task && ACTIVE_MODEL_STATES.has(task.state));
+                const titles = displayModelTitles(m);
+                const slot = categorySlots[m.model_type] ?? 5;
+                const isSelected = selectedIds.has(m.id);
+                const isInspected = detailId === m.id;
+                const menuOpen = openMenuId === m.id;
+                const flipUp = idx >= Math.max(2, visibleItems.length - 2);
+                const refCount = m.reference_count || 0;
+                const sizeRatio = m.size && maxVisibleSize > 0 ? Math.max(3, Math.round((m.size / maxVisibleSize) * 100)) : 0;
+                const effectiveState = isActive && task ? task.state : m.state;
+                const statusTone = isActive
+                  ? 'active'
+                  : m.state === 'ready'
+                    ? 'ready'
+                    : m.state === 'failed' || m.state === 'missing'
+                      ? 'danger'
+                      : 'warn';
+                const canDeleteFile = Boolean(m.drive_file_id && m.managed_file && !isActive);
+
+                return (
+                  <div
+                    key={m.id}
+                    role="row"
+                    tabIndex={0}
+                    className={styles.modelRow}
+                    data-selected={isSelected}
+                    data-inspected={isInspected}
+                    data-selecting={selectedIds.size > 0}
+                    data-menu-open={menuOpen}
+                    onClick={() => setDetailId(m.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'BUTTON') return;
+                        e.preventDefault();
+                        setDetailId(m.id);
+                      }
+                    }}
+                  >
+                    <div
+                      className={styles.modelColCheck}
+                      role="cell"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <label className={styles.modelCheckWrap}>
+                        <input
+                          type="checkbox"
+                          aria-label={`选择 ${titles.primary}`}
+                          checked={isSelected}
+                          onChange={() => toggleRowSelection(m.id)}
+                        />
+                      </label>
+                    </div>
+
+                    <div className={styles.modelColName} role="cell">
+                      <div className={styles.modelTitleLine}>
+                        <i className={styles.legendDot} data-slot={slot} aria-hidden />
+                        <span className={styles.modelPrimaryName} title={titles.primary}>{titles.primary}</span>
+                        {m.external_source?.status === 'verified' && (
+                          <span className={styles.modelVerifiedIcon} title="外部来源已验证">
+                            <CheckCircle2 size={13} strokeWidth={2} aria-hidden />
+                          </span>
+                        )}
+                      </div>
+                      {(titles.secondary || m.external_source?.status === 'unverified') && (
+                        <div className={styles.modelSubLine}>
+                          {titles.secondary && (
+                            <span className={styles.modelSubPath} title={titles.secondary}>{titles.secondary}</span>
+                          )}
+                          {m.external_source?.status === 'unverified' && (
+                            <span className={styles.modelSubWarn}>来源待验证</span>
+                          )}
+                        </div>
+                      )}
+                      {isActive && task && (
+                        <div className={styles.modelRowProgress}>
+                          <div className={styles.progress} data-indeterminate={!task.total}>
+                            <span style={{ width: task.total ? `${Math.min(100, (task.bytes / task.total) * 100)}%` : undefined }} />
+                          </div>
+                          <small className="muted">
+                            {modelStatus[task.state] || task.state} · {task.bytes ? bytesLabel(task.bytes) : '0 B'} / {bytesLabel(task.total)}
+                            {task.speed ? ` · ${(task.speed / 1024 ** 2).toFixed(1)} MB/s` : ''}
+                            {task.attempt && task.attempt > 1 ? ` · 第 ${task.attempt} 次尝试` : ''}
+                          </small>
+                        </div>
+                      )}
+                      {m.error && !isActive && (
+                        <p className={styles.modelRowError} title={m.error}>{m.error}</p>
+                      )}
+                    </div>
+
+                    <div className={styles.modelColType} role="cell" onClick={(e) => e.stopPropagation()}>
+                      <button
+                        type="button"
+                        className={styles.modelTypeChip}
+                        data-active={category === m.model_type}
+                        title={`按 ${m.model_type} 筛选`}
+                        onClick={() => setCategory(category === m.model_type ? '' : m.model_type)}
+                      >
+                        {m.model_type}
+                      </button>
+                      {m.architecture && m.architecture !== 'unknown' && (
+                        <span className={styles.modelArchTag}>{m.architecture}</span>
+                      )}
+                      {refCount > 0 && (
+                        <span className={`${styles.modelRefBadge} ${styles.modelMobileOnly}`}>
+                          {refCount} 引用
+                        </span>
+                      )}
+                      <span className={styles.modelMobileOnly}>
+                        {statusTone === 'ready' ? (
+                          <span className={styles.modelStatusReady}>
+                            <i aria-hidden />
+                            {COMPACT_STATUS_LABEL[effectiveState] || '已就绪'}
+                          </span>
+                        ) : (
+                          <span className={styles.depStatusBadge} data-tone={statusTone}>
+                            {COMPACT_STATUS_LABEL[effectiveState] || modelStatus[effectiveState] || effectiveState}
+                          </span>
+                        )}
+                      </span>
+                    </div>
+
+                    <div className={styles.modelColRef} role="cell">
+                      {refCount > 0 ? (
+                        <span className={styles.modelRefBadge} title={`被 ${refCount} 个工作流引用`}>
+                          {refCount} 引用
+                        </span>
+                      ) : (
+                        <span className={styles.modelMutedDash} title="暂无工作流引用">—</span>
+                      )}
+                    </div>
+
+                    <div className={styles.modelColStatus} role="cell">
+                      {statusTone === 'ready' ? (
+                        <span className={styles.modelStatusReady}>
+                          <i aria-hidden />
+                          {COMPACT_STATUS_LABEL[effectiveState] || '已就绪'}
+                        </span>
+                      ) : (
+                        <span className={styles.depStatusBadge} data-tone={statusTone}>
+                          {COMPACT_STATUS_LABEL[effectiveState] || modelStatus[effectiveState] || effectiveState}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className={styles.modelColSize} role="cell">
+                      <span className={styles.modelSizeText}>{bytesLabel(m.size)}</span>
+                      {sizeRatio > 0 && (
+                        <span className={styles.modelSizeTrack} aria-hidden="true">
+                          <i style={{ width: `${sizeRatio}%` }} data-slot={slot} />
+                        </span>
+                      )}
+                    </div>
+
+                    <div
+                      className={styles.modelColActions}
+                      role="cell"
+                      data-row-menu="true"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {isActive && task ? (
+                        <button
+                          type="button"
+                          className="button secondary small"
+                          disabled={busy}
+                          onClick={() => void runAction(() => libraryApi(`/tasks/${task.id}/cancel`, {}), '已取消模型准备')}
+                        >
+                          取消
+                        </button>
+                      ) : (m.state === 'failed' || m.state === 'missing') ? (
+                        <button
+                          type="button"
+                          className="button secondary small"
+                          disabled={busy}
+                          onClick={() => void runAction(() => libraryApi(`/${m.id}/prepare`, { action: 'prepare' }), '已重新加入准备队列')}
+                        >
+                          重试
+                        </button>
+                      ) : (m.state === 'pending' || m.state === 'unverified') ? (
+                        <button
+                          type="button"
+                          className="button secondary small"
+                          disabled={busy}
+                          onClick={() => void runAction(
+                            () => libraryApi(`/${m.id}/prepare`, { action: m.state === 'unverified' && m.drive_file_id ? 'verify' : 'prepare' }),
+                            m.state === 'unverified' ? '已加入校验队列' : '已加入准备队列',
+                          )}
+                        >
+                          {m.state === 'unverified' ? '校验' : '准备'}
+                        </button>
+                      ) : null}
+
+                      <div className={styles.rowMenuWrap}>
+                        <button
+                          type="button"
+                          className={styles.iconGhost}
+                          aria-label={`${titles.primary} 更多操作`}
+                          aria-expanded={menuOpen}
+                          aria-haspopup="menu"
+                          onClick={() => setOpenMenuId((curr) => (curr === m.id ? null : m.id))}
+                        >
+                          <MoreHorizontal size={16} aria-hidden />
+                        </button>
+
+                        {menuOpen && (
+                          <div className={styles.rowMenuPopover} data-up={flipUp} role="menu">
+                            <button
+                              type="button"
+                              role="menuitem"
+                              onClick={() => { setOpenMenuId(null); setDetailId(m.id); }}
+                            >
+                              详情与引用
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              disabled={busy || isActive}
+                              onClick={() => {
+                                setOpenMenuId(null);
+                                void runAction(() => libraryApi(`/${m.id}/prepare`, { action: 'prepare' }), '已加入准备队列');
+                              }}
+                            >
+                              <RefreshCw size={13} aria-hidden />
+                              准备 / 重试
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              disabled={busy || !m.drive_file_id || isActive}
+                              onClick={() => {
+                                setOpenMenuId(null);
+                                void runAction(() => libraryApi(`/${m.id}/prepare`, { action: 'verify' }), '已加入重新校验队列');
+                              }}
+                            >
+                              <ShieldCheck size={13} aria-hidden />
+                              重新校验
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              disabled={busy || !m.drive_file_id || isActive}
+                              onClick={() => {
+                                setOpenMenuId(null);
+                                void runAction(() => libraryApi(`/${m.id}/check`, {}), 'Drive 文件状态已检查');
+                              }}
+                            >
+                              <HardDrive size={13} aria-hidden />
+                              检查 Drive 文件
+                            </button>
+                            <hr />
+                            <button
+                              type="button"
+                              role="menuitem"
+                              data-danger="true"
+                              disabled={busy || isActive}
+                              onClick={() => {
+                                setOpenMenuId(null);
+                                setSingleDeleteTarget({ model: m, deleteFile: false });
+                              }}
+                            >
+                              移除索引
+                            </button>
+                            <button
+                              type="button"
+                              role="menuitem"
+                              data-danger="true"
+                              disabled={busy || !canDeleteFile}
+                              title={!m.managed_file ? '外部导入/历史缓存文件仅支持移除索引' : undefined}
+                              onClick={() => {
+                                setOpenMenuId(null);
+                                setSingleDeleteTarget({ model: m, deleteFile: true });
+                              }}
+                            >
+                              <Trash2 size={13} aria-hidden />
+                              删除 Drive 文件
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </section>
+
+      <ModelAddDialog
+        open={addOpen}
+        availableTypes={availableTypes}
+        defaultType={category || undefined}
+        models={allItems}
+        onClose={() => setAddOpen(false)}
+        onAdded={async (_model, msg) => {
+          setProgress(msg);
+          await refresh();
+        }}
+        onLocateModel={locateModel}
+      />
+
+      <ModelDetailDrawer
+        model={inspectedModel}
+        task={inspectedModel ? taskByModelId.get(inspectedModel.id) : undefined}
+        categorySlot={inspectedModel ? (categorySlots[inspectedModel.model_type] ?? 5) : 5}
+        hasPrev={activeDetailIndex > 0}
+        hasNext={activeDetailIndex >= 0 && activeDetailIndex < visibleItems.length - 1}
+        onPrev={() => {
+          if (activeDetailIndex > 0) setDetailId(visibleItems[activeDetailIndex - 1].id);
+        }}
+        onNext={() => {
+          if (activeDetailIndex >= 0 && activeDetailIndex < visibleItems.length - 1) {
+            setDetailId(visibleItems[activeDetailIndex + 1].id);
+          }
+        }}
+        onClose={() => setDetailId(null)}
+        onRefresh={refresh}
+        onProgress={setProgress}
+      />
+
+      {/* Single Row Delete Confirmation */}
+      <ConfirmDialog
+        open={Boolean(singleDeleteTarget)}
+        title={singleDeleteTarget?.deleteFile ? '删除 Drive 物理文件并移除索引？' : '移除模型索引？'}
+        description={singleDeleteTarget
+          ? (singleDeleteTarget.deleteFile
+            ? `将把「${displayModelTitles(singleDeleteTarget.model).primary}」（${bytesLabel(singleDeleteTarget.model.size)}）移至 Drive 回收站并移除索引，当前被 ${singleDeleteTarget.model.reference_count || 0} 个工作流引用。`
+            : `将从模型库移除「${displayModelTitles(singleDeleteTarget.model).primary}」的索引（保留 Drive 物理文件），当前被 ${singleDeleteTarget.model.reference_count || 0} 个工作流引用。`)
+          : ''}
+        confirmLabel={singleDeleteTarget?.deleteFile ? '确认删除' : '确认移除'}
+        danger
+        busy={busy}
+        onCancel={() => setSingleDeleteTarget(null)}
+        onConfirm={() => void executeSingleDelete()}
+      />
+
+      {/* Smart Batch Cleanup Confirmation */}
+      <ConfirmDialog
+        open={Boolean(batchPlan)}
+        title={batchPlan?.mode === 'delete_file'
+          ? `批量删除 ${batchPlan.deletable.length} 个模型？`
+          : `批量移除 ${batchPlan?.deletable.length || 0} 个模型索引？`}
+        description={batchPlan
+          ? (() => {
+            if (batchPlan.deletable.length === 0) {
+              return '当前所选模型均处于下载/校验中，请先取消任务后再清理。';
+            }
+            if (batchPlan.mode === 'remove_index') {
+              return `将从模型库移除 ${batchPlan.deletable.length} 条索引，保留所有 Drive 物理文件。`;
+            }
+            const physicalCount = batchPlan.deletable.filter((d) => d.deletePhysical).length;
+            if (physicalCount === 0) {
+              return `本次所选 ${batchPlan.deletable.length} 个模型均无应用托管 Drive 文件或被其他索引共享，将仅移除索引（不删除 Drive 原文件）。`;
+            }
+            return `将清理 ${batchPlan.deletable.length} 个模型（其中 ${physicalCount} 个将移入 Drive 回收站${batchPlan.reclaimableBytes > 0 ? `，预计释放 ${bytesLabel(batchPlan.reclaimableBytes)}` : ''}）。`;
+          })()
+          : ''}
+        confirmLabel={batchPlan?.deletable.length
+          ? (batchPlan.mode === 'delete_file' ? `确认删除（${batchPlan.deletable.length}）` : `确认移除（${batchPlan.deletable.length}）`)
+          : '知道了'}
+        danger={Boolean(batchPlan?.deletable.length)}
+        busy={busy}
+        onCancel={() => setBatchDeleteMode(null)}
+        onConfirm={() => void executeBatchDelete()}
+      >
+        {batchPlan && (
+          <div className={styles.stack} style={{ gap: '8px' }}>
+            {batchPlan.referencedModels.length > 0 && (
+              <div className={styles.depNoticeStrip}>
+                <span className={styles.batchWarnLine}>
+                  <AlertTriangle size={14} aria-hidden />
+                  其中 <strong>{batchPlan.referencedModels.length} 个模型</strong>正被工作流引用，清理后对应工作流依赖将失效。
+                </span>
+              </div>
+            )}
+            {batchPlan.fallbackToIndexOnly.length > 0 && (
+              <p className="muted small">
+                其中 {batchPlan.fallbackToIndexOnly.length} 个为外部导入/历史缓存或被其他未选中索引共享的文件，将自动仅移除索引、保留 Drive 原文件。
+              </p>
+            )}
+            {batchPlan.activeBlocked.length > 0 && (
+              <p className="muted small">
+                其中 {batchPlan.activeBlocked.length} 个模型正在下载或校验中，本次将自动跳过。
+              </p>
+            )}
+            {batchPlan.deletable.length > 0 && (
+              <div className={styles.batchPreviewList}>
+                {batchPlan.deletable.map(({ model: m, deletePhysical, fallbackReason }) => (
+                  <div key={m.id} className={styles.batchPreviewItem}>
+                    <div className={styles.batchPreviewName}>
+                      <span>{displayModelTitles(m).primary}</span>
+                      <small className="muted">
+                        {m.model_type} · {bytesLabel(m.size)}
+                        {(m.reference_count || 0) > 0 ? ` · 被 ${m.reference_count} 个工作流引用` : ''}
+                      </small>
+                    </div>
+                    <span className={styles.depTag} title={fallbackReason}>
+                      {deletePhysical ? '删文件' : '仅移索引'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </ConfirmDialog>
+    </div>
+  );
 }
