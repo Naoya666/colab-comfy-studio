@@ -1,0 +1,65 @@
+name: CI
+
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --locked --extra test
+      - run: uv run --no-sync pytest -q
+
+  frontend:
+    name: Frontend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run test:contract
+      - run: node --test tests/*.test.mjs
+      - run: npm run build
+
+  image:
+    name: Build Docker image
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: docker build --tag "colab-gpu-studio:${GITHUB_SHA}" .
+      - name: Export image
+        run: docker save "colab-gpu-studio:${GITHUB_SHA}" | gzip > "${RUNNER_TEMP}/colab-gpu-studio.tar.gz"
+        shell: bash
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: colab-gpu-studio-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/colab-gpu-studio.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

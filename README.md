@@ -207,6 +207,8 @@ docker compose exec api alembic upgrade head
 
 后端采用 **Python 3.11+ / FastAPI / SQLAlchemy 2 / Alembic**（`uv` 管理依赖），前端采用 **React 19 / TypeScript / Vite 6**（`npm` 管理依赖）。
 
+每次推送都会触发 GitHub Actions。前后端测试均通过后，CI 使用根目录的 `Dockerfile` 构建镜像，并将其保存到该次运行的 **Artifacts**，保留 14 天。下载并解压产物 ZIP 后，运行 `docker load -i colab-gpu-studio.tar.gz` 即可导入镜像，镜像标签为 `colab-gpu-studio:<提交 SHA>`。
+
 在仓库根目录执行完整离线自动化验证与构建：
 
 ```bash
