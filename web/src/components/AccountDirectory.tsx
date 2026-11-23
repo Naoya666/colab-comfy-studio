@@ -466,14 +466,14 @@ export function AccountDirectory({ accounts: suppliedAccounts, accountsLoaded = 
               <div className={styles.authGrid}>
                 <div className={styles.authCell}>
                   <div className={styles.authCellHead}>
-                    <span>Colab 算力</span>
+                    <span className={styles.authCellLabel}>Colab 算力</span>
                     {channelText && <span className={styles.channelTag}>{channelText}</span>}
                   </div>
                   <b>{statusLabel(colab)}</b>
                   <div className={styles.authButtons}>
                     <button
                       type="button"
-                      className={`${colab === 'connected' && channel === 'colab_cli' ? styles.buttonSecondary : styles.button} ${styles.authButtonRow}`}
+                      className={`${styles.buttonSecondary} ${styles.authActionPrimary}`}
                       disabled={Boolean(busy)}
                       onClick={() => setCliAuthAccount(account)}
                     >
@@ -482,7 +482,7 @@ export function AccountDirectory({ accounts: suppliedAccounts, accountsLoaded = 
                     </button>
                     <button
                       type="button"
-                      className={`${styles.buttonSecondary} ${styles.authButtonRow}`}
+                      className={`${styles.buttonSecondary} ${styles.authActionSub}`}
                       disabled={Boolean(busy)}
                       title="使用下方自建 Web OAuth 应用授权 Colab（需 GCP 开通 Colaboratory API，长驻保活与实时速率待更多真机验证）"
                       onClick={() => void authorize(account, 'colab')}
@@ -494,19 +494,26 @@ export function AccountDirectory({ accounts: suppliedAccounts, accountsLoaded = 
                 </div>
                 <div className={styles.authCell}>
                   <div className={styles.authCellHead}>
-                    <span>Google Drive</span>
+                    <span className={styles.authCellLabel}>Google Drive</span>
                     <span className={styles.channelTag}>Web OAuth</span>
                   </div>
                   <b>{delegatedAlias ? `复用「${delegatedAlias}」(${statusLabel(drive)})` : statusLabel(drive)}</b>
                   <div className={styles.authButtons}>
                     <button
                       type="button"
-                      className={`${styles.buttonSecondary} ${styles.authButtonRow}`}
+                      className={`${styles.buttonSecondary} ${styles.authActionDrive}`}
                       disabled={Boolean(busy)}
                       onClick={() => void authorize(account, 'drive')}
                     >
-                      <span>{drive === 'connected' && !delegatedAlias ? '重新授权 Drive' : '授权独立 Drive'}</span>
+                      {drive === 'connected' && !delegatedAlias ? '重新授权 Drive' : '授权独立 Drive'}
                     </button>
+                    <p className={styles.authCellNote}>
+                      {delegatedAlias
+                        ? `已复用「${delegatedAlias}」网盘，无需单独授权`
+                        : drive === 'connected'
+                          ? '已作为模型库、缓存与原生输出盘'
+                          : '配置下方 Web OAuth 后授权，或复用已有 Drive'}
+                    </p>
                   </div>
                 </div>
               </div>
