@@ -131,4 +131,13 @@ test('buildNativeRestartStages exposes four restart phases with live elapsed and
   assert.equal(failed[1].key, 'restart_syncing');
   assert.equal(failed[1].status, 'failed');
   assert.equal(failed[1].seconds, 4.2);
+
+  const pending = buildNativeRestartStages({
+    restart: null,
+    pending: true,
+    fallbackActiveSeconds: 1.4,
+  });
+  assert.deepEqual(pending.map((s) => [s.key, s.status, s.seconds]), [
+    ['restart_checking', 'in_progress', 1.4],
+  ]);
 });

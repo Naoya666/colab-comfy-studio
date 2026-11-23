@@ -202,28 +202,39 @@ export function buildNativeStartupStages(params: {
 
 export function buildNativeRestartStages(params: {
   restart?: NativeRestartInfo | null;
+  pending?: boolean;
   elapsedDeltaSeconds?: number;
   fallbackActiveSeconds?: number;
 }): StageTimelineItem[] {
-  const { restart, elapsedDeltaSeconds = 0, fallbackActiveSeconds } = params;
-  if (!restart) return [];
-  const details = restart.timing_details || {};
-  const failedKey = restart.phase === 'failed' && restart.failed_phase ? `restart_${restart.failed_phase}` : '';
+  const { restart, pending = false, elapsedDeltaSeconds = 0, fallbackActiveSeconds } = params;
+  const details = restart?.timing_details || {};
+  const failedKey = restart?.phase === 'failed' && restart.failed_phase ? `restart_${restart.failed_phase}` : '';
   const items: StageTimelineItem[] = [];
 
-  for (const key of RESTART_ORDER) {
-    const detail = details[key];
-    const isFailed = key === failedKey;
-    if (!detail && !isFailed) continue;
-    let status: StageStatus = detail?.status === 'in_progress' ? 'in_progress' : 'completed';
-    if (isFailed) status = 'failed';
-    const seconds = liveSeconds(detail?.seconds, status, elapsedDeltaSeconds, fallbackActiveSeconds);
+  if (restart) {
+    for (const key of RESTART_ORDER) {
+      const detail = details[key];
+      const isFailed = key === failedKey;
+      if (!detail && !isFailed) continue;
+      let status: StageStatus = detail?.status === 'in_progress' ? 'in_progress' : 'completed';
+      if (isFailed) status = 'failed';
+      const seconds = liveSeconds(detail?.seconds, status, elapsedDeltaSeconds, fallbackActiveSeconds);
+      items.push({
+        key,
+        label: jobStageLabel(key),
+        seconds,
+        status,
+        source: detail?.source || 'events',
+      });
+    }
+  }
+  if (!items.length && pending) {
     items.push({
-      key,
-      label: jobStageLabel(key),
-      seconds,
-      status,
-      source: detail?.source || 'events',
+      key: 'restart_checking',
+      label: jobStageLabel('restart_checking'),
+      seconds: liveSeconds(null, 'in_progress', elapsedDeltaSeconds, fallbackActiveSeconds),
+      status: 'in_progress',
+      source: 'events',
     });
   }
   return items;

@@ -287,16 +287,15 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   }), [status?.state, status?.stage, status?.timings, status?.timing_details, elapsedDeltaSeconds, fallbackActiveSeconds]);
 
   const restartStages = useMemo(() => buildNativeRestartStages({
-    restart,
+    restart: submittingRestart || pendingRestart ? undefined : restart,
+    pending: submittingRestart || Boolean(pendingRestart),
     elapsedDeltaSeconds,
     fallbackActiveSeconds,
-  }), [restart, elapsedDeltaSeconds, fallbackActiveSeconds]);
+  }), [restart, submittingRestart, pendingRestart, elapsedDeltaSeconds, fallbackActiveSeconds]);
 
   const restartMatchesCurrent = Boolean(
-    restart && (
-      restartInProgress
-      || (status?.instance_id && restart.instance_id === status.instance_id)
-    ),
+    restartInProgress
+    || (restart && status?.instance_id && restart.instance_id === status.instance_id),
   );
   const showRestartPrimary = Boolean(restartMatchesCurrent && restartStages.length);
 
