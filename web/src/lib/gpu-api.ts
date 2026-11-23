@@ -42,7 +42,7 @@ export type Provider = 'mock' | 'colab';
 export type ParamType = 'string' | 'text' | 'integer' | 'number' | 'boolean' | 'image' | 'video' | 'file' | string;
 
 export interface ApiEnvelope<T> { data?: T; error?: { code?: string; message?: string; detail?: unknown } | string | null; request_id?: string; }
-export interface Project { id: string; title: string; [key: string]: unknown; }
+export interface Project { id: string; title: string; is_default?: boolean; system?: boolean; [key: string]: unknown; }
 export interface GpuModel { model_id: string; display_name: string; enabled: boolean; reason?: string; [key: string]: unknown; }
 export interface GpuOption { value: string | number | boolean; label?: string; }
 export interface GpuParameter { id?: string; key?: string; name?: string; label?: string; type: ParamType; widget?: string; options?: Array<GpuOption | string | number | boolean>; default?: unknown; min?: number; max?: number; step?: number; group?: string; advanced?: boolean; required?: boolean; description?: string; [key: string]: unknown; }
@@ -85,6 +85,7 @@ export interface GpuJob {
   retained_until?: string | null;
   runtime_deleted?: boolean | null;
   stage?: string | null;
+  system?: boolean;
   created_at?: string;
   updated_at?: string;
   events?: GpuEvent[];
@@ -262,6 +263,7 @@ export async function login(password: string): Promise<string> {
 export const getProjects = () => apiFetch<Project[]>('/api/gpu/projects');
 export const createProject = (title: string) => apiFetch<Project>('/api/gpu/projects', post({ title }));
 export const renameProject = (id: string, title: string) => apiFetch<Project>(`/api/gpu/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ title }) });
+export const setDefaultProject = (id: string) => apiFetch<Project>(`/api/gpu/projects/${encodeURIComponent(id)}/default`, post({}));
 export const deleteProject = (id: string) => apiFetch<{ deleted: boolean; id: string }>(`/api/gpu/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
 export const getGpuModels = () => apiFetch<GpuModel[]>('/api/gpu/models');
 export const getGpuWorkflows = (modelId?: string) => apiFetch<GpuWorkflow[]>(`/api/gpu/workflows${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`);
@@ -320,15 +322,15 @@ export const deleteGpuPreset = (id: string) =>
 export async function createGpuJob(body: GpuJobRequest, idempotencyKey: string): Promise<GpuJob> {
   return apiFetch<GpuJob>('/api/gpu/jobs', { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(body) });
 }
-export const getGpuJobs = (projectId: string) => apiFetch<GpuJob[]>(`/api/gpu/jobs?project_id=${encodeURIComponent(projectId)}`);
+export const getGpuJobs = (projectId?: string) => apiFetch<GpuJob[]>(projectId ? `/api/gpu/jobs?project_id=${encodeURIComponent(projectId)}` : '/api/gpu/jobs');
 export const getGpuJob = (id: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}`);
 export const cancelGpuJob = (id: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/cancel`, post({}));
 export const retryGpuJob = (id: string, idempotencyKey: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify({}) });
-export const clearGpuJobHistory = (body: { project_id?: string; scope?: 'all_terminal' | 'failed_cancelled' | 'mock'; job_ids?: string[] } = {}) =>
+export const clearGpuJobHistory = (body: { project_id?: string; scope?: 'all_terminal' | 'failed_cancelled' | 'mock'; job_ids?: string[]; include_system?: boolean } = {}) =>
   apiFetch<{ cleared: number }>('/api/gpu/jobs/history/clear', post(body));
 export const clearCreationWarmups = () =>
   apiFetch<{ cleared: number }>('/api/gpu/creation-api/warmups/clear', post({}));
-export const getGpuGallery = (projectId: string) => apiFetch<GalleryAsset[]>(`/api/gpu/gallery?project_id=${encodeURIComponent(projectId)}`);
+export const getGpuGallery = (projectId?: string) => apiFetch<GalleryAsset[]>(projectId ? `/api/gpu/gallery?project_id=${encodeURIComponent(projectId)}` : '/api/gpu/gallery');
 export const getGpuUsage = () => apiFetch<GpuUsage>('/api/gpu/usage', { cache: 'no-store' });
 export const saveCuGuard = (limits: Pick<CuGuard, 'daily_limit_cu' | 'min_balance_cu'>) =>
   apiFetch<CuGuard>('/api/gpu/cu/guard', { method: 'PUT', body: JSON.stringify(limits) });
@@ -457,12 +459,18 @@ export const assetUrl = (asset: GalleryAsset, thumbnail = false) => thumbnail ? 
 export const updateAsset = (id: string, favorite: boolean) => apiFetch<GalleryAsset>(`/api/assets/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ favorite }) });
 export const deleteAsset = (id: string) => apiFetch<void>(`/api/assets/${encodeURIComponent(id)}`, { method: 'DELETE' });
 export const BATCH_DELETE_ASSET_LIMIT = 200;
+export const BATCH_MOVE_ASSET_LIMIT = 200;
 export const batchDeleteAssets = (assetIds: string[]) => apiFetch<{ deleted: number; ids: string[] }>('/api/assets/batch-delete', post({ asset_ids: assetIds }));
+export const batchMoveAssets = (assetIds: string[], targetProjectId: string) =>
+  apiFetch<{ moved: number; ids: string[]; target_project_id: string }>('/api/assets/batch-move', post({
+    asset_ids: assetIds,
+    target_project_id: targetProjectId,
+  }));
 
 export interface GoogleClientConfig { configured: boolean; client_id?: string; redirect_uri: string; source?: string; }
 export const getGoogleClientConfig = (accountId?: string) => apiFetch<GoogleClientConfig>(`/api/gpu/auth/google/config${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`);
 export const saveGoogleClientConfig = (body: {account_id?: string; client_id?: string; client_secret?: string; client_json?: Record<string, unknown>; confirmed: true}) => apiFetch<GoogleClientConfig>('/api/gpu/auth/google/config', post(body));
-export const getReferenceAssets = (projectId: string) => apiFetch<GalleryAsset[]>(`/api/assets?project_id=${encodeURIComponent(projectId)}`);
+export const getReferenceAssets = (projectId?: string) => apiFetch<GalleryAsset[]>(projectId ? `/api/assets?project_id=${encodeURIComponent(projectId)}` : '/api/assets');
 
 export function createGpuBatch(jobs: GpuJobRequest[], mode: 'save'|'smart'|'batch'|'retain', idempotencyKey: string) {
   return apiFetch<{ id: string; job_ids: string[] }>('/api/gpu/batches', {method:'POST',headers:{'Idempotency-Key':idempotencyKey},body:JSON.stringify({jobs,mode})});

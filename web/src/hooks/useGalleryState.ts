@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   apiMessage,
   BATCH_DELETE_ASSET_LIMIT,
+  BATCH_MOVE_ASSET_LIMIT,
   batchDeleteAssets,
+  batchMoveAssets,
   deleteAsset,
   deleteNativeOutput,
   favoriteNativeOutput,
@@ -13,7 +15,9 @@ import {
   type GalleryAsset,
   type GpuJob,
   type NativeOutputAsset,
+  type Project,
 } from '../lib/gpu-api';
+import { projectTitleById } from '../lib/project-label';
 import type { ViewerItem } from '../components/GalleryViewer';
 import type { MainTab } from '../lib/route-state';
 
@@ -21,6 +25,7 @@ export type GallerySource = 'studio' | 'native';
 
 export function useGalleryState({
   projectId,
+  projects,
   loggedIn,
   tab,
   desktop,
@@ -31,6 +36,7 @@ export function useGalleryState({
   onUseReference,
 }: {
   projectId: string;
+  projects: Project[];
   loggedIn: boolean;
   tab: MainTab;
   desktop: boolean;
@@ -40,10 +46,8 @@ export function useGalleryState({
   onLoadedAgainJob: (job: GpuJob) => void;
   onUseReference: (asset: GalleryAsset) => void;
 }) {
-  const currentProjectId = useRef(projectId);
-  currentProjectId.current = projectId;
-
   const [gallerySource, setGallerySource] = useState<GallerySource>('studio');
+  const [galleryProjectFilter, setGalleryProjectFilter] = useState('');
   const [gallery, setGallery] = useState<GalleryAsset[]>([]);
   const [galleryError, setGalleryError] = useState('');
   const [galleryRevision, setGalleryRevision] = useState(0);
@@ -64,12 +68,16 @@ export function useGalleryState({
   const [importingNativeRef, setImportingNativeRef] = useState(false);
   const [confirmDeleteNative, setConfirmDeleteNative] = useState<NativeOutputAsset | null>(null);
 
-  const projectGallery = useMemo(
-    () => gallery.filter((asset) => asset.project_id === projectId),
+  const createProjectGallery = useMemo(
+    () => (projectId ? gallery.filter((asset) => asset.project_id === projectId) : []),
     [gallery, projectId],
   );
-  const viewer = viewerSelection?.project_id === projectId
-    ? projectGallery.find((asset) => asset.id === viewerSelection.id) ?? viewerSelection
+  const projectGallery = useMemo(
+    () => (galleryProjectFilter ? gallery.filter((asset) => asset.project_id === galleryProjectFilter) : gallery),
+    [gallery, galleryProjectFilter],
+  );
+  const viewer = viewerSelection
+    ? gallery.find((asset) => asset.id === viewerSelection.id) ?? viewerSelection
     : null;
   const nativeViewer = useMemo(() => {
     if (!nativeViewerSelection || nativeDeletedIds.has(nativeViewerSelection.id)) return null;
@@ -87,9 +95,9 @@ export function useGalleryState({
   const inlineViewer = desktop && tab === '作品';
 
   const studioNavList = useMemo(() => {
-    const base = viewerList.length ? viewerList.filter((a) => projectGallery.some((g) => g.id === a.id)) : projectGallery;
-    return base.map((item) => projectGallery.find((g) => g.id === item.id) || item);
-  }, [viewerList, projectGallery]);
+    const base = viewerList.length ? viewerList.filter((a) => gallery.some((g) => g.id === a.id)) : projectGallery;
+    return base.map((item) => gallery.find((g) => g.id === item.id) || item);
+  }, [viewerList, gallery, projectGallery]);
 
   const nativeNavList = useMemo(
     () => nativeViewerList
@@ -106,37 +114,40 @@ export function useGalleryState({
       : -1;
 
   useEffect(() => {
-    if (!pendingRouteAssetId || !projectGallery.length) return;
-    const found = projectGallery.find((a) => a.id === pendingRouteAssetId);
+    if (!pendingRouteAssetId || !gallery.length) return;
+    const found = gallery.find((a) => a.id === pendingRouteAssetId);
     if (found) {
       setGallerySource('studio');
+      if (galleryProjectFilter && found.project_id !== galleryProjectFilter) {
+        setGalleryProjectFilter('');
+      }
       setViewer(found);
-      setViewerList(projectGallery);
+      setViewerList(galleryProjectFilter && found.project_id === galleryProjectFilter ? projectGallery : gallery);
       setPendingRouteAssetId('');
     }
-  }, [pendingRouteAssetId, projectGallery]);
+  }, [pendingRouteAssetId, gallery, projectGallery, galleryProjectFilter]);
 
   useEffect(() => {
-    if (!projectId || !loggedIn) return;
+    if (!loggedIn) return;
     let alive = true;
     setGalleryError('');
     setRefreshingGallery(true);
-    getGpuGallery(projectId).then((next) => {
-      if (alive) setGallery(next.map((asset) => (asset.project_id ? asset : { ...asset, project_id: projectId })));
+    getGpuGallery().then((next) => {
+      if (alive) setGallery(next);
     }).catch((cause) => {
       if (alive) setGalleryError(apiMessage(cause));
     }).finally(() => {
       if (alive) setRefreshingGallery(false);
     });
     return () => { alive = false; };
-  }, [projectId, loggedIn, tab, galleryOutputs, galleryRevision]);
+  }, [loggedIn, tab, galleryOutputs, galleryRevision]);
 
   const refreshGallery = useCallback(() => {
     setGalleryRevision((revision) => revision + 1);
   }, []);
 
   useEffect(() => {
-    if (!viewerJobId || !projectId || !loggedIn) {
+    if (!viewerJobId || !loggedIn) {
       setViewerJob(null);
       setViewerJobError('');
       return;
@@ -144,12 +155,12 @@ export function useGalleryState({
     let alive = true;
     setViewerJobError('');
     getGpuJob(viewerJobId).then((job) => {
-      if (alive && job.project_id === projectId) setViewerJob(job);
+      if (alive && job.id === viewerJobId) setViewerJob(job);
     }).catch((cause) => {
       if (alive) setViewerJobError(apiMessage(cause));
     });
     return () => { alive = false; };
-  }, [viewerJobId, projectId, loggedIn]);
+  }, [viewerJobId, loggedIn]);
 
   const closeViewers = useCallback(() => {
     setViewer(null);
@@ -175,11 +186,10 @@ export function useGalleryState({
     setGalleryError('');
     try {
       const job = await getGpuJob(sourceJobId);
-      if (currentProjectId.current !== asset.project_id) return;
       onLoadedAgainJob(job);
       setViewer((current) => (current?.id === asset.id ? null : current));
     } catch (cause) {
-      if (currentProjectId.current === asset.project_id) setGalleryError(`再次生成：${apiMessage(cause)}`);
+      setGalleryError(`再次生成：${apiMessage(cause)}`);
     }
   }
 
@@ -191,7 +201,7 @@ export function useGalleryState({
       setViewer((current) => (current?.id === next.id ? { ...current, ...next } : current));
       pushToast(next.favorite ? '已收藏作品' : '已取消收藏', 'info');
     } catch (cause) {
-      if (currentProjectId.current === asset.project_id) setGalleryError(apiMessage(cause));
+      setGalleryError(apiMessage(cause));
     }
   }
 
@@ -203,7 +213,7 @@ export function useGalleryState({
       setViewer((current) => (current?.id === asset.id ? null : current));
       pushToast('已删除作品', 'success');
     } catch (cause) {
-      if (currentProjectId.current === asset.project_id) setGalleryError(`删除失败：${apiMessage(cause)}`);
+      setGalleryError(`删除失败：${apiMessage(cause)}`);
     }
   }
 
@@ -218,7 +228,7 @@ export function useGalleryState({
         result.ids.forEach((id) => removedIds.add(id));
       }
     } catch (cause) {
-      const remaining = await getGpuGallery(projectId).catch(() => null);
+      const remaining = await getGpuGallery().catch(() => null);
       if (remaining) {
         const existing = new Set(remaining.map((asset) => asset.id));
         ids.filter((id) => !existing.has(id)).forEach((id) => removedIds.add(id));
@@ -228,10 +238,35 @@ export function useGalleryState({
     if (removedIds.size > 0) {
       setGallery((current) => current.filter((asset) => !removedIds.has(asset.id)));
       setViewer((current) => (current && removedIds.has(current.id) ? null : current));
-      if (currentProjectId.current === projectId) setGalleryRevision((revision) => revision + 1);
+      setGalleryRevision((revision) => revision + 1);
     }
     if (!batchError) pushToast(`已批量删除 ${removedIds.size} 件作品`, 'success');
     return { removedIds: [...removedIds], error: batchError };
+  }
+
+  async function moveAssets(ids: string[], targetProjectId: string) {
+    const movedIds = new Set<string>();
+    let moveError = '';
+    setGalleryError('');
+    try {
+      for (let offset = 0; offset < ids.length; offset += BATCH_MOVE_ASSET_LIMIT) {
+        const batch = ids.slice(offset, offset + BATCH_MOVE_ASSET_LIMIT);
+        const result = await batchMoveAssets(batch, targetProjectId);
+        result.ids.forEach((id) => movedIds.add(id));
+      }
+    } catch (cause) {
+      moveError = `移动失败：${apiMessage(cause)}`;
+    }
+    if (movedIds.size > 0) {
+      setGallery((current) => current.map((asset) => (movedIds.has(asset.id) ? { ...asset, project_id: targetProjectId } : asset)));
+      setViewer((current) => (current && movedIds.has(current.id) ? { ...current, project_id: targetProjectId } : current));
+      setGalleryRevision((revision) => revision + 1);
+    }
+    if (!moveError && movedIds.size > 0) {
+      const label = projectTitleById(targetProjectId, projects) || '目标项目';
+      pushToast(`已将 ${movedIds.size} 件作品移动到「${label}」`, 'success');
+    }
+    return { movedIds: [...movedIds], error: moveError };
   }
 
   async function favoriteNative(asset: NativeOutputAsset) {
@@ -311,6 +346,10 @@ export function useGalleryState({
   return {
     gallerySource,
     setGallerySource,
+    galleryProjectFilter,
+    setGalleryProjectFilter,
+    allGallery: gallery,
+    createProjectGallery,
     projectGallery,
     galleryError,
     setGalleryError,
@@ -344,6 +383,7 @@ export function useGalleryState({
     favorite,
     remove,
     batchRemove,
+    moveAssets,
     favoriteNative,
     importNativeRef,
     removeNative,

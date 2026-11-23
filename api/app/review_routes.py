@@ -670,9 +670,7 @@ def real_smoke(
     except (TypeError, ValueError) as exc:
         raise APIError("WORKFLOW_INVALID", str(exc)[:300]) from exc
     for asset_id in asset_ids:
-        asset = own(st, "assets", asset_id, user)
-        if asset.get("project_id") != project["id"]:
-            raise APIError("ASSET_PROJECT_MISMATCH", "参考素材不属于当前项目")
+        own(st, "assets", asset_id, user)
 
     cfg = GpuConfig.from_env()
     runtime = _runtime_cap(row)

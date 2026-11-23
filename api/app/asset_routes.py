@@ -24,7 +24,8 @@ def gallery(
 ):
     if project_id:
         own(st, "projects", project_id, user)
-    job_map = {job["id"]: job for job in Repository(st).list("jobs", user["id"], project_id)}
+    # Index across all owner jobs so assets moved to another project retain workflow/batch metadata.
+    job_map = {job["id"]: job for job in Repository(st).list("jobs", user["id"])}
     result = []
     for a in st.list("assets", user["id"], project_id):
         source_job_id = a.get("source_job_id") or a.get("gpu_job_id")
@@ -48,8 +49,11 @@ def gallery(
 
 
 @assets_router.get("/api/assets")
-def reference_assets(request: Request, project_id: str, user=Depends(current_user), st=Depends(get_store)):
-    own(st, "projects", project_id, user)
+def reference_assets(
+    request: Request, project_id: str | None = None, user=Depends(current_user), st=Depends(get_store)
+):
+    if project_id:
+        own(st, "projects", project_id, user)
     rows = [
         public_asset(a)
         for a in st.list("assets", user["id"], project_id)
@@ -96,16 +100,57 @@ def thumbnail(asset_id: str, user=Depends(current_user), st=Depends(get_store)):
     return Response(target.getvalue(), media_type="image/webp")
 
 
+def _require_target_project(st, project_id: str, user: dict) -> dict:
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise APIError("VALIDATION_ERROR", "请指定目标项目")
+    project = own(st, "projects", project_id.strip(), user)
+    if project.get("archived_at") is not None:
+        raise APIError("PROJECT_ARCHIVED", "目标项目已归档，无法移入作品", 409)
+    if project.get("system") is True:
+        raise APIError("PROJECT_SYSTEM_PROTECTED", "不能将作品移入系统内部项目", 409)
+    return project
+
+
 @assets_router.patch("/api/assets/{asset_id}")
 def favorite_asset(
     asset_id: str, body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)
 ):
     own(st, "assets", asset_id, user)
-    if not isinstance(body.get("favorite"), bool):
+    if not isinstance(body, dict):
+        raise APIError("VALIDATION_ERROR", "请求体格式无效")
+    patch: dict = {}
+    if "favorite" in body:
+        if not isinstance(body.get("favorite"), bool):
+            raise APIError("VALIDATION_ERROR", "favorite必须为布尔值")
+        patch["favorite"] = body["favorite"]
+    if "project_id" in body:
+        target = _require_target_project(st, body.get("project_id"), user)
+        patch["project_id"] = target["id"]
+    if not patch:
         raise APIError("VALIDATION_ERROR", "favorite必须为布尔值")
-    return ok(
-        public_asset(st.update("assets", asset_id, {"favorite": body["favorite"]}, user["id"])), request
-    )
+    return ok(public_asset(st.update("assets", asset_id, patch, user["id"])), request)
+
+
+@assets_router.post("/api/assets/batch-move")
+def batch_move_assets(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    raw_ids = body.get("asset_ids") if isinstance(body, dict) else None
+    target_project_id = body.get("target_project_id") if isinstance(body, dict) else None
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or len(raw_ids) > 200
+        or any(not isinstance(item, str) for item in raw_ids)
+    ):
+        raise APIError("VALIDATION_ERROR", "请提供 1~200 个待移动的素材编号")
+    target = _require_target_project(st, target_project_id, user)
+    unique_ids = list(dict.fromkeys(raw_ids))
+    assets = [own(st, "assets", aid, user) for aid in unique_ids]
+    moved_ids = []
+    for asset in assets:
+        if asset.get("project_id") != target["id"]:
+            st.update("assets", asset["id"], {"project_id": target["id"]}, user["id"])
+        moved_ids.append(asset["id"])
+    return ok({"moved": len(moved_ids), "ids": moved_ids, "target_project_id": target["id"]}, request)
 
 
 @assets_router.delete("/api/assets/{asset_id}")

@@ -32,8 +32,6 @@ def resolve_input_images(own_asset, project_id: str, manifest: dict, params: dic
         if spec.get("type") != "image" or params.get(name) in (None, ""):
             continue
         asset = own_asset(params[name])
-        if asset.get("project_id") != project_id:
-            raise APIError("ASSET_PROJECT_MISMATCH", "参考素材不属于当前项目")
         if asset.get("mime") not in ("image/png", "image/jpeg", "image/webp"):
             raise APIError("VALIDATION_ERROR", f"参数 {name} 只接受 PNG/JPEG/WebP 图片")
         filename = f"input_{name}.jpg"

@@ -221,9 +221,7 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
     )
     bound = bind_parameters(workflow["manifest"], workflow["api_graph"], bind_params)
     for asset_id in body["asset_ids"]:
-        asset = own(st, "assets", asset_id, user)
-        if asset["project_id"] != project["id"]:
-            raise APIError("ASSET_PROJECT_MISMATCH", "参考素材不属于当前项目")
+        own(st, "assets", asset_id, user)
     snapshot = {
         "manifest": workflow["manifest"],
         "api_graph": workflow["api_graph"],

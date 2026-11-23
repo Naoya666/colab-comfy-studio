@@ -77,6 +77,7 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     auto_start: bool = False
     account_id: str | None = None
+    project_id: str | None = None
     gpu: dict = DEFAULT_GPU
     lifecycle: str = "save"
     retain_idle_minutes: int = 15
@@ -328,14 +329,30 @@ def warm_status(repo, row):
     )}, "ready": ready, "expires_at": expires if ready else None}
 
 
+def default_project_id(owner: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"studio:creation-api:{owner}"))
+
+
 def get_project(store, owner):
-    ident = str(uuid.uuid5(uuid.NAMESPACE_URL, f"studio:creation-api:{owner}"))
-    if not store.get("projects", ident, owner):
+    cfg = config(store, owner)
+    configured = cfg.get("project_id")
+    if isinstance(configured, str) and configured:
+        target = store.get("projects", configured, owner)
+        if target and target.get("archived_at") is None and target.get("system") is not True:
+            return configured
+    ident = default_project_id(owner)
+    existing = store.get("projects", ident, owner)
+    if not existing:
         with store.admission_lock() as locked:
             if not locked:
                 raise APIError("SCHEDULER_BUSY", "创作 API 项目初始化中，请重试", 503, True)
-            if not store.get("projects", ident, owner):
+            existing = store.get("projects", ident, owner)
+            if not existing:
                 store.create("projects", owner, {"title": "创作 API"}, record_id=ident)
+    elif existing.get("archived_at") is not None:
+        with store.admission_lock() as locked:
+            if locked:
+                store.update("projects", ident, {"archived_at": None}, owner)
     return ident
 
 
@@ -532,6 +549,7 @@ def admin_status(request: Request, user=Depends(current_user), store=Depends(get
         "urls": urls,
         "listener": _listener_status(request.app),
         "config": cfg,
+        "default_project_id": default_project_id(owner),
         "keys": [public_key(row) for row in store.list(KEYS, owner)],
         "workflows": [public_workflow(row) for row in eligible(repo, owner)],
         "warmups": warmups,
@@ -600,6 +618,14 @@ async def save_config(body: Config, request: Request, user=Depends(current_user)
         account = repo.get("accounts", cfg["account_id"], owner)
         if not account or not _account_is_usable(account) or not _google_status(repo, owner, cfg["account_id"])["colab"]["connected"]:
             raise APIError("ACCOUNT_UNAVAILABLE", "请选择已经授权且允许分配的 Colab 账号", 409)
+    raw_project_id = (cfg.get("project_id") or "").strip()
+    if not raw_project_id or raw_project_id == default_project_id(owner):
+        cfg["project_id"] = None
+    else:
+        target_project = store.get("projects", raw_project_id, owner)
+        if not target_project or target_project.get("archived_at") is not None or target_project.get("system") is True:
+            raise APIError("CREATION_PROJECT_UNAVAILABLE", "请选择有效且未归档的普通项目", 409)
+        cfg["project_id"] = raw_project_id
 
     mgr = getattr(request.app.state, "port_listeners", None)
     if mgr is not None:

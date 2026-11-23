@@ -1,14 +1,15 @@
 import { useCallback, useMemo, useState } from 'react';
 import {
   Zap, Search, RefreshCw, Image as ImageIcon, Film, Loader, ChevronRight, ChevronDown,
-  Square, RotateCcw, Trash2, Layers, Eraser,
+  Square, RotateCcw, Trash2, Layers, Eraser, Folder, Terminal,
 } from 'lucide-react';
-import { type GpuJob, type GpuWorkflow } from '../lib/gpu-api';
+import { type GpuJob, type GpuWorkflow, type Project } from '../lib/gpu-api';
 import styles from '../gpu.module.css';
 import { formatDateTime, jobSize, progressPercent, readableState, terminalStates } from '../lib/ui-helpers';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
 import { canRetainJobInstance, gpuLabel } from '../lib/gpu-label';
 import { groupJobsByBatch, partitionJobEntries, type DateBucketKey, type JobBatchEntry, type JobDisplayEntry } from '../lib/history-grouping';
+import { isSystemJob, projectOptionLabel, projectTitleById } from '../lib/project-label';
 import { workflowTitle } from '../lib/workflow-copy';
 import { ConfirmDialog } from '../components/Feedback';
 
@@ -19,12 +20,34 @@ const DONE = ['completed', 'succeeded'];
 const FAILED = ['failed', 'failed_final', 'cancelled', 'cancelled_local', 'blocked'];
 
 type Filter = 'all' | 'running' | 'completed' | 'failed' | string;
-export type JobClearRequest = { scope?: 'all_terminal' | 'failed_cancelled' | 'mock'; jobIds?: string[] };
+export type JobClearRequest = { scope?: 'all_terminal' | 'failed_cancelled' | 'mock'; jobIds?: string[]; includeSystem?: boolean };
 
 export function TasksPanel({
-  jobs, workflows = [], error, refreshing, clearingHistory = false, onRefresh, onCancel, onRetry, onDetail, onRetain, onInstance, onClearHistory, selectedId,
+  jobs,
+  projects = [],
+  projectFilter = '',
+  onProjectFilterChange,
+  showSystemJobs = false,
+  onShowSystemJobsChange,
+  workflows = [],
+  error,
+  refreshing,
+  clearingHistory = false,
+  onRefresh,
+  onCancel,
+  onRetry,
+  onDetail,
+  onRetain,
+  onInstance,
+  onClearHistory,
+  selectedId,
 }: {
   jobs: GpuJob[];
+  projects?: Project[];
+  projectFilter?: string;
+  onProjectFilterChange?: (projectId: string) => void;
+  showSystemJobs?: boolean;
+  onShowSystemJobsChange?: (show: boolean) => void;
   workflows?: GpuWorkflow[];
   error: string;
   refreshing: boolean;
@@ -54,7 +77,7 @@ export function TasksPanel({
   const stateOf = (job: GpuJob) => String(job.state || 'queued').toLowerCase();
   const isActive = (job: GpuJob) => !terminalStates.has(stateOf(job));
 
-  const uniqueJobs = useMemo(() => {
+  const allUniqueJobs = useMemo(() => {
     const seen = new Set<string>();
     return jobs.filter((job, index) => {
       const key = String(job.id || job.job_id || `job-${index}`);
@@ -63,6 +86,32 @@ export function TasksPanel({
       return true;
     });
   }, [jobs]);
+
+  const systemJobsCount = useMemo(
+    () => allUniqueJobs.filter(isSystemJob).length,
+    [allUniqueJobs],
+  );
+
+  const projectJobCounts = useMemo(() => {
+    const map = new Map<string, number>();
+    let nonSystemTotal = 0;
+    for (const job of allUniqueJobs) {
+      if (isSystemJob(job)) continue;
+      nonSystemTotal += 1;
+      if (job.project_id) map.set(job.project_id, (map.get(job.project_id) || 0) + 1);
+    }
+    return { map, nonSystemTotal };
+  }, [allUniqueJobs]);
+
+  const uniqueJobs = useMemo(() => {
+    if (projectFilter) {
+      return allUniqueJobs.filter((job) => job.project_id === projectFilter);
+    }
+    return showSystemJobs ? allUniqueJobs : allUniqueJobs.filter((job) => !isSystemJob(job));
+  }, [allUniqueJobs, projectFilter, showSystemJobs]);
+
+  const scopeLabel = projectFilter ? `项目「${projectTitleById(projectFilter, projects)}」` : '全部项目';
+  const showProjectTag = !projectFilter;
 
   const counts = useMemo(() => ({
     running: uniqueJobs.filter(isActive).length,
@@ -91,8 +140,9 @@ export function TasksPanel({
     if (filter === 'completed' && !DONE.includes(s)) return false;
     if (filter === 'failed' && !FAILED.includes(s)) return false;
     if (!['all', 'running', 'completed', 'failed'].includes(filter) && job.state !== filter) return false;
-    return `${job.workflow_key || ''} ${wfName(job.workflow_key)} ${job.id} ${job.batch_id || ''}`.toLowerCase().includes(query.toLowerCase());
-  }), [uniqueJobs, filter, query, wfName]);
+    const projName = projectTitleById(job.project_id, projects);
+    return `${job.workflow_key || ''} ${wfName(job.workflow_key)} ${job.id} ${job.batch_id || ''} ${projName}`.toLowerCase().includes(query.toLowerCase());
+  }), [uniqueJobs, filter, query, wfName, projects]);
 
   const entries = useMemo<JobDisplayEntry[]>(() => {
     if (!stackBatches) {
@@ -185,7 +235,12 @@ export function TasksPanel({
               <span className={`pill ${done ? 'solid' : failed ? 'danger' : ''}`}>{jobStateLabel(job.state)}</span>
             </div>
             <p className="muted small">
-              {[video ? '视频' : '图片', size, job.provider === 'mock' ? '模拟' : job.provider === 'colab' ? 'Colab' : ''].filter(Boolean).join(' · ')}
+              {[
+                showProjectTag ? projectTitleById(job.project_id, projects) : '',
+                isSystemJob(job) ? '系统任务' : video ? '视频' : '图片',
+                size,
+                job.provider === 'mock' ? '模拟' : job.provider === 'colab' ? 'Colab' : '',
+              ].filter(Boolean).join(' · ')}
             </p>
             <p className="muted small">创建于 {formatDateTime(job.created_at)}</p>
             {instanceId ? <button type="button" className={styles.linkButton} onClick={() => onInstance?.(job)}>{machineInfo}</button>
@@ -272,7 +327,12 @@ export function TasksPanel({
                 </span>
               </span>
               <small className="muted">
-                {summaryParts} · {entry.provider === 'mock' ? '模拟' : entry.provider === 'colab' ? 'Colab' : '任务'} · {formatDateTime(entry.latestCreatedAt)}
+                {[
+                  showProjectTag ? projectTitleById(entry.jobs[0]?.project_id, projects) : '',
+                  summaryParts,
+                  entry.provider === 'mock' ? '模拟' : entry.provider === 'colab' ? 'Colab' : '任务',
+                  formatDateTime(entry.latestCreatedAt),
+                ].filter(Boolean).join(' · ')}
               </small>
             </span>
             <ChevronDown size={16} strokeWidth={1.6} aria-hidden className={styles.chev} />
@@ -372,8 +432,8 @@ export function TasksPanel({
                 disabled={clearingHistory}
                 onClick={() => setPendingClear({
                   title: '清理失败和已取消任务？',
-                  description: `将隐藏当前项目中 ${counts.failed} 条失败/已取消的任务记录。`,
-                  request: { scope: 'failed_cancelled' },
+                  description: `将隐藏${scopeLabel}中 ${counts.failed} 条失败/已取消的任务记录。`,
+                  request: { scope: 'failed_cancelled', includeSystem: !projectFilter && showSystemJobs },
                 })}
               >
                 清理失败/取消 ({counts.failed})
@@ -386,8 +446,8 @@ export function TasksPanel({
                 disabled={clearingHistory}
                 onClick={() => setPendingClear({
                   title: '清理离线模拟任务？',
-                  description: `将隐藏当前项目中 ${counts.mockTerminal} 条已结束的模拟任务记录。`,
-                  request: { scope: 'mock' },
+                  description: `将隐藏${scopeLabel}中 ${counts.mockTerminal} 条已结束的模拟任务记录。`,
+                  request: { scope: 'mock', includeSystem: !projectFilter && showSystemJobs },
                 })}
               >
                 清理模拟任务 ({counts.mockTerminal})
@@ -399,8 +459,8 @@ export function TasksPanel({
               disabled={clearingHistory}
               onClick={() => setPendingClear({
                 title: '清理全部已结束任务？',
-                description: `将隐藏当前项目中 ${counts.terminal} 条已结束任务（进行中的任务不受影响），已生成的作品和账单会保留。`,
-                request: { scope: 'all_terminal' },
+                description: `将隐藏${scopeLabel}中 ${counts.terminal} 条已结束任务（进行中的任务不受影响），已生成的作品和账单会保留。`,
+                request: { scope: 'all_terminal', includeSystem: !projectFilter && showSystemJobs },
               })}
             >
               清理全部已结束 ({counts.terminal})
@@ -424,6 +484,36 @@ export function TasksPanel({
           {counts.failed > 0 && chip('failed', `失败/取消 ${counts.failed}`)}
         </div>
         <div className={styles.filterRight}>
+          {onProjectFilterChange && projects.length > 0 && (
+            <label className={`small muted ${styles.filterSelectWrap}`}>
+              <Folder size={13} aria-hidden />
+              <select
+                aria-label="按项目筛选任务"
+                className={styles.miniSelect}
+                value={projectFilter}
+                onChange={(e) => { onProjectFilterChange(e.target.value); setLimit(30); }}
+              >
+                <option value="">全部项目 ({projectJobCounts.nonSystemTotal})</option>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {projectOptionLabel(p, projects)}{p.is_default ? ' · 默认' : ''} ({projectJobCounts.map.get(p.id) || 0})
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {!projectFilter && systemJobsCount > 0 && onShowSystemJobsChange && (
+            <button
+              type="button"
+              className={styles.chip}
+              data-active={showSystemJobs}
+              aria-pressed={showSystemJobs}
+              onClick={() => onShowSystemJobsChange(!showSystemJobs)}
+              title="显示或隐藏原生 ComfyUI 开机、GPU 可行性检查等系统后台任务"
+            >
+              <Terminal size={13} strokeWidth={1.7} aria-hidden />显示系统任务 ({systemJobsCount})
+            </button>
+          )}
           {hasMultiBatches && (
             <button
               type="button"

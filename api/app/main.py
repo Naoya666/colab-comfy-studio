@@ -621,6 +621,7 @@ def clear_job_history(
         if not isinstance(raw_ids, list) or len(raw_ids) > 500 or any(not isinstance(item, str) for item in raw_ids):
             raise APIError("VALIDATION_ERROR", "job_ids 格式无效")
         target_ids = set(raw_ids)
+    include_system = bool(payload.get("include_system"))
     repo = Repository(st)
     rows = repo.list("jobs", user["id"], project_id)
     now = time.time()
@@ -632,10 +633,16 @@ def clear_job_history(
         if target_ids is not None:
             if row["id"] not in target_ids:
                 continue
-        elif scope == "failed_cancelled" and state not in _FAILED_JOB_STATES:
-            continue
-        elif scope == "mock" and row.get("provider") != "mock":
-            continue
+        else:
+            if not project_id and not include_system:
+                snap = row.get("snapshot") or {}
+                wf_key = str(row.get("workflow_key") or "")
+                if snap.get("native_comfy") is True or snap.get("system_smoke") is True or wf_key.startswith("system/"):
+                    continue
+            if scope == "failed_cancelled" and state not in _FAILED_JOB_STATES:
+                continue
+            if scope == "mock" and row.get("provider") != "mock":
+                continue
         repo.update("jobs", row["id"], {"history_cleared_at": now}, user["id"])
         cleared += 1
     return ok({"cleared": cleared}, request)

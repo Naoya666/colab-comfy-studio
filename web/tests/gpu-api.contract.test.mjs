@@ -179,3 +179,30 @@ test('createGpuBatch accepts the v0.2 retain mode and envelopes are unwrapped', 
   assert.equal(header(request, 'Idempotency-Key'), 'batch-1');
   assert.deepEqual(JSON.parse(request.init.body), { jobs: [], mode: 'retain' });
 });
+
+test('project default, batch asset move, and optional project_id queries match backend contract', async () => {
+  await api.setDefaultProject('proj/1');
+  let request = lastRequest();
+  assert.equal(request.url, '/api/gpu/projects/proj%2F1/default');
+  assert.equal(request.init.method, 'POST');
+
+  requests = [];
+  const moved = await jsonBody(api.batchMoveAssets(['a1', 'a2'], 'proj-2'));
+  assert.equal(moved.request.url, '/api/assets/batch-move');
+  assert.equal(moved.request.init.method, 'POST');
+  assert.deepEqual(moved.body, { asset_ids: ['a1', 'a2'], target_project_id: 'proj-2' });
+
+  requests = [];
+  await api.getGpuJobs();
+  assert.equal(lastRequest().url, '/api/gpu/jobs');
+  requests = [];
+  await api.getGpuJobs('p1');
+  assert.equal(lastRequest().url, '/api/gpu/jobs?project_id=p1');
+
+  requests = [];
+  await api.getGpuGallery();
+  assert.equal(lastRequest().url, '/api/gpu/gallery');
+  requests = [];
+  await api.getReferenceAssets();
+  assert.equal(lastRequest().url, '/api/assets');
+});

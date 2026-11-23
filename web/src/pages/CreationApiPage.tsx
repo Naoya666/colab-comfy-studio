@@ -5,7 +5,8 @@ import { RuntimeSelection, type RuntimeLifecycle } from '../components/RuntimeSe
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import { ConfirmDialog } from '../components/Feedback';
 import { Card } from '../components/ui';
-import { apiFetch, clearCreationWarmups } from '../lib/gpu-api';
+import { apiFetch, clearCreationWarmups, type Project } from '../lib/gpu-api';
+import { projectOptionLabel } from '../lib/project-label';
 import { useSmartPoll } from '../lib/smart-poll';
 import styles from '../gpu.module.css';
 
@@ -34,6 +35,7 @@ type ListenerStatus = {
 type Config = {
   auto_start: boolean;
   account_id: string | null;
+  project_id?: string | null;
   gpu: Record<string, unknown>;
   lifecycle: RuntimeLifecycle;
   retain_idle_minutes: number;
@@ -88,6 +90,7 @@ type Status = {
   urls?: AccessUrls;
   listener?: ListenerStatus;
   config: Config;
+  default_project_id?: string;
   keys: Key[];
   workflows: Workflow[];
   warmups: Warmup[];
@@ -114,7 +117,11 @@ function parseOriginsInput(text: string): string[] {
   return text.split(/[\n,]+/).map(item => item.trim()).filter(Boolean);
 }
 
-export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
+export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: {
+  accounts: GpuAccount[];
+  projects?: Project[];
+  onProjectsRefresh?: () => void;
+}) {
   const [status, setStatus] = useState<Status>();
   const [draft, setDraft] = useState<Config>();
   const [originsText, setOriginsText] = useState('');
@@ -229,6 +236,7 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
   async function start(id: string) {
     const job = await apiFetch<Warmup>(`${prefix}/warmups`, write('POST', { workflow_id: id }));
     setWarmups(rows => [job, ...rows.filter(row => row.id !== job.id)].slice(0, 20));
+    onProjectsRefresh?.();
   }
 
   return <div className={styles.stack}>
@@ -479,6 +487,26 @@ export function CreationApiPage({ accounts }: { accounts: GpuAccount[] }) {
       </Card>
 
       <Card title="默认运行配置">
+        <div className="field">
+          <label htmlFor="creation-target-project">任务与作品保存项目</label>
+          <select
+            id="creation-target-project"
+            value={draft.project_id || ''}
+            onChange={e => setDraft({ ...draft, project_id: e.target.value || null })}
+          >
+            <option value="">默认独立项目（创作 API）</option>
+            {projects
+              .filter(p => p.id !== status.default_project_id)
+              .map(p => (
+                <option key={p.id} value={p.id}>
+                  {projectOptionLabel(p, projects)}{p.is_default ? '（默认项目）' : ''}
+                </option>
+              ))}
+          </select>
+          <span className="muted small">
+            经创作 API 提交的正式出图与下方「启动工作流」预热任务都会归入所选项目；保持默认时自动写入独立的「创作 API」项目。
+          </span>
+        </div>
         <RuntimeSelection value={{ accountId: draft.account_id, instanceId: null, lifecycle: draft.lifecycle,
           retainIdleMinutes: draft.retain_idle_minutes }} accounts={accounts} instances={[]} provider="colab" showInstances={false}
           onChange={value => setDraft({ ...draft, account_id: value.accountId, lifecycle: value.lifecycle,

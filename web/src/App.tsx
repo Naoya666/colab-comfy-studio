@@ -11,7 +11,7 @@ import { CreatePanel } from './pages/CreatePage';
 import { CreateResults } from './components/CreateResults';
 import { ComputePage } from './pages/ComputePage';
 import { LoginScreen } from './components/LoginScreen';
-import { NewProjectDialog, ProjectSheet } from './components/ProjectDialogs';
+import { MoveProjectDialog, NewProjectDialog, ProjectSheet } from './components/ProjectDialogs';
 import { JobDetailInspector } from './components/JobDetailInspector';
 import { GalleryViewer } from './components/GalleryViewer';
 import { NativeGalleryPanel } from './components/NativeGalleryPanel';
@@ -28,7 +28,7 @@ import {
   getGpuComputeSpecs, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
   getGpuPresets, getReferenceAssets, getGpuSettings, getGpuSpecOrder, getGpuUsage, getGpuWorkflowSchema, getGpuWorkflows, getProjects,
   importGpuWorkflow,
-  isLoggedIn, previewGpuJobReuse, publishGpuWorkflow, renameProject, retryGpuJob, retryGpuAttempt, stopGpuCompute,
+  isLoggedIn, previewGpuJobReuse, publishGpuWorkflow, renameProject, retryGpuJob, retryGpuAttempt, setDefaultProject, stopGpuCompute,
   updateGpuPreset, uploadAsset,
   validateGpuWorkflow, rollbackGpuWorkflow, deactivateGpuWorkflow, saveGpuPreset, ApiError,
   type ComputeSpec, type GalleryAsset, type GpuJob, type GpuPreset,
@@ -46,7 +46,7 @@ import {
   buildConfirmActions, formatReuseDecisionTitle, isCreationPoolInstance,
   resolveInstanceSubmission, shouldBypassSkipConfirm, type ConfirmActionOption,
 } from './lib/instance-submission';
-import { projectOptionLabel } from './lib/project-label';
+import { isSystemJob, pickInitialProjectId, projectOptionLabel, projectTitleById } from './lib/project-label';
 import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
 import { useDesktopLayout } from './lib/desktop-layout';
 import { parameterKey, parameterList, readableState } from './lib/ui-helpers';
@@ -109,6 +109,15 @@ export default function App() {
 
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState('');
+  const [jobsProjectFilter, setJobsProjectFilter] = useState('');
+  const [showSystemJobs, setShowSystemJobs] = useState(false);
+  const [referenceScope, setReferenceScope] = useState<'project' | 'all'>('project');
+  const [pinnedReferenceAssets, setPinnedReferenceAssets] = useState<GalleryAsset[]>([]);
+  const [moveDialog, setMoveDialog] = useState<{
+    ids: string[];
+    currentProjectId?: string;
+    onMoved?: (movedIds: string[]) => void;
+  } | null>(null);
   const [showProjectSheet, setShowProjectSheet] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
   const currentProjectId = useRef(projectId);
@@ -195,33 +204,41 @@ export default function App() {
   const activeProject = projects.find((p) => p.id === projectId);
   const activeWorkflow = workflows.find((item) => item.id === workflowId);
   const workflowParamsReady = Boolean(projectId && workflowId && draftReady.current === `${projectId}:${workflowId}`);
-  const projectJobs = useMemo(() => jobs.filter((job) => job.project_id === projectId), [jobs, projectId]);
-  const latestJob = projectJobs.find((job) => !job.prep);
+  const createProjectJobs = useMemo(
+    () => jobs.filter((job) => job.project_id === projectId),
+    [jobs, projectId],
+  );
+  const latestJob = createProjectJobs.find((job) => !job.prep && !isSystemJob(job));
   const currentSubmission = submission?.projectId === projectId ? submission : null;
   const previewJobs = currentSubmission
-    ? projectJobs.filter((job) => currentSubmission.ids.includes(job.id))
+    ? createProjectJobs.filter((job) => currentSubmission.ids.includes(job.id))
     : latestJob?.batch_id
-      ? projectJobs.filter((job) => job.batch_id === latestJob.batch_id)
+      ? createProjectJobs.filter((job) => job.batch_id === latestJob.batch_id)
       : latestJob ? [latestJob] : [];
-  const galleryOutputs = desktop && (tab === '创作' || tab === '作品')
-    ? projectJobs.flatMap((job) => job.output_asset_ids || []).join(',')
+  const galleryOutputs = (tab === '创作' || tab === '作品')
+    ? jobs.flatMap((job) => job.output_asset_ids || []).join(',')
     : '';
   const activeInstance = instances.find((instance) => instance.provider === 'colab' && !instance.runtime_deleted
     && instanceIdOf(instance) === runtimeChoice.instanceId)
     || instances.find((instance) => instance.provider === 'colab' && !instance.runtime_deleted
       && ['ready', 'busy', 'retained_idle', 'allocating', 'preparing'].includes(instance.state || ''));
-  const detailRevision = projectJobs.find((job) => job.id === detailId)?.updated_at;
+  const detailRevision = jobs.find((job) => job.id === detailId)?.updated_at;
 
   const activeJobsCount = useMemo(
-    () => projectJobs.filter((j) => !terminalStates.has(String(j.state || '').toLowerCase())).length,
-    [projectJobs],
+    () => jobs.filter((j) => !isSystemJob(j) && !terminalStates.has(String(j.state || '').toLowerCase())).length,
+    [jobs],
   );
   const hasActiveInstances = useMemo(
     () => instances.some((i) => !i.runtime_deleted && activeInstanceStates.has(String(i.state || '').toLowerCase())),
     [instances],
   );
+  const availableReferenceImages = useMemo(
+    () => uniqueBy([...pinnedReferenceAssets, ...referenceImages], (asset) => asset.id),
+    [pinnedReferenceAssets, referenceImages],
+  );
 
   const bindReferenceAsset = useCallback((asset: GalleryAsset) => {
+    setPinnedReferenceAssets((curr) => [asset, ...curr.filter((item) => item.id !== asset.id)]);
     setReferenceImages((curr) => [asset, ...curr.filter((item) => item.id !== asset.id)]);
     setSelectedAssets((curr) => [...new Set([...curr, asset.id])]);
     if (manifest) {
@@ -241,6 +258,7 @@ export default function App() {
 
   const gs = useGalleryState({
     projectId,
+    projects,
     loggedIn,
     tab,
     desktop,
@@ -313,8 +331,7 @@ export default function App() {
         const list = projR.value;
         setProjectId((curr) => {
           if (curr && list.some((p) => p.id === curr)) return curr;
-          const saved = savedProjectId();
-          return (saved && list.some((p) => p.id === saved) ? saved : list[0]?.id) || '';
+          return pickInitialProjectId(list, savedProjectId());
         });
       } else setError(apiMessage(projR.reason));
       if (modR.status === 'fulfilled') setModels(modR.value);
@@ -448,15 +465,13 @@ export default function App() {
   }, [params, projectId, workflowId]);
 
   const refreshJobs = useCallback(async () => {
-    const pid = currentProjectId.current;
-    if (!pid) return;
     const seq = ++jobSequence.current;
-    const current = () => currentProjectId.current === pid && seq === jobSequence.current;
+    const current = () => seq === jobSequence.current;
     setRefreshingJobs(true);
     try {
-      const next = await getGpuJobs(pid);
+      const next = await getGpuJobs();
       if (!current()) return;
-      setJobs(next.filter((j) => j.project_id === pid));
+      setJobs(next);
       setJobError('');
     } catch (cause) {
       if (current()) setJobError(apiMessage(cause));
@@ -466,45 +481,50 @@ export default function App() {
   }, []);
 
   useSmartPoll(refreshJobs, {
-    enabled: Boolean(projectId && loggedIn),
+    enabled: loggedIn,
     active: activeJobsCount > 0,
     activeMs: 4000,
     idleMs: 25000,
   });
 
   useEffect(() => {
-    if (projectId && loggedIn) void refreshJobs();
-  }, [projectId, loggedIn, refreshJobs]);
+    if (loggedIn) void refreshJobs();
+  }, [loggedIn, refreshJobs]);
+
+  useEffect(() => {
+    setPinnedReferenceAssets([]);
+    setSelectedAssets([]);
+  }, [projectId]);
 
   useEffect(() => {
     setReferenceImages([]);
-    setSelectedAssets([]);
-    if (!projectId || !loggedIn) return;
+    if (!loggedIn) return;
+    if (referenceScope === 'project' && !projectId) return;
     let alive = true;
-    getReferenceAssets(projectId).then((next) => {
+    getReferenceAssets(referenceScope === 'all' ? undefined : projectId).then((next) => {
       if (alive) setReferenceImages(referenceAssets(next));
     }).catch((cause) => {
       if (alive) setError(`素材：${apiMessage(cause)}`);
     });
     return () => { alive = false; };
-  }, [projectId, loggedIn]);
+  }, [projectId, referenceScope, loggedIn]);
 
   useEffect(() => {
     setSelectedAssets([]);
-  }, [workflowId, projectId]);
+  }, [workflowId]);
 
   useEffect(() => {
-    if (tab !== '任务' || !detailId || !projectId || !loggedIn) return;
+    if (tab !== '任务' || !detailId || !loggedIn) return;
     let alive = true;
     getGpuJob(detailId).then((job) => {
-      if (!alive || job.project_id !== projectId) return;
+      if (!alive || job.id !== detailId) return;
       setDetail(job);
       setDetailError('');
     }).catch((cause) => {
       if (alive) setDetailError(apiMessage(cause));
     });
     return () => { alive = false; };
-  }, [tab, detailId, detailRevision, detailRefresh, projectId, loggedIn]);
+  }, [tab, detailId, detailRevision, detailRefresh, loggedIn]);
 
   useEffect(() => {
     if (againJob && (againJob.resolved_params || againJob.params)) {
@@ -520,22 +540,31 @@ export default function App() {
     }
   }, [againJob, workflows, pushToast]);
 
-  function chooseProject(id: string) {
-    if (id !== projectId) {
-      setDetailId('');
-      setDetail(null);
-      gs.setViewer(null);
-      gs.setPendingRouteAssetId('');
-    }
+  function chooseProject(id: string, opts: { syncView?: boolean } = {}) {
     setProjectId(id);
     saveProjectId(id);
+    if (opts.syncView) {
+      if (tab === '作品') {
+        gs.setGalleryProjectFilter(id);
+        gs.setViewer(null);
+        gs.setPendingRouteAssetId('');
+      } else if (tab === '任务') {
+        setJobsProjectFilter(id);
+        setDetailId('');
+        setDetail(null);
+      }
+    }
   }
 
   async function createLocalProject(title: string): Promise<boolean> {
     try {
       const created = await createProject(title);
-      setProjects((curr) => [created, ...curr]);
-      chooseProject(created.id);
+      setProjects((curr) => {
+        const defaults = curr.filter((item) => item.is_default);
+        const others = curr.filter((item) => !item.is_default);
+        return [...defaults, created, ...others];
+      });
+      chooseProject(created.id, { syncView: true });
       pushToast(`已创建项目「${created.title}」`, 'success');
       return true;
     } catch (cause) {
@@ -556,12 +585,30 @@ export default function App() {
     }
   }
 
+  async function setDefaultLocalProject(id: string): Promise<boolean> {
+    try {
+      const updated = await setDefaultProject(id);
+      setProjects((curr) => {
+        const next = curr.map((item) => (item.id === id ? { ...item, ...updated, is_default: true } : { ...item, is_default: false }));
+        const target = next.find((item) => item.id === id);
+        return target ? [target, ...next.filter((item) => item.id !== id)] : next;
+      });
+      pushToast(`已将「${updated.title}」设为默认项目`, 'success');
+      return true;
+    } catch (cause) {
+      pushToast(`设置默认失败：${apiMessage(cause)}`, 'error');
+      return false;
+    }
+  }
+
   async function removeLocalProject(project: Project): Promise<boolean> {
     try {
       await deleteProject(project.id);
       const remaining = projects.filter((item) => item.id !== project.id);
       setProjects(remaining);
-      if (projectId === project.id) chooseProject(remaining[0]?.id || '');
+      if (projectId === project.id) chooseProject(pickInitialProjectId(remaining, ''));
+      if (gs.galleryProjectFilter === project.id) gs.setGalleryProjectFilter('');
+      if (jobsProjectFilter === project.id) setJobsProjectFilter('');
       pushToast(`已移除项目「${project.title}」`, 'success');
       return true;
     } catch (cause) {
@@ -714,7 +761,7 @@ export default function App() {
         resolvedAccountId = decision.accountId;
         resolvedInstanceId = decision.instanceId;
       }
-      const validAssetIds = new Set(referenceAssets(referenceImages).filter((a) => a.project_id === projectId).map((a) => a.id));
+      const validAssetIds = new Set(referenceAssets(availableReferenceImages).map((a) => a.id));
       const body = {
         project_id: projectId,
         model_id: modelId,
@@ -816,12 +863,12 @@ export default function App() {
   }
 
   async function clearJobs(request: JobClearRequest) {
-    if (!projectId) return;
     await action('clear-jobs', async () => {
       const { cleared } = await clearGpuJobHistory({
-        project_id: projectId,
+        project_id: jobsProjectFilter || undefined,
         scope: request.scope,
         job_ids: request.jobIds,
+        include_system: request.includeSystem,
       });
       if (request.jobIds?.includes(detailId) || !request.jobIds) {
         setDetailId('');
@@ -965,25 +1012,26 @@ export default function App() {
       if (e.key === 'Escape') {
         if (gs.confirmDeleteViewer) gs.setConfirmDeleteViewer(null);
         else if (gs.confirmDeleteNative) gs.setConfirmDeleteNative(null);
+        else if (moveDialog) setMoveDialog(null);
         else if (confirm) setConfirm(null);
         else if (showNewProject) setShowNewProject(false);
         else if (showProjectSheet) setShowProjectSheet(false);
         else if (gs.activeViewerItem) gs.closeViewers();
         else if (detailId && tab === '任务') setDetailId('');
-      } else if (!typing && gs.activeViewerItem && !confirm && !gs.confirmDeleteViewer && !gs.confirmDeleteNative && !showNewProject && !showProjectSheet) {
+      } else if (!typing && gs.activeViewerItem && !moveDialog && !confirm && !gs.confirmDeleteViewer && !gs.confirmDeleteNative && !showNewProject && !showProjectSheet) {
         if (e.key === 'ArrowLeft') { e.preventDefault(); gs.stepActiveViewer(-1); }
         else if (e.key === 'ArrowRight') { e.preventDefault(); gs.stepActiveViewer(1); }
       }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [gs, detailId, tab, confirm, showProjectSheet, showNewProject]);
+  }, [gs, detailId, tab, moveDialog, confirm, showProjectSheet, showNewProject]);
 
   if (!loggedIn) {
     return <LoginScreen onLoggedIn={() => { setLoggedIn(true); setLoginRefresh((c) => c + 1); }} />;
   }
 
-  const inspectedJob = detail?.id === detailId && detail.project_id === projectId ? detail : null;
+  const inspectedJob = detail?.id === detailId ? detail : null;
 
   function inspectJob(id: string) {
     setDetailError('');
@@ -1003,6 +1051,13 @@ export default function App() {
   function openJobFromViewer(jobId: string) {
     gs.closeViewers();
     gs.setPendingRouteAssetId('');
+    const target = jobs.find((j) => j.id === jobId);
+    if (jobsProjectFilter && target && target.project_id !== jobsProjectFilter) {
+      setJobsProjectFilter('');
+    }
+    if (target && isSystemJob(target)) {
+      setShowSystemJobs(true);
+    }
     setTab('任务');
     inspectJob(jobId);
     window.scrollTo(0, 0);
@@ -1010,9 +1065,12 @@ export default function App() {
 
   function openOutputAsset(assetId: string) {
     gs.setGallerySource('studio');
-    const existing = gs.projectGallery.find((asset) => asset.id === assetId);
+    const existing = gs.allGallery.find((asset) => asset.id === assetId);
     if (existing) {
-      gs.setViewerList(gs.projectGallery);
+      if (gs.galleryProjectFilter && existing.project_id !== gs.galleryProjectFilter) {
+        gs.setGalleryProjectFilter('');
+      }
+      gs.setViewerList(gs.galleryProjectFilter && existing.project_id === gs.galleryProjectFilter ? gs.projectGallery : gs.allGallery);
       gs.setViewer(existing);
     } else {
       gs.setPendingRouteAssetId(assetId);
@@ -1022,10 +1080,12 @@ export default function App() {
     window.scrollTo(0, 0);
   }
 
+  const studioViewerAsset = gs.activeViewerItem?.kind === 'studio' ? gs.activeViewerItem.asset : null;
   const viewerNode = gs.activeViewerItem && (
     <GalleryViewer
       item={gs.activeViewerItem}
       workflows={workflows}
+      projectName={studioViewerAsset ? projectTitleById(studioViewerAsset.project_id, projects) : undefined}
       navCount={gs.activeNavCount}
       navIndex={gs.activeNavIndex}
       inlineViewer={gs.inlineViewer}
@@ -1041,6 +1101,9 @@ export default function App() {
       onFavoriteStudio={(asset) => void gs.favorite(asset)}
       onReuseStudio={(asset) => void gs.reuseAsset(asset)}
       onUseStudioAsReference={useAssetAsReference}
+      onMoveStudio={studioViewerAsset && projects.some((p) => p.id !== studioViewerAsset.project_id)
+        ? (asset) => setMoveDialog({ ids: [asset.id], currentProjectId: asset.project_id })
+        : undefined}
       onDeleteStudio={gs.setConfirmDeleteViewer}
       onFavoriteNative={(asset) => void gs.favoriteNative(asset)}
       onImportNativeReference={gs.importNativeRef}
@@ -1060,7 +1123,13 @@ export default function App() {
           </span>
         </div>
         <div className="topbarActions">
-          <button className="projectChip" type="button" aria-label="切换项目" onClick={() => setShowProjectSheet(true)}>
+          <button
+            className="projectChip"
+            type="button"
+            aria-label="切换项目"
+            title={activeProject ? `当前创作保存项目：${projectOptionLabel(activeProject, projects)}（点击切换与管理）` : '选择与管理项目'}
+            onClick={() => setShowProjectSheet(true)}
+          >
             <Folder size={15} strokeWidth={1.6} aria-hidden />
             <span>{activeProject ? projectOptionLabel(activeProject, projects) : '选择项目'}</span>
             <ChevronDown size={14} strokeWidth={1.6} aria-hidden />
@@ -1112,11 +1181,29 @@ export default function App() {
         projects={projects}
         projectId={projectId}
         onClose={() => setShowProjectSheet(false)}
-        onSelect={chooseProject}
+        onSelect={(id) => chooseProject(id, { syncView: true })}
         onRename={renameLocalProject}
+        onSetDefault={setDefaultLocalProject}
         onDelete={removeLocalProject}
       />
       <NewProjectDialog open={showNewProject} onClose={() => setShowNewProject(false)} onCreate={createLocalProject} />
+      <MoveProjectDialog
+        open={Boolean(moveDialog)}
+        assetIds={moveDialog?.ids || []}
+        currentProjectId={moveDialog?.currentProjectId}
+        projects={projects}
+        onClose={() => setMoveDialog(null)}
+        onConfirm={async (ids, targetProjectId) => {
+          const res = await gs.moveAssets(ids, targetProjectId);
+          if (res.movedIds.length > 0) {
+            const movedSet = new Set(res.movedIds);
+            setReferenceImages((curr) => curr.map((a) => (movedSet.has(a.id) ? { ...a, project_id: targetProjectId } : a)));
+            setPinnedReferenceAssets((curr) => curr.map((a) => (movedSet.has(a.id) ? { ...a, project_id: targetProjectId } : a)));
+            moveDialog?.onMoved?.(res.movedIds);
+          }
+          return res;
+        }}
+      />
 
       <main className={styles.page}>
         {tab === '创作' && (
@@ -1135,7 +1222,13 @@ export default function App() {
                 </button>
               )}
             </div>
-            {adminRole && creationApiOpen ? <CreationApiPage accounts={accounts} /> : (
+            {adminRole && creationApiOpen ? (
+              <CreationApiPage
+                accounts={accounts}
+                projects={projects}
+                onProjectsRefresh={() => void getProjects().then(setProjects).catch(() => {})}
+              />
+            ) : (
               <div className={styles.createColumns}>
                 <CreatePanel
                   desktop={desktop}
@@ -1151,6 +1244,10 @@ export default function App() {
                   }}
                   gpuSelection={runtime === 'colab' ? <WorkflowGpuSelection manifest={manifest} accountId={runtimeChoice.accountId} value={selectedCompute} onChange={chooseGpu} gpuOrder={gpuOrder} /> : null}
                   projectId={projectId}
+                  projectTitle={activeProject ? projectOptionLabel(activeProject, projects) : ''}
+                  projects={projects}
+                  referenceScope={referenceScope}
+                  onReferenceScopeChange={setReferenceScope}
                   models={models}
                   workflows={workflows}
                   presets={presets}
@@ -1158,7 +1255,7 @@ export default function App() {
                   manifest={workflowParamsReady ? manifest : null}
                   params={workflowParamsReady ? params : {}}
                   setParams={setParams}
-                  gallery={referenceImages}
+                  gallery={availableReferenceImages}
                   selectedAssets={selectedAssets}
                   setSelectedAssets={setSelectedAssets}
                   uploadProgress={uploadProgress}
@@ -1200,9 +1297,9 @@ export default function App() {
                     key={projectId}
                     jobs={previewJobs}
                     count={currentSubmission?.ids.length || previewJobs.length}
-                    gallery={gs.projectGallery}
+                    gallery={gs.createProjectGallery}
                     error={gs.galleryError}
-                    onOpen={(asset) => { gs.setGallerySource('studio'); gs.setViewerList(gs.projectGallery); gs.setViewer(asset); }}
+                    onOpen={(asset) => { gs.setGallerySource('studio'); gs.setViewerList(gs.createProjectGallery); gs.setViewer(asset); }}
                     onJobs={() => navigate('任务')}
                     onFavorite={(asset) => void gs.favorite(asset)}
                     onDelete={(asset) => void gs.remove(asset)}
@@ -1217,7 +1314,12 @@ export default function App() {
         {tab === '任务' && (
           <div className={styles.detailWorkspace}>
             <TasksPanel
-              jobs={projectJobs}
+              jobs={jobs}
+              projects={projects}
+              projectFilter={jobsProjectFilter}
+              onProjectFilterChange={setJobsProjectFilter}
+              showSystemJobs={showSystemJobs}
+              onShowSystemJobsChange={setShowSystemJobs}
               workflows={workflows}
               error={jobError}
               refreshing={refreshingJobs}
@@ -1225,7 +1327,7 @@ export default function App() {
               onRefresh={() => void refreshJobs()}
               onCancel={(id) => void action('cancel', async () => { await cancelGpuJob(id); await refreshJobs(); })}
               onRetry={(id) => void action('retry', async () => {
-                const job = projectJobs.find((item) => item.id === id);
+                const job = jobs.find((item) => item.id === id);
                 const key = retryKeys.current[id] || `attempt:${id}:${keyId()}`;
                 retryKeys.current[id] = key;
                 if (job?.provider === 'mock') await retryGpuAttempt(id, key);
@@ -1282,8 +1384,12 @@ export default function App() {
             <div className={styles.detailWorkspace} data-gallery>
               {gs.gallerySource === 'studio' ? (
                 <GalleryPanel
-                  key={projectId}
+                  key={gs.galleryProjectFilter || '__all__'}
                   gallery={gs.projectGallery}
+                  allGallery={gs.allGallery}
+                  projects={projects}
+                  projectFilter={gs.galleryProjectFilter}
+                  onProjectFilterChange={gs.setGalleryProjectFilter}
                   workflows={workflows}
                   error={gs.viewer ? '' : gs.galleryError}
                   refreshing={gs.refreshingGallery}
@@ -1291,6 +1397,7 @@ export default function App() {
                   inspectedId={desktop ? gs.viewer?.id || '' : undefined}
                   onFavorite={(asset) => void gs.favorite(asset)}
                   onBatchDelete={gs.batchRemove}
+                  onRequestMove={(ids, opts) => setMoveDialog({ ids, currentProjectId: opts?.currentProjectId, onMoved: opts?.onMoved })}
                   onOpen={(asset, ordered) => {
                     gs.setViewerList(ordered || gs.projectGallery);
                     gs.setViewer(asset);
@@ -1401,11 +1508,13 @@ export default function App() {
                   projectId={projectId}
                   projectTitle={activeProject ? projectOptionLabel(activeProject, projects) : ''}
                   onOpenJob={(jobId, jobProjectId) => {
-                    if (jobProjectId) chooseProject(jobProjectId);
+                    if (jobsProjectFilter && jobProjectId && jobProjectId !== jobsProjectFilter) {
+                      setJobsProjectFilter('');
+                    }
                     setTab('任务');
                     inspectJob(jobId);
                   }}
-                  onUseProject={(id) => { chooseProject(id); setTab('任务'); }}
+                  onUseProject={(id) => { setJobsProjectFilter(id); setTab('任务'); }}
                   onActivated={() => { void getGpuWorkflows().then(setWorkflows); void getGpuModels().then(setModels).catch(() => undefined); }}
                 />
               </>

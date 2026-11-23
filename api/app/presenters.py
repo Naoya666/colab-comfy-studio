@@ -66,10 +66,17 @@ def public_job(job):
         "creation_runtime",
     }
     result = {k: v for k, v in job.items() if k in keys}
+    snapshot = job.get("snapshot") or {}
+    workflow_key = str(job.get("workflow_key") or "")
     result["job_id"] = job["id"]
     result["mock"] = job.get("provider") == "mock"
-    result["workflow_smoke"] = job.get("workflow_smoke") is True or (job.get("snapshot") or {}).get("workflow_smoke") is True
-    result["resolved_params"] = (job.get("snapshot") or {}).get("resolved_params", {})
+    result["system"] = bool(
+        snapshot.get("native_comfy") is True
+        or snapshot.get("system_smoke") is True
+        or workflow_key.startswith("system/")
+    )
+    result["workflow_smoke"] = job.get("workflow_smoke") is True or snapshot.get("workflow_smoke") is True
+    result["resolved_params"] = snapshot.get("resolved_params", {})
     # The requested Colab spec is shown separately from the GPU the worker actually measured.
     requested = (job.get("requested_spec") or (job.get("execution_policy") or {}).get("requested_spec")
                  or ((job.get("snapshot") or {}).get("manifest") or {}).get("compute_spec"))

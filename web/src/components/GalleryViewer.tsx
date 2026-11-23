@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from 'react';
 import {
-  ArrowUpRight, ChevronLeft, ChevronRight, Copy, Download, FileCode2, ImagePlus, Maximize2, RotateCcw, Star, Trash2,
+  ArrowUpRight, ChevronLeft, ChevronRight, Copy, Download, FileCode2, FolderInput, ImagePlus, Maximize2, RotateCcw, Star, Trash2,
 } from 'lucide-react';
 import {
   apiMessage, assetUrl, fetchNativeOutputBytes,
@@ -21,6 +21,7 @@ export type ViewerItem =
 export function GalleryViewer({
   item,
   workflows = [],
+  projectName,
   navCount,
   navIndex,
   inlineViewer,
@@ -36,6 +37,7 @@ export function GalleryViewer({
   onFavoriteStudio,
   onReuseStudio,
   onUseStudioAsReference,
+  onMoveStudio,
   onDeleteStudio,
   onFavoriteNative,
   onImportNativeReference,
@@ -44,6 +46,7 @@ export function GalleryViewer({
 }: {
   item: ViewerItem;
   workflows?: GpuWorkflow[];
+  projectName?: string;
   navCount: number;
   navIndex: number;
   inlineViewer: boolean;
@@ -59,6 +62,7 @@ export function GalleryViewer({
   onFavoriteStudio: (asset: GalleryAsset) => void;
   onReuseStudio: (asset: GalleryAsset) => void;
   onUseStudioAsReference: (asset: GalleryAsset) => void;
+  onMoveStudio?: (asset: GalleryAsset) => void;
   onDeleteStudio: (asset: GalleryAsset) => void;
   onFavoriteNative?: (asset: NativeOutputAsset) => void;
   onImportNativeReference?: (asset: NativeOutputAsset) => Promise<void>;
@@ -105,7 +109,7 @@ export function GalleryViewer({
       : (matchedViewerJob?.gpu_reported || item.asset.gpu_reported || ''))
     : '';
   const studioCreatedAt = item.kind === 'studio' ? (item.asset.created_at || matchedViewerJob?.created_at || '') : '';
-  const hasStudioInfo = Boolean(studioWfName || (studioWidth > 0 && studioHeight > 0) || studioGpu || studioCreatedAt || viewerJobId);
+  const hasStudioInfo = Boolean(projectName || studioWfName || (studioWidth > 0 && studioHeight > 0) || studioGpu || studioCreatedAt || viewerJobId);
 
   async function handleExtractPng() {
     if (item.kind !== 'native' || extracting) return;
@@ -217,6 +221,9 @@ export function GalleryViewer({
           <summary>作品信息</summary>
           <div className="foldContent">
             <dl className={styles.kv}>
+              {projectName && (
+                <><dt>所属项目</dt><dd>{projectName}</dd></>
+              )}
               {studioWfName && (
                 <>
                   <dt>工作流</dt>
@@ -314,6 +321,11 @@ export function GalleryViewer({
             {(mime.startsWith('image/') || mime.startsWith('video/')) && (
               <button className="button secondary small" type="button" onClick={() => onUseStudioAsReference(item.asset)}>
                 <ImagePlus size={14} strokeWidth={1.6} aria-hidden />用作参考图
+              </button>
+            )}
+            {onMoveStudio && (
+              <button className="button secondary small" type="button" onClick={() => onMoveStudio(item.asset)}>
+                <FolderInput size={14} strokeWidth={1.6} aria-hidden />移动到项目
               </button>
             )}
             <a className="button secondary small" href={downloadHref} download={title} target="_blank" rel="noreferrer">

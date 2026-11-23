@@ -1,10 +1,11 @@
 import { useCallback, useMemo, useState } from 'react';
 import {
   Image as ImageIcon, Film, Search, Star, Check, Eye, RotateCcw, Trash2, Play,
-  Layers, CheckSquare, X, FileJson, RefreshCw, Workflow,
+  Layers, CheckSquare, X, FileJson, RefreshCw, Workflow, Folder, FolderInput,
 } from 'lucide-react';
-import { assetUrl, type GalleryAsset, type GpuWorkflow } from '../lib/gpu-api';
+import { assetUrl, type GalleryAsset, type GpuWorkflow, type Project } from '../lib/gpu-api';
 import { groupGalleryAssets, isDiagnosticAsset } from '../lib/history-grouping';
+import { projectOptionLabel, projectTitleById } from '../lib/project-label';
 import { workflowTitle } from '../lib/workflow-copy';
 import { ConfirmDialog } from '../components/Feedback';
 import styles from '../gpu.module.css';
@@ -19,15 +20,35 @@ function dims(asset: GalleryAsset): string {
 }
 
 export function GalleryPanel({
-  gallery, workflows = [], error, refreshing = false, onRefresh, onFavorite, onBatchDelete, onOpen, onReuse, onGoCreate, inspectedId,
+  gallery,
+  allGallery,
+  projects = [],
+  projectFilter = '',
+  onProjectFilterChange,
+  workflows = [],
+  error,
+  refreshing = false,
+  onRefresh,
+  onFavorite,
+  onBatchDelete,
+  onRequestMove,
+  onOpen,
+  onReuse,
+  onGoCreate,
+  inspectedId,
 }: {
   gallery: GalleryAsset[];
+  allGallery?: GalleryAsset[];
+  projects?: Project[];
+  projectFilter?: string;
+  onProjectFilterChange?: (projectId: string) => void;
   workflows?: GpuWorkflow[];
   error?: string;
   refreshing?: boolean;
   onRefresh?: () => void;
   onFavorite: (asset: GalleryAsset) => void;
   onBatchDelete: (ids: string[]) => Promise<{ removedIds: string[]; error?: string }>;
+  onRequestMove?: (ids: string[], opts?: { currentProjectId?: string; onMoved?: (movedIds: string[]) => void }) => void;
   onOpen: (asset: GalleryAsset, ordered?: GalleryAsset[]) => void;
   onReuse?: (asset: GalleryAsset) => void;
   onGoCreate?: () => void;
@@ -61,6 +82,22 @@ export function GalleryPanel({
 
   const diagnosticAssets = useMemo(() => gallery.filter(isDiagnosticAsset), [gallery]);
   const mediaCount = gallery.length - diagnosticAssets.length;
+  const projectCounts = useMemo(() => {
+    const source = allGallery || gallery;
+    const map = new Map<string, number>();
+    let totalMedia = 0;
+    for (const asset of source) {
+      if (isDiagnosticAsset(asset)) continue;
+      totalMedia += 1;
+      if (asset.project_id) map.set(asset.project_id, (map.get(asset.project_id) || 0) + 1);
+    }
+    return { map, totalMedia };
+  }, [allGallery, gallery]);
+  const extraProjectIds = useMemo(() => {
+    const known = new Set(projects.map((p) => p.id));
+    return [...projectCounts.map.keys()].filter((id) => !known.has(id));
+  }, [projects, projectCounts.map]);
+  const showProjectTag = !projectFilter;
 
   const workflowOptions = useMemo(() => {
     const counts = new Map<string, number>();
@@ -86,8 +123,9 @@ export function GalleryPanel({
     if (filter === 'unfavorited' && asset.favorite) return false;
     if (activeWorkflowFilter && asset.workflow_key !== activeWorkflowFilter) return false;
     const wfName = workflowLabel(asset.workflow_key);
-    return `${asset.filename || ''} ${asset.source_job_id || ''} ${asset.workflow_key || ''} ${wfName}`.toLowerCase().includes(query.toLowerCase());
-  }), [gallery, filter, activeWorkflowFilter, query, showDiagnostics, workflowLabel]);
+    const projName = projectTitleById(asset.project_id, projects);
+    return `${asset.filename || ''} ${asset.source_job_id || ''} ${asset.workflow_key || ''} ${wfName} ${projName}`.toLowerCase().includes(query.toLowerCase());
+  }), [gallery, filter, activeWorkflowFilter, query, showDiagnostics, workflowLabel, projects]);
 
   const stacks = useMemo(() => groupGalleryAssets(filtered), [filtered]);
   const hasMultiStacks = useMemo(() => stacks.some((s) => s.items.length > 1), [stacks]);
@@ -236,14 +274,15 @@ export function GalleryPanel({
           <div>
             {(() => {
               const wfName = workflowLabel(asset.workflow_key);
+              const projName = showProjectTag ? projectTitleById(asset.project_id, projects) : '';
               const primary = wfName || asset.filename || `作品 ${asset.id.slice(0, 6)}`;
               const versionTag = asset.workflow_version != null ? `v${asset.workflow_version}` : '';
               const jobTag = asset.source_job_id ? `任务 ${asset.source_job_id.slice(0, 6)}` : '';
               const secondary = isStackedCover && stackInfo
-                ? `同批共 ${stackInfo.count} 件${versionTag ? ` · ${versionTag}` : ''}${jobTag ? ` · ${jobTag}` : ''}`
+                ? [projName, `同批共 ${stackInfo.count} 件`, versionTag, jobTag].filter(Boolean).join(' · ')
                 : wfName
-                  ? [versionTag, jobTag || '作品', asset.filename].filter(Boolean).join(' · ')
-                  : jobTag || '上传素材';
+                  ? [projName, versionTag, jobTag || '作品', asset.filename].filter(Boolean).join(' · ')
+                  : [projName, jobTag || '上传素材'].filter(Boolean).join(' · ');
               const fullTitle = [
                 wfName ? `${wfName}${versionTag ? ` ${versionTag}` : ''}` : '',
                 asset.filename || asset.id,
@@ -329,6 +368,30 @@ export function GalleryPanel({
             >
               清空选择
             </button>
+            {onRequestMove && projects.length > 0 && (
+              projects.length > 1 || activeCheckedIds.some((id) => gallery.find((a) => a.id === id)?.project_id !== projects[0]?.id)
+            ) && (
+              <button
+                type="button"
+                className="button secondary small"
+                disabled={!activeCheckedIds.length}
+                onClick={() => onRequestMove(activeCheckedIds, {
+                  currentProjectId: activeCheckedIds.length === 1
+                    ? gallery.find((a) => a.id === activeCheckedIds[0])?.project_id
+                    : undefined,
+                  onMoved: (movedIds) => {
+                    const moved = new Set(movedIds);
+                    setCheckedIds((curr) => {
+                      const next = new Set(curr);
+                      moved.forEach((id) => next.delete(id));
+                      return next;
+                    });
+                  },
+                })}
+              >
+                <FolderInput size={14} aria-hidden />移动到项目 ({activeCheckedIds.length})
+              </button>
+            )}
             <button
               type="button"
               className="button danger small"
@@ -359,6 +422,29 @@ export function GalleryPanel({
           {chip('unfavorited', '未收藏')}
         </div>
         <div className={styles.filterRight}>
+          {onProjectFilterChange && (projects.length > 0 || extraProjectIds.length > 0) && (
+            <label className={`small muted ${styles.filterSelectWrap}`}>
+              <Folder size={13} aria-hidden />
+              <select
+                aria-label="按项目筛选作品"
+                className={styles.miniSelect}
+                value={projectFilter}
+                onChange={(e) => { onProjectFilterChange(e.target.value); setLimit(24); }}
+              >
+                <option value="">全部项目 ({projectCounts.totalMedia})</option>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {projectOptionLabel(p, projects)}{p.is_default ? ' · 默认' : ''} ({projectCounts.map.get(p.id) || 0})
+                  </option>
+                ))}
+                {extraProjectIds.map((pid) => (
+                  <option key={pid} value={pid}>
+                    {projectTitleById(pid, projects)} ({projectCounts.map.get(pid) || 0})
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {workflowOptions.length > 0 && (
             <label className={`small muted ${styles.filterSelectWrap}`}>
               <Workflow size={13} aria-hidden />
@@ -459,6 +545,12 @@ export function GalleryPanel({
           <button type="button" onClick={() => onOpen(selected, filtered)}><Eye size={17} strokeWidth={1.6} aria-hidden />预览</button>
           <i />
           <button type="button" disabled={!onReuse || !selected.source_job_id} onClick={() => onReuse && onReuse(selected)}><RotateCcw size={17} strokeWidth={1.6} aria-hidden />再次生成</button>
+          {onRequestMove && projects.some((p) => p.id !== selected.project_id) && (
+            <>
+              <i />
+              <button type="button" onClick={() => onRequestMove([selected.id], { currentProjectId: selected.project_id })}><FolderInput size={17} strokeWidth={1.6} aria-hidden />移动</button>
+            </>
+          )}
           <i />
           <button type="button" onClick={() => setConfirmBatchDelete({
             ids: [selected.id],

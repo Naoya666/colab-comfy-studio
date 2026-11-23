@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Upload, Check } from 'lucide-react';
-import type { GalleryAsset, GpuManifest } from '../lib/gpu-api';
+import type { GalleryAsset, GpuManifest, Project } from '../lib/gpu-api';
+import { projectTitleById } from '../lib/project-label';
 import styles from '../gpu.module.css';
 
 export function referenceAssets(assets: GalleryAsset[]): GalleryAsset[] {
@@ -15,8 +16,9 @@ export function supportsReferences(manifest: GpuManifest | null): boolean {
   return params.some((p) => ['image', 'video', 'file', 'audio'].includes(String(p.type)) || p.widget === 'file');
 }
 
-export function ReferencePicker({ manifest, assets, selected, onChange, onUpload }: {
+export function ReferencePicker({ manifest, assets, selected, currentProjectId, projects = [], onChange, onUpload }: {
   manifest: GpuManifest | null; assets: GalleryAsset[]; selected: string[];
+  currentProjectId?: string; projects?: Project[];
   onChange: (ids: string[]) => void; onUpload: (file: File) => Promise<void>;
 }) {
   const [dragging, setDragging] = useState(false);
@@ -62,9 +64,12 @@ export function ReferencePicker({ manifest, assets, selected, onChange, onUpload
         <div className={styles.refGrid}>
           {available.map((asset) => {
             const on = selected.includes(asset.id);
+            const fromOther = Boolean(currentProjectId && asset.project_id && asset.project_id !== currentProjectId);
+            const projLabel = fromOther ? projectTitleById(asset.project_id, projects) : '';
+            const label = projLabel ? `${asset.filename || asset.id}（${projLabel}）` : (asset.filename || asset.id);
             return (
-              <label className={styles.refItem} data-on={on} key={asset.id} title={asset.filename || asset.id}>
-                <input type="checkbox" hidden aria-label={`选用 ${asset.filename || asset.id}`} checked={on} onChange={() => toggle(asset.id)} />
+              <label className={styles.refItem} data-on={on} key={asset.id} title={label}>
+                <input type="checkbox" hidden aria-label={`选用 ${label}`} checked={on} onChange={() => toggle(asset.id)} />
                 {asset.mime.startsWith('image/')
                   ? <img src={asset.thumbnail_url || `/api/assets/${asset.id}/thumbnail`} alt="" loading="lazy" />
                   : <span className={styles.refMedia}>{asset.mime.startsWith('video/') ? '视频' : '音频'}</span>}

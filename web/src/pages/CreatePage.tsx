@@ -4,7 +4,7 @@ import {
   ChevronRight, ChevronDown, Minus, Plus, X, Check, Trash2, Save, ArrowLeftRight,
 } from 'lucide-react';
 import type {
-  GalleryAsset, GpuManifest, GpuModel, GpuPreset, GpuSettings, GpuUsage, GpuWorkflow, Provider,
+  GalleryAsset, GpuManifest, GpuModel, GpuPreset, GpuSettings, GpuUsage, GpuWorkflow, Project, Provider,
 } from '../lib/gpu-api';
 import { getGpuWorkflowSchema } from '../lib/gpu-api';
 import { GpuParamForm, splitParams } from '../components/GpuParamForm';
@@ -59,7 +59,8 @@ function buildSizes(defW: number, defH: number, step: number, min: number, max: 
 }
 
 export function CreatePanel({
-  projectId, models, workflows, presets, settings, usage, computeSpec, specBelowDefaultError, onEditGuard, manifest, params, setParams, gallery,
+  projectId, projectTitle, projects = [], referenceScope = 'project', onReferenceScopeChange,
+  models, workflows, presets, settings, usage, computeSpec, specBelowDefaultError, onEditGuard, manifest, params, setParams, gallery,
   selectedAssets, setSelectedAssets, uploadProgress, onUpload, setModelId, workflowId, setWorkflowId,
   runtime, setRuntime, maxRuntime, setMaxRuntime, batchCount, setBatchCount, batchMode,
   runtimeChoice, accounts, instances, onRuntimeChoiceChange,
@@ -70,6 +71,10 @@ export function CreatePanel({
   desktop: boolean;
   draftReady: boolean;
   projectId: string;
+  projectTitle?: string;
+  projects?: Project[];
+  referenceScope?: 'project' | 'all';
+  onReferenceScopeChange?: (scope: 'project' | 'all') => void;
   models: GpuModel[];
   workflows: GpuWorkflow[];
   presets: GpuPreset[];
@@ -446,11 +451,36 @@ export function CreatePanel({
 
         {/* 4 参考素材（有素材槽位时放在前面，方便图生图/图生视频） */}
         {manifest && (split.assets.length > 0 || showGeneralReferencePicker) && (
-          <Card icon={<ImageIcon size={17} strokeWidth={1.6} aria-hidden />} title="参考素材">
-            <GpuParamForm section="assets" manifest={manifest} values={params} assets={gallery} uploadProgress={uploadProgress}
+          <Card
+            icon={<ImageIcon size={17} strokeWidth={1.6} aria-hidden />}
+            title="参考素材"
+            aside={onReferenceScopeChange ? (
+              <div className={styles.chipRow} role="group" aria-label="参考素材范围">
+                <button
+                  type="button"
+                  className={styles.chip}
+                  data-active={referenceScope === 'project'}
+                  aria-pressed={referenceScope === 'project'}
+                  onClick={() => onReferenceScopeChange('project')}
+                >
+                  当前项目
+                </button>
+                <button
+                  type="button"
+                  className={styles.chip}
+                  data-active={referenceScope === 'all'}
+                  aria-pressed={referenceScope === 'all'}
+                  onClick={() => onReferenceScopeChange('all')}
+                >
+                  全部项目
+                </button>
+              </div>
+            ) : undefined}
+          >
+            <GpuParamForm section="assets" manifest={manifest} values={params} assets={gallery} currentProjectId={projectId} projects={projects} uploadProgress={uploadProgress}
               onChange={(k, v) => patch({ [k]: v })} onUpload={onUpload} excludeKeys={excluded} />
             {showGeneralReferencePicker && (
-              <ReferencePicker manifest={manifest} assets={gallery} selected={selectedAssets} onChange={setSelectedAssets} onUpload={async (file) => { await onUpload(file); }} />
+              <ReferencePicker manifest={manifest} assets={gallery} selected={selectedAssets} currentProjectId={projectId} projects={projects} onChange={setSelectedAssets} onUpload={async (file) => { await onUpload(file); }} />
             )}
           </Card>
         )}
@@ -553,13 +583,13 @@ export function CreatePanel({
 
         {children}
 
-        {!desktop && <Card icon={<Play size={17} strokeWidth={1.6} aria-hidden />} title="开始生成">{cuHint}{submitButton}{submitError}</Card>}
+        {!desktop && <Card icon={<Play size={17} strokeWidth={1.6} aria-hidden />} title="开始生成" aside={projectTitle ? <span className="muted small">保存至「{projectTitle}」</span> : undefined}>{cuHint}{submitButton}{submitError}</Card>}
       </section>
       {desktop && <div className={styles.createSubmit}>
         {submitError}
         {cuHint}
         <div className={styles.submitRow}>
-          <span>{runtime === 'mock' ? '离线模拟' : 'Colab GPU'} · {batchCount} 个任务</span>
+          <span>{runtime === 'mock' ? '离线模拟' : 'Colab GPU'} · {batchCount} 个任务{projectTitle ? ` · 保存至「${projectTitle}」` : ''}</span>
           {submitButton}
         </div>
       </div>}

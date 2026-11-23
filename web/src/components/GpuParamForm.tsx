@@ -1,7 +1,8 @@
 import { useMemo, useRef, useState } from 'react';
 import { Dices, Shuffle, Upload, X, Check } from 'lucide-react';
-import { assetUrl, type GalleryAsset, type GpuManifest, type GpuParameter } from '../lib/gpu-api';
+import { assetUrl, type GalleryAsset, type GpuManifest, type GpuParameter, type Project } from '../lib/gpu-api';
 import { friendlyHint, friendlyLabel, MODE_HELP, modeHelp } from '../lib/labels';
+import { projectTitleById } from '../lib/project-label';
 import { InfoTip } from './ui';
 import styles from '../gpu.module.css';
 
@@ -11,6 +12,8 @@ type Props = {
   manifest?: GpuManifest | null;
   values: Record<string, unknown>;
   assets: GalleryAsset[];
+  currentProjectId?: string;
+  projects?: Project[];
   uploadProgress: Record<string, number>;
   onChange: (key: string, value: unknown) => void;
   onUpload: (file: File) => Promise<GalleryAsset | void>;
@@ -89,12 +92,21 @@ export function splitParams(manifest: GpuManifest | null | undefined, excludeKey
   return { assets, options, advanced };
 }
 
-export function GpuParamForm({ manifest, values, assets, uploadProgress, onChange, onUpload, excludeKeys = [], section }: Props) {
+export function GpuParamForm({ manifest, values, assets, currentProjectId, projects = [], uploadProgress, onChange, onUpload, excludeKeys = [], section }: Props) {
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const [openPickerKey, setOpenPickerKey] = useState<string | null>(null);
   const [dragKey, setDragKey] = useState<string | null>(null);
   const entries = useMemo(() => splitParams(manifest, excludeKeys)[section], [manifest, excludeKeys, section]);
   if (!entries.length) return null;
+
+  function assetDisplayName(asset: GalleryAsset): string {
+    const base = asset.filename || asset.id;
+    if (currentProjectId && asset.project_id && asset.project_id !== currentProjectId) {
+      const proj = projectTitleById(asset.project_id, projects);
+      if (proj) return `${base}（${proj}）`;
+    }
+    return base;
+  }
 
   function renderField({ param: parameter, key }: Entry) {
     const label = friendlyLabel(key, parameter.label || parameter.name || key);
@@ -224,7 +236,7 @@ export function GpuParamForm({ manifest, values, assets, uploadProgress, onChang
               )}
               <select id={`gpu-${key}`} value={String(current ?? '')} onChange={(e) => onChange(key, e.target.value)}>
                 <option value="">从素材库选择或拖入文件…</option>
-                {matchingAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.filename || asset.id}</option>)}
+                {matchingAssets.map((asset) => <option key={asset.id} value={asset.id}>{assetDisplayName(asset)}</option>)}
               </select>
               {selectedAsset && (
                 <button type="button" className={styles.iconGhost} aria-label="清除已选素材" title="清除" onClick={() => onChange(key, '')}>
@@ -267,7 +279,7 @@ export function GpuParamForm({ manifest, values, assets, uploadProgress, onChang
                       key={asset.id}
                       className={styles.refItem}
                       data-on={active}
-                      title={asset.filename || asset.id}
+                      title={assetDisplayName(asset)}
                       onClick={() => {
                         onChange(key, active ? '' : asset.id);
                         setOpenPickerKey(null);

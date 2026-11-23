@@ -14,6 +14,7 @@ const bundled = await build({
         isDiagnosticAsset,
       } from './src/lib/history-grouping.ts';
       export { parseHashRoute, formatHashRoute } from './src/lib/route-state.ts';
+      export { pickInitialProjectId, projectTitleById, isSystemJob } from './src/lib/project-label.ts';
     `,
     resolveDir: fileURLToPath(new URL('..', import.meta.url)),
     sourcefile: 'ux-optimizations-entry.ts',
@@ -34,6 +35,9 @@ const {
   isDiagnosticAsset,
   parseHashRoute,
   formatHashRoute,
+  pickInitialProjectId,
+  projectTitleById,
+  isSystemJob,
 } = await import('data:text/javascript;base64,' + Buffer.from(bundled.outputFiles[0].text).toString('base64'));
 
 test('groupJobsByBatch stacks multi-job batches and leaves single jobs flat', () => {
@@ -113,4 +117,22 @@ test('hash route parse and format preserve tab, sub-tab, and selection state', (
     const hash = formatHashRoute(state);
     assert.deepEqual(parseHashRoute(hash), state);
   }
+});
+
+test('project label helpers pick default project and detect system jobs', () => {
+  const projects = [
+    { id: 'p-new', title: '新项目', is_default: false },
+    { id: 'p-def', title: '默认项目', is_default: true },
+  ];
+  assert.equal(pickInitialProjectId(projects, 'p-new'), 'p-new');
+  assert.equal(pickInitialProjectId(projects, 'missing-id'), 'p-def');
+  assert.equal(pickInitialProjectId(projects, ''), 'p-def');
+
+  assert.equal(projectTitleById('p-def', projects), '默认项目');
+  assert.equal(projectTitleById('native-comfy-owner', projects), '原生 ComfyUI（系统）');
+  assert.equal(projectTitleById('system-smoke-owner', projects), 'GPU 可行性检查（系统）');
+
+  assert.equal(isSystemJob({ system: true }), true);
+  assert.equal(isSystemJob({ workflow_key: 'system/native-comfy' }), true);
+  assert.equal(isSystemJob({ workflow_key: 'flux-dev', system: false }), false);
 });
