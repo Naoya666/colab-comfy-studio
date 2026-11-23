@@ -82,8 +82,11 @@ _MEM_SCAN_CACHE: dict[str, str] = {}
 _LOADED_SCAN_CACHE_PATH: Path | None = None
 
 
+_SECRET_HINT_RE = re.compile(rb'(?i:(?:access_token|refresh_token|client_secret|api_key|password)[ \t\r\n\f\v"]*[:=])')
+
+
 def _may_contain_secret(chunk: bytes) -> bool:
-    """Exact pre-filter using C memmem before running case-insensitive regex."""
+    """Exact pre-filter using C memmem / compiled regex before full credential AST scan."""
     if SECRET is not _DEFAULT_SECRET or not env_flag('NATIVE_FAST_SCAN', True):
         return True
     if b'-----BEGIN ' in chunk:
@@ -101,18 +104,7 @@ def _may_contain_secret(chunk: bytes) -> bool:
             pos = chunk.find(prefix, pos + 1)
     if b':' not in chunk and b'=' not in chunk:
         return False
-    lowered = chunk.lower()
-    for token in _SECRET_LOWER_HINTS:
-        pos = lowered.find(token)
-        tlen = len(token)
-        while pos != -1:
-            idx = pos + tlen
-            while idx < chunk_len and lowered[idx] in _SECRET_ASSIGN_SKIP:
-                idx += 1
-            if idx < chunk_len and lowered[idx] in _SECRET_ASSIGN_DELIM:
-                return True
-            pos = lowered.find(token, pos + 1)
-    return False
+    return _SECRET_HINT_RE.search(chunk) is not None
 
 
 def is_verified_binary(path: Path, header: bytes) -> bool:
@@ -457,6 +449,41 @@ def inventory(nodes, *, snapshot_databases=True, check_secrets=True):
     return sorted(result, key=lambda item: item['path'])
 
 
+def _full_tree_stat_fingerprint(nodes: Path) -> str:
+    """Full directory metadata stamp (pure lstat walk, no hashing/git/sqlite) for status caching."""
+    nodes = Path(nodes)
+    if not nodes.is_dir():
+        return 'missing'
+    entries: list[tuple] = []
+    for base, dirs, names in os.walk(nodes, followlinks=False):
+        base_path = Path(base)
+        rel_base = '' if base_path == nodes else str(base_path.relative_to(nodes))
+        if rel_base == '':
+            dirs[:] = sorted(d for d in dirs if d not in {'studio_native_guard', '__pycache__'} and (d in {'.disabled', 'disabled'} or not d.startswith('.')))
+        else:
+            git_dir = base_path / '.git'
+            if git_dir.is_dir():
+                for git_file in ('HEAD', 'packed-refs', 'shallow'):
+                    gp = git_dir / git_file
+                    try:
+                        gst = gp.lstat()
+                        entries.append((f'{rel_base}/.git/{git_file}', gst.st_ino, gst.st_size, gst.st_mtime_ns, gst.st_ctime_ns))
+                    except OSError:
+                        pass
+            dirs[:] = sorted(d for d in dirs if d not in EXCLUDE)
+        for name in sorted(names):
+            if rel_base == '' and (name in {'studio_native_state.py', '__pycache__'} or name.startswith('.')):
+                continue
+            if name in EXCLUDE or name.startswith('.env') or name.endswith(('.pem', '.key', '.pyc', '-wal', '-shm', '-journal')):
+                continue
+            try:
+                st = (base_path / name).lstat()
+            except OSError:
+                return f'err:{time.monotonic_ns()}'
+            entries.append((f'{rel_base}/{name}', st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+    return digest(entries)
+
+
 def fast_tree_fingerprint(nodes: Path) -> str:
     """Lightweight directory & dependency-file metadata stamp (<2ms) for prestartup guard."""
     nodes = Path(nodes)
@@ -546,8 +573,27 @@ class Remote:
             list_path.unlink(missing_ok=True)
 
     def put(self, source, key):
+        source = Path(source)
+        remote_target = 'studio:native-comfy/plugins/' + key
         try:
-            self.command('copyto', '--ignore-times', str(source), 'studio:native-comfy/plugins/' + key)
+            extra = ('--drive-chunk-size', '64M') if key.endswith('.tar.gz') else ()
+            self.command('copyto', '--ignore-times', *extra, str(source), remote_target)
+            # For large plugin archives, verify via server-side MD5 hash instead of re-downloading
+            # up to hundreds of MBs; fall back to read-after-write if MD5 is unavailable.
+            if key.endswith('.tar.gz') and source.stat().st_size >= 1024**2:
+                try:
+                    with source.open('rb') as handle:
+                        local_md5 = hashlib.file_digest(handle, 'md5').hexdigest().lower()
+                    res = self.command('md5sum', remote_target, timeout=120)
+                    remote_line = (res.stdout or '').strip().splitlines()
+                    if remote_line:
+                        remote_md5 = remote_line[0].split(None, 1)[0].strip().lower()
+                        if len(remote_md5) == 32 and remote_md5 == local_md5:
+                            return
+                        if len(remote_md5) == 32:
+                            raise RuntimeError('Drive remote MD5 checksum mismatch: ' + key)
+                except subprocess.CalledProcessError:
+                    pass
             # Read after write ensures the object is in Drive, not merely queued locally.
             with tempfile.TemporaryDirectory() as temp:
                 check = Path(temp) / 'verify'
@@ -764,6 +810,9 @@ class Persistence:
         self.boot_scan_done.set()
         self.manifest = read(self.root / 'plugins-verified.json')
         self.error = None
+        self._inv_lock = threading.Lock()
+        self._inv_cache: tuple[str, str, float] | None = None
+        self._last_tick_fingerprint: str | None = None
 
     def download_json(self, key):
         path = self.cache / 'download.json'
@@ -1036,8 +1085,14 @@ class Persistence:
 
     def tick(self, busy=False, now=None):
         now = time.monotonic() if now is None else now
+        tree_before = _full_tree_stat_fingerprint(self.nodes)
         plugins = inventory(self.nodes)
         fingerprint = digest(plugins)
+        self._last_tick_fingerprint = fingerprint
+        tree_after = _full_tree_stat_fingerprint(self.nodes)
+        if tree_before == tree_after:
+            with self._inv_lock:
+                self._inv_cache = (tree_after, fingerprint, time.monotonic())
         if busy or fingerprint != self.previous:
             self.previous, self.stable_since = fingerprint, now
             return False
@@ -1070,10 +1125,11 @@ class Persistence:
                     archive = Path(temp.name)
                 try:
                     p['kind'] = 'directory' if node.is_dir() else 'file'
-                    with tarfile.open(archive, 'w:gz') as target:
+
+                    def _pack_plugin(target: tarfile.TarFile) -> None:
                         if node.is_dir():
                             checks = [(str(path.relative_to(node)), checksum)
-                                      for path, checksum in files(node, archive=target)]
+                                      for path, checksum in files(node, archive=target, use_disk_cache=True)]
                             if digest(checks) != p['checksum']:
                                 raise RuntimeError('Plugin files changed during backup; retrying after settling')
                             if (node / '.git').exists():
@@ -1085,7 +1141,10 @@ class Persistence:
                                 with tarfile.open(fileobj=io.BytesIO(committed)) as source:
                                     for member in source:
                                         if member.isfile():
-                                            check_credentials(source.extractfile(member).read(), Path(member.name))
+                                            content = source.extractfile(member).read()
+                                            if is_verified_binary(Path(member.name), content[:64]):
+                                                continue
+                                            check_credentials(content, Path(member.name))
                                 objects = subprocess.check_output(['git', '-C', str(node), 'rev-list', '--objects', '--no-walk', 'HEAD'])
                                 ids = b'\n'.join(line.split(b' ')[0] for line in objects.splitlines()) + b'\n'
                                 bundle = self.cache / 'repo.pack'
@@ -1097,6 +1156,31 @@ class Persistence:
                         else:
                             # File nodes use a containing directory in the archive.
                             target.add(node, arcname=node.name, recursive=False)
+
+                    if shutil.which('pigz'):
+                        with archive.open('wb') as out_stream:
+                            pigz = subprocess.Popen(
+                                ['pigz', '-1', '-p', '4', '-c'],
+                                stdin=subprocess.PIPE,
+                                stdout=out_stream,
+                                stderr=subprocess.PIPE,
+                            )
+                            try:
+                                assert pigz.stdin is not None
+                                with tarfile.open(fileobj=pigz.stdin, mode='w|') as target:
+                                    _pack_plugin(target)
+                                pigz.stdin.close()
+                                pigz.stdin = None
+                                _, err = pigz.communicate(timeout=600)
+                                if pigz.returncode != 0:
+                                    raise RuntimeError('pigz plugin archive failed: ' + err.decode(errors='replace')[-200:])
+                            finally:
+                                if pigz.poll() is None:
+                                    pigz.kill()
+                                    pigz.wait(timeout=5)
+                    else:
+                        with tarfile.open(archive, 'w:gz', compresslevel=1) as target:
+                            _pack_plugin(target)
                     p['archive'] = file_hash(archive)
                     cached = self.cache / (p['archive'] + '.tar.gz')
                     if not cached.exists():
@@ -1117,11 +1201,27 @@ class Persistence:
             self.manifest = manifest
         return True
 
-    def status(self):
-        pending = read(self.root / 'plugins-pending.json', {}).get('manifest')
+    def status(self, *, fingerprint: str | None = None, use_cache: bool = False):
+        pending_doc = read(self.root / 'plugins-pending.json', {})
+        pending = pending_doc.get('manifest')
         error = self.error or read(self.root / 'plugin-errors.json')
         try:
-            durable = bool(read(self.root / 'plugins-pending.json', {}).get('source') == digest(inventory(self.nodes)))
+            current_fp = fingerprint
+            if current_fp is None and use_cache and env_flag('NATIVE_FAST_SCAN', True) and SECRET is _DEFAULT_SECRET:
+                tree_stamp = _full_tree_stat_fingerprint(self.nodes)
+                now_mono = time.monotonic()
+                with self._inv_lock:
+                    cached = self._inv_cache
+                if cached and cached[0] == tree_stamp and now_mono - cached[2] < 15.0:
+                    current_fp = cached[1]
+                else:
+                    current_fp = digest(inventory(self.nodes))
+                    if _full_tree_stat_fingerprint(self.nodes) == tree_stamp:
+                        with self._inv_lock:
+                            self._inv_cache = (tree_stamp, current_fp, time.monotonic())
+            if current_fp is None:
+                current_fp = digest(inventory(self.nodes))
+            durable = bool(pending_doc.get('source') == current_fp)
         except Exception as exc:
             durable = False
             error = str(exc)
@@ -1765,7 +1865,7 @@ def upload_env_cache_from_plan(root: Path, plan_path: Path, remote: Remote | Non
 
             if shutil.which('pigz'):
                 with tar_tmp.open('wb') as out_stream:
-                    pigz = subprocess.Popen(['pigz', '-1', '-c'], stdin=subprocess.PIPE, stdout=out_stream, stderr=subprocess.PIPE)
+                    pigz = subprocess.Popen(['pigz', '-1', '-p', '4', '-c'], stdin=subprocess.PIPE, stdout=out_stream, stderr=subprocess.PIPE)
                     try:
                         assert pigz.stdin is not None
                         with tarfile.open(fileobj=pigz.stdin, mode='w|') as tar:
@@ -1879,14 +1979,17 @@ def install(server, root, manager_busy):
         # Scan failures are retried by tick; startup/dependency failures stay sticky.
         load_error = persistence.error if read(root / 'plugin-errors.json') else None
         while True:
+            tick_fp = None
             try:
                 success = await asyncio.to_thread(persistence.tick, await asyncio.to_thread(manager_busy))
+                tick_fp = persistence._last_tick_fingerprint
                 if success:
                     persistence.error = load_error
             except Exception as exc:
                 persistence.error = str(exc)
                 logging.error('Plugin persistence: %s', exc)
-            atomic(root / 'plugins-status.json', persistence.status())
+            status_payload = await asyncio.to_thread(persistence.status, fingerprint=tick_fp, use_cache=True)
+            await asyncio.to_thread(atomic, root / 'plugins-status.json', status_payload)
             await asyncio.sleep(10)
 
     # Comfy imports nodes before run_until_complete; create_task on that loop works.
@@ -1898,6 +2001,18 @@ def _main(argv: list[str]) -> int:
     if len(argv) == 2 and argv[0] == 'upload-env-cache':
         plan_path = Path(argv[1]).resolve()
         try:
+            # Scheme D: yield CPU and wait briefly after startup so ComfyUI initial UI/model loads are never starved.
+            try:
+                os.nice(15)
+            except OSError:
+                pass
+            default_delay = 0.0 if (os.getenv('PYTEST_CURRENT_TEST') or os.getenv('STUDIO_OFFLINE_TEST') == '1') else 15.0
+            try:
+                delay = float(os.getenv('NATIVE_ENV_CACHE_UPLOAD_DELAY_SECONDS', str(default_delay)))
+            except ValueError:
+                delay = default_delay
+            if delay > 0:
+                time.sleep(min(delay, 60.0))
             upload_env_cache_from_plan(plan_path.parent, plan_path)
             return 0
         except Exception as exc:

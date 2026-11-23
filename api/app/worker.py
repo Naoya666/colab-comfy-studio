@@ -51,6 +51,10 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     store = Store(settings.database_url)
+    from .gpu.repository import Repository
+
+    repo = Repository(store)
+    scheduler = Scheduler(repo)
     last_ccu_tick = 0.0
     restart_pool = ThreadPoolExecutor(max_workers=1) if args.mode == "worker" and not args.once else None
     ccu_pool = ThreadPoolExecutor(max_workers=1) if args.mode == "worker" and not args.once else None
@@ -60,24 +64,21 @@ def main():
         advanced = False
         fast_control = env_flag("NATIVE_FAST_CONTROL_PLANE", True)
         try:
-            scheduler = Scheduler(store)
             if args.mode == "model-worker":
                 from .gpu.model_library import transfer_tick
-                from .gpu.repository import Repository
-                result = transfer_tick(Repository(store), stopping=lambda: not running)
+                result = transfer_tick(repo, stopping=lambda: not running)
             else:
                 result = scheduler.watchdog() if args.mode == "watchdog" else scheduler.tick()
             if args.mode == "worker" and (restart_future is None or restart_future.done()):
                 from .gpu.native_restart import tick as restart_tick
-                from .gpu.repository import Repository
 
                 if restart_future is not None:
                     completed, restart_future = restart_future, None
                     completed.result()
                 if restart_pool:
-                    restart_future = restart_pool.submit(restart_tick, Repository(store))
+                    restart_future = restart_pool.submit(restart_tick, repo)
                 else:
-                    restart_tick(Repository(store))
+                    restart_tick(repo)
             if args.mode == "worker" and os.getenv("STUDIO_ATELIER_ENABLED", "0") == "1":
                 from .atelier_routes import auto_export_tick
 

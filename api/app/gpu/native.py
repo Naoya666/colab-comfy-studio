@@ -163,7 +163,7 @@ def guard_generation(repo, owner, policy):
         CuGuardService(repo).check(owner, "colab", policy.get("account_id"), policy.get("instance_id"))
 
 
-def busy(client=None, *, repo=None, owner="owner"):
+def busy(client=None, *, repo=None, owner="owner", state_payload=None):
     """Unknown is busy: network errors must never stop a video or an upload."""
     try:
         url, headers = backend_for(repo, owner)
@@ -174,9 +174,11 @@ def busy(client=None, *, repo=None, owner="owner"):
             if not isinstance(data.get("queue_running"), list) or not isinstance(data.get("queue_pending"), list):
                 return True
             queued = bool(data["queue_running"] or data["queue_pending"])
-            state = c.get(url + "/studio_native/state", headers=headers)
-            state.raise_for_status()
-            return queued or state.json().get("busy") is not False
+            if state_payload is None:
+                state = c.get(url + "/studio_native/state", headers=headers)
+                state.raise_for_status()
+                state_payload = state.json()
+            return queued or state_payload.get("busy") is not False
     except Exception:
         return True
 
@@ -184,10 +186,10 @@ def busy(client=None, *, repo=None, owner="owner"):
 _default_busy = busy
 
 
-def busy_for(repo=None, owner="owner", client=None):
+def busy_for(repo=None, owner="owner", client=None, *, state_payload=None):
     if busy is not _default_busy:
         return busy() if client is None else busy(client)
-    return busy(client=client, repo=repo, owner=owner)
+    return busy(client=client, repo=repo, owner=owner, state_payload=state_payload)
 
 
 class _borrow:
@@ -517,7 +519,7 @@ def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None, smar
             "lease_patch": {},
         }
     finally:
-        if owns_provider or (smart and isinstance(provider, GoogleColabProvider)):
+        if (owns_provider or isinstance(provider, GoogleColabProvider)) and hasattr(provider, "close"):
             provider.close()
 
     if not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
@@ -560,16 +562,26 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
     """Fence idle shutdown against new uploads/prompts under the existing dispatch lock."""
     if not lease.get("native_comfy") or lease.get("force_stop"):
         return False
-    if GpuConfig.from_env().real_enabled:
-        try:
-            sync_plugins(repo, lease)
-        except Exception as exc:
-            repo.update("leases", lease["id"], {"native_plugin_sync_error": type(exc).__name__}, lease["owner_id"])
-            # Busy probe fails closed if persistence has an error or dirty files.
-            # A VPS mirror outage must not replace the last committed manifest.
-            pass
     identity = _lease_identity(lease)
-    upstream_busy = busy_for(repo, lease["owner_id"])
+    # Reuse one HTTP client and a single /studio_native/state fetch across plugin sync and busy probe.
+    if GpuConfig.from_env().real_enabled and sync_plugins is _default_sync_plugins and busy is _default_busy:
+        state_payload = None
+        with httpx.Client(timeout=15) as shared_client:
+            try:
+                _, state_payload = sync_plugins(repo, lease, client=shared_client, return_state=True)
+            except Exception as exc:
+                repo.update("leases", lease["id"], {"native_plugin_sync_error": type(exc).__name__}, lease["owner_id"])
+            upstream_busy = busy_for(repo, lease["owner_id"], client=shared_client, state_payload=state_payload)
+    else:
+        if GpuConfig.from_env().real_enabled:
+            try:
+                sync_plugins(repo, lease)
+            except Exception as exc:
+                repo.update("leases", lease["id"], {"native_plugin_sync_error": type(exc).__name__}, lease["owner_id"])
+                # Busy probe fails closed if persistence has an error or dirty files.
+                # A VPS mirror outage must not replace the last committed manifest.
+                pass
+        upstream_busy = busy_for(repo, lease["owner_id"])
     # An offline tunnel also reports "busy". It cannot veto reconciliation of
     # a VM already confirmed absent by Colab's independent control plane.
     remote_deleted = check_remote and upstream_busy and _runtime_deleted(repo, lease)
@@ -768,13 +780,14 @@ def ready_for(repo=None, owner="owner", client=None):
     return ready(client=client, repo=repo, owner=owner)
 
 
-def sync_plugins(repo, lease, client=None):
+def sync_plugins(repo, lease, client=None, *, return_state=False):
     """Pull committed metadata over the existing authenticated tunnel; no GPU token on VPS."""
     url, headers = backend_for(repo, lease["owner_id"])
     with httpx.Client(timeout=15) if client is None else _borrow(client) as c:
         response = c.get(url + '/studio_native/state', headers=headers)
         response.raise_for_status()
-        status = response.json().get('plugins') or {}
+        state_payload = response.json()
+        status = state_payload.get('plugins') or {}
     manifest = status.get('manifest')
     from .node_persistence import digest
     if manifest and (manifest.get('schema') != 1 or manifest.get('generation') != digest(manifest.get('plugins'))):
@@ -784,7 +797,7 @@ def sync_plugins(repo, lease, client=None):
     key = 'native-plugins-' + digest(owner)[:32]
     with repo.store.dispatch_lock() as acquired:
         if not acquired:
-            return status
+            return (status, state_payload) if return_state else status
         saved = repo.store.get('settings', key, owner) or {}
         history = saved.get('history', [])
         if manifest and (not history or history[-1]['generation'] != manifest['generation']):
@@ -795,4 +808,7 @@ def sync_plugins(repo, lease, client=None):
                 repo.store.update('settings', key, data, owner)
         else:
             repo.store.create('settings', owner, data, record_id=key)
-    return status
+    return (status, state_payload) if return_state else status
+
+
+_default_sync_plugins = sync_plugins

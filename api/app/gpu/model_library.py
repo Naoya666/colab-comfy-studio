@@ -40,8 +40,8 @@ from .model_sources import (
 
 ACTIVE = {"pending", "downloading", "verifying", "uploading"}
 BUFFER = 1024 ** 2
-CHECKPOINT_BYTES = 32 * BUFFER
-UPLOAD_CHUNK = 8 * BUFFER
+CHECKPOINT_BYTES = 256 * BUFFER
+UPLOAD_CHUNK = 64 * BUFFER
 FIELDS = "id,name,size,mimeType,trashed,md5Checksum,sha256Checksum,appProperties"
 
 
@@ -549,18 +549,30 @@ class ModelTransfer:
     def progress(self, phase, written=0, total=None, *, force=False):
         if self.stopping():
             raise TransferPaused
-        current = self.lib.repo.get("model_downloads", self.task["id"], self.lib.owner)
-        if current.get("cancel_requested"):
-            raise ModelError("模型准备已取消，可重试")
         now = time.monotonic()
-        if self.phase != phase:
+        phase_changed = self.phase != phase
+        if phase_changed:
             self.phase = phase
             self.phase_started = now
             self.phase_offset = written
-        if force or now - self.last_progress >= 1:
-            self.lib.repo.update("model_downloads", self.task["id"], {"state": phase, "bytes": written, "total": total,
-                                 "speed": round(max(0, written - self.phase_offset) / max(now - self.phase_started, 0.01)), "heartbeat": time.time()}, self.lib.owner)
-            self.lib.update(self.model["id"], state=phase)
+        if force or phase_changed or now - self.last_progress >= 1:
+            current = self.lib.repo.get("model_downloads", self.task["id"], self.lib.owner)
+            if current and current.get("cancel_requested"):
+                raise ModelError("模型准备已取消，可重试")
+            self.lib.repo.update(
+                "model_downloads",
+                self.task["id"],
+                {
+                    "state": phase,
+                    "bytes": written,
+                    "total": total,
+                    "speed": round(max(0, written - self.phase_offset) / max(now - self.phase_started, 0.01)),
+                    "heartbeat": time.time(),
+                },
+                self.lib.owner,
+            )
+            if phase_changed or force:
+                self.lib.update(self.model["id"], state=phase)
             self.last_progress = now
 
     def read_drive(self, path):
@@ -572,19 +584,22 @@ class ModelTransfer:
         from .runtime_worker import DriveCache
         cache = DriveCache(token, self.lib.drive.model_cache()["folder_id"])
         written = 0
+        sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
         with cache._open("GET", f"https://www.googleapis.com/drive/v3/files/{quote(meta['id'])}?alt=media") as response, path.open("wb") as output:
             for block in iter(lambda: response.read(BUFFER), b""):
                 written += len(block)
                 if written > total:
                     raise ModelError("Drive 文件大小变化，请重试")
                 output.write(block)
+                sha.update(block)
+                md5.update(block)
                 if written % CHECKPOINT_BYTES == 0:
                     self.flush_data(output)
                 self.progress("verifying", written, total)
             self.flush_data(output)
         if written != total:
             raise ModelError("Drive 文件读取不完整，请重试")
-        return meta
+        return meta, (sha, md5, written)
 
     def ensure_space(self, path, size):
         if size > max_file_bytes():
@@ -690,8 +705,10 @@ class ModelTransfer:
             return total
         return expected
 
-    def consume_download(self, path, response, checkpoint, sha, total):
+    def consume_download(self, path, response, checkpoint, sha, total, *, md5=None):
         written = checkpoint["bytes"] if checkpoint else 0
+        if md5 is None and written == 0:
+            md5 = hashlib.md5(usedforsecurity=False)
         if total is not None and total > max_file_bytes():
             raise ModelError("模型文件超过管理员设置的单文件大小限制")
         self.ensure_space(path, (total - written) if total is not None else BUFFER)
@@ -709,6 +726,8 @@ class ModelTransfer:
                     raise ModelError("下载文件大小超过预期或限制")
                 output.write(block)
                 sha.update(block)
+                if md5 is not None:
+                    md5.update(block)
                 if written - checkpoint_at >= CHECKPOINT_BYTES:
                     self.ensure_space(path, 0)
                     self.checkpoint(path, output, identity, sha, total)
@@ -719,6 +738,7 @@ class ModelTransfer:
             if not written or (total is not None and written != total):
                 raise ModelError("下载中断或文件不完整，请重试")
             self.checkpoint(path, output, identity, sha, written, complete=True)
+        return (sha, md5, written) if md5 is not None else None
 
     def download(self, path):
         prior = path.exists()
@@ -742,13 +762,14 @@ class ModelTransfer:
                     total = self.response_total(response, checkpoint)
                     if total is not None:
                         self.task_update(restart_reason=None)
-                        self.consume_download(path, response, checkpoint, sha, total)
-                        return None
+                        return self.consume_download(path, response, checkpoint, sha, total, md5=md5)
                     if response.status_code == 200:
                         self.task_update(restart_reason="来源版本变化或忽略了 HTTP Range，已从头下载")
                         path.with_suffix(".json").unlink(missing_ok=True)
-                        self.consume_download(path, response, None, hashlib.sha256(), self.response_total(response, None))
-                        return None
+                        return self.consume_download(
+                            path, response, None, hashlib.sha256(), self.response_total(response, None),
+                            md5=hashlib.md5(usedforsecurity=False),
+                        )
                 reason = "来源版本变化或未返回匹配的 HTTP Range，已从头下载"
             else:
                 reason = "无法确认下载来源版本，已从头下载"
@@ -758,8 +779,10 @@ class ModelTransfer:
             self.task_update(restart_reason=reason)
         path.with_suffix(".json").unlink(missing_ok=True)
         with self.lib.http.stream(self.model["download_url"]) as response:
-            self.consume_download(path, response, None, hashlib.sha256(), self.response_total(response, None))
-        return None
+            return self.consume_download(
+                path, response, None, hashlib.sha256(), self.response_total(response, None),
+                md5=hashlib.md5(usedforsecurity=False),
+            )
 
     @staticmethod
     def matches(entry, sha, md5, size):
@@ -793,7 +816,8 @@ class ModelTransfer:
     def upload(self, path, sha, md5, size):
         drive = self.lib.drive
         root = drive.model_cache()["folder_id"]
-        parent = drive._folder(sha[:2], drive._folder("by-sha256", root))
+        by_sha = drive._cached_folder("by-sha256", "by-sha256", root) if hasattr(drive, "_cached_folder") else drive._folder("by-sha256", root)
+        parent = drive._cached_folder(f"by-sha256/{sha[:2]}", sha[:2], by_sha) if hasattr(drive, "_cached_folder") else drive._folder(sha[:2], by_sha)
         mime = "application/octet-stream"
         identity = [root, sha, size]
         file_id = self.task.get("upload_file_id") if self.task.get("upload_identity") == identity else None
@@ -938,10 +962,20 @@ class ModelTransfer:
                     self.model["drive_file_id"] = entry["id"]
                     legacy = True
             imported = legacy or self.model.get("source") in {"drive", "upload", "legacy_cache"} or (self.task.get("action") == "verify" and bool(self.model.get("drive_file_id")))
-            meta = self.read_drive(path) if imported else None
-            verified = None if imported else self.download(path)
+            if imported:
+                drive_result = self.read_drive(path)
+                if isinstance(drive_result, tuple) and len(drive_result) == 2:
+                    meta, verified = drive_result
+                else:
+                    meta, verified = drive_result, None
+            else:
+                meta = None
+                verified = self.download(path)
             self.progress("verifying", force=True)
-            sha, md5, size = verified or self.hash_file(path)
+            if verified is not None and type(self).hash_file is _DEFAULT_HASH_FILE:
+                sha, md5, size = verified
+            else:
+                sha, md5, size = self.hash_file(path)
             sha, md5 = sha.hexdigest(), md5.hexdigest()
             if not size or (expected and sha != expected) or (self.model.get("expected_size") and size != self.model["expected_size"]):
                 path.unlink(missing_ok=True)
@@ -995,19 +1029,26 @@ class ModelTransfer:
                              "upload_file_id": None}, self.lib.owner)
 
 
+_DEFAULT_HASH_FILE = ModelTransfer.hash_file
+
+
 def transfer_tick(repo, *, stopping=lambda: False):
     """Run in a dedicated worker; one active transfer per shared data directory."""
     with transfer_lock() as acquired:
         if not acquired or stopping():
             return {"advanced": False}
-        tasks = []
-        for task in repo.list("model_downloads"):
-            if task.get("state") in ACTIVE:
-                tasks.append(task)
-            elif task.get("state") in {"ready", "cancelled"}:
-                directory = transfer_directory(task["id"])
-                if directory.is_dir():
-                    shutil.rmtree(directory)
+        scratch = Path(os.getenv("MODEL_LIBRARY_SCRATCH", str(settings.data_dir / "model-scratch")))
+        if scratch.is_dir():
+            try:
+                has_scratch = any(scratch.iterdir())
+            except OSError:
+                has_scratch = False
+            if has_scratch:
+                for task in repo.list_by_states("model_downloads", {"ready", "cancelled"}):
+                    directory = transfer_directory(task["id"])
+                    if directory.is_dir():
+                        shutil.rmtree(directory)
+        tasks = repo.list_by_states("model_downloads", ACTIVE)
         if not tasks:
             return {"advanced": False}
         task = sorted(tasks, key=lambda t: str(t.get("created_at")))[0]

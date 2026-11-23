@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -225,15 +226,61 @@ class LocalModels:
         self.tokens = config.get("tokens", {})
         self.drive_auth = config.get("drive_auth", {})
         self.client = http or httpx.Client(timeout=45, trust_env=False, follow_redirects=False)
+        self._state_lock = threading.Lock()
         self.drive_tokens = {}
-        self.hashes = {}
         self.partials = root / "model-transfers"
         self.partials.mkdir(mode=0o700, exist_ok=True)
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="studio-models")
+        self.hashes = self._load_hash_cache()
+        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="studio-models")
         self.jobs = {}
         self.current_rows = {}
         self.inflight = {}
         self.handoffs = 0
+
+    def _hash_cache_file(self) -> Path:
+        return self.root / ".model-hash-cache.json"
+
+    def _load_hash_cache(self) -> dict:
+        path = self._hash_cache_file()
+        try:
+            if not path.is_file():
+                return {}
+            raw = json.loads(path.read_text())
+            if not isinstance(raw, dict):
+                return {}
+            loaded = {}
+            for key, value in raw.items():
+                if (
+                    isinstance(key, str)
+                    and isinstance(value, dict)
+                    and isinstance(value.get("stamp"), list)
+                    and len(value["stamp"]) == 5
+                ):
+                    loaded[Path(key)] = (
+                        tuple(value["stamp"]),
+                        value.get("sha256"),
+                        None,
+                        value.get("md5"),
+                    )
+            return loaded
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_hash_cache(self) -> None:
+        # Never persist external download URLs in plaintext; URL provenance is
+        # stored separately as an HMAC digest in model-transfers/*.json.
+        with self._state_lock:
+            payload = {
+                str(path): {"stamp": list(entry[0]), "sha256": entry[1], "md5": entry[3]}
+                for path, entry in self.hashes.items()
+            }
+        cache_file = self._hash_cache_file()
+        tmp = cache_file.with_name(f".model-hash-cache.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, separators=(",", ":")))
+            tmp.replace(cache_file)
+        except OSError:
+            tmp.unlink(missing_ok=True)
 
     def signed(self, request):
         return hmac.compare_digest(request.headers.get("X-Studio-Model-Channel", ""), self.config["channel"])
@@ -250,9 +297,10 @@ class LocalModels:
         if account not in self.drive_auth:
             raise ModelError("Drive 副本所属账号未授权，请检查模型库存储账号")
         identity = graph_key(self.drive_auth[account])
-        current = self.drive_tokens.get(account)
-        if current and current[1] > time.monotonic() and current[2] == identity:
-            return current[0]
+        with self._state_lock:
+            current = self.drive_tokens.get(account)
+            if current and current[1] > time.monotonic() and current[2] == identity:
+                return current[0]
         response = self.client.post("https://oauth2.googleapis.com/token", data={
             "grant_type": "refresh_token", **self.drive_auth[account],
         })
@@ -262,7 +310,8 @@ class LocalModels:
         token = data.get("access_token")
         if not isinstance(token, str) or not token:
             raise ModelError("Drive 未返回有效授权")
-        self.drive_tokens[account] = token, time.monotonic() + max(0, int(data.get("expires_in", 0)) - 60), identity
+        with self._state_lock:
+            self.drive_tokens[account] = token, time.monotonic() + max(0, int(data.get("expires_in", 0)) - 60), identity
         return token
 
     @staticmethod
@@ -416,13 +465,17 @@ class LocalModels:
             raise ModelError("本地目标不是常规模型文件")
         stamp = self.stamp(target)
         size = stamp[2]
-        known = self.hashes.get(target)
+        with self._state_lock:
+            known = self.hashes.get(target)
         if not known or known[0] != stamp:
             if plan["sha256"] or plan["md5"]:
                 sha, md5 = self.file_hashes(target)
                 if self.stamp(target) != stamp:
                     raise ModelError("本地文件仍在写入，请完成后重试")
-                known = self.hashes[target] = stamp, sha, None, md5
+                known = stamp, sha, None, md5
+                with self._state_lock:
+                    self.hashes[target] = known
+                self._save_hash_cache()
             else:
                 known = stamp, None, None, None
         provenance_matches = known[2] == plan["url"]
@@ -468,11 +521,18 @@ class LocalModels:
         etag = resource = None
         written = 0
         total = plan["size"]
+        sha_hasher = hashlib.sha256()
+        md5_hasher = hashlib.md5(usedforsecurity=False)
+        hasher_aligned = True
         try:
             self.ensure_space(total or CHUNK)
             deadline = time.monotonic() + 3600
             for attempt in range(3):
                 offset = written if etag else 0
+                if offset == 0:
+                    sha_hasher = hashlib.sha256()
+                    md5_hasher = hashlib.md5(usedforsecurity=False)
+                    hasher_aligned = True
                 try:
                     with source.stream(url, offset=offset, validator=etag, drive_token=drive_token) as response:
                         if response.headers.get("content-type", "").split(";")[0] in {"text/html", "application/json", "text/plain"}:
@@ -490,6 +550,9 @@ class LocalModels:
                             declared = int(bounds[3])
                         elif response.status_code == 200:
                             offset = written = 0
+                            sha_hasher = hashlib.sha256()
+                            md5_hasher = hashlib.md5(usedforsecurity=False)
+                            hasher_aligned = True
                             declared = int(response.headers.get("content-length") or 0)
                         else:
                             etag = None
@@ -503,14 +566,20 @@ class LocalModels:
                         etag = current_etag if current_etag and current_etag.startswith('"') else None
                         resource = current_resource
                         self.ensure_space(total - offset)
+                        next_space_check = written + 32 * CHUNK
                         with scratch.open("ab" if offset else "wb") as output:
                             for chunk in response.iter_raw(CHUNK):
                                 if time.monotonic() >= deadline:
                                     raise ModelError("单个模型下载超过 60 分钟，请检查来源或改用 Drive 挂载")
                                 if written + len(chunk) > total:
                                     raise ModelError("下载内容超过声明的文件大小")
-                                self.ensure_space(len(chunk))
+                                if written >= next_space_check:
+                                    self.ensure_space(len(chunk))
+                                    next_space_check = written + 32 * CHUNK
                                 output.write(chunk)
+                                if hasher_aligned:
+                                    sha_hasher.update(chunk)
+                                    md5_hasher.update(chunk)
                                 written += len(chunk)
                                 update(bytes=written, total=total, attempt=attempt + 1)
                             output.flush()
@@ -526,7 +595,10 @@ class LocalModels:
                     if written == total:
                         etag = None
                     time.sleep(1 + attempt)
-            digest, md5 = self.file_hashes(scratch)
+            if hasher_aligned and written == total:
+                digest, md5 = sha_hasher.hexdigest(), md5_hasher.hexdigest()
+            else:
+                digest, md5 = self.file_hashes(scratch)
             if plan["sha256"] and digest != plan["sha256"]:
                 raise ModelError("下载文件 SHA-256 不匹配，请核对版本和来源")
             target_category = category_for(target.relative_to(self.model_dir).parts[0])
@@ -544,14 +616,17 @@ class LocalModels:
                     raise ModelError("同路径已被其他写入占用，请核对模型文件") from None
             else:
                 scratch.unlink()
-                self.hashes[target] = self.stamp(target), digest, plan["url"], md5
+                target_stamp = self.stamp(target)
+                with self._state_lock:
+                    self.hashes[target] = target_stamp, digest, plan["url"], md5
+                self._save_hash_cache()
                 if plan["url"] and not plan["sha256"]:
                     # Only a URL fingerprint is persisted. This lets a ComfyUI process
                     # restart reuse a complete URL-only file on the same instance.
                     provenance = self.partials / (key + ".json")
                     try:
                         with provenance.with_suffix(".tmp").open("w") as record:
-                            json.dump({"stamp": self.stamp(target), "digest": hashlib.sha256(plan["url"].encode()).hexdigest()}, record)
+                            json.dump({"stamp": target_stamp, "digest": hashlib.sha256(plan["url"].encode()).hexdigest()}, record)
                         provenance.with_suffix(".tmp").replace(provenance)
                     except OSError:
                         LOG.warning("Could not save model provenance for process restart")
@@ -676,12 +751,20 @@ class LocalModels:
                         raise ModelError("每个工作流最多检查 256 个模型路径")
             except (ModelError, TypeError, ValueError, KeyError, AttributeError):
                 raise ModelError("工作流模型声明或文件路径无效") from None
+            planned: list[tuple[dict, Path, dict, tuple]] = []
             for (category, name), entries in grouped.items():
                 status = rows[(category, name)] = {"category": category, "name": name, "state": "pending"}
                 try:
                     target, plan = self.plan(entries, catalog)
                     identity = (plan["sha256"], plan["md5"], plan["size"], None if plan["sha256"] else plan["url"],
                                 (plan["drive"] or {}).get("drive_file_id") if not plan["sha256"] else None)
+                    planned.append((status, target, plan, identity))
+                except ModelError as exc:
+                    status.update(state="failed", error=str(exc))
+            # Start largest model weights first so multi-GB downloads overlap with smaller CLIP/VAE weights.
+            planned.sort(key=lambda item: -(int(item[2].get("size") or 0)))
+            for status, target, plan, identity in planned:
+                try:
                     current = self.inflight.get(target)
                     if current and current[0] != identity:
                         raise ModelError("该路径正在准备另一版本，请等候并核对模型身份")

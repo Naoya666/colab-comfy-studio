@@ -377,7 +377,7 @@ class DriveStorage:
             f"and appProperties has {{ key='studio_key_hash' and value='{self._q(key_hash)}' }} "
             f"and appProperties has {{ key='studio_sha256' and value='{self._q(sha256)}' }}"
         )
-        fields = "files(id,name,size,mimeType,parents,appProperties)"
+        fields = "files(id,name,size,mimeType,sha256Checksum,parents,appProperties)"
         response = self._request(
             "GET", self.base_url + "/files", params={"q": q, "pageSize": "10", "fields": fields}
         )
@@ -490,7 +490,7 @@ class DriveStorage:
             response = self._request(
                 "POST",
                 self.upload_url + "/files",
-                params={"uploadType": "multipart", "fields": "id,name,size,mimeType,appProperties"},
+                params={"uploadType": "multipart", "fields": "id,name,size,mimeType,sha256Checksum,appProperties"},
                 content=body,
                 headers={"Content-Type": content_type},
             )
@@ -554,7 +554,7 @@ class DriveStorage:
             response = self._request(
                 "POST",
                 self.upload_url + "/files",
-                params={"uploadType": "resumable", "fields": "id,name,size,mimeType,appProperties"},
+                params={"uploadType": "resumable", "fields": "id,name,size,mimeType,sha256Checksum,appProperties"},
                 json_body=metadata,
                 headers={"X-Upload-Content-Type": mime, "X-Upload-Content-Length": str(len(content))},
             )
@@ -670,7 +670,7 @@ class DriveStorage:
                 result = existing
             else:
                 response = self._request('POST', self.upload_url + '/files',
-                    params={'uploadType': 'resumable', 'fields': 'id,name,size,mimeType,appProperties'},
+                    params={'uploadType': 'resumable', 'fields': 'id,name,size,mimeType,sha256Checksum,appProperties'},
                     json_body={'name': posixpath.basename(normalized), 'parents': [parent], 'mimeType': mime,
                         'appProperties': {'studio_key_hash': key_hash, 'studio_sha256': sha256}},
                     headers={'X-Upload-Content-Type': mime, 'X-Upload-Content-Length': str(size)})
@@ -731,7 +731,12 @@ class DriveStorage:
             valid_size = False
         if not result or not isinstance(result.get('id'), str) or not result['id'] or not valid_size:
             raise DriveError("Drive file upload completion invalid")
-        if self._media_download(result['id'], size) != (size, sha256):
+        # Trust Google Drive's server-computed sha256Checksum when present; fall back to media download otherwise.
+        remote_sha = result.get("sha256Checksum")
+        if isinstance(remote_sha, str) and remote_sha:
+            if remote_sha.lower() != sha256.lower():
+                raise DriveError("Drive file upload checksum invalid")
+        elif self._media_download(result['id'], size) != (size, sha256):
             raise DriveError("Drive file upload checksum invalid")
         self._save_file_record(normalized, key_hash, sha256, mime, result, size)
         if self.store.get('files', session_id, self.owner_id):
@@ -790,9 +795,11 @@ class DriveStorage:
             "mime": mime,
             "sha256": sha256,
             "app_properties": record.get("appProperties") or {},
+            **({"sha256Checksum": record["sha256Checksum"]} if isinstance(record.get("sha256Checksum"), str) else {}),
         }
         if not result["id"] or not self.verify(result, raw):
             raise DriveError("Drive上传后校验失败")
+        result.pop("sha256Checksum", None)
         self._save_file_record(normalized, key_hash, sha256, mime, record, len(raw))
         result["verified"] = True
         return result
@@ -857,6 +864,11 @@ class DriveStorage:
         limit = len(raw) if max_expectedbytes is None else max_expectedbytes
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < len(raw):
             return False
+        # When Drive returns its server-computed sha256Checksum alongside exact size,
+        # avoid downloading the entire uploaded payload back over the network.
+        remote_sha = record.get("sha256Checksum")
+        if isinstance(remote_sha, str) and remote_sha and record.get("size") is not None:
+            return remote_sha.lower() == expected_hash.lower()
         downloaded = self._media_download(record["id"], limit)
         return downloaded == (len(raw), expected_hash)
 

@@ -1160,8 +1160,9 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     cloud_record = storage.put(
                         key, bytes(content), output.get("mime", "application/octet-stream")
                     )
-                    if not storage.verify(cloud_record, bytes(content)):
-                        raise ComputeError("stored GPU output failed verification")
+                    if not (isinstance(cloud_record, dict) and cloud_record.get("verified") is True):
+                        if not storage.verify(cloud_record, bytes(content)):
+                            raise ComputeError("stored GPU output failed verification")
                     metadata = {**metadata, "cloud_record": cloud_record}
                 from app.storage import save_asset
 
@@ -1181,8 +1182,9 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 metadata_record = storage.put(
                     f"outputs/{job['id']}/metadata.json", metadata_content, "application/json"
                 )
-                if not storage.verify(metadata_record, metadata_content):
-                    raise ComputeError("stored GPU metadata failed verification")
+                if not (isinstance(metadata_record, dict) and metadata_record.get("verified") is True):
+                    if not storage.verify(metadata_record, metadata_content):
+                        raise ComputeError("stored GPU metadata failed verification")
             else:
                 metadata_record = self._write_local_metadata(job, result_metadata)
         except Exception as exc:
@@ -1201,6 +1203,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             job,
             "cleaning_up",
             "GPU outputs persisted",
+            outputs=[],
             output_asset_ids=output_asset_ids,
             persisted_outputs=assets,
             **({'prep_report':report} if report is not None else {}),

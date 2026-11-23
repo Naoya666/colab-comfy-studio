@@ -168,7 +168,12 @@ async def state(request):
         if not result.get("busy"):
             result.update(busy=True, busy_reason="plugins")
     elif has_status:
-        result["plugins"] = await asyncio.to_thread(PERSISTENCE.status)
+        def _cached_status():
+            try:
+                return PERSISTENCE.status(use_cache=True)
+            except TypeError:
+                return PERSISTENCE.status()
+        result["plugins"] = await asyncio.to_thread(_cached_status)
         if not result["busy"] and (not result["plugins"].get("durable") or result["plugins"].get("error")):
             result.update(busy=True, busy_reason="plugins")
     result.update(boot_id=BOOT_ID, lease_id=LEASE_ID, reboot_id=REBOOT_ID)
@@ -365,6 +370,20 @@ def _mount_error(log, secret):
     return text.strip()[-1200:] or "rclone 未提供错误详情"
 
 
+def _write_rclone_config(root, secret) -> Path | None:
+    required = ("access_token", "refresh_token", "client_id", "client_secret", "owner_folder_id")
+    if not all(secret.get(k) for k in required):
+        return None
+    config = root / "rclone.conf"
+    token = json.dumps({"access_token": secret["access_token"], "refresh_token": secret["refresh_token"],
+                        "token_type": "Bearer", "expiry": "2000-01-01T00:00:00Z"})
+    # The root is the existing AI-Studio/<owner> folder, including models and its existing cache layout.
+    _write_secret(config, "[studio]\ntype = drive\nscope = drive.file\n" +
+                  f"client_id = {secret['client_id']}\nclient_secret = {secret['client_secret']}\n" +
+                  f"root_folder_id = {secret['owner_folder_id']}\ntoken = {token}\n")
+    return config
+
+
 def mount_drive(root, secret):
     mount = root / "drive"
     mount.mkdir(exist_ok=True)
@@ -374,13 +393,7 @@ def mount_drive(root, secret):
         if applied.is_file() and json.loads(applied.read_text()) != cache:
             raise RuntimeError("已挂载的 Drive 使用其他 VFS 配置，请停止并重新分配实例")
         return mount
-    config = root / "rclone.conf"
-    token = json.dumps({"access_token": secret["access_token"], "refresh_token": secret["refresh_token"],
-                        "token_type": "Bearer", "expiry": "2000-01-01T00:00:00Z"})
-    # The root is the existing AI-Studio/<owner> folder, including models and its existing cache layout.
-    _write_secret(config, "[studio]\ntype = drive\nscope = drive.file\n" +
-                  f"client_id = {secret['client_id']}\nclient_secret = {secret['client_secret']}\n" +
-                  f"root_folder_id = {secret['owner_folder_id']}\ntoken = {token}\n")
+    config = _write_rclone_config(root, secret) or (root / "rclone.conf")
     args = [str(root / "rclone"), "mount", "studio:", str(mount), "--config", str(config),
          "--vfs-cache-mode", "full", "--vfs-write-back", "5s",
          "--vfs-cache-max-size", f"{cache[0]}G", "--vfs-cache-min-free-space", "5G",
@@ -460,7 +473,11 @@ def prepare_paths(comfy, mount, *, local=False):
     nodes.mkdir(exist_ok=True)
     # One-time import of the old Drive layout. Preserve the original as a backup.
     legacy = data / "custom_nodes"
-    if legacy.exists() and not (comfy.parent / "plugins-legacy-imported").exists():
+    if (
+        legacy.exists()
+        and not (comfy.parent / "plugins-legacy-imported").exists()
+        and not (comfy.parent / "plugins-restored.json").exists()
+    ):
         shutil.copytree(legacy, nodes, dirs_exist_ok=True, symlinks=True)
         (comfy.parent / "plugins-legacy-imported").touch()
     return data
@@ -473,32 +490,45 @@ def _index_models(secret, worker):
     index = cache._folder("native-index", cache.folder_id, True)
     aliases = []
     shortcut_mime = "application/vnd.google-apps.shortcut"
+    # Group models by category so we list each category folder once instead of 1 API call per model.
+    by_category: dict[str, list[dict]] = {}
     for model in secret.get("models", []):
         category, name = model.get("category"), model.get("filename")
         if category not in CATEGORIES or not name or Path(name).name != name:
             continue
+        by_category.setdefault(category, []).append(model)
+    for category, cat_models in by_category.items():
         parent = cache._folder(category, index, True)
-        # ID-based aliases avoid moving, copying, or overwriting existing model files.
-        alias = model["file_id"] + "-" + name
-        query = f"name = '{cache._q(alias)}' and '{cache._q(parent)}' in parents and trashed = false"
-        params = {"q": query, "fields": "nextPageToken,files(mimeType,shortcutDetails(targetId))"}
-        matches = []
+        existing_by_name: dict[str, list[dict]] = {}
+        query = f"'{cache._q(parent)}' in parents and trashed = false"
+        params = {"q": query, "pageSize": "1000", "fields": "nextPageToken,files(name,mimeType,shortcutDetails(targetId))"}
         while True:
             page = cache._json("GET", worker.DRIVE_API + "/files?" + urlencode(params))
-            matches.extend(page.get("files") or [])
+            for item in page.get("files") or []:
+                if isinstance(item, dict) and item.get("name"):
+                    existing_by_name.setdefault(item["name"], []).append(item)
             if not page.get("nextPageToken"):
                 break
             params["pageToken"] = page["nextPageToken"]
-        if any(item.get("mimeType") != shortcut_mime
-               or (item.get("shortcutDetails") or {}).get("targetId") != model["file_id"] for item in matches):
-            raise ValueError(f"Drive 模型快捷方式目标冲突：{alias}")
-        if not matches:
-            cache._json("POST", worker.DRIVE_API + "/files", {
-                "name": alias, "mimeType": shortcut_mime, "parents": [parent],
-                "shortcutDetails": {"targetId": model["file_id"]}})
-        item = {"category": category, "alias": alias}
-        if item not in aliases:
-            aliases.append(item)
+        for model in cat_models:
+            alias = model["file_id"] + "-" + model["filename"]
+            matches = existing_by_name.get(alias, [])
+            if any(
+                item.get("mimeType") != shortcut_mime
+                or (item.get("shortcutDetails") or {}).get("targetId") != model["file_id"]
+                for item in matches
+            ):
+                raise ValueError(f"Drive 模型快捷方式目标冲突：{alias}")
+            if not matches:
+                cache._json("POST", worker.DRIVE_API + "/files", {
+                    "name": alias, "mimeType": shortcut_mime, "parents": [parent],
+                    "shortcutDetails": {"targetId": model["file_id"]}})
+                existing_by_name.setdefault(alias, []).append(
+                    {"name": alias, "mimeType": shortcut_mime, "shortcutDetails": {"targetId": model["file_id"]}}
+                )
+            item = {"category": category, "alias": alias}
+            if item not in aliases:
+                aliases.append(item)
     return aliases
 
 
@@ -535,7 +565,7 @@ def wait_for_comfy(worker, process, timeout=2100):
                 raise RuntimeError("Native ComfyUI exited during startup; inspect comfy.log") from None
             if time.monotonic() >= deadline:
                 raise RuntimeError("Native ComfyUI health check timed out; inspect comfy.log") from None
-            time.sleep(1)
+            time.sleep(0.25)
 
 
 def wait_for_tunnel(tunnel, timeout=10.0):
@@ -659,9 +689,10 @@ def run(root, payload, stages):
         else:
             comfy = ROOT / "ComfyUI"
             parallel_boot = _flag("NATIVE_PARALLEL_BOOTSTRAP", True)
-            boot_pool = ThreadPoolExecutor(max_workers=5) if parallel_boot else None
+            boot_pool = ThreadPoolExecutor(max_workers=6) if parallel_boot else None
             cloudflared_future = None
             comfy_future = None
+            mount_future = None
             try:
                 stages.start("native_system")
                 if boot_pool is not None:
@@ -670,19 +701,28 @@ def run(root, payload, stages):
                     cloudflared_future = boot_pool.submit(install_cloudflared, ROOT, worker)
                     comfy_future = boot_pool.submit(_ensure_comfy_checkout, comfy, commit, worker)
                     index_future = boot_pool.submit(_index_models, secret, worker) if not local else None
-                    apt_future.result()
+                    # rclone + rclone.conf are enough for plugins_restore and env-cache; hide apt-get + FUSE mount
+                    # behind plugins_restore, base Python install, and env-cache restore.
                     rclone_future.result()
                     if index_future is not None:
                         index_future.result()
+                    stages.start("native_drive")
+                    _write_rclone_config(ROOT, secret)
+
+                    def _finish_apt_and_mount():
+                        apt_future.result()
+                        return mount_drive(ROOT, secret)
+
+                    mount_future = boot_pool.submit(_finish_apt_and_mount)
+                    mount = None
                 else:
                     _install_system_apt(worker)
                     install_rclone(ROOT, worker)
                     install_cloudflared(ROOT, worker)
-
-                stages.start("native_drive")
-                if not parallel_boot and not local:
-                    _index_models(secret, worker)
-                mount = mount_drive(ROOT, secret)
+                    stages.start("native_drive")
+                    if not local:
+                        _index_models(secret, worker)
+                    mount = mount_drive(ROOT, secret)
 
                 stages.start("native_models")
                 if comfy_future is not None:
@@ -692,7 +732,10 @@ def run(root, payload, stages):
                 manager = comfy / "manager_requirements.txt"
                 if not manager.is_file():
                     raise RuntimeError("Pinned ComfyUI must support the official Manager (--enable-manager)")
-                data = prepare_paths(comfy, mount, local=True) if local else prepare_paths(comfy, mount)
+                (comfy / "custom_nodes").mkdir(exist_ok=True)
+                data = None
+                if mount is not None:
+                    data = prepare_paths(comfy, mount, local=True) if local else prepare_paths(comfy, mount)
                 extra = ROOT / "extra_model_paths.yaml"
                 local_config = ROOT / "local-model-config.json"
                 if local:
@@ -710,10 +753,11 @@ def run(root, payload, stages):
                                                             "directories": secret["directories"], "rules": secret["rules"]}))
                 else:
                     local_config.unlink(missing_ok=True)
-                    extra.write_text(json.dumps(model_paths(mount)))
+                    if mount is not None:
+                        extra.write_text(json.dumps(model_paths(mount)))
 
                 shutil.copyfile(Path(__file__).with_name("node_persistence.py"), ROOT / "node_persistence.py")
-                persistence = Persistence(ROOT, comfy, data / "user")
+                persistence = Persistence(ROOT, comfy, (data / "user") if data is not None else (ROOT / "drive" / "native-comfy" / "user"))
                 baseline_protected = protect_environment(ROOT)
                 site = worker._site_dir()
                 use_env_cache = _flag("NATIVE_ENV_CACHE", True) and site.is_dir() and persistence.remote.available()
@@ -760,6 +804,14 @@ def run(root, payload, stages):
                         dep_key = persistence.stamp_cached_dependencies(current_plugins)
                         if dep_key:
                             mark_prestartup_verified(ROOT, comfy / "custom_nodes", dep_key)
+
+                # Ensure apt-get + FUSE Drive mount completed before Manager/dependencies or ComfyUI startup.
+                if mount_future is not None:
+                    mount = mount_future.result()
+                    data = prepare_paths(comfy, mount, local=True) if local else prepare_paths(comfy, mount)
+                    persistence.user = data / "user"
+                    if not local:
+                        extra.write_text(json.dumps(model_paths(mount)))
 
                 if not env_cache_hit:
                     if use_env_cache and key_info is not None:

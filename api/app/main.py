@@ -430,8 +430,9 @@ def cloud_sync_workflow(st, owner, row):
     ]:
         content = json.dumps(row.get(field, {}), ensure_ascii=False, sort_keys=True).encode()
         record = storage.put(folder + "/" + name, content, "application/json")
-        if not storage.verify(record, content):
-            raise APIError("DRIVE_VERIFY_FAILED", "工作流保存后校验失败")
+        if not (isinstance(record, dict) and record.get("verified") is True):
+            if not storage.verify(record, content):
+                raise APIError("DRIVE_VERIFY_FAILED", "工作流保存后校验失败")
         records[field] = record
     return Repository(st).update("workflows", row["id"], {"drive_files": records}, owner)
 
