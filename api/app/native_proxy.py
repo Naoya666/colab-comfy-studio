@@ -189,7 +189,7 @@ class NativeGateway:
                 )
 
             internal_path = scope["path"].removeprefix("/api").rstrip("/")
-            if internal_path == "/studio_native/index" or internal_path.startswith("/studio_native/models"):
+            if internal_path in {"/studio_native/index", "/studio_native/plugin-telemetry"} or internal_path.startswith("/studio_native/models"):
                 raise APIError("NOT_FOUND", "接口不存在", 404)
 
             if weak_policy is not None:

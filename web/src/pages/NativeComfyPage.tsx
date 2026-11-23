@@ -1,11 +1,12 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUpRight, Loader2 } from 'lucide-react';
+import { ArrowUpRight, FolderKanban, Loader2 } from 'lucide-react';
 import { apiFetch, apiMessage, type GpuUsage } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import { NativeModelSettings, type ModelStorage } from '../components/NativeModelSettings';
 import { NativeModelPreparation } from '../components/NativeModelPreparation';
 import { NativeApiSettings } from '../components/NativeApiSettings';
 import { NativeSetupWizard } from '../components/NativeSetupWizard';
+import { NativeWorkspaceManager } from '../components/NativeWorkspaceManager';
 import { StageTimelineBar } from '../components/StageTimelineBar';
 import type { GpuAccount, GpuInstance } from '../components/AccountDirectory';
 import { formatInstanceTime } from '../lib/instance-time';
@@ -86,6 +87,7 @@ type NativeStatus = {
   url?: string;
   ready: boolean;
   can_restart: boolean;
+  has_pending_offline_plugins?: boolean;
   restart?: NativeRestart;
   state: string;
   stage?: string | null;
@@ -398,11 +400,35 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const openSetupWizard = useCallback((step?: 1 | 2 | 3 | 4 | 5) => {
     setWizardRequest(current => ({ seq: (current?.seq || 0) + 1, step }));
   }, []);
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const webUiReady = status?.web_ui_configured !== false;
+  if (workspaceOpen) {
+    return (
+      <NativeWorkspaceManager
+        onBack={() => {
+          setWorkspaceOpen(false);
+          refreshStatusNow();
+        }}
+        onMutated={refreshStatusNow}
+      />
+    );
+  }
   return <section className={styles.nativeWorkspace}>
     <div className="actions nativeApiHeading">
       <h1>原生 ComfyUI</h1>
       <div className="actions">
+        <button
+          type="button"
+          className="button secondary"
+          onClick={() => setWorkspaceOpen(true)}
+          title="免开 GPU 管理原生工作流、自定义节点插件与构建缓存"
+        >
+          <FolderKanban size={15} aria-hidden />
+          工作流与插件管理
+          {status?.has_pending_offline_plugins && (
+            <span className={styles.wsPendingDot} title="已有离线插件变更待下次启动生效" aria-label="有待生效变更" />
+          )}
+        </button>
         <NativeSetupWizard
           configured={status?.configured}
           webUiConfigured={status?.web_ui_configured}

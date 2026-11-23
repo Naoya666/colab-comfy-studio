@@ -3799,3 +3799,254 @@
   font-size: 0.78rem;
   overflow-wrap: anywhere;
 }
+
+
+/* Native ComfyUI Offline Workspace Manager */
+.wsPendingDot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn, #e09f3e);
+  margin-left: 4px;
+}
+
+.wsHeadingGroup {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.wsBannerWarn,
+.wsBannerInfo {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-strong);
+  background: var(--card);
+}
+
+.wsBannerWarn {
+  border-color: color-mix(in srgb, var(--warn, #e09f3e) 55%, var(--line));
+  background: color-mix(in srgb, var(--warn, #e09f3e) 10%, var(--card));
+}
+
+.wsBannerInfo {
+  border-color: color-mix(in srgb, var(--primary) 50%, var(--line));
+  background: color-mix(in srgb, var(--primary) 8%, var(--card));
+}
+
+.wsBannerWarn p,
+.wsBannerInfo p {
+  margin: 4px 0 0;
+}
+
+.wsEmpty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 28px 16px;
+  color: var(--muted);
+}
+
+.wsSummaryGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.wsStatCard {
+  display: grid;
+  gap: 4px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--card);
+  font-variant-numeric: tabular-nums;
+}
+
+.wsStatCard strong {
+  font-size: 1.2rem;
+  font-weight: 650;
+}
+
+.wsSectionStack {
+  display: grid;
+  gap: 14px;
+}
+
+.wsCard {
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--card);
+  display: grid;
+  gap: 12px;
+}
+
+.wsCardHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.wsCardHead h2 {
+  margin: 0 0 4px;
+  font-size: 1rem;
+}
+
+.wsCardHead p {
+  margin: 0;
+}
+
+.wsSummaryToggle {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.wsList {
+  display: grid;
+  gap: 8px;
+}
+
+.wsRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  flex-wrap: wrap;
+}
+
+.wsRow[data-selected="true"] {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 6%, var(--bg));
+}
+
+.wsCheck {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex: 1 1 280px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.wsCheck input[type="checkbox"] {
+  margin-top: 3px;
+  flex: none;
+}
+
+.wsRowMain {
+  display: grid;
+  gap: 6px;
+  flex: 1 1 280px;
+  min-width: 0;
+}
+
+.wsRowTitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  word-break: break-word;
+}
+
+.wsMetaLine {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.wsTagList {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.wsPluginChip,
+.wsBadgeOk,
+.wsBadgeWarn,
+.wsBadgeDanger,
+.wsBadgeMuted {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  border: 1px solid var(--line-strong);
+  background: var(--card);
+  color: var(--text-2);
+}
+
+.wsPluginChip {
+  cursor: pointer;
+}
+
+.wsPluginChip:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.wsBadgeOk {
+  border-color: color-mix(in srgb, var(--ok, #2a9d8f) 45%, var(--line));
+  background: color-mix(in srgb, var(--ok, #2a9d8f) 12%, var(--card));
+  color: var(--text);
+}
+
+.wsBadgeWarn {
+  border-color: color-mix(in srgb, var(--warn, #e09f3e) 55%, var(--line));
+  background: color-mix(in srgb, var(--warn, #e09f3e) 14%, var(--card));
+  color: var(--text);
+}
+
+.wsBadgeDanger {
+  border-color: color-mix(in srgb, var(--danger, #e63946) 55%, var(--line));
+  background: color-mix(in srgb, var(--danger, #e63946) 14%, var(--card));
+  color: var(--danger, #e63946);
+}
+
+.wsBadgeMuted {
+  color: var(--muted);
+}
+
+.wsCacheKey {
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+
+.wsDialogList {
+  margin: 6px 0 8px;
+  padding-left: 18px;
+  max-height: 180px;
+  overflow: auto;
+  font-size: 0.86rem;
+}
+
+.wsLinkedBox {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--card);
+  display: grid;
+  gap: 6px;
+}

@@ -11,6 +11,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -1226,6 +1227,7 @@ class Persistence:
         return {'manifest': self.manifest, 'pending_generation': (pending or {}).get('generation'),
                 'restart_required': bool(pending and (not self.manifest or pending['generation'] != self.manifest['generation'])),
                 'durable': durable,
+                'telemetry_digest': read(self.root / 'plugins-telemetry-digest.json', {}).get('digest'),
                 'install_notes': read(self.root / 'plugin-install-notes.json', []),
                 'error': error}
 
@@ -1909,6 +1911,253 @@ def upload_env_cache_from_plan(root: Path, plan_path: Path, remote: Remote | Non
             tar_final.unlink(missing_ok=True)
 
 
+_IMPORT_TIME_RE = re.compile(
+    r'^\s*([0-9]+(?:\.[0-9]+)?)\s+seconds(?:\s+\((IMPORT FAILED)\))?:\s+(.+?)\s*$'
+)
+_INTERNAL_CUSTOM_NODES = frozenset({'studio_native_state.py', 'studio_native_guard', '__pycache__'})
+_JS_SKIP_DIRS = frozenset({'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'tests', 'test', 'examples'})
+
+
+def _normalize_imported_plugin_path(raw_path: str, nodes_dir: Path) -> str | None:
+    cleaned = raw_path.strip().rstrip('/\\')
+    if not cleaned:
+        return None
+    normalized = cleaned.replace('\\', '/')
+    nodes_prefix = str(nodes_dir).replace('\\', '/').rstrip('/') + '/'
+    if normalized.startswith(nodes_prefix):
+        rel = normalized[len(nodes_prefix):]
+    elif '/custom_nodes/' in normalized:
+        rel = normalized.rsplit('/custom_nodes/', 1)[1]
+    else:
+        rel = Path(normalized).name
+    rel = rel.strip('/')
+    if not rel or rel.split('/', 1)[0] in _INTERNAL_CUSTOM_NODES:
+        return None
+    return rel
+
+
+def parse_import_times(startup_log: str, nodes_dir: str | Path) -> tuple[dict[str, float], list[str]]:
+    """Extract per-plugin import times from ComfyUI startup stdout log."""
+    nodes_path = Path(nodes_dir)
+    import_times: dict[str, float] = {}
+    import_failed: list[str] = []
+    in_section = False
+    for line in startup_log.splitlines():
+        stripped = line.strip()
+        if 'Import times for custom nodes:' in line:
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if not stripped:
+            if import_times or import_failed:
+                in_section = False
+            continue
+        match = _IMPORT_TIME_RE.match(line)
+        if not match:
+            if import_times or import_failed:
+                in_section = False
+            continue
+        seconds = round(float(match.group(1)), 2)
+        failed = bool(match.group(2))
+        plugin_path = _normalize_imported_plugin_path(match.group(3), nodes_path)
+        if not plugin_path:
+            continue
+        import_times[plugin_path] = seconds
+        if failed and plugin_path not in import_failed:
+            import_failed.append(plugin_path)
+    return import_times, sorted(import_failed)
+
+
+def _count_js_in_dir(directory: Path, *, limit: int = 2000) -> int:
+    count = 0
+    if not directory.is_dir():
+        return 0
+    for cur, dirs, filenames in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in _JS_SKIP_DIRS and not d.startswith('.')]
+        for fname in filenames:
+            if fname.endswith(('.js', '.mjs')):
+                count += 1
+                if count >= limit:
+                    return count
+    return count
+
+
+def _count_plugin_js_files(nodes_dir: Path, plugin_path: str, web_dirs: dict[str, str] | None = None) -> int:
+    node = nodes_dir / plugin_path
+    if not node.is_dir():
+        return 0
+    if isinstance(web_dirs, dict):
+        matched_dirs: list[Path] = []
+        plugin_resolved = node.resolve()
+        for key, raw_dir in web_dirs.items():
+            if not isinstance(raw_dir, str) or not raw_dir:
+                continue
+            cand = Path(raw_dir)
+            if not cand.is_dir():
+                continue
+            try:
+                cand_resolved = cand.resolve()
+            except OSError:
+                continue
+            if key == plugin_path or key == node.name or cand_resolved == plugin_resolved or plugin_resolved in cand_resolved.parents:
+                matched_dirs.append(cand_resolved)
+        if matched_dirs:
+            total = 0
+            seen: set[Path] = set()
+            for d in matched_dirs:
+                if d in seen:
+                    continue
+                seen.add(d)
+                total += _count_js_in_dir(d)
+            return total
+    total = 0
+    for sub in ('web', 'js', 'web_version', 'frontend'):
+        sub_dir = node / sub
+        if sub_dir.is_dir():
+            total += _count_js_in_dir(sub_dir)
+    return total
+
+
+def _resolve_class_plugin(cls, nodes_dir: Path, known_plugins: dict[str, str]) -> str | None:
+    mod = getattr(cls, '__module__', None) or ''
+    if isinstance(mod, str) and mod.startswith('custom_nodes.'):
+        rest = mod[len('custom_nodes.'):]
+        top = rest.split('.', 1)[0]
+        if top in _INTERNAL_CUSTOM_NODES:
+            return None
+        if top in known_plugins:
+            return known_plugins[top]
+        if (top + '.py') in known_plugins:
+            return known_plugins[top + '.py']
+        if top:
+            return top
+    try:
+        src = inspect.getsourcefile(cls)
+    except (TypeError, OSError):
+        src = None
+    if src:
+        try:
+            rel = Path(src).resolve().relative_to(nodes_dir.resolve())
+            top = rel.parts[0] if rel.parts else ''
+            if top and top not in _INTERNAL_CUSTOM_NODES:
+                return known_plugins.get(top, top)
+        except ValueError:
+            pass
+    return None
+
+
+def collect_plugin_telemetry(
+    root: Path,
+    comfy: Path,
+    startup_log: str,
+    *,
+    node_class_mappings: dict | None = None,
+    extension_web_dirs: dict | None = None,
+    gpu_reported: str | None = None,
+    comfy_commit: str | None = None,
+    generation: str | None = None,
+) -> dict:
+    """Build compact plugin startup telemetry (import times, node_map, JS/dependency profile)."""
+    nodes_dir = Path(comfy) / 'custom_nodes'
+    import_times, import_failed = parse_import_times(startup_log, nodes_dir)
+
+    installed_paths: list[str] = []
+    known_lookup: dict[str, str] = {}
+    if nodes_dir.is_dir():
+        for entry in sorted(nodes_dir.iterdir()):
+            if entry.name in _INTERNAL_CUSTOM_NODES:
+                continue
+            if entry.name in {'.disabled', 'disabled'} and entry.is_dir():
+                for child in sorted(entry.iterdir()):
+                    rel = f'{entry.name}/{child.name}'
+                    installed_paths.append(rel)
+                    known_lookup[rel] = rel
+                continue
+            if entry.name.startswith('.'):
+                continue
+            if entry.is_dir() or entry.name.endswith(('.py', '.py.disabled')):
+                installed_paths.append(entry.name)
+                known_lookup[entry.name] = entry.name
+                if entry.name.endswith('.py'):
+                    known_lookup[entry.name[:-3]] = entry.name
+
+    mappings = node_class_mappings
+    web_dirs = extension_web_dirs
+    if mappings is None or web_dirs is None:
+        try:
+            import nodes as comfy_nodes  # type: ignore[import-not-found]
+
+            if mappings is None:
+                mappings = getattr(comfy_nodes, 'NODE_CLASS_MAPPINGS', {}) or {}
+            if web_dirs is None:
+                web_dirs = getattr(comfy_nodes, 'EXTENSION_WEB_DIRS', {}) or {}
+        except Exception:
+            mappings = mappings or {}
+            web_dirs = web_dirs or {}
+
+    node_map: dict[str, str] = {}
+    node_counts: dict[str, int] = {}
+    if isinstance(mappings, dict):
+        for node_type, cls in mappings.items():
+            if not isinstance(node_type, str) or not node_type:
+                continue
+            plugin_path = _resolve_class_plugin(cls, nodes_dir, known_lookup)
+            if plugin_path:
+                node_map[node_type] = plugin_path
+                node_counts[plugin_path] = node_counts.get(plugin_path, 0) + 1
+
+    plugins_meta: dict[str, dict] = {}
+    all_paths = sorted(set(installed_paths) | set(import_times) | set(node_counts))
+    for plugin_path in all_paths:
+        if plugin_path.split('/', 1)[0] in _INTERNAL_CUSTOM_NODES:
+            continue
+        node = nodes_dir / plugin_path
+        plugins_meta[plugin_path] = {
+            'node_count': node_counts.get(plugin_path, 0),
+            'js_count': _count_plugin_js_files(nodes_dir, plugin_path, web_dirs if isinstance(web_dirs, dict) else None),
+            'has_requirements': (node / 'requirements.txt').is_file() if node.is_dir() else False,
+            'has_install_py': (node / 'install.py').is_file() if node.is_dir() else False,
+        }
+
+    commit = comfy_commit
+    if not commit:
+        state_doc = read(Path(root) / 'state.json', {})
+        commit = state_doc.get('commit') if isinstance(state_doc, dict) else None
+    if not commit:
+        head_file = Path(comfy) / '.git' / 'HEAD'
+        if head_file.is_file():
+            commit = head_file.read_text(errors='replace').strip()
+
+    gen = generation
+    if not gen:
+        for fname in ('plugins-verified.json', 'plugins-restored.json'):
+            doc = read(Path(root) / fname, {})
+            if isinstance(doc, dict) and doc.get('generation'):
+                gen = doc['generation']
+                break
+
+    return {
+        'schema': 1,
+        'collected_at': time.time(),
+        'gpu_reported': gpu_reported,
+        'comfy_commit': commit,
+        'generation': gen,
+        'import_times': import_times,
+        'import_failed': import_failed,
+        'plugins': plugins_meta,
+        'node_map': node_map,
+    }
+
+
+def save_plugin_telemetry(root: Path, telemetry: dict) -> str:
+    root = Path(root)
+    tel_digest = digest(telemetry)
+    atomic(root / 'plugins-telemetry.json', telemetry)
+    atomic(root / 'plugins-telemetry-digest.json', {'digest': tel_digest, 'collected_at': telemetry.get('collected_at')})
+    return tel_digest
+
+
 def install(server, root, manager_busy):
     """Called by the native extension. A restart captures a new immutable boot set."""
     import asyncio
@@ -1968,6 +2217,16 @@ def install(server, root, manager_busy):
                 source.seek(config['log_offset'])
                 startup = source.read().decode(errors='replace')
             failed = [line for line in startup.splitlines() if '(IMPORT FAILED)' in line or 'Cannot import ' in line]
+            try:
+                tel = await asyncio.to_thread(
+                    collect_plugin_telemetry,
+                    root,
+                    Path(config['comfy']),
+                    startup,
+                )
+                await asyncio.to_thread(save_plugin_telemetry, root, tel)
+            except Exception as tel_exc:
+                logging.warning('Plugin telemetry collection skipped: %s', tel_exc)
             if failed:
                 raise RuntimeError('Plugin load verification failed: ' + '; '.join(failed)[-2000:])
             persistence.boot = boot_result['fingerprint']

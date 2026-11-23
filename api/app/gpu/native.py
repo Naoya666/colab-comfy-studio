@@ -11,6 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import httpx
 
@@ -143,6 +144,94 @@ def backend_for(repo=None, owner="owner"):
 
 
 _INACTIVE_LEASE_STATES = ("deleted", "quarantined", "releasing", "deleting")
+WORKSPACE_WRITE_LOCK_TTL_SECONDS = 90.0
+
+
+def _workspace_lock_key(owner: str) -> str:
+    return "native-workspace-lock-" + digest(owner)[:32]
+
+
+def active_workspace_write_lock(repo, owner: str = "owner", now: float | None = None) -> dict | None:
+    """Return active offline workspace write lock row if held and unexpired."""
+    if not hasattr(repo, "store") or not hasattr(repo.store, "get"):
+        return None
+    row = repo.store.get("settings", _workspace_lock_key(owner), owner)
+    if not isinstance(row, dict) or not row.get("lock_id"):
+        return None
+    current = time.time() if now is None else float(now)
+    if float(row.get("expires_at") or 0) <= current:
+        return None
+    return row
+
+
+def workspace_offline_status(repo, owner: str = "owner", now: float | None = None) -> tuple[bool, str | None]:
+    """Return (offline_writable, lock_reason) for native offline workspace operations."""
+    lease = active_lease(repo, owner)
+    if lease:
+        if lease.get("native_draining"):
+            return False, "当前原生 ComfyUI 正在排空停止，请等待实例完全释放后再执行修改"
+        if restart_active(lease):
+            return False, "当前原生 ComfyUI 正在重启，请等待实例完全停止后再执行修改"
+        return False, "当前原生 ComfyUI 实例正在运行，仅支持只读查看；停止实例后可进行停用、删除与缓存清理"
+    active_jobs = (
+        repo.list_by_states("jobs", TERMINAL, owner, exclude=True)
+        if hasattr(repo, "list_by_states")
+        else repo.list("jobs", owner)
+    )
+    running = next(
+        (j for j in active_jobs if (j.get("snapshot") or {}).get("native_comfy") and j.get("state") not in TERMINAL),
+        None,
+    )
+    if running:
+        return False, "当前原生 ComfyUI 正在启动或收尾中，请等待任务结束并停止实例后再执行修改"
+    return True, None
+
+
+def acquire_workspace_write_lock(
+    repo,
+    owner: str = "owner",
+    *,
+    reason: str = "workspace_write",
+    ttl_seconds: float = WORKSPACE_WRITE_LOCK_TTL_SECONDS,
+    now: float | None = None,
+) -> str:
+    """Verify native ComfyUI is offline and acquire short-lived write lock mutually exclusive with admit()."""
+    with repo.store.dispatch_lock() as acquired:
+        if not acquired:
+            raise APIError("SCHEDULER_BUSY", "调度正在同步，请稍后重试", 503)
+        writable, lock_reason = workspace_offline_status(repo, owner, now=now)
+        if not writable:
+            raise APIError("NATIVE_INSTANCE_ACTIVE", lock_reason or "当前原生 ComfyUI 处于活动状态，禁止离线修改", 409)
+        current = time.time() if now is None else float(now)
+        existing = active_workspace_write_lock(repo, owner, now=current)
+        if existing:
+            raise APIError("NATIVE_WORKSPACE_BUSY", "另一项离线管理写入操作正在进行，请数秒后重试", 409)
+        lock_id = uuid4().hex
+        key = _workspace_lock_key(owner)
+        payload = {
+            "lock_id": lock_id,
+            "reason": reason,
+            "started_at": current,
+            "expires_at": current + float(ttl_seconds),
+        }
+        if repo.store.get("settings", key, owner):
+            repo.store.update("settings", key, payload, owner)
+        else:
+            repo.store.create("settings", owner, payload, record_id=key)
+        return lock_id
+
+
+def release_workspace_write_lock(repo, owner: str, lock_id: str) -> None:
+    """Release workspace write lock if still owned by lock_id."""
+    if not lock_id or not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
+        return
+    with repo.store.dispatch_lock() as acquired:
+        if not acquired:
+            return
+        key = _workspace_lock_key(owner)
+        row = repo.store.get("settings", key, owner)
+        if isinstance(row, dict) and row.get("lock_id") == lock_id:
+            repo.store.update("settings", key, {"lock_id": None, "expires_at": 0.0, "reason": None}, owner)
 
 
 def active_lease(repo, owner="owner"):
@@ -242,6 +331,8 @@ def admit(repo, owner, body, key, *, api_key_id=None):
             if previous.get("native_request_hash") != digest(body):
                 raise APIError("IDEMPOTENCY_CONFLICT", "幂等键参数冲突", 409)
             return previous
+        if active_workspace_write_lock(repo, owner):
+            raise APIError("NATIVE_WORKSPACE_LOCKED", "离线工作流或插件管理正在写入 Drive，请数秒后重试启动", 409)
         from .cu_guard import CuGuardService
         CuGuardService(repo).check(owner, "colab", account, body.get("instance_id"))
         active_jobs = (
@@ -783,31 +874,64 @@ def ready_for(repo=None, owner="owner", client=None):
 def sync_plugins(repo, lease, client=None, *, return_state=False):
     """Pull committed metadata over the existing authenticated tunnel; no GPU token on VPS."""
     url, headers = backend_for(repo, lease["owner_id"])
+    owner = lease["owner_id"]
+    from .node_persistence import digest
+    key = "native-plugins-" + digest(owner)[:32]
+    existing_saved = repo.store.get("settings", key, owner) or {}
+    fetched_telemetry = None
+    fetched_telemetry_digest = None
     with httpx.Client(timeout=15) if client is None else _borrow(client) as c:
-        response = c.get(url + '/studio_native/state', headers=headers)
+        response = c.get(url + "/studio_native/state", headers=headers)
         response.raise_for_status()
         state_payload = response.json()
-        status = state_payload.get('plugins') or {}
-    manifest = status.get('manifest')
-    from .node_persistence import digest
-    if manifest and (manifest.get('schema') != 1 or manifest.get('generation') != digest(manifest.get('plugins'))):
-        raise ValueError('Invalid runtime plugin manifest')
+        status = state_payload.get("plugins") or {}
+        remote_tel_digest = status.get("telemetry_digest")
+        if (
+            isinstance(remote_tel_digest, str)
+            and remote_tel_digest
+            and remote_tel_digest != existing_saved.get("telemetry_digest")
+        ):
+            try:
+                tel_resp = c.get(url + "/studio_native/plugin-telemetry", headers=headers, timeout=10)
+                if tel_resp.status_code == 200:
+                    parsed_tel = tel_resp.json()
+                    if isinstance(parsed_tel, dict) and parsed_tel.get("schema") == 1:
+                        if not parsed_tel.get("gpu_reported") and lease.get("gpu_reported"):
+                            parsed_tel["gpu_reported"] = lease.get("gpu_reported")
+                        fetched_telemetry = parsed_tel
+                        fetched_telemetry_digest = remote_tel_digest
+            except (httpx.HTTPError, ValueError):
+                pass
+    manifest = status.get("manifest")
+    if manifest and (manifest.get("schema") != 1 or manifest.get("generation") != digest(manifest.get("plugins"))):
+        raise ValueError("Invalid runtime plugin manifest")
     # Existing settings table: each update commits the entire manifest in one transaction.
-    owner = lease['owner_id']
-    key = 'native-plugins-' + digest(owner)[:32]
     with repo.store.dispatch_lock() as acquired:
         if not acquired:
             return (status, state_payload) if return_state else status
-        saved = repo.store.get('settings', key, owner) or {}
-        history = saved.get('history', [])
-        if manifest and (not history or history[-1]['generation'] != manifest['generation']):
+        saved = repo.store.get("settings", key, owner) or {}
+        history = saved.get("history", [])
+        if manifest and (not history or history[-1]["generation"] != manifest["generation"]):
             history = [*history, manifest][-20:]
-        data = {'manifest': manifest or saved.get('manifest'), 'status': status, 'history': history}
+        offline_pending = saved.get("offline_pending")
+        if manifest and isinstance(offline_pending, dict):
+            if offline_pending.get("generation") == manifest.get("generation"):
+                offline_pending = None
+            elif status.get("pending_generation") and status.get("pending_generation") != offline_pending.get("generation"):
+                offline_pending = None
+        data = {
+            "manifest": manifest or saved.get("manifest"),
+            "status": status,
+            "history": history,
+            "telemetry": fetched_telemetry if fetched_telemetry is not None else saved.get("telemetry"),
+            "telemetry_digest": fetched_telemetry_digest if fetched_telemetry_digest is not None else saved.get("telemetry_digest"),
+            "offline_pending": offline_pending,
+        }
         if saved:
             if any(saved.get(k) != value for k, value in data.items()):
-                repo.store.update('settings', key, data, owner)
+                repo.store.update("settings", key, data, owner)
         else:
-            repo.store.create('settings', owner, data, record_id=key)
+            repo.store.create("settings", owner, data, record_id=key)
     return (status, state_payload) if return_state else status
 
 

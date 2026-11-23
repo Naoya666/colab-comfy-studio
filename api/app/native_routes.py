@@ -9,12 +9,12 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 
 from . import native_api, native_model_api
 from .api_access import build_access_urls, get_or_create_path_code, peek_path_code, reset_path_code
 from .common import APIError, admin, current_user, ok
-from .gpu import native, native_config, native_restart
+from .gpu import native, native_config, native_restart, native_workspace
 from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
 from .job_history import job_timing_details
 from .native_proxy import get_native_gateway
@@ -424,6 +424,14 @@ async def status(request: Request, user=Depends(current_user)):
     }
     gpu_reported = (job or {}).get("gpu_reported") or (lease or {}).get("gpu_reported") or (instance or {}).get("gpu_reported")
     can_restart = ready and can_restart_base
+    from .gpu.node_persistence import digest as _plugin_digest
+    saved_plugins = repo.store.get("settings", "native-plugins-" + _plugin_digest(user["id"])[:32], user["id"]) or {}
+    offline_pending = saved_plugins.get("offline_pending")
+    has_pending_offline_plugins = bool(
+        isinstance(offline_pending, dict)
+        and offline_pending.get("generation")
+        and offline_pending.get("generation") != (saved_plugins.get("manifest") or {}).get("generation")
+    )
     return ok({"configured": bool(ncfg.tunnel_configured or (not ncfg.has_db_override and ncfg.any_configured)),
                "tunnel_configured": ncfg.tunnel_configured,
                "web_ui_configured": ncfg.web_ui_configured,
@@ -436,6 +444,7 @@ async def status(request: Request, user=Depends(current_user)):
                "stage": (job or {}).get("stage"), "gpu_reported": gpu_reported,
                "timings": timings, "timing_details": timing_details,
                "restart": restart, "can_restart": can_restart,
+               "has_pending_offline_plugins": has_pending_offline_plugins,
                "reason": RUNTIME_MISSING if reclaimed else None,
                "error": RUNTIME_MISSING_MESSAGE if reclaimed else (job or {}).get("error_message"),
                "events": [{"message": e.get("message"), "state": e.get("state"), "created_at": e.get("created_at")}
@@ -597,3 +606,130 @@ def plugins(request: Request, user=Depends(current_user)):
     saved = repo.store.get("settings", "native-plugins-" + digest(user["id"])[:32], user["id"]) or {}
     return ok({**saved.get("status", {}), "manifest": saved.get("manifest"), "history": saved.get("history", []),
                "offline": not online}, request)
+
+
+@router.get("/workspace/overview")
+async def workspace_overview(
+    request: Request,
+    refresh: bool = False,
+    keep_history: int = Query(default=native_workspace.DEFAULT_KEEP_HISTORY, ge=1, le=native_workspace.MAX_HISTORY_ENTRIES),
+    user=Depends(current_user),
+):
+    admin(user)
+    data = await asyncio.to_thread(
+        native_workspace.get_workspace_overview,
+        request.app.state.repo,
+        user["id"],
+        refresh=refresh,
+        keep_history=keep_history,
+    )
+    response = ok(data, request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/workspace/workflows/action")
+async def workspace_workflows_action(body: dict, request: Request, user=Depends(current_user)):
+    admin(user)
+    if not isinstance(body, dict):
+        raise APIError("WORKSPACE_INVALID_INPUT", "请求体格式无效", 422)
+    unknown = set(body) - {"action", "items", "overwrite", "also_plugins"}
+    if unknown:
+        raise APIError("WORKSPACE_INVALID_INPUT", "包含不支持的参数字段", 422)
+    result = await asyncio.to_thread(
+        native_workspace.apply_workflow_action,
+        request.app.state.repo,
+        user["id"],
+        action=str(body.get("action") or ""),
+        items=body.get("items") or [],
+        overwrite=bool(body.get("overwrite", False)),
+        also_plugins=body.get("also_plugins"),
+    )
+    return ok(result, request)
+
+
+@router.post("/workspace/plugins/action")
+async def workspace_plugins_action(body: dict, request: Request, user=Depends(current_user)):
+    admin(user)
+    if not isinstance(body, dict):
+        raise APIError("WORKSPACE_INVALID_INPUT", "请求体格式无效", 422)
+    unknown = set(body) - {"action", "paths", "force_in_use"}
+    if unknown:
+        raise APIError("WORKSPACE_INVALID_INPUT", "包含不支持的参数字段", 422)
+    if not isinstance(body.get("paths"), list):
+        raise APIError("WORKSPACE_INVALID_INPUT", "paths 必须为数组", 422)
+    result = await asyncio.to_thread(
+        native_workspace.apply_plugin_action,
+        request.app.state.repo,
+        user["id"],
+        action=str(body.get("action") or ""),
+        paths=body["paths"],
+        force_in_use=bool(body.get("force_in_use", False)),
+    )
+    return ok(result, request)
+
+
+@router.post("/workspace/plugins/rollback")
+async def workspace_plugins_rollback(body: dict, request: Request, user=Depends(current_user)):
+    admin(user)
+    if not isinstance(body, dict) or set(body) != {"generation"}:
+        raise APIError("WORKSPACE_INVALID_INPUT", "必须提供 generation", 422)
+    result = await asyncio.to_thread(
+        native_workspace.rollback_plugins,
+        request.app.state.repo,
+        user["id"],
+        generation=str(body.get("generation") or ""),
+    )
+    return ok(result, request)
+
+
+@router.delete("/workspace/env-cache")
+async def workspace_delete_env_cache(
+    request: Request,
+    all_caches: bool = Query(default=False, alias="all"),
+    keys_query: list[str] | None = Query(default=None, alias="key"),
+    body: dict | None = Body(default=None),
+    user=Depends(current_user),
+):
+    admin(user)
+    keys = list(keys_query or [])
+    delete_all = bool(all_caches)
+    if body is not None:
+        if not isinstance(body, dict):
+            raise APIError("WORKSPACE_INVALID_INPUT", "请求体格式无效", 422)
+        unknown = set(body) - {"keys", "all"}
+        if unknown:
+            raise APIError("WORKSPACE_INVALID_INPUT", "包含不支持的参数字段", 422)
+        if "keys" in body:
+            if not isinstance(body["keys"], list):
+                raise APIError("WORKSPACE_INVALID_INPUT", "keys 必须为数组", 422)
+            keys.extend(body["keys"])
+        if body.get("all") is True:
+            delete_all = True
+    result = await asyncio.to_thread(
+        native_workspace.delete_env_caches,
+        request.app.state.repo,
+        user["id"],
+        keys=keys,
+        delete_all=delete_all,
+    )
+    return ok(result, request)
+
+
+@router.post("/workspace/orphan-objects/cleanup")
+async def workspace_cleanup_orphans(body: dict, request: Request, user=Depends(current_user)):
+    admin(user)
+    if not isinstance(body, dict):
+        raise APIError("WORKSPACE_INVALID_INPUT", "请求体格式无效", 422)
+    unknown = set(body) - {"keep_history", "dry_run"}
+    if unknown:
+        raise APIError("WORKSPACE_INVALID_INPUT", "包含不支持的参数字段", 422)
+    keep_history = body.get("keep_history", native_workspace.DEFAULT_KEEP_HISTORY)
+    result = await asyncio.to_thread(
+        native_workspace.cleanup_orphan_objects,
+        request.app.state.repo,
+        user["id"],
+        keep_history=keep_history,
+        dry_run=bool(body.get("dry_run", False)),
+    )
+    return ok(result, request)

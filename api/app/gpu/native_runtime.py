@@ -182,6 +182,17 @@ async def state(request):
     return web.json_response(result)
 
 
+@PromptServer.instance.routes.get("/studio_native/plugin-telemetry")
+async def plugin_telemetry(request):
+    path = ROOT / "plugins-telemetry.json"
+    if not path.is_file():
+        return web.json_response({"available": False}, status=404)
+    try:
+        return web.json_response(json.loads(path.read_text()))
+    except Exception:
+        return web.json_response({"available": False}, status=500)
+
+
 @PromptServer.instance.routes.post("/studio_native/index")
 async def index(request):
     body = await request.json()
