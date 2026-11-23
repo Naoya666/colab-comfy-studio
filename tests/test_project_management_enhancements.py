@@ -191,6 +191,29 @@ def test_creation_api_project_binding_warmup_and_delete_protection(client, monke
     assert creation_api.get_project(store, "owner") == creation_api.default_project_id("owner")
 
 
+def test_create_default_project_is_retryable_when_admission_lock_is_busy(client):
+    store = app.state.store
+    original = client.get("/api/gpu/projects").json()["data"][0]
+    body = {"title": "主项目", "is_default": True}
+
+    with store.admission_lock() as acquired:
+        assert acquired
+        for _ in range(2):
+            response = client.post("/api/gpu/projects", json=body)
+            assert response.status_code == 503
+            assert response.json()["code"] == "SCHEDULER_BUSY"
+
+    assert store.list("projects", "owner") == [original]
+    response = client.post("/api/gpu/projects", json=body)
+    assert response.status_code == 201
+    created = response.json()["data"]
+    assert created["is_default"] is True
+    projects = client.get("/api/gpu/projects").json()["data"]
+    assert [(row["id"], row["is_default"]) for row in projects] == [
+        (created["id"], True), (original["id"], False)
+    ]
+
+
 def test_asset_move_preserves_cross_project_job_metadata_and_rejects_system_target(client):
     store = app.state.store
     store.create("projects", "owner", {"title": "原生 ComfyUI", "system": True}, record_id="native-comfy-owner")

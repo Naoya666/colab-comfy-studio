@@ -2121,9 +2121,15 @@ async def test_native_state_route_fails_closed_fast_during_boot_scan_without_dup
     boot_done = threading.Event()  # unset = boot scan in progress
     probe_calls = []
     status_calls = []
+    durable = True
+
+    def plugin_status(*, use_cache=False):
+        status_calls.append(use_cache)
+        return {"durable": durable or use_cache, "error": None}
+
     fake_persistence = SimpleNamespace(
         boot_scan_done=boot_done,
-        status=lambda: (status_calls.append(1), {"durable": True, "error": None})[1],
+        status=plugin_status,
     )
 
     import sys
@@ -2158,8 +2164,30 @@ async def test_native_state_route_fails_closed_fast_during_boot_scan_without_dup
     probe_calls.clear()
     resp3 = await handler(SimpleNamespace())
     assert probe_calls == [False]
-    assert status_calls == [1]
+    assert status_calls == [True]
     assert resp3.data["busy"] is False
+
+    # Reboot uses a fresh read even if a concurrent status poll reported the old archive.
+    durable = False
+    ns["LEASE_ID"] = "lease"
+    reboot_request = SimpleNamespace(path="/v2/manager/reboot", headers={
+        "X-Studio-Restart-Id": "restart", "X-Studio-Restart-Lease": "lease",
+        "X-Studio-Restart-Boot": ns["BOOT_ID"],
+    })
+    forwarded = []
+
+    async def reboot_handler(request):
+        forwarded.append(request)
+        return SimpleNamespace(status=200)
+
+    refused = await ns["bind_restart"](reboot_request, reboot_handler)
+    assert refused.status == 423
+    assert status_calls[-1] is False
+    assert not forwarded and ns["REBOOT_ID"] is None
+
+    durable = True
+    assert (await ns["bind_restart"](reboot_request, reboot_handler)).status == 200
+    assert forwarded == [reboot_request]
 
 
 def test_mcp_poll_inlines_small_artifacts_without_second_chunk_roundtrip(monkeypatch, tmp_path):

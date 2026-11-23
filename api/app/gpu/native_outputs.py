@@ -52,12 +52,12 @@ MAX_BULK_PAGES = 25
 MAX_THUMB_SOURCE_BYTES = 32 * 1024 * 1024
 
 _LIST_LOCK = threading.Lock()
-_LIST_CACHE: dict[tuple[str, str], tuple[float, list[dict[str, Any]], str | None]] = {}
+_LIST_CACHE: dict[tuple[str, str | None], tuple[float, list[dict[str, Any]], str | None]] = {}
 _SCAN_LOCKS_GUARD = threading.Lock()
-_SCAN_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_SCAN_LOCKS: dict[tuple[str, str | None], threading.Lock] = {}
 
 
-def _scan_lock_for(cache_key: tuple[str, str]) -> threading.Lock:
+def _scan_lock_for(cache_key: tuple[str, str | None]) -> threading.Lock:
     with _SCAN_LOCKS_GUARD:
         lock = _SCAN_LOCKS.get(cache_key)
         if lock is None:
@@ -270,7 +270,7 @@ def _bulk_scan_output_tree(
     seen: set[str] = set()
     queue: deque[tuple[str, str, int]] = deque([(output_folder, "", 0)])
     visited_folders = 0
-    while queue and visited_folders < MAX_OUTPUT_FOLDERS and len(items) < MAX_OUTPUT_FILES:
+    while queue and visited_folders < MAX_OUTPUT_FOLDERS:
         folder_id, subfolder, depth = queue.popleft()
         visited_folders += 1
         for entry in children.get(folder_id, ()):
@@ -287,9 +287,8 @@ def _bulk_scan_output_tree(
             if built is not None:
                 seen.add(fid)
                 items.append(built)
-                if len(items) >= MAX_OUTPUT_FILES:
-                    break
-    return items, output_folder
+    items.sort(key=lambda row: str(row.get("modified_at") or ""), reverse=True)
+    return items[:MAX_OUTPUT_FILES], output_folder
 
 
 def _scan_output_tree(
@@ -300,7 +299,7 @@ def _scan_output_tree(
     *,
     force_refresh: bool = False,
 ) -> tuple[list[dict[str, Any]], str | None, float]:
-    cache_key = (owner_id, str(account_id or "default"))
+    cache_key = (owner_id, account_id)
     now = time.time()
     if not force_refresh:
         with _LIST_LOCK:
@@ -327,7 +326,6 @@ def _scan_output_tree(
         bulk = _bulk_scan_output_tree(drive, owner_folder, account_id, account_alias)
         if bulk is not None:
             items, output_folder = bulk
-            items.sort(key=lambda row: str(row.get("modified_at") or ""), reverse=True)
             scanned_at = time.time()
             with _LIST_LOCK:
                 _LIST_CACHE[cache_key] = (scanned_at, items, output_folder)
@@ -572,18 +570,6 @@ def _encode_webp_thumbnail(raw_bytes: bytes) -> bytes:
         return out.getvalue()
 
 
-def _cached_item_for_owner(owner_id: str, file_id: str) -> dict[str, Any] | None:
-    now = time.time()
-    with _LIST_LOCK:
-        for (cached_owner, _account), (cached_at, items, _folder) in _LIST_CACHE.items():
-            if cached_owner != owner_id or now - cached_at >= LIST_CACHE_TTL:
-                continue
-            for row in items:
-                if row.get("id") == file_id:
-                    return row
-    return None
-
-
 def get_native_output_thumbnail(
     repo,
     owner_id: str,
@@ -591,17 +577,6 @@ def get_native_output_thumbnail(
     *,
     drive: DriveStorage | None = None,
 ) -> tuple[bytes, str]:
-    if not FILE_ID_RE.fullmatch(file_id or ""):
-        raise APIError("INVALID_FILE_ID", "无效的原生作品文件 ID", 400)
-    # Fast path: if the owner's fresh directory index confirms file_id and the WebP
-    # thumbnail already exists on disk, serve directly without Drive/Account DB lookups.
-    if drive is None:
-        cached_item = _cached_item_for_owner(owner_id, file_id)
-        if cached_item is not None:
-            fast_file = _thumb_path(owner_id, file_id, str(cached_item.get("revision") or "0"))
-            if fast_file.is_file():
-                return fast_file.read_bytes(), "image/webp"
-
     item, storage, owns = resolve_output_item(repo, owner_id, file_id, drive=drive)
     try:
         cache_file = _thumb_path(owner_id, file_id, str(item.get("revision") or "0"))

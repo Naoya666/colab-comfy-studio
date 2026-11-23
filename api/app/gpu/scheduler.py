@@ -34,6 +34,7 @@ from .scheduler_instances import SchedulerError, SchedulerInstancesMixin
 from .scheduler_watchdog import ACTIVE_STATES, TERMINAL_STATES, SchedulerWatchdogMixin
 
 MAX_OUTPUT_BYTES = 100 * 1024 * 1024
+_MAX_STALLED_JOB_DEFERRALS = 8
 
 
 # Stage markers written by runtime_worker.py into status.json while a job is running.
@@ -745,6 +746,8 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 if job.get("instance_id"):
                     self._update("instances", job["instance_id"], {"runtime_spec_reported": reported}, job["owner_id"])
                 self._event(job, "preparing", "实际分配规格：" + str(reported), None)
+            if self._provider_name(job) == "colab" and lease.get("allocation_confirmed") is not True:
+                self._update("leases", lease["id"], {"allocation_confirmed": True}, job["owner_id"])
             job = self._mark_instance("mark_ready", job)
             return self._set_state(job, "loading", "GPU runtime is ready")
         return job
@@ -1311,7 +1314,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         if not (lease or {}).get("force_stop"):
             job = self._trusted_plugin_cleanup(job, lease)
         instance = self._service_instance_for_job(job)
-        retention_allowed = not (instance or {}).get("manual_stop_requested")
+        from .instances import POOL_CREATION, job_pool, lease_allocation_unconfirmed
+
+        can_retain_lease = not (lease and lease_allocation_unconfirmed(
+            lease.get("state"), lease, job, instance_state=(instance or {}).get("state"),
+        ))
+        retention_allowed = can_retain_lease and not (instance or {}).get("manual_stop_requested")
         if self._provider_name(job) == "colab":
             retention_allowed = retention_allowed and not CuGuardService(self.store, self.clock).state(job["owner_id"])["soft_tripped"]
         if lease and retention_allowed and job.get("batch_id") and job.get("cleanup_final_state") == "completed":
@@ -1334,8 +1342,6 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     self._event(job, "completed", msg)
                     return self._get("jobs", job["id"], job["owner_id"])
         final_state = job.get("cleanup_final_state") or job.get("requested_outcome") or "failed"
-        from .instances import POOL_CREATION, job_pool, lease_allocation_unconfirmed
-
         if (
             final_state == "cancelled"
             and lease
@@ -1376,7 +1382,6 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     error_code=job.get("error_code") or "gpu_instance_completion_pending",
                     error_message=job.get("error_message") or str(exc),
                 )
-            can_retain_lease = not (lease and lease_allocation_unconfirmed(lease.get("state"), lease, job))
             if can_retain_lease and isinstance(instance, dict) and instance.get("state") == "retained_idle":
                 with self.db_store.admission_lock() as acquired:
                     if not acquired:
@@ -1614,15 +1619,18 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             stalled.pop(stale_id, None)
         if not jobs:
             return None, None
-        jobs.sort(
-            key=lambda x: (
-                # Cleanup goes first; a job parked on its cache prep goes last so it cannot starve its prep job.
-                0 if x.get("state") in {"cleanup_pending", "cleaning_up"} else 2 if x.get("awaiting_prep") else 1,
-                # Jobs that polled without changing state yield to newly queued/advancing jobs in FIFO round-robin.
-                stalled.get(x["id"], 0),
-                x.get("created_epoch", x.get("created_at", "")),
-            )
-        )
+        def priority(job):
+            last_poll = stalled.get(job["id"])
+            if job.get("state") in {"cleanup_pending", "cleaning_up"}:
+                group = 0
+            elif last_poll is not None and rr["seq"] - last_poll >= _MAX_STALLED_JOB_DEFERRALS:
+                # A stream of new jobs must not indefinitely delay a due poll.
+                group = 1
+            else:
+                group = 3 if job.get("awaiting_prep") else 2
+            return group, last_poll or 0, job.get("created_epoch", job.get("created_at", ""))
+
+        jobs.sort(key=priority)
         for job in jobs:
             state = job.get("state")
             if state not in ACTIVE_STATES:
@@ -1645,6 +1653,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 {"claim_token": token, "claim_until": now + self.config.claim_ttl_seconds},
                 job.get("owner_id"),
             )
+            rr["seq"] += 1
             return claimed, token
         return None, None
 
@@ -1681,7 +1690,6 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         if after.get("state") in TERMINAL_STATES or advanced:
             rr["stalled"].pop(job["id"], None)
         else:
-            rr["seq"] += 1
             rr["stalled"][job["id"]] = rr["seq"]
         return {
             "acquired": True,

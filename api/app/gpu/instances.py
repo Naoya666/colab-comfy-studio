@@ -75,7 +75,8 @@ def instance_pool_of(instance: Mapping | None) -> str:
 
 
 def lease_allocation_unconfirmed(
-    lease_state: str | None, lease_data: Mapping | None, job: Mapping | None = None
+    lease_state: str | None, lease_data: Mapping | None, job: Mapping | None = None,
+    *, instance_state: str | None = None,
 ) -> bool:
     """Return True when a lease never reached a confirmed, reusable remote allocation."""
     data = lease_data if isinstance(lease_data, Mapping) else {}
@@ -85,9 +86,16 @@ def lease_allocation_unconfirmed(
     has_tunnel = bool(data.get("tunnel_endpoint") and data.get("proxy_url"))
     if data.get("tunnel_nbh") and not has_tunnel:
         return True
-    if data.get("last_create_error") and not has_tunnel and not data.get("operation_done"):
-        return True
     handle = data.get("handle")
+    if (
+        has_tunnel or data.get("allocation_confirmed") is True
+        or (handle and (instance_state in {"ready", "busy", "retained_idle"} or state == "idle"))
+    ):
+        return False
+    if data.get("operation_name") and isinstance(data.get("operation_done"), bool):
+        return True
+    if data.get("last_create_error") and not data.get("operation_done"):
+        return True
     if (
         isinstance(handle, Mapping)
         and handle.get("intent") == "gpu-studio"
@@ -1592,7 +1600,9 @@ class InstanceService:
             unconfirmed_allocation = False
             if lease is not None:
                 unstarted_vm = not lease_data.get("handle") and int(lease_data.get("create_attempts") or 0) == 0
-                unconfirmed_allocation = lease_allocation_unconfirmed(lease.state, lease_data, job)
+                unconfirmed_allocation = lease_allocation_unconfirmed(
+                    lease.state, lease_data, job, instance_state=instance.state,
+                )
             elif data.get("provider") == "colab" or (not success and instance.state == "allocating"):
                 unstarted_vm = True
             force_stopped = bool(data.get("force_stop") or lease_data.get("force_stop"))

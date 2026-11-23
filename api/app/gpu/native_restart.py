@@ -290,6 +290,8 @@ def _sync_and_reboot(repo, lease, operation, client, url, headers):
             "X-Studio-Restart-Id": operation["id"], "X-Studio-Restart-Lease": lease["id"],
             "X-Studio-Restart-Boot": operation["boot_id"],
         })
+        if response.status_code == 423:
+            return _fail(repo, lease, operation, "Manager 插件归档尚未同步至 Drive")
         if 400 <= response.status_code < 500 and response.status_code not in {408, 409, 429}:
             return _fail(repo, lease, operation, f"Manager 拒绝重启请求（HTTP {response.status_code}）")
     except httpx.TransportError:

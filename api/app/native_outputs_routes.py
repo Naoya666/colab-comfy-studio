@@ -113,7 +113,7 @@ async def output_thumbnail(
     digest = hashlib.sha256(data).hexdigest()[:16]
     etag = f'W/"native-thumb-{file_id[:32]}-{digest}"'
     headers = {
-        "Cache-Control": "private, max-age=86400",
+        "Cache-Control": "private, no-cache",
         "ETag": etag,
         "Vary": "Cookie, Authorization",
     }

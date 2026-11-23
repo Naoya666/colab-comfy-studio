@@ -450,7 +450,7 @@ def inventory(nodes, *, snapshot_databases=True, check_secrets=True):
 
 
 def _full_tree_stat_fingerprint(nodes: Path) -> str:
-    """Full directory metadata stamp (pure lstat walk, no hashing/git/sqlite) for status caching."""
+    """Directory metadata stamp, including SQLite sidecars that can affect snapshots."""
     nodes = Path(nodes)
     if not nodes.is_dir():
         return 'missing'
@@ -474,7 +474,7 @@ def _full_tree_stat_fingerprint(nodes: Path) -> str:
         for name in sorted(names):
             if rel_base == '' and (name in {'studio_native_state.py', '__pycache__'} or name.startswith('.')):
                 continue
-            if name in EXCLUDE or name.startswith('.env') or name.endswith(('.pem', '.key', '.pyc', '-wal', '-shm', '-journal')):
+            if name in EXCLUDE or name.startswith('.env') or name.endswith(('.pem', '.key', '.pyc', '-shm')):
                 continue
             try:
                 st = (base_path / name).lstat()
@@ -812,7 +812,6 @@ class Persistence:
         self.error = None
         self._inv_lock = threading.Lock()
         self._inv_cache: tuple[str, str, float] | None = None
-        self._last_tick_fingerprint: str | None = None
 
     def download_json(self, key):
         path = self.cache / 'download.json'
@@ -1088,7 +1087,6 @@ class Persistence:
         tree_before = _full_tree_stat_fingerprint(self.nodes)
         plugins = inventory(self.nodes)
         fingerprint = digest(plugins)
-        self._last_tick_fingerprint = fingerprint
         tree_after = _full_tree_stat_fingerprint(self.nodes)
         if tree_before == tree_after:
             with self._inv_lock:
@@ -1201,27 +1199,27 @@ class Persistence:
             self.manifest = manifest
         return True
 
-    def status(self, *, fingerprint: str | None = None, use_cache: bool = False):
+    def status(self, *, use_cache: bool = False):
         pending_doc = read(self.root / 'plugins-pending.json', {})
         pending = pending_doc.get('manifest')
         error = self.error or read(self.root / 'plugin-errors.json')
         try:
-            current_fp = fingerprint
-            if current_fp is None and use_cache and env_flag('NATIVE_FAST_SCAN', True) and SECRET is _DEFAULT_SECRET:
-                tree_stamp = _full_tree_stat_fingerprint(self.nodes)
-                now_mono = time.monotonic()
+            tree_stamp = _full_tree_stat_fingerprint(self.nodes)
+            cached = None
+            use_cache = use_cache and env_flag('NATIVE_FAST_SCAN', True) and SECRET is _DEFAULT_SECRET
+            if use_cache:
                 with self._inv_lock:
                     cached = self._inv_cache
-                if cached and cached[0] == tree_stamp and now_mono - cached[2] < 15.0:
-                    current_fp = cached[1]
-                else:
-                    current_fp = digest(inventory(self.nodes))
-                    if _full_tree_stat_fingerprint(self.nodes) == tree_stamp:
-                        with self._inv_lock:
-                            self._inv_cache = (tree_stamp, current_fp, time.monotonic())
-            if current_fp is None:
+            if cached and cached[0] == tree_stamp and time.monotonic() - cached[2] < 15.0:
+                current_fp = cached[1]
+                stable = True
+            else:
                 current_fp = digest(inventory(self.nodes))
-            durable = bool(pending_doc.get('source') == current_fp)
+                stable = _full_tree_stat_fingerprint(self.nodes) == tree_stamp
+                if use_cache and stable:
+                    with self._inv_lock:
+                        self._inv_cache = (tree_stamp, current_fp, time.monotonic())
+            durable = stable and pending_doc.get('source') == current_fp
         except Exception as exc:
             durable = False
             error = str(exc)
@@ -1979,16 +1977,14 @@ def install(server, root, manager_busy):
         # Scan failures are retried by tick; startup/dependency failures stay sticky.
         load_error = persistence.error if read(root / 'plugin-errors.json') else None
         while True:
-            tick_fp = None
             try:
                 success = await asyncio.to_thread(persistence.tick, await asyncio.to_thread(manager_busy))
-                tick_fp = persistence._last_tick_fingerprint
                 if success:
                     persistence.error = load_error
             except Exception as exc:
                 persistence.error = str(exc)
                 logging.error('Plugin persistence: %s', exc)
-            status_payload = await asyncio.to_thread(persistence.status, fingerprint=tick_fp, use_cache=True)
+            status_payload = await asyncio.to_thread(persistence.status, use_cache=True)
             await asyncio.to_thread(atomic, root / 'plugins-status.json', status_payload)
             await asyncio.sleep(10)
 

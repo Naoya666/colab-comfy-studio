@@ -599,10 +599,12 @@ def test_plugin_backup_captures_committed_wal_data_without_archiving_sidecars(se
         writer.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         original_main = db.read_bytes()
         original = sync(instance)['manifest']['generation']
+        assert instance.status(use_cache=True)['durable'] is True
 
         writer.execute("INSERT INTO tags VALUES ('committed')")
         writer.commit()
         assert db.read_bytes() == original_main
+        assert instance.status(use_cache=True)['durable'] is False
         writer.execute("INSERT INTO tags VALUES ('uncommitted')")
         latest = sync(instance)['manifest']['generation']
         assert latest != original

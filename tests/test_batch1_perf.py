@@ -114,6 +114,22 @@ def test_scheduler_cleanup_priority_remains_ahead_of_normal_jobs():
         scheduler._release_claim(picked["id"], token, "owner")
 
 
+def test_scheduler_repolls_running_job_during_continuous_submissions(monkeypatch):
+    repo = Repository(Store("sqlite://"))
+    running = repo.create("jobs", "owner", {"state": "running", "provider": "mock"})
+    scheduler = Scheduler(repo, clock=lambda: 1000.0)
+    monkeypatch.setattr(scheduler, "_run", lambda job: job)
+    assert scheduler.tick()["job_id"] == running["id"]
+
+    picked = []
+    for _ in range(16):
+        repo.create("jobs", "owner", {"state": "queued", "provider": "mock"})
+        picked.append(scheduler.tick()["job_id"])
+
+    assert picked[0] != running["id"]
+    assert running["id"] in picked[:9]
+
+
 def test_media_cache_headers_thumbnail_disk_cache_etag_304_and_gzip(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "studio_api_token", "test-batch1-token")

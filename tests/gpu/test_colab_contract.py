@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from app.db import Store
 from app.gpu.colab import ColabError, GoogleColabProvider
+from app.gpu.repository import Repository
+from app.gpu.scheduler import Scheduler
 from app.security import encrypt_secret
 
 
@@ -200,6 +203,40 @@ def test_inspect_without_operation_uses_runtime_get():
     )
     assert result["ready"] is True and "token" not in str(result)
     assert paths == ["/v1beta/runtimes/atelier-runtime-1"]
+
+
+@pytest.mark.parametrize("ready,expected", [(False, "releasing"), (True, "retained_idle")])
+def test_rest_allocation_retention_requires_runtime_readiness(ready, expected):
+    repo = Repository(Store("sqlite://"))
+    job = repo.create("jobs", "owner", {
+        "state": "preparing", "provider": "colab", "lease_id": "lease", "instance_id": "instance",
+        "execution_policy": {"lifecycle": "retain", "retain_idle_minutes": 15},
+    }, record_id="job")
+    repo.create("instances", "owner", {
+        "state": "allocating", "provider": "colab", "lease_id": "lease", "current_job_id": "job",
+    }, record_id="instance")
+    repo.create("leases", "owner", {
+        "state": "active", "provider": "colab", "owner_job_id": "job", "create_attempts": 2,
+        "operation_name": "operations/create", "operation_done": False,
+        "handle": {"runtime_name": "runtimes/studio-test", "operation_name": "operations/create"},
+        **({"last_create_error": "previous timeout"} if ready else {}),
+    }, record_id="lease")
+
+    class Provider:
+        def inspect(self, handle):
+            return {"ready": ready, "deleted": False, "operation_pending": not ready}
+
+    scheduler = Scheduler(repo, provider_factory=lambda _: Provider(), clock=lambda: 1000.0)
+    result = scheduler._prepare(job)
+    lease = repo.get("leases", "lease", "owner")
+    assert result["state"] == ("loading" if ready else "preparing")
+    assert lease.get("allocation_confirmed") is (True if ready else None)
+
+    # A restarted scheduler can make the decision from the stored allocation evidence.
+    if ready:
+        repo.update("instances", "instance", {"state": "allocating"}, "owner")
+    instance = Scheduler(repo, clock=lambda: 1000.0).instance_service.complete(result, success=ready)
+    assert instance["state"] == expected
 
 
 def test_delete_requires_owner_and_get_404_confirmation():

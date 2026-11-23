@@ -36,8 +36,8 @@ def test_node_persistence_status_cache_avoids_redundant_inventory(tmp_path, monk
     # tick() runs inventory once and populates the stat cache.
     p.tick(busy=True, now=100.0)
     assert inv_calls == 1
-    # status(fingerprint=...) reuses tick's fingerprint with zero extra inventory calls.
-    st1 = p.status(fingerprint=p._last_tick_fingerprint, use_cache=True)
+    # Status reuses tick's fingerprint after checking the current tree stamp.
+    st1 = p.status(use_cache=True)
     assert inv_calls == 1
     assert st1["durable"] is False
     # External /studio_native/state status(use_cache=True) hits the tree-stat cache.

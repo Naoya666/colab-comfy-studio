@@ -206,6 +206,12 @@ async def bind_restart(request, handler):
     if (not LEASE_ID or request.headers.get("X-Studio-Restart-Lease") != LEASE_ID
             or request.headers.get("X-Studio-Restart-Boot") != BOOT_ID or REBOOT_ID):
         return web.json_response({"error": "会话或进程已切换，或已受理重启"}, status=409)
+    if PERSISTENCE is not None:
+        plugins = await asyncio.to_thread(PERSISTENCE.status)
+        if not plugins.get("durable") or plugins.get("error"):
+            return web.json_response({"error": "Manager 插件归档尚未同步至 Drive"}, status=423)
+    if REBOOT_ID:
+        return web.json_response({"error": "Manager 已受理重启"}, status=409)
     REBOOT_ID = restart_id
     try:
         response = await handler(request)

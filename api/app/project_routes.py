@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import time
+import uuid
 
 from fastapi import APIRouter, Depends, Request
+from sqlalchemy import select
 
 from .common import APIError, current_user, get_store, ok, own
+from .db import ProjectRow, utcnow
 from .gpu.repository import Repository
 
 router = APIRouter()
@@ -35,19 +38,33 @@ def _sort_projects(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=lambda row: 0 if row.get("is_default") is True else 1)
 
 
-def _set_default_project(st, owner_id: str, target_id: str) -> dict:
+def _save_default_project(st, owner_id: str, target_id: str | None = None, *, patch: dict | None = None) -> dict:
     with st.admission_lock() as acquired:
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "项目设置繁忙，请重试", 503, True)
-        target = st.get("projects", target_id, owner_id)
-        if not target or target.get("archived_at") is not None:
-            raise APIError("NOT_FOUND", "项目不存在或已归档", 404)
-        if target.get("system") is True:
-            raise APIError("PROJECT_SYSTEM_PROTECTED", "系统内部项目不能设为默认项目", 409)
-        for row in st.list("projects", owner_id):
-            if row["id"] != target_id and row.get("is_default") is True:
-                st.update("projects", row["id"], {"is_default": False}, owner_id)
-        return st.update("projects", target_id, {"is_default": True}, owner_id)
+        with st.db_lock(), st.Session.begin() as session:
+            st.begin_immediate(session)
+            rows = session.scalars(select(ProjectRow).where(ProjectRow.owner_id == owner_id).with_for_update()).all()
+            changes = {**(patch or {}), "is_default": True}
+            if target_id is None:
+                target = ProjectRow(id=uuid.uuid4().hex, owner_id=owner_id, data=changes)
+                session.add(target)
+            else:
+                target = next((row for row in rows if row.id == target_id), None)
+                if target is None or target.data.get("archived_at") is not None:
+                    raise APIError("NOT_FOUND", "项目不存在或已归档", 404)
+                if target.data.get("system") is True:
+                    raise APIError("PROJECT_SYSTEM_PROTECTED", "系统内部项目不能设为默认项目", 409)
+                target.data = {**target.data, **changes}
+                target.version += 1
+                target.updated_at = utcnow()
+            for row in rows:
+                if row is not target and (row.data or {}).get("is_default") is True:
+                    row.data = {**row.data, "is_default": False}
+                    row.version += 1
+                    row.updated_at = utcnow()
+            session.flush()
+            return st._row(target)
 
 
 def _ensure_initial_project(st, owner_id: str) -> list[dict]:
@@ -87,13 +104,11 @@ def create_project(body: dict, request: Request, user=Depends(current_user), st=
     title = str(body.get("title", "")).strip()[:200]
     if not title:
         raise APIError("VALIDATION_ERROR", "项目名称不能为空")
-    created = st.create(
-        "projects",
-        user["id"],
-        {"title": title, "atelier_project_id": str(body.get("atelier_project_id", ""))[:128]},
-    )
+    data = {"title": title, "atelier_project_id": str(body.get("atelier_project_id", ""))[:128]}
     if body.get("is_default") is True:
-        created = _set_default_project(st, user["id"], created["id"])
+        created = _save_default_project(st, user["id"], patch=data)
+    else:
+        created = st.create("projects", user["id"], data)
     return ok(created, request, 201)
 
 
@@ -106,7 +121,7 @@ def update_project(project_id: str, body: dict, request: Request, user=Depends(c
     set_default = body.get("is_default") is True
     if not has_title and not set_default:
         raise APIError("PROJECT_INVALID", "仅支持修改本地项目名称或设为默认项目")
-    updated = project
+    patch = {}
     if has_title:
         title = str(body["title"]).strip()[:200]
         if not title:
@@ -114,16 +129,17 @@ def update_project(project_id: str, body: dict, request: Request, user=Depends(c
         patch = {"title": title}
         if "atelier_project_id" in body:
             patch["atelier_project_id"] = str(body["atelier_project_id"])[:128]
-        updated = st.update("projects", project_id, patch, user["id"])
     if set_default:
-        updated = _set_default_project(st, user["id"], project_id)
+        updated = _save_default_project(st, user["id"], project_id, patch=patch)
+    else:
+        updated = st.update("projects", project_id, patch, user["id"])
     return ok(updated, request)
 
 
 @router.post("/projects/{project_id}/default")
 def set_default_project(project_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
     own(st, "projects", project_id, user)
-    return ok(_set_default_project(st, user["id"], project_id), request)
+    return ok(_save_default_project(st, user["id"], project_id), request)
 
 
 @router.delete("/projects/{project_id}")

@@ -6,6 +6,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 from app.common import APIError, current_user
 from app.db import Store
 from app.gpu import native_outputs
@@ -156,6 +157,8 @@ def test_native_outputs_single_flight_and_disk_thumb_fast_path(tmp_path, monkeyp
         time.sleep(0.05)
         with scan_lock:
             scan_calls += 1
+        if account_id != "acc-1":
+            return [], "other-output"
         return [
             {
                 "id": "img-sf-1",
@@ -192,15 +195,55 @@ def test_native_outputs_single_flight_and_disk_thumb_fast_path(tmp_path, monkeyp
     assert scan_calls == 1
     assert all(len(r[0]) == 1 and r[0][0]["id"] == "img-sf-1" for r in results)
 
-    # Seed disk thumbnail cache and verify get_native_output_thumbnail never touches _open_drive.
+    # A warm lookup checks the current binding and uses the account's cached directory.
     thumb_file = native_outputs._thumb_path("owner-sf", "img-sf-1", "rev123")
     thumb_file.write_bytes(b"RIFF\x00\x00\x00\x00WEBP")
-    monkeypatch.setattr(
-        native_outputs,
-        "_open_drive",
-        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("_open_drive should not be called on warm cache hit")),
-    )
+    binding = ("acc-1", "主盘")
+    monkeypatch.setattr(native_outputs, "resolve_owner_drive_account", lambda *_: binding)
+    monkeypatch.setattr(native_outputs, "DriveStorage", lambda *_a, **_kw: drive)
     data, ctype = native_outputs.get_native_output_thumbnail(object(), "owner-sf", "img-sf-1")
     assert ctype == "image/webp"
     assert data.startswith(b"RIFF")
+    assert scan_calls == 1
+
+    binding = (None, None)
+    with pytest.raises(APIError) as disconnected:
+        native_outputs.get_native_output_thumbnail(object(), "owner-sf", "img-sf-1")
+    assert disconnected.value.code == "DRIVE_NOT_CONNECTED"
+
+    binding = ("acc-2", "另一块盘")
+    with pytest.raises(APIError) as switched:
+        native_outputs.get_native_output_thumbnail(object(), "owner-sf", "img-sf-1")
+    assert switched.value.code == "NOT_FOUND"
     native_outputs.invalidate_native_outputs_cache()
+
+
+def test_native_outputs_bulk_scan_keeps_newest_across_folders(monkeypatch):
+    monkeypatch.setattr(native_outputs, "MAX_OUTPUT_FILES", 2)
+
+    def folder(file_id, name, parent):
+        return {"id": file_id, "name": name, "mimeType": native_outputs.FOLDER_MIME, "parents": [parent]}
+
+    def image(file_id, parent, day):
+        return {
+            "id": file_id, "name": f"{file_id}.png", "mimeType": "image/png", "parents": [parent],
+            "modifiedTime": f"2026-11-{day:02d}T00:00:00Z",
+        }
+
+    class Drive:
+        base_url = "https://drive.example"
+
+        def _request(self, *args, **kwargs):
+            return {"files": [
+                folder("native", "native-comfy", "owner"), folder("output", "output", "native"),
+                image("old", "output", 1), image("recent", "output", 2),
+                folder("nested", "nested", "output"), image("newest", "nested", 3),
+            ]}
+
+        def _ensure_ok(self, response, _action):
+            return response
+
+    items, folder_id = native_outputs._bulk_scan_output_tree(Drive(), "owner", "acc-1", "主盘")
+    assert folder_id == "output"
+    assert [item["id"] for item in items] == ["newest", "recent"]
+    assert items[0]["path"] == "nested/newest.png"
