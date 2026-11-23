@@ -197,6 +197,9 @@ export function NativeApiSettings({ accounts }: { accounts: GpuAccount[] }) {
 
   const policy = data?.policy;
   const urls = data?.urls;
+  const isStrictMode = (policy?.auth_mode || 'strict') === 'strict';
+  const activeKeys = (data?.keys || []).filter(key => !key.revoked_at);
+  const revokedKeys = (data?.keys || []).filter(key => Boolean(key.revoked_at));
   const accessUnsaved = Boolean(policy && (policy.auth_mode !== savedAuthMode || (policy.listen_port ?? null) !== savedPort));
   const configuredAccounts = accounts.filter(account => account.enabled !== false && account.allow_allocation !== false);
 
@@ -221,7 +224,7 @@ export function NativeApiSettings({ accounts }: { accounts: GpuAccount[] }) {
               )}
             </div>
 
-            <label className="field">API 鉴权模式（三档并存）
+            <label className="field">API 鉴权模式
               <select value={policy.auth_mode} onChange={event => changePolicy({ auth_mode: event.target.value as AuthMode })}>
                 <option value="strict">强鉴权（仅专用 API Key，需请求头携带 Bearer）</option>
                 <option value="url_path">弱鉴权（URL 路径短码，免中继直连推荐）</option>
@@ -231,7 +234,7 @@ export function NativeApiSettings({ accounts }: { accounts: GpuAccount[] }) {
 
             {policy.auth_mode !== 'strict' && (
               <p className="muted small">
-                弱鉴权 / 免鉴权模式已开放完整生图能力（含 /ws 实时进度、/upload/image 上传图片、/queue 与 /interrupt），并自动封禁 ComfyUI-Manager 节点管理接口；现有专用 Key 依然并存可用。
+                弱鉴权 / 免鉴权模式已开放完整生图能力（含 /ws 实时进度、/upload/image 上传图片、/queue 与 /interrupt），并自动封禁 ComfyUI-Manager 节点管理接口。
               </p>
             )}
 
@@ -399,58 +402,85 @@ export function NativeApiSettings({ accounts }: { accounts: GpuAccount[] }) {
           <button className="button" disabled={pending || (policy.auto_start && (!policy.account_id || !policy.gpu))}>保存接入与启动设置</button>
         </form>
 
-        <form onSubmit={create}>
-          <h3>专用接入 Key（强鉴权与多客户端隔离）</h3>
-          <label className="field">客户端名称<input value={name} required maxLength={80} onChange={event => setName(event.target.value)} placeholder="例如，外部脚本" /></label>
-          <label className="field">工作流权限
-            <select value={mode} onChange={event => setMode(event.target.value === 'trusted' ? 'trusted' : 'approved')}>
-              <option value="approved">限定已批准的工作流</option>
-              <option value="trusted">信任客户端提交的工作流</option>
-            </select>
-          </label>
-          {mode === 'approved' && <label className="field">已批准的工作流模板
-            <textarea required value={workflow} onChange={event => setWorkflow(event.target.value)} spellCheck={false} />
-            <span className="muted small">使用 API 格式 JSON。仅在批准修改的输入位置放完整占位符，例如 %prompt%、%negative_prompt%、%nl%、%seed%、%width% 或 %height%。</span>
-          </label>}
-          {mode === 'trusted' && <p className="muted small">此权限适合你管理的客户端或脚本。客户端可以提交任意原生工作流。</p>}
-          <label className="actions"><input type="checkbox" checked={canStart} onChange={event => setCanStart(event.target.checked)} />允许此 Key 触发自动启动</label>
-          <button className="button" disabled={pending || !name.trim()}>创建 Key</button>
-        </form>
-        {token && <div className="status">
-          <label className="field">接入 Key（仅本次显示）<input readOnly value={token} onFocus={event => event.target.select()} /></label>
-          <button type="button" className="button secondary small" onClick={() => void copy(token)}>复制 Key</button>
-        </div>}
-        {data.keys.length > 0 && (() => {
-          const activeKeys = data.keys.filter(key => !key.revoked_at);
-          const revokedKeys = data.keys.filter(key => Boolean(key.revoked_at));
-          const visibleKeys = showRevokedKeys ? data.keys : activeKeys;
-          return <section>
-            <div className="actions nativeApiHeading">
-              <h3>已创建的接入 Key（{activeKeys.length} 个有效）</h3>
-              {revokedKeys.length > 0 && (
-                <button type="button" className="button ghost small" onClick={() => setShowRevokedKeys(v => !v)}>
-                  {showRevokedKeys ? '隐藏已撤销' : `显示已撤销 (${revokedKeys.length})`}
-                </button>
-              )}
+        {isStrictMode ? (
+          <>
+            <form onSubmit={create}>
+              <h3>专用接入 Key（强鉴权与多客户端隔离）</h3>
+              <label className="field">客户端名称<input value={name} required maxLength={80} onChange={event => setName(event.target.value)} placeholder="例如，外部脚本" /></label>
+              <label className="field">工作流权限
+                <select value={mode} onChange={event => setMode(event.target.value === 'trusted' ? 'trusted' : 'approved')}>
+                  <option value="approved">限定已批准的工作流</option>
+                  <option value="trusted">信任客户端提交的工作流</option>
+                </select>
+              </label>
+              {mode === 'approved' && <label className="field">已批准的工作流模板
+                <textarea required value={workflow} onChange={event => setWorkflow(event.target.value)} spellCheck={false} />
+                <span className="muted small">使用 API 格式 JSON。仅在批准修改的输入位置放完整占位符，例如 %prompt%、%negative_prompt%、%nl%、%seed%、%width% 或 %height%。</span>
+              </label>}
+              {mode === 'trusted' && <p className="muted small">此权限适合你管理的客户端或脚本。客户端可以提交任意原生工作流。</p>}
+              <label className="actions"><input type="checkbox" checked={canStart} onChange={event => setCanStart(event.target.checked)} />允许此 Key 触发自动启动</label>
+              <button className="button" disabled={pending || !name.trim()}>创建 Key</button>
+            </form>
+            {token && <div className="status">
+              <label className="field">接入 Key（仅本次显示）<input readOnly value={token} onFocus={event => event.target.select()} /></label>
+              <button type="button" className="button secondary small" onClick={() => void copy(token)}>复制 Key</button>
+            </div>}
+            {data.keys.length > 0 && (() => {
+              const visibleKeys = showRevokedKeys ? data.keys : activeKeys;
+              return <section>
+                <div className="actions nativeApiHeading">
+                  <h3>已创建的接入 Key（{activeKeys.length} 个有效）</h3>
+                  {revokedKeys.length > 0 && (
+                    <button type="button" className="button ghost small" onClick={() => setShowRevokedKeys(v => !v)}>
+                      {showRevokedKeys ? '隐藏已撤销' : `显示已撤销 (${revokedKeys.length})`}
+                    </button>
+                  )}
+                </div>
+                {visibleKeys.length > 0 ? <ul className="nativeApiKeys">
+                  {visibleKeys.map(key => <li key={key.id}>
+                    <strong>{key.name}</strong> · {key.mode === 'trusted' ? '信任工作流' : '已批准工作流'}
+                    <p className="muted small">{key.revoked_at ? '已撤销' : key.auto_start ? '允许开机' : '仅使用已就绪实例'} · 已提交 {key.submitted} 次
+                      {key.last_used_at && <> · 最近使用 {new Date(key.last_used_at).toLocaleString()}</>}</p>
+                    {!key.revoked_at && <div className="actions">
+                      <button type="button" className="button secondary small" disabled={pending} onClick={() => changeKey(key)}>
+                        {key.auto_start ? '移除开机权限' : '允许开机'}
+                      </button>
+                      {confirmRevoke === key.id ? <>
+                        <button type="button" className="button danger small" disabled={pending} onClick={() => changeKey(key, true)}>确认撤销</button>
+                        <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(undefined)}>取消</button>
+                      </> : <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(key.id)}>撤销 Key</button>}
+                    </div>}
+                  </li>)}
+                </ul> : <p className="muted small">当前没有有效的接入 Key。</p>}
+              </section>;
+            })()}
+          </>
+        ) : activeKeys.length > 0 ? (
+          <details className="foldable">
+            <summary>已有 {activeKeys.length} 个历史专用 Key 仍在后台生效（展开查看或撤销）</summary>
+            <div className="foldContent">
+              <p className="muted small">
+                当前处于{policy.auth_mode === 'local_open' ? '免鉴权' : '弱鉴权'}模式，常规客户端无需配置 Key；如需新建专用 Key，请切换回「强鉴权」模式。
+              </p>
+              <ul className="nativeApiKeys">
+                {activeKeys.map(key => <li key={key.id}>
+                  <strong>{key.name}</strong> · {key.mode === 'trusted' ? '信任工作流' : '已批准工作流'}
+                  <p className="muted small">{key.auto_start ? '允许开机' : '仅使用已就绪实例'} · 已提交 {key.submitted} 次
+                    {key.last_used_at && <> · 最近使用 {new Date(key.last_used_at).toLocaleString()}</>}</p>
+                  <div className="actions">
+                    <button type="button" className="button secondary small" disabled={pending} onClick={() => changeKey(key)}>
+                      {key.auto_start ? '移除开机权限' : '允许开机'}
+                    </button>
+                    {confirmRevoke === key.id ? <>
+                      <button type="button" className="button danger small" disabled={pending} onClick={() => changeKey(key, true)}>确认撤销</button>
+                      <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(undefined)}>取消</button>
+                    </> : <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(key.id)}>撤销 Key</button>}
+                  </div>
+                </li>)}
+              </ul>
             </div>
-            {visibleKeys.length > 0 ? <ul className="nativeApiKeys">
-              {visibleKeys.map(key => <li key={key.id}>
-                <strong>{key.name}</strong> · {key.mode === 'trusted' ? '信任工作流' : '已批准工作流'}
-                <p className="muted small">{key.revoked_at ? '已撤销' : key.auto_start ? '允许开机' : '仅使用已就绪实例'} · 已提交 {key.submitted} 次
-                  {key.last_used_at && <> · 最近使用 {new Date(key.last_used_at).toLocaleString()}</>}</p>
-                {!key.revoked_at && <div className="actions">
-                  <button type="button" className="button secondary small" disabled={pending} onClick={() => changeKey(key)}>
-                    {key.auto_start ? '移除开机权限' : '允许开机'}
-                  </button>
-                  {confirmRevoke === key.id ? <>
-                    <button type="button" className="button danger small" disabled={pending} onClick={() => changeKey(key, true)}>确认撤销</button>
-                    <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(undefined)}>取消</button>
-                  </> : <button type="button" className="button ghost small" disabled={pending} onClick={() => setConfirmRevoke(key.id)}>撤销 Key</button>}
-                </div>}
-              </li>)}
-            </ul> : <p className="muted small">当前没有有效的接入 Key。</p>}
-          </section>;
-        })()}
+          </details>
+        ) : null}
         {data.recent_starts.length > 0 && (() => {
           const limit = 3;
           const visibleStarts = showAllStarts ? data.recent_starts : data.recent_starts.slice(0, limit);

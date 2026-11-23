@@ -138,7 +138,7 @@ export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: 
   const [warmups, setWarmups] = useState<Warmup[]>([]);
   const [poolInstances, setPoolInstances] = useState<PoolInstance[]>([]);
   const [showAllWarmups, setShowAllWarmups] = useState(false);
-  const [confirmRevokeKey, setConfirmRevokeKey] = useState(false);
+  const [confirmRevokeKeyId, setConfirmRevokeKeyId] = useState<string | null>(null);
   const [confirmResetCode, setConfirmResetCode] = useState(false);
   const [confirmClearWarmups, setConfirmClearWarmups] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -154,6 +154,12 @@ export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: 
     setWarmups(data.warmups);
     setPoolInstances(data.pool_instances || []);
     setWorkflowId(current => current || data.workflows[0]?.id || '');
+    setCheckTarget(current => {
+      if (data.config.auth_mode !== 'strict') {
+        return current === '' || current === WEAK_CHANNEL_ID ? WEAK_CHANNEL_ID : WEAK_CHANNEL_ID;
+      }
+      return current === WEAK_CHANNEL_ID ? '' : current;
+    });
   }, []);
 
   useEffect(() => {
@@ -220,10 +226,12 @@ export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: 
     || status.config.allow_lan !== draft.allow_lan
   );
   const liveKeys = keys.filter(key => !key.revoked_at);
+  const isStrictMode = (draft?.auth_mode || 'strict') === 'strict';
   const clearableWarmupsCount = warmups.filter(job => finished.has(job.state) && !job.ready).length;
   const visibleWarmups = showAllWarmups ? warmups : warmups.slice(0, WARMUP_COLLAPSED_LIMIT);
   const urls = status?.urls;
   const activeMode = status?.config.auth_mode || 'strict';
+  const revokingKey = confirmRevokeKeyId ? liveKeys.find(key => key.id === confirmRevokeKeyId) || null : null;
 
   async function saveAllConfig() {
     if (!draft) return;
@@ -251,11 +259,20 @@ export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: 
         ) : undefined}
       >
         <div className="field">
-          <label htmlFor="creation-auth-mode">API 鉴权模式（三档并存，切换弱鉴权后专用 Key 仍可独立使用）</label>
+          <label htmlFor="creation-auth-mode">API 鉴权模式</label>
           <select
             id="creation-auth-mode"
             value={draft.auth_mode}
-            onChange={e => setDraft({ ...draft, auth_mode: e.target.value as AuthMode })}
+            onChange={e => {
+              const nextMode = e.target.value as AuthMode;
+              setDraft({ ...draft, auth_mode: nextMode });
+              setMatch(undefined);
+              setCheckTarget(current => (
+                nextMode !== 'strict'
+                  ? WEAK_CHANNEL_ID
+                  : (current === WEAK_CHANNEL_ID ? '' : current)
+              ));
+            }}
           >
             <option value="strict">强鉴权（仅专用 API Key，需请求头携带 Bearer）</option>
             <option value="url_path">弱鉴权（URL 路径短码，免中继直连推荐）</option>
@@ -530,58 +547,87 @@ export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: 
         </button>
       </Card>
 
-      <Card title="专用 Key（强鉴权与多客户端隔离）">
-        <div className="field">
-          <label htmlFor="creation-key">选择 Key</label>
-          <select id="creation-key" value={keyId} onChange={e => selectKey(e.target.value)}>
-            <option value="">新建 Key</option>
-            {liveKeys.map(key => <option value={key.id} key={key.id}>{key.name}</option>)}
-          </select>
-        </div>
-        <div className="field">
-          <label htmlFor="creation-key-name">名称</label>
-          <input id="creation-key-name" value={keyName} maxLength={80} onChange={e => setKeyName(e.target.value)} />
-        </div>
-        <fieldset>
-          <legend>授权发布版本</legend>
-          {status.workflows.map(workflow => <div key={workflow.id}><label>
-            <input type="checkbox" checked={allowed.includes(workflow.id)} onChange={e => setAllowed(e.target.checked
-              ? [...allowed, workflow.id] : allowed.filter(id => id !== workflow.id))} /> {title(workflow)}{workflow.active ? '（当前激活）' : ''}
-          </label></div>)}
-          {!status.workflows.length && <p>暂无已通过真机冒烟、可执行的发布版本。</p>}
-        </fieldset>
-        <div className="actions">
-          <button type="button" className="button" disabled={busy || !keyName.trim()} onClick={() => void run(async () => {
-            const row = await apiFetch<Key>(keyId ? `${prefix}/keys/${keyId}` : `${prefix}/keys`,
-              write(keyId ? 'PUT' : 'POST', { name: keyName, workflow_ids: allowed }));
-            const { token: plaintext, ...saved } = row;
-            setKeys(current => [...current.filter(key => key.id !== saved.id), saved]);
-            setKeyId(saved.id);
-            setCheckTarget(saved.id);
-            setKeyName(saved.name);
-            setToken(plaintext || '');
-            setMatch(undefined);
-            setNotice('Key 权限已保存');
-          })}>{keyId ? '保存授权' : '创建 Key'}</button>
-          {keyId && <button type="button" className="button danger" disabled={busy} onClick={() => setConfirmRevokeKey(true)}>撤销 Key</button>}
-        </div>
-        {token && <div className="field">
-          <label htmlFor="creation-key-token">Key 仅显示一次</label>
-          <input id="creation-key-token" readOnly value={token} />
-          <button className="button ghost" onClick={() => void run(async () => {
-            await navigator.clipboard.writeText(token);
-            setNotice('已复制 Key');
-          })}>复制 Key</button>
-        </div>}
-      </Card>
+      {isStrictMode ? (
+        <Card title="专用 Key（强鉴权与多客户端隔离）">
+          <div className="field">
+            <label htmlFor="creation-key">选择 Key</label>
+            <select id="creation-key" value={keyId} onChange={e => selectKey(e.target.value)}>
+              <option value="">新建 Key</option>
+              {liveKeys.map(key => <option value={key.id} key={key.id}>{key.name}</option>)}
+            </select>
+          </div>
+          <div className="field">
+            <label htmlFor="creation-key-name">名称</label>
+            <input id="creation-key-name" value={keyName} maxLength={80} onChange={e => setKeyName(e.target.value)} />
+          </div>
+          <fieldset>
+            <legend>授权发布版本</legend>
+            {status.workflows.map(workflow => <div key={workflow.id}><label>
+              <input type="checkbox" checked={allowed.includes(workflow.id)} onChange={e => setAllowed(e.target.checked
+                ? [...allowed, workflow.id] : allowed.filter(id => id !== workflow.id))} /> {title(workflow)}{workflow.active ? '（当前激活）' : ''}
+            </label></div>)}
+            {!status.workflows.length && <p>暂无已通过真机冒烟、可执行的发布版本。</p>}
+          </fieldset>
+          <div className="actions">
+            <button type="button" className="button" disabled={busy || !keyName.trim()} onClick={() => void run(async () => {
+              const row = await apiFetch<Key>(keyId ? `${prefix}/keys/${keyId}` : `${prefix}/keys`,
+                write(keyId ? 'PUT' : 'POST', { name: keyName, workflow_ids: allowed }));
+              const { token: plaintext, ...saved } = row;
+              setKeys(current => [...current.filter(key => key.id !== saved.id), saved]);
+              setKeyId(saved.id);
+              setCheckTarget(saved.id);
+              setKeyName(saved.name);
+              setToken(plaintext || '');
+              setMatch(undefined);
+              setNotice('Key 权限已保存');
+            })}>{keyId ? '保存授权' : '创建 Key'}</button>
+            {keyId && <button type="button" className="button danger" disabled={busy} onClick={() => setConfirmRevokeKeyId(keyId)}>撤销 Key</button>}
+          </div>
+          {token && <div className="field">
+            <label htmlFor="creation-key-token">Key 仅显示一次</label>
+            <input id="creation-key-token" readOnly value={token} />
+            <button className="button ghost" onClick={() => void run(async () => {
+              await navigator.clipboard.writeText(token);
+              setNotice('已复制 Key');
+            })}>复制 Key</button>
+          </div>}
+        </Card>
+      ) : liveKeys.length > 0 ? (
+        <details className="foldable">
+          <summary>已有 {liveKeys.length} 个历史专用 Key 仍在后台生效（展开查看或撤销）</summary>
+          <div className="foldContent">
+            <p className="muted small">
+              当前处于{draft.auth_mode === 'local_open' ? '免鉴权' : '弱鉴权'}模式，常规客户端无需使用 Key。下方仅列出历史保留的专用 Key；如需新建或调整授权，请切换回「强鉴权」模式。
+            </p>
+            <div className={styles.legacyKeyList}>
+              {liveKeys.map(key => (
+                <div key={key.id} className={styles.legacyKeyRow}>
+                  <div className={styles.legacyKeyMeta}>
+                    <strong>{key.name}</strong>
+                    <span className="muted small">已授权 {key.workflow_ids.length} 个发布版本</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="button danger small"
+                    disabled={busy}
+                    onClick={() => setConfirmRevokeKeyId(key.id)}
+                  >
+                    撤销 Key
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </details>
+      ) : null}
 
       <Card title="检查工作流匹配">
         <div className="field">
           <label htmlFor="creation-check-target">校验目标通道</label>
           <select id="creation-check-target" value={checkTarget} onChange={e => { setCheckTarget(e.target.value); setMatch(undefined); }}>
             <option value="">全部可执行发布版本</option>
-            <option value={WEAK_CHANNEL_ID}>弱鉴权 / 免鉴权默认通道</option>
-            {liveKeys.map(key => <option value={key.id} key={key.id}>专用 Key：{key.name}</option>)}
+            {!isStrictMode && <option value={WEAK_CHANNEL_ID}>弱鉴权 / 免鉴权默认通道</option>}
+            {isStrictMode && liveKeys.map(key => <option value={key.id} key={key.id}>专用 Key：{key.name}</option>)}
           </select>
         </div>
         <div className="field">
@@ -663,19 +709,22 @@ export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: 
     />
 
     <ConfirmDialog
-      open={confirmRevokeKey}
-      title="撤销此 Key？"
+      open={Boolean(confirmRevokeKeyId)}
+      title={revokingKey ? `撤销「${revokingKey.name}」？` : '撤销此 Key？'}
       description="撤销后此 Key 将不能提交、查询或取图，且无法恢复。"
       confirmLabel="确认撤销"
       danger
       busy={busy}
-      onCancel={() => setConfirmRevokeKey(false)}
+      onCancel={() => setConfirmRevokeKeyId(null)}
       onConfirm={() => {
-        setConfirmRevokeKey(false);
+        const targetId = confirmRevokeKeyId;
+        setConfirmRevokeKeyId(null);
+        if (!targetId) return;
         void run(async () => {
-          await apiFetch(`${prefix}/keys/${keyId}`, write('DELETE'));
-          setKeys(current => current.filter(key => key.id !== keyId));
-          selectKey('');
+          await apiFetch(`${prefix}/keys/${targetId}`, write('DELETE'));
+          setKeys(current => current.filter(key => key.id !== targetId));
+          if (keyId === targetId) selectKey('');
+          if (checkTarget === targetId) setCheckTarget(isStrictMode ? '' : WEAK_CHANNEL_ID);
           setNotice('Key 已撤销');
         });
       }}

@@ -184,3 +184,38 @@ test('CreationApiPage uses CSS module stack and styles.css defines valid progres
   assert.doesNotMatch(stylesCss, /light-dark\(/);
   assert.doesNotMatch(gpuCss, /light-dark\(/);
 });
+
+test('API key management collapses in weak/open modes, CU UI uses compact popover & structured lists, and fullscreen uses dark lightbox', () => {
+  const creationApi = readFileSync(join(webRoot, 'src/pages/CreationApiPage.tsx'), 'utf8');
+  const nativeApi = readFileSync(join(webRoot, 'src/components/NativeApiSettings.tsx'), 'utf8');
+  const compute = readFileSync(join(webRoot, 'src/pages/ComputePage.tsx'), 'utf8');
+  const cuDetails = readFileSync(join(webRoot, 'src/components/CuSessionDetails.tsx'), 'utf8');
+  const accounts = readFileSync(join(webRoot, 'src/components/AccountDirectory.tsx'), 'utf8');
+  const viewer = readFileSync(join(webRoot, 'src/components/GalleryViewer.tsx'), 'utf8');
+  const app = readFileSync(join(webRoot, 'src/App.tsx'), 'utf8');
+  const gpuCss = readFileSync(join(webRoot, 'src/gpu.module.css'), 'utf8');
+
+  assert.match(creationApi, /isStrictMode \?/);
+  assert.match(creationApi, /历史专用 Key 仍在后台生效/);
+  assert.match(nativeApi, /isStrictMode \?/);
+  assert.match(nativeApi, /历史专用 Key 仍在后台生效/);
+
+  assert.match(compute, /colab_connected !== false/);
+  assert.match(compute, /Colab 账号余额/);
+
+  assert.match(cuDetails, /CuDateRangePicker/);
+  assert.match(cuDetails, /presetDates\(localTodayFallback\(\), '7d'\)/);
+  assert.match(cuDetails, /styles\.cuList/);
+  assert.match(cuDetails, /styles\.cuSessionRow/);
+  assert.match(cuDetails, /styles\.cuDailyRow/);
+
+  assert.match(accounts, /deleteGoogleAccount/);
+  assert.match(accounts, /driveDependentsOf/);
+  assert.match(accounts, /确认删除账号/);
+
+  assert.match(viewer, /fullscreenchange/);
+  assert.match(viewer, /退出全屏/);
+  assert.match(viewer, /styles\.viewerStage/);
+  assert.match(app, /if \(document\.fullscreenElement\) return;/);
+  assert.match(gpuCss, /\.dialog:fullscreen,[\s\S]*\.assetInspector:fullscreen[\s\S]*--text: #ffffff/);
+});

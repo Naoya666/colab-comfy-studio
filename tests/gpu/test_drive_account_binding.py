@@ -145,6 +145,94 @@ def test_cross_owner_or_unconnected_drive_account_rejected_and_disconnect_leaves
     assert GoogleService(repo, "owner-1", account_id=old_acc["account_id"]).status()["drive"]["connected"] is True
 
 
+def test_account_delete_guards_drive_dependents_clears_api_defaults_and_preserves_shared_oauth(tmp_path, monkeypatch):
+    from app.account_routes import get_current_user_for_tests, router
+    from app.gpu import ccu
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("STUDIO_OFFLINE_TEST", "1")
+    st = Store("sqlite:///" + str(tmp_path / "delete_acc.db"))
+    repo = Repository(st)
+    service = AccountService(repo, "owner-1")
+
+    # Seed legacy default account with a migrated shared oauth_client_config.
+    default_id = AccountService.default_account_id("owner-1")
+    repo.create(
+        "accounts",
+        "owner-1",
+        {"account_id": default_id, "alias": "Google账号", "enabled": True, "allow_allocation": False, "legacy_default": True},
+        record_id=default_id,
+    )
+    repo.create(
+        "credentials",
+        "owner-1",
+        {
+            "provider": "google",
+            "purpose": "oauth_client_config",
+            "account_id": default_id,
+            "client_id": "shared-app.apps.googleusercontent.com",
+            "encrypted_client_secret": encrypt_secret("shared-secret"),
+        },
+        record_id="legacy-oauth-app",
+    )
+
+    drive_acc = service.create({"alias": "drive账号"}, "del-drive-1")
+    _add_token(repo, "owner-1", drive_acc["account_id"], "drive", "drive-tok")
+
+    colab_acc = service.create({"alias": "colab账号", "drive_account_id": drive_acc["account_id"]}, "del-colab-1")
+    _add_token(repo, "owner-1", colab_acc["account_id"], "colab", "colab-tok")
+
+    # Seed creation-api & native-api defaults pointing at colab_acc, plus a CCU snapshot.
+    st.create("settings", "owner-1", {"account_id": colab_acc["account_id"], "auth_mode": "url_path"}, record_id="creation-api:owner-1")
+    st.create("settings", "owner-1", {"account_id": colab_acc["account_id"], "auto_start": True, "gpu": {"accelerator": "L4"}}, record_id="native-api:owner-1")
+    st.create("settings", "owner-1", {"balance": 100.0, "sampled_at": 1000.0}, record_id=ccu._snapshot_key("owner-1", colab_acc["account_id"]))
+
+    app = FastAPI()
+    app.state.store = st
+    app.include_router(router)
+    app.dependency_overrides[get_current_user_for_tests] = lambda: {"id": "owner-1", "role": "admin"}
+    client = TestClient(app)
+
+    # list() exposes drive_dependents for drive_acc
+    listed = {row["account_id"]: row for row in client.get("/api/gpu/accounts").json()["data"]}
+    assert listed[drive_acc["account_id"]]["drive_dependents"] == ["colab账号"]
+
+    # Deleting drive_acc while colab_acc delegates Drive to it must be blocked with 409
+    blocked = client.delete(f"/api/gpu/accounts/{drive_acc['account_id']}", headers={"Idempotency-Key": "del-blocked-1"})
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "ACCOUNT_DRIVE_IN_USE"
+    assert "colab账号" in blocked.json()["error"]["message"]
+
+    # Deleting colab_acc succeeds, clears API default references & CCU snapshot, and is idempotent on retry
+    deleted = client.delete(f"/api/gpu/accounts/{colab_acc['account_id']}", headers={"Idempotency-Key": "del-colab-ok"})
+    assert deleted.status_code == 200
+    payload = deleted.json()["data"]
+    assert payload["deleted"] is True
+    assert set(payload["cleared_defaults"]) == {"创作 API", "原生 ComfyUI API"}
+
+    retried = client.delete(f"/api/gpu/accounts/{colab_acc['account_id']}", headers={"Idempotency-Key": "del-colab-ok"})
+    assert retried.status_code == 200
+    assert retried.json()["data"] == payload
+
+    assert st.get("settings", "creation-api:owner-1", "owner-1")["account_id"] is None
+    native_cfg = st.get("settings", "native-api:owner-1", "owner-1")
+    assert native_cfg["account_id"] is None and native_cfg["auto_start"] is False
+    assert st.get("settings", ccu._snapshot_key("owner-1", colab_acc["account_id"]), "owner-1") is None
+
+    # Now drive_acc has no dependents and can be deleted cleanly
+    deleted_drive = client.delete(f"/api/gpu/accounts/{drive_acc['account_id']}", headers={"Idempotency-Key": "del-drive-ok"})
+    assert deleted_drive.status_code == 200
+
+    # Deleting migrated legacy default detaches shared oauth_client_config so future accounts still see it
+    deleted_default = client.delete(f"/api/gpu/accounts/{default_id}", headers={"Idempotency-Key": "del-default-ok"})
+    assert deleted_default.status_code == 200
+    shared_app = repo.get("credentials", "legacy-oauth-app", "owner-1")
+    assert shared_app is not None
+    assert shared_app["account_id"] is None
+    assert client.get("/api/gpu/accounts").json()["data"] == []
+
+
 def test_credential_bound_client_config_used_for_cli_colab_refresh_without_env_config(tmp_path, monkeypatch):
     monkeypatch.delenv("GPU_GOOGLE_CLIENT_ID", raising=False)
     monkeypatch.delenv("GPU_GOOGLE_CLIENT_SECRET", raising=False)

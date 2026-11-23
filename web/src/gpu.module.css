@@ -136,8 +136,69 @@
 }
 @keyframes fade { from { opacity: 0; } }
 @keyframes rise { from { transform: translateY(24px); opacity: 0; } }
-.dialog:fullscreen { max-width: 100vw; max-height: 100vh; width: 100vw; height: 100vh; border: 0; border-radius: 0; background: #000; }
-.dialog:fullscreen .viewerImage, .dialog:fullscreen .viewerVideo { max-height: 78vh; }
+.viewerStage {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+.dialog:fullscreen,
+.assetInspector:fullscreen {
+  --bg: #000000;
+  --card: #121212;
+  --card-2: rgba(255, 255, 255, 0.12);
+  --card-3: #1e1e1e;
+  --line: rgba(255, 255, 255, 0.14);
+  --line-strong: rgba(255, 255, 255, 0.3);
+  --text: #ffffff;
+  --text-2: #d6d6d6;
+  --muted: #9a9a9a;
+  --primary: #ffffff;
+  --on-primary: #000000;
+  --primary-hover: #e6e6e6;
+  --danger: #ff6b6b;
+  --danger-line: rgba(255, 107, 107, 0.5);
+  color-scheme: dark;
+  position: static;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100vw;
+  height: 100vh;
+  max-width: 100vw;
+  max-height: 100vh;
+  padding: 14px 20px 18px;
+  border: 0;
+  border-radius: 0;
+  background: #000000;
+  color: #ffffff;
+  overflow: hidden;
+}
+.dialog:fullscreen .viewerHead,
+.assetInspector:fullscreen .viewerHead {
+  flex: none;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+}
+.dialog:fullscreen .viewerStage,
+.assetInspector:fullscreen .viewerStage {
+  flex: 1 1 auto;
+  height: 100%;
+  overflow: hidden;
+}
+.dialog:fullscreen .viewerImage,
+.dialog:fullscreen .viewerVideo,
+.assetInspector:fullscreen .viewerImage,
+.assetInspector:fullscreen .viewerVideo {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--r-sm);
+  background: transparent;
+}
 
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 0.88rem; }
 .kv dt { color: var(--muted); }
@@ -593,8 +654,6 @@
   }
   .inspector > h2, .inspector .cardHead h2, .nativeWorkspace h2 { font-size: 1rem; }
   .assetInspector { scrollbar-gutter: stable; }
-  .assetInspector:fullscreen { width: 100%; max-height: none; background: var(--bg); }
-  .assetInspector:fullscreen .viewerImage, .assetInspector:fullscreen .viewerVideo { max-height: 78dvh; }
   .jobCard[data-inspected="true"] { border-color: var(--workspace-accent); }
   .galleryGrid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 145px), 1fr)); gap: 12px; }
   .nativeWorkspace { gap: 16px; }
@@ -605,7 +664,7 @@
   .nativeActivity .activityLogList { max-height: 40dvh; }
   .nativeControls .nativeFieldPair { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
   .dialog:has(.viewerImage), .dialog:has(.viewerVideo) { max-width: min(960px, calc(100vw - 48px)); }
-  .dialog:fullscreen { max-width: 100vw; }
+  .dialog:fullscreen { max-width: 100vw; max-height: 100vh; }
 }
 @media (min-width: 960px) and (min-height: 500px) {
   .createColumns { grid-template-columns: minmax(340px, min(41%, 450px)) minmax(0, 1fr); }
@@ -832,42 +891,691 @@
   color: var(--warning);
 }
 
-.cuSessionTiming { display: block; font-size: .8rem; color: var(--muted); }
-.cuSectionHead {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.cuSectionHead h3 { font-size: 0.92rem; font-weight: 600; }
-.cuFilters {
+/* ───── 创作 API 历史专用 Key 折叠列表 ───── */
+.legacyKeyList {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 8px;
-  align-items: end;
 }
-.cuRangeSummary {
+.legacyKeyRow {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px 12px;
-  flex-wrap: wrap;
+  gap: 12px;
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--bg);
-  font-size: 0.82rem;
-  font-variant-numeric: tabular-nums;
 }
-.cuRangeSummary strong { font-weight: 600; color: var(--text); }
-.cuRangeMetrics {
+.legacyKeyMeta {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.legacyKeyMeta strong {
+  font-size: 0.88rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* ───── 算力页：Colab 账号余额列表 ───── */
+.cuBalanceBlock {
+  display: grid;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.cuBalanceHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cuBalanceTitle {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.cuBalanceBadges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.cuBalanceList {
+  display: grid;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+}
+.cuBalanceRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 14px;
+  min-width: 0;
+}
+.cuBalanceRow + .cuBalanceRow {
+  border-top: 1px solid var(--line);
+}
+.cuBalanceIdentity {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.cuBalanceNameRow {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  color: var(--text-2);
+  min-width: 0;
 }
+.cuBalanceNameRow strong {
+  font-size: 0.9rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cuBalanceDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+.cuBalanceDot[data-tone="ok"] {
+  background: var(--workspace-accent);
+}
+.cuBalanceDot[data-tone="warn"] {
+  background: var(--warning);
+}
+.cuBalanceDot[data-tone="error"] {
+  background: var(--danger);
+}
+.cuBalanceSub {
+  font-size: 0.76rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.cuBalanceRight {
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+  flex: none;
+}
+.cuBalanceAmount {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.cuBalanceAmount strong {
+  font-size: 1.06rem;
+  font-weight: 650;
+  line-height: 1.1;
+}
+.cuBalanceAmount em {
+  font-style: normal;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.cuBalanceShareTrack {
+  width: 72px;
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--card-2);
+  overflow: hidden;
+}
+.cuBalanceShareFill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-full);
+  background: var(--workspace-accent);
+}
+
+/* ───── CU 消耗明细：紧凑筛选工具栏 + 悬浮日期框 + 结构化明细表 ───── */
+.cuToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 12px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.cuToolbarFilters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.cuDatePickerWrap {
+  position: relative;
+  display: inline-flex;
+}
+.cuDateTrigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-full);
+  background: var(--card);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  transition: border-color 0.14s, background 0.14s;
+}
+.cuDateTrigger:hover,
+.cuDateTrigger[data-open="true"] {
+  border-color: var(--text);
+  background: var(--card-2);
+}
+.cuDateTrigger[data-filtered="true"] {
+  border-color: var(--workspace-accent);
+}
+.cuTriggerChevron {
+  color: var(--muted);
+  transition: transform 0.15s;
+}
+.cuDateTrigger[data-open="true"] .cuTriggerChevron {
+  transform: rotate(180deg);
+}
+.cuDatePopover {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 8px);
+  left: 0;
+  width: min(376px, calc(100vw - 44px));
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--card);
+  color: var(--text);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.28);
+  animation: fade 0.12s ease;
+}
+.cuDateInputsRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: end;
+  gap: 8px;
+}
+.cuDateField {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.cuDateField span {
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.cuDateField input {
+  min-height: 36px;
+  padding: 4px 10px;
+  font-size: 0.82rem;
+  border-radius: var(--r-sm);
+  font-variant-numeric: tabular-nums;
+}
+.cuDateTil {
+  padding-bottom: 8px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.cuDateError {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--danger);
+}
+.cuPresetRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cuPresetChip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  background: var(--card-2);
+  color: var(--text-2);
+  font-size: 0.78rem;
+  font-weight: 500;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.cuPresetChip:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+.cuPresetChip[data-active="true"] {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
+  font-weight: 600;
+}
+.cuDatePopoverFoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.cuKindSelect {
+  width: auto;
+  height: 34px;
+  min-height: 34px;
+  padding: 0 28px 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-full);
+  background-color: var(--card);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 500;
+}
+.cuResetBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: var(--r-full);
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.cuResetBtn:hover {
+  background: var(--card-2);
+  color: var(--text);
+}
+.cuToolbarStats {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-variant-numeric: tabular-nums;
+}
+.cuStatPill {
+  position: relative;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px 0 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  background: var(--card);
+  font-size: 0.78rem;
+  line-height: 26px;
+}
+.cuStatPill::before {
+  content: '';
+  display: inline-block;
+  width: 2.5px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--line-strong);
+  align-self: center;
+}
+.cuStatPill[data-accent="true"]::before {
+  background: var(--workspace-accent);
+}
+.cuStatPill small {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.cuStatPill strong {
+  font-size: 0.82rem;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.cuActiveSection {
+  display: grid;
+  gap: 6px;
+}
+.cuSubLabel {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-2);
+  padding-inline: 2px;
+}
+.cuList {
+  display: grid;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+}
+.cuList[data-active-list="true"] {
+  border-color: var(--workspace-accent);
+}
+.cuListRow {
+  display: block;
+  width: 100%;
+  padding: 11px 14px;
+  background: transparent;
+  transition: background 0.12s;
+}
+.cuList > .cuListRow + .cuListRow,
+.cuList > .cuListRow + .cuListFold,
+.cuList > .cuListFold + .cuListRow,
+.cuList > .cuListFold + .cuListFold {
+  border-top: 1px solid var(--line);
+}
+.cuListRowButton {
+  border: 0;
+  text-align: left;
+  color: inherit;
+}
+.cuListRowButton:hover,
+.cuListFold > summary.cuListRow:hover {
+  background: var(--card);
+}
+.cuListFold > summary {
+  list-style: none;
+  user-select: none;
+}
+.cuListFold > summary::-webkit-details-marker {
+  display: none;
+}
+.cuListFold[open] .cuRowChevron {
+  transform: rotate(180deg);
+}
+
+/* 运行会话行 */
+.cuSessionRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 20px;
+  grid-template-areas:
+    "main cost caret"
+    "dur  cost caret";
+  align-items: center;
+  gap: 3px 12px;
+  min-width: 0;
+}
+.cuSessionMain {
+  grid-area: main;
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.cuSessionTop {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.cuSessionTop strong {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.cuGpuBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-full);
+  background: var(--card);
+  color: var(--text-2);
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+}
+.cuMetaTag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  background: var(--card-2);
+  color: var(--text-2);
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+.cuMetaTag[data-tone="live"] {
+  background: var(--primary);
+  color: var(--on-primary);
+  font-weight: 600;
+}
+.cuMetaTag[data-tone="warn"] {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+.cuSessionSub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 0.76rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.cuSessionDur {
+  grid-area: dur;
+  font-size: 0.78rem;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cuSessionCost {
+  grid-area: cost;
+  display: grid;
+  justify-items: end;
+  gap: 1px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cuCostValue {
+  font-size: 0.94rem;
+  font-weight: 650;
+  color: var(--text);
+}
+.cuCostZero {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+.cuCostValue em,
+.cuCostZero em {
+  font-style: normal;
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+.cuSessionCost small {
+  font-size: 0.72rem;
+}
+.cuSessionCaret {
+  grid-area: caret;
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  color: var(--muted);
+}
+.cuRowChevron {
+  transition: transform 0.16s ease;
+}
+
+.cuSubJobs {
+  display: grid;
+  gap: 4px;
+  padding: 8px 14px 10px 26px;
+  border-top: 1px solid var(--line);
+  background: var(--card);
+}
+.cuSubJobRow {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 76px;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0 4px 10px;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+.cuSubJobRow::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--line-strong);
+}
+.cuSubJobName {
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cuSubJobDur {
+  color: var(--muted);
+  white-space: nowrap;
+}
+.cuSubJobCost {
+  text-align: right;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.cuSubJobIdle .cuSubJobName,
+.cuSubJobIdle .cuSubJobCost {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+/* 按自然日汇总行 */
+.cuDailyRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 20px;
+  grid-template-areas:
+    "date cost arrow"
+    "bar  cost arrow";
+  align-items: center;
+  gap: 6px 12px;
+  min-width: 0;
+}
+.cuDailyDateCol {
+  grid-area: date;
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.cuDailyDateTop {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cuDateMono {
+  font-size: 0.9rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.cuWeekdayTag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  background: var(--card-2);
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 500;
+  line-height: 1.45;
+}
+.cuWeekdayTag[data-today="true"] {
+  background: var(--primary);
+  color: var(--on-primary);
+  font-weight: 600;
+}
+.cuDailyBarCol {
+  grid-area: bar;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.cuDailyBarTrack {
+  flex: 1;
+  min-width: 60px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--card-2);
+  overflow: hidden;
+}
+.cuDailyBarFill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-full);
+  background: var(--workspace-accent);
+  transition: width 0.25s ease;
+}
+.cuDailySessions,
+.cuDailySessionsZero {
+  min-width: 48px;
+  text-align: right;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cuDailySessions {
+  color: var(--text-2);
+  font-weight: 500;
+}
+.cuDailySessionsZero {
+  color: var(--muted);
+}
+.cuDailyCostCol {
+  grid-area: cost;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cuDailyArrow {
+  grid-area: arrow;
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  color: var(--muted);
+}
+
+@media (min-width: 640px) {
+  .cuSessionRow {
+    grid-template-columns: minmax(0, 1fr) 88px 116px 20px;
+    grid-template-areas: "main dur cost caret";
+  }
+  .cuSessionDur {
+    text-align: right;
+  }
+  .cuDailyRow {
+    grid-template-columns: minmax(158px, 1.05fr) minmax(120px, 1.45fr) 108px 20px;
+    grid-template-areas: "date bar cost arrow";
+  }
+}
+
 .cuPager {
   display: flex;
   align-items: center;

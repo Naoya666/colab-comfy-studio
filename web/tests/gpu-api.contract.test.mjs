@@ -62,7 +62,7 @@ async function jsonBody(call) {
 test('exports the v0.2 account, instance, and workbench client functions', () => {
   for (const name of [
     'getGoogleAccounts', 'createGoogleAccount', 'updateGoogleAccount',
-    'disconnectGoogleAccount', 'startGoogleAccountAuth', 'getAccountRuntimes',
+    'disconnectGoogleAccount', 'deleteGoogleAccount', 'startGoogleAccountAuth', 'getAccountRuntimes',
     'listGpuInstances', 'getGpuInstance', 'getInstanceJobs', 'getInstanceEvents',
     'setInstanceRetention', 'stopInstance', 'getWorkbench', 'workbenchAction',
   ]) assert.equal(typeof api[name], 'function', `${name} should be exported`);
@@ -87,6 +87,13 @@ test('account writes use the account routes and caller-supplied idempotency key'
   assert.equal(result.request.url, '/api/gpu/accounts/account%2F1/disconnect');
   assert.equal(result.request.init.method, 'POST');
   assert.equal(header(result.request, 'Idempotency-Key'), 'acct-disconnect-1');
+
+  requests = [];
+  await api.deleteGoogleAccount('account/1', 'acct-delete-1');
+  const deleteReq = lastRequest();
+  assert.equal(deleteReq.url, '/api/gpu/accounts/account%2F1');
+  assert.equal(deleteReq.init.method, 'DELETE');
+  assert.equal(header(deleteReq, 'Idempotency-Key'), 'acct-delete-1');
 });
 
 test('account auth and runtime reads preserve the typed route contract', async () => {

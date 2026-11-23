@@ -1,6 +1,6 @@
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import {
-  ArrowUpRight, ChevronLeft, ChevronRight, Copy, Download, FileCode2, FolderInput, ImagePlus, Maximize2, RotateCcw, Star, Trash2,
+  ArrowUpRight, ChevronLeft, ChevronRight, Copy, Download, FileCode2, FolderInput, ImagePlus, Maximize2, Minimize2, RotateCcw, Star, Trash2,
 } from 'lucide-react';
 import {
   apiMessage, assetUrl, fetchNativeOutputBytes,
@@ -74,6 +74,18 @@ export function GalleryViewer({
   const [extractError, setExtractError] = useState('');
   const [selectedJson, setSelectedJson] = useState<'workflow' | 'prompt'>('workflow');
   const [importingDraft, setImportingDraft] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const headRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function syncFullscreen() {
+      const panel = headRef.current?.closest('section') ?? null;
+      setIsFullscreen(Boolean(panel && document.fullscreenElement === panel));
+    }
+    syncFullscreen();
+    document.addEventListener('fullscreenchange', syncFullscreen);
+    return () => document.removeEventListener('fullscreenchange', syncFullscreen);
+  }, []);
 
   const assetId = item.asset.id;
   useEffect(() => {
@@ -165,7 +177,7 @@ export function GalleryViewer({
 
   return (
     <>
-      <div className={`${styles.cardHead} ${styles.viewerHead}`}>
+      <div ref={headRef} className={`${styles.cardHead} ${styles.viewerHead}`}>
         <h2>{title}</h2>
         <div className={styles.viewerHeadActions}>
           {navCount > 1 && navIndex >= 0 && (
@@ -178,6 +190,24 @@ export function GalleryViewer({
                 <ChevronRight size={14} aria-hidden />
               </button>
             </div>
+          )}
+          {isFullscreen && (
+            <>
+              {item.kind === 'studio' ? (
+                <button className="button secondary small" type="button" onClick={() => onFavoriteStudio(item.asset)}>
+                  <Star size={14} strokeWidth={1.6} fill={item.asset.favorite ? 'currentColor' : 'none'} aria-hidden />
+                  {item.asset.favorite ? '已收藏' : '收藏'}
+                </button>
+              ) : onFavoriteNative ? (
+                <button className="button secondary small" type="button" onClick={() => onFavoriteNative(item.asset)}>
+                  <Star size={14} strokeWidth={1.6} fill={item.asset.favorite ? 'currentColor' : 'none'} aria-hidden />
+                  {item.asset.favorite ? '已收藏' : '收藏'}
+                </button>
+              ) : null}
+              <a className="button secondary small" href={downloadHref} download={title} target="_blank" rel="noreferrer">
+                <Download size={14} strokeWidth={1.6} aria-hidden />下载
+              </a>
+            </>
           )}
           <button
             className="button secondary small"
@@ -193,7 +223,11 @@ export function GalleryViewer({
               }
             }}
           >
-            <Maximize2 size={14} strokeWidth={1.6} aria-hidden />全屏查看
+            {isFullscreen ? (
+              <><Minimize2 size={14} strokeWidth={1.6} aria-hidden />退出全屏</>
+            ) : (
+              <><Maximize2 size={14} strokeWidth={1.6} aria-hidden />全屏查看</>
+            )}
           </button>
           <button
             className="button secondary small"
@@ -208,15 +242,17 @@ export function GalleryViewer({
         </div>
       </div>
 
-      {mime.startsWith('video/') ? (
-        <video className={styles.viewerVideo} src={mediaSrc} controls autoPlay playsInline />
-      ) : mime.startsWith('image/') ? (
-        <img className={styles.viewerImage} src={mediaSrc} alt="" />
-      ) : (
-        <p className="muted">这是诊断文件，不能直接预览，请下载查看。</p>
-      )}
+      <div className={styles.viewerStage}>
+        {mime.startsWith('video/') ? (
+          <video className={styles.viewerVideo} src={mediaSrc} controls autoPlay playsInline />
+        ) : mime.startsWith('image/') ? (
+          <img className={styles.viewerImage} src={mediaSrc} alt="" />
+        ) : (
+          <p className="muted">这是诊断文件，不能直接预览，请下载查看。</p>
+        )}
+      </div>
 
-      {item.kind === 'studio' && hasStudioInfo && (
+      {!isFullscreen && item.kind === 'studio' && hasStudioInfo && (
         <details className="foldable" open={inlineViewer}>
           <summary>作品信息</summary>
           <div className="foldContent">
@@ -260,7 +296,7 @@ export function GalleryViewer({
         </details>
       )}
 
-      {item.kind === 'studio' && viewerJobId && (
+      {!isFullscreen && item.kind === 'studio' && viewerJobId && (
         matchedViewerJob ? (
           <details className="foldable" open={inlineViewer}>
             <summary>生成参数</summary>
@@ -293,7 +329,7 @@ export function GalleryViewer({
         )
       )}
 
-      {item.kind === 'native' && (
+      {!isFullscreen && item.kind === 'native' && (
         <details className="foldable" open={inlineViewer}>
           <summary>原生作品信息（Drive）</summary>
           <div className="foldContent">
@@ -308,7 +344,7 @@ export function GalleryViewer({
         </details>
       )}
 
-      <div className={styles.viewerActions}>
+      {!isFullscreen && <div className={styles.viewerActions}>
         {item.kind === 'studio' ? (
           <>
             <button className="button secondary small" type="button" onClick={() => onFavoriteStudio(item.asset)}>
@@ -375,11 +411,11 @@ export function GalleryViewer({
             )}
           </>
         )}
-      </div>
+      </div>}
 
-      {extractError && <p className="status error" role="alert">{extractError}</p>}
+      {!isFullscreen && extractError && <p className="status error" role="alert">{extractError}</p>}
 
-      {extracted && (
+      {!isFullscreen && extracted && (
         <div className={styles.inlinePanel} aria-label="PNG 工作流提取结果">
           <div className={styles.cardHead}>
             <strong>已提取 ComfyUI 工作流</strong>

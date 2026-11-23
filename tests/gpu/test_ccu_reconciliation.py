@@ -403,3 +403,69 @@ def test_cu_sessions_and_daily_pagination_and_date_range(tmp_path, monkeypatch):
     assert dr["total"] == 3
     assert dr["total_actual_cu"] == pytest.approx(3.0)
     assert dr["total_sessions"] == 3
+
+
+def test_real_balance_query_skips_unlinked_and_drive_only_accounts(tmp_path, monkeypatch):
+    import time
+
+    from app.gpu.colab import GoogleColabProvider
+    from app.security import encrypt_secret
+
+    repo = make_repo(tmp_path)
+    monkeypatch.setenv("GPU_GOOGLE_CLIENT_ID", "client-id")
+    monkeypatch.setenv("GPU_GOOGLE_CLIENT_SECRET", "client-secret")
+    monkeypatch.setattr(ccu, "sampling_enabled", lambda: True)
+
+    for aid, alias in (("colab-acc", "Colab号"), ("drive-only", "Drive号"), ("unlinked", "空白号")):
+        repo.create("accounts", OWNER, {"account_id": aid, "alias": alias, "enabled": True}, record_id=aid)
+
+    repo.create(
+        "credentials",
+        OWNER,
+        {
+            "provider": "google",
+            "purpose": "colab",
+            "account_id": "colab-acc",
+            "encrypted_access_token": encrypt_secret("tok-c"),
+            "encrypted_refresh_token": encrypt_secret("ref-c"),
+            "expires_at": time.time() + 3600,
+        },
+        record_id="cred-colab",
+    )
+    repo.create(
+        "credentials",
+        OWNER,
+        {
+            "provider": "google",
+            "purpose": "drive",
+            "account_id": "drive-only",
+            "encrypted_access_token": encrypt_secret("tok-d"),
+            "encrypted_refresh_token": encrypt_secret("ref-d"),
+            "expires_at": time.time() + 3600,
+        },
+        record_id="cred-drive",
+    )
+    # Seed a legacy stale sample_failed error on the unlinked account to confirm it is suppressed.
+    repo.store.create("settings", OWNER, {"error": "sample_failed", "attempted_at": 100.0}, record_id=ccu._snapshot_key(OWNER, "unlinked"))
+
+    queried = []
+
+    def fake_subscription(self):
+        queried.append(self.account_id)
+        return {"currentBalance": 42.5, "consumptionRateHourly": 0.0, "assignmentsCount": 0}
+
+    monkeypatch.setattr(GoogleColabProvider, "subscription", fake_subscription)
+
+    snaps = ccu.balance_snapshots(repo, OWNER, source="manual")
+    assert queried == ["colab-acc"]
+    assert set(snaps) == {"colab-acc"}
+    assert snaps["colab-acc"]["balance"] == pytest.approx(42.5)
+
+    summary = ccu.usage_summary(repo, OWNER)
+    by_id = {row["account_id"]: row for row in summary["accounts"]}
+    assert by_id["colab-acc"]["colab_connected"] is True
+    assert by_id["drive-only"]["colab_connected"] is False
+    assert by_id["unlinked"]["colab_connected"] is False
+    assert by_id["unlinked"]["error"] is None
+    assert set(summary["ccu"]["snapshots"]) == {"colab-acc"}
+    assert summary["ccu"]["total_balance"] == pytest.approx(42.5)

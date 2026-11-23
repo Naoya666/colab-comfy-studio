@@ -156,6 +156,19 @@ def disconnect_account(
     return _invoke(request, action)
 
 
+@router.delete("/{account_id}")
+def delete_account(
+    account_id: str,
+    request: Request,
+    user=Depends(get_current_user_for_tests),
+):
+    def action():
+        key = _idempotency(request)
+        return ok(_service(request, user).delete(account_id, key), request)
+
+    return _invoke(request, action)
+
+
 @router.get("/{account_id}/runtimes")
 def account_runtimes(account_id: str, request: Request, user=Depends(get_current_user_for_tests)):
     return _invoke(request, lambda: ok(_service(request, user).runtimes(account_id), request))

@@ -31,6 +31,7 @@ class AccountService:
             "allow_allocation",
             "drive_account_id",
             "drive_account_alias",
+            "drive_dependents",
             "projects",
             "workflows",
             "budget",
@@ -215,6 +216,14 @@ class AccountService:
             return "connected", authorization, drive_alias
         return "not_connected", authorization, drive_alias
 
+    def _drive_dependents(self, account_id: str) -> list[str]:
+        return [
+            self._clean_text(item.get("alias"), 80, str(item.get("account_id") or item.get("id"))[:8])
+            for item in self._rows("accounts")
+            if str(item.get("account_id") or item.get("id")) != account_id
+            and item.get("drive_account_id") == account_id
+        ]
+
     def _public(self, row: dict) -> dict:
         account_id = str(row.get("account_id") or row.get("id"))
         raw_drive_id = row.get("drive_account_id")
@@ -228,6 +237,7 @@ class AccountService:
             "allow_allocation": bool(row.get("allow_allocation", False)),
             "drive_account_id": drive_account_id,
             "drive_account_alias": drive_alias,
+            "drive_dependents": self._drive_dependents(account_id),
             "projects": list(row.get("projects") or []),
             "workflows": list(row.get("workflows") or []),
             "budget": dict(row.get("budget") or {}) if isinstance(row.get("budget") or {}, dict) else row.get("budget"),
@@ -341,6 +351,119 @@ class AccountService:
                 remote_confirmed = False
         result = {"account_id": account_id, "disconnected": remote_confirmed, "remote_confirmed": remote_confirmed, "status": "confirmed" if remote_confirmed else "remote_unconfirmed"}
         return self._save_operation(idempotency_key, body, result, operation="disconnect")
+
+    def delete(self, account_id: str, idempotency_key: str | None = None) -> dict:
+        body = {"account_id": account_id, "action": "delete"}
+        existing = self._operation(idempotency_key, body)
+        if existing is not None:
+            return existing
+        row = self.require(account_id)
+        active = [
+            item
+            for item in self._rows("instances")
+            if item.get("account_id") == account_id and item.get("state") in self.ACTIVE_INSTANCE_STATES
+        ] + [
+            item
+            for item in self._rows("leases")
+            if item.get("account_id") == account_id and item.get("state") not in {None, "deleted", "released"}
+        ]
+        if active:
+            raise APIError("ACCOUNT_HAS_ACTIVE_RESOURCES", "账号仍有活动实例或任务，请先停止并确认释放后再删除", 409)
+        dependents = self._drive_dependents(account_id)
+        if dependents:
+            names = "、".join(dependents)
+            raise APIError(
+                "ACCOUNT_DRIVE_IN_USE",
+                f"以下账号正在复用该账号的 Google Drive 存储：{names}。请先将它们的 Drive 存储来源切换为其他账号或独立 Drive 后再删除。",
+                409,
+            )
+
+        credential_rows = [item for item in self._rows("credentials") if item.get("account_id") == account_id]
+        # Detach any legacy owner-wide shared OAuth app config before removing the migrated default account.
+        if row.get("legacy_default") is True or row.get("legacy_trusted") is True:
+            from app.oauth_config_routes import config_id
+
+            dedicated_cfg_id = config_id(self.owner_id, account_id)
+            for cred in credential_rows:
+                if (
+                    cred.get("provider") == "google"
+                    and cred.get("purpose") == "oauth_client_config"
+                    and not cred.get("revoked")
+                    and cred.get("id") != dedicated_cfg_id
+                ):
+                    self.repo.update("credentials", cred["id"], {"account_id": None}, self.owner_id)
+
+        remote_confirmed = True
+        if os.getenv("STUDIO_OFFLINE_TEST") == "1":
+            for cred in credential_rows:
+                if cred.get("purpose") in {"colab", "drive"}:
+                    self.repo.update(
+                        "credentials",
+                        cred["id"],
+                        {
+                            "revoked": True,
+                            "encrypted_access_token": None,
+                            "encrypted_refresh_token": None,
+                            "disconnect_status": "offline_unconfirmed",
+                        },
+                        self.owner_id,
+                    )
+            remote_confirmed = False
+        else:
+            from .google import GoogleService
+
+            service = GoogleService(self.repo, self.owner_id, account_id=account_id)
+            for purpose in ("colab", "drive"):
+                had_credential = any(item.get("purpose") == purpose and not item.get("revoked") for item in credential_rows)
+                outcome = service.disconnect(purpose)
+                if had_credential and not outcome:
+                    remote_confirmed = False
+
+        # Remove token/state credentials tied strictly to this account (never touch detached shared oauth_client_config).
+        for cred in credential_rows:
+            if cred.get("purpose") in {"colab", "drive", "oauth_state"}:
+                try:
+                    self.repo.delete("credentials", cred["id"], self.owner_id)
+                except KeyError:
+                    pass
+
+        cleared_defaults: list[str] = []
+        store = getattr(self.repo, "store", None)
+        if store is not None:
+            for key_prefix, label in (("creation-api", "创作 API"), ("native-api", "原生 ComfyUI API")):
+                setting_id = f"{key_prefix}:{self.owner_id}"
+                saved = store.get("settings", setting_id, self.owner_id)
+                if isinstance(saved, dict) and saved.get("account_id") == account_id:
+                    patch: dict[str, Any] = {"account_id": None}
+                    if key_prefix == "native-api":
+                        patch["auto_start"] = False
+                        patch["gpu"] = None
+                    store.update("settings", setting_id, patch, self.owner_id)
+                    cleared_defaults.append(label)
+
+            # Clear CCU balance snapshot & stale anomalies referencing the deleted account.
+            from . import ccu
+
+            snapshot_key = ccu._snapshot_key(self.owner_id, account_id)
+            try:
+                store.delete("settings", snapshot_key, self.owner_id)
+            except KeyError:
+                pass
+            anomaly_key = f"cu-anomalies:{self.owner_id}"
+            anomaly_row = store.get("settings", anomaly_key, self.owner_id)
+            if isinstance(anomaly_row, dict) and isinstance(anomaly_row.get("items"), list):
+                kept = [item for item in anomaly_row["items"] if not (isinstance(item, dict) and item.get("account_id") == account_id)]
+                if len(kept) != len(anomaly_row["items"]):
+                    store.update("settings", anomaly_key, {"items": kept}, self.owner_id)
+
+        self.repo.delete("accounts", account_id, self.owner_id)
+        result = {
+            "account_id": account_id,
+            "deleted": True,
+            "remote_confirmed": remote_confirmed,
+            "cleared_defaults": cleared_defaults,
+        }
+        return self._save_operation(idempotency_key, body, result, operation="delete")
 
     def runtimes(self, account_id: str) -> list[dict]:
         self.require(account_id)

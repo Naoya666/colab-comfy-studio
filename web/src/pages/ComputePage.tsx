@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Cpu, HardDrive, Info, Square, Search } from 'lucide-react';
+import { Cpu, HardDrive, Info, RefreshCw, Search, Square } from 'lucide-react';
 import { apiMessage, queryCcuBalance, type ComputeSpec, type GpuSettings, type GpuUsage } from '../lib/gpu-api';
 import { CuGuardSettings } from '../components/CuGuardSettings';
 import { CuSessionDetails } from '../components/CuSessionDetails';
@@ -11,44 +11,70 @@ import { Card } from '../components/ui';
 import styles from '../gpu.module.css';
 import { cuNumber, formatDateTime, shown } from '../lib/ui-helpers';
 
-function CcuBalanceQuery({ usage, refresh }: { usage: GpuUsage | null; refresh: () => Promise<void> }) {
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const accounts = usage?.accounts || [];
-  const partial = accounts.some(snapshot => snapshot.error || snapshot.balance == null);
+function CcuAccountBalanceList({ usage, error }: { usage: GpuUsage | null; error: string }) {
+  const colabAccounts = (usage?.accounts || []).filter(snapshot => snapshot.colab_connected !== false);
+  const failedCount = colabAccounts.filter(snapshot => Boolean(snapshot.error)).length;
+  const totalPositive = colabAccounts.reduce((acc, row) => acc + (row.balance && row.balance > 0 ? row.balance : 0), 0);
 
-  async function query() {
-    setLoading(true);
-    setError('');
-    try {
-      await queryCcuBalance();
-      await refresh();
-    } catch (e) {
-      setError(apiMessage(e));
-    } finally {
-      setLoading(false);
-    }
-  }
+  return (
+    <div className={styles.cuBalanceBlock}>
+      {error && <p className="status error" role="alert">{error}</p>}
+      {usage && (
+        <>
+          <div className={styles.cuBalanceHead}>
+            <span className={styles.cuBalanceTitle}>Colab 账号余额</span>
+            <div className={styles.cuBalanceBadges}>
+              <span className="pill">{colabAccounts.length} 个已授权</span>
+              {failedCount > 0 && <span className="pill danger">{failedCount} 个查询失败</span>}
+            </div>
+          </div>
 
-  return <div className={styles.inlinePanel}>
-    <div className="actions">
-      <button type="button" className="button secondary small" disabled={loading} onClick={() => void query()}>
-        <Search size={15} strokeWidth={1.8} aria-hidden />{loading ? '查询中…' : '查询剩余 CU'}
-      </button>
+          {!colabAccounts.length ? (
+            <p className="muted small">暂无已授权 Colab 的账号。可在「设置」中完成 Colab 授权后查询余额。</p>
+          ) : (
+            <div className={styles.cuBalanceList} role="status">
+              {colabAccounts.map(snapshot => {
+                const tone = snapshot.error ? 'error' : snapshot.below_floor ? 'warn' : snapshot.balance != null ? 'ok' : 'idle';
+                const sharePct = colabAccounts.length > 1 && totalPositive > 0 && snapshot.balance != null && snapshot.balance > 0
+                  ? Math.max(4, Math.min(100, (snapshot.balance / totalPositive) * 100))
+                  : null;
+                return (
+                  <div key={snapshot.account_id} className={styles.cuBalanceRow}>
+                    <div className={styles.cuBalanceIdentity}>
+                      <div className={styles.cuBalanceNameRow}>
+                        <span className={styles.cuBalanceDot} data-tone={tone} aria-hidden />
+                        <strong>{snapshot.alias || snapshot.account_id}</strong>
+                        {snapshot.below_floor && <span className="pill danger">触及底线</span>}
+                        {snapshot.error && <span className="pill danger">查询失败</span>}
+                      </div>
+                      <span className={styles.cuBalanceSub}>
+                        今日扣费 {cuNumber(snapshot.today_actual_cu)} CU
+                        {snapshot.sampled_at != null ? ` · 更新于 ${formatDateTime(snapshot.sampled_at * 1000)}` : ' · 尚未查询'}
+                      </span>
+                    </div>
+                    <div className={styles.cuBalanceRight}>
+                      <div className={styles.cuBalanceAmount} data-empty={snapshot.balance == null}>
+                        {snapshot.balance == null ? (
+                          <span className="muted small">{snapshot.error ? '读取失败' : '未查询'}</span>
+                        ) : (
+                          <><strong>{cuNumber(snapshot.balance)}</strong><em>CU</em></>
+                        )}
+                      </div>
+                      {sharePct !== null && (
+                        <div className={styles.cuBalanceShareTrack} aria-hidden>
+                          <span className={styles.cuBalanceShareFill} style={{ width: `${sharePct}%` }} />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
     </div>
-    {error && <p className="status error" role="alert">{error}</p>}
-    {usage && <div className={styles.stack} role="status">
-      {!accounts.length && <p className="muted small">暂无启用的 Colab 账号。可在设置中添加并授权。</p>}
-      {usage.ccu?.total_balance != null && <p>
-        {partial ? '已查到的余额合计' : 'Colab 剩余 CU 合计'} <strong>{cuNumber(usage.ccu?.total_balance)} CU</strong>
-      </p>}
-      {accounts.map(snapshot => <p key={snapshot.account_id} className="small">
-        <strong>{snapshot.alias || snapshot.account_id}</strong> · {snapshot.balance == null ? '暂时无法读取余额' : `${cuNumber(snapshot.balance)} CU`}
-        {snapshot.error && <span className="muted"> · 最近查询失败</span>}
-        {snapshot.sampled_at != null && <span className="muted"> · {formatDateTime(snapshot.sampled_at * 1000)}</span>}
-      </p>)}
-    </div>}
-  </div>;
+  );
 }
 
 export function ComputePage({
@@ -70,6 +96,8 @@ export function ComputePage({
   specsNote?: string;
   error?: string;
 }) {
+  const [queryingBalance, setQueryingBalance] = useState(false);
+  const [balanceError, setBalanceError] = useState('');
   const realEnabled = Boolean(settings?.real_enabled) && settings?.offline_mode !== true;
   const actual = usage?.today_actual_cu;
   const limit = usage?.guard?.daily_limit_cu;
@@ -77,6 +105,19 @@ export function ComputePage({
     ? (limit === 0 ? '已达上限' : `${Math.round((actual / limit) * 100)}%`)
     : '不限';
   const unresolved = (usage?.ccu?.anomalies || []).filter((item) => !item.resolved_at);
+
+  async function handleQueryBalance() {
+    setQueryingBalance(true);
+    setBalanceError('');
+    try {
+      await queryCcuBalance();
+      await onRefreshUsage();
+    } catch (e) {
+      setBalanceError(apiMessage(e));
+    } finally {
+      setQueryingBalance(false);
+    }
+  }
 
   return (
     <div className={`${styles.stack} ${styles.workspaceGrid}`}>
@@ -87,7 +128,21 @@ export function ComputePage({
 
       <RuntimeTelemetryCard settings={settings} usage={usage} instances={instances} />
 
-      <Card icon={<HardDrive size={17} strokeWidth={1.6} aria-hidden />} title="CU 用量">
+      <Card
+        icon={<HardDrive size={17} strokeWidth={1.6} aria-hidden />}
+        title="CU 用量"
+        aside={
+          <button
+            type="button"
+            className="button secondary small"
+            disabled={queryingBalance}
+            onClick={() => void handleQueryBalance()}
+          >
+            <RefreshCw size={14} strokeWidth={1.8} className={queryingBalance ? styles.spin : undefined} aria-hidden />
+            {queryingBalance ? '查询中…' : '查询剩余 CU'}
+          </button>
+        }
+      >
         <div className={styles.grid2}>
           <div className={styles.statBox}><small className="muted">今日扣费 · {usage?.local_date || '—'}</small>
             <strong>{cuNumber(actual)}<em> CU</em></strong>
@@ -106,7 +161,7 @@ export function ComputePage({
             {usage?.ccu?.sampled_at && <small className="muted">{formatDateTime(usage.ccu.sampled_at * 1000)}</small>}
           </div>
         </div>
-        <CcuBalanceQuery usage={usage} refresh={onRefreshUsage} />
+        <CcuAccountBalanceList usage={usage} error={balanceError} />
         {unresolved.length > 0 && <p className={styles.cuWarning}>
           检测到空转机器 · {unresolved.map(item => `${item.alias || item.account_id}（${shown(item.assignments)} 台）`).join('、')}
         </p>}

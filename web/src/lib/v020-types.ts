@@ -54,6 +54,7 @@ export interface GoogleAccount {
   email_masked?: string | null;
   drive_account_id?: string | null;
   drive_account_alias?: string | null;
+  drive_dependents?: string[];
   colab: GoogleAuthorization;
   drive: GoogleAuthorization;
   allowed_project_ids?: string[];

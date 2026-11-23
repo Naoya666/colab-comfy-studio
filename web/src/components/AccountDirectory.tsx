@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { RefreshCw } from 'lucide-react';
-import { apiMessage, createGoogleAccount, disconnectGoogleAccount, getGoogleAccounts, startGoogleAccountAuth, updateGoogleAccount, type CuAccount } from '../lib/gpu-api';
+import { RefreshCw, Trash2 } from 'lucide-react';
+import { apiMessage, createGoogleAccount, deleteGoogleAccount, disconnectGoogleAccount, getGoogleAccounts, startGoogleAccountAuth, updateGoogleAccount, type CuAccount } from '../lib/gpu-api';
 import { cuNumber } from '../lib/ui-helpers';
 import styles from './v020.module.css';
 
@@ -17,6 +17,7 @@ export interface GpuAccount {
   drive_status?: AuthorizationStatus;
   drive_account_id?: string | null;
   drive_account_alias?: string | null;
+  drive_dependents?: string[];
   authorization?: { colab?: { connected?: boolean; configured?: boolean; expires_at?: string | null; message?: string }; drive?: { connected?: boolean; configured?: boolean; expires_at?: string | null; message?: string; delegated_to?: string; delegated_alias?: string } };
   allow_allocation?: boolean;
   enabled?: boolean;
@@ -94,6 +95,7 @@ export interface AccountDirectoryApi {
   createGpuAccount: (body: { alias: string }, idempotencyKey: string) => Promise<GpuAccount>;
   updateGpuAccount: (accountId: string, patch: Record<string, unknown>, idempotencyKey: string) => Promise<GpuAccount>;
   disconnectGpuAccount: (accountId: string, idempotencyKey: string, confirmActiveStop: boolean) => Promise<unknown>;
+  deleteGpuAccount: (accountId: string, idempotencyKey: string) => Promise<{ account_id?: string; deleted?: boolean; cleared_defaults?: string[] }>;
   startGpuAccountAuth: (accountId: string, purpose: 'colab' | 'drive', idempotencyKey: string) => Promise<{ authorization_url?: string } | string>;
 }
 
@@ -133,6 +135,7 @@ const defaultAccountApi: AccountDirectoryApi = {
   createGpuAccount: async (body, key) => accountPayload(await createGoogleAccount(body, key)),
   updateGpuAccount: async (accountId, patch, key) => accountPayload(await updateGoogleAccount(accountId, patch as Parameters<typeof updateGoogleAccount>[1], key)),
   disconnectGpuAccount: (accountId, key, _confirmActiveStop) => disconnectGoogleAccount(accountId, key),
+  deleteGpuAccount: (accountId, key) => deleteGoogleAccount(accountId, key),
   startGpuAccountAuth: (accountId, purpose, key) => startGoogleAccountAuth(accountId, purpose, key),
 };
 
@@ -176,6 +179,7 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editAlias, setEditAlias] = useState('');
   const [disconnecting, setDisconnecting] = useState<GpuAccount | null>(null);
+  const [deleting, setDeleting] = useState<GpuAccount | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
@@ -252,17 +256,54 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
     }
   }
 
+  function driveDependentsOf(account: GpuAccount): string[] {
+    if (Array.isArray(account.drive_dependents) && account.drive_dependents.length > 0) {
+      return account.drive_dependents;
+    }
+    return accounts
+      .filter((item) => item.account_id !== account.account_id && item.drive_account_id === account.account_id)
+      .map((item) => item.alias || item.account_id.slice(0, 8));
+  }
+
+  function hasOwnAuthorization(account: GpuAccount): boolean {
+    const colab = authStatus(account, 'colab');
+    const drive = authStatus(account, 'drive');
+    const hasDelegatedDrive = Boolean(account.drive_account_id || account.authorization?.drive?.delegated_to);
+    const hasOwnColab = colab === 'connected' || colab === 'needs_reauth';
+    const hasOwnDrive = !hasDelegatedDrive && (drive === 'connected' || drive === 'needs_reauth');
+    return hasOwnColab || hasOwnDrive;
+  }
+
   async function disconnect() {
     const account = disconnecting;
     if (!account || busy) return;
     const operation = `account-disconnect-${account.account_id}`;
-    setBusy(operation); setError(''); setStatus('正在请求解除连接…');
+    setBusy(operation); setError(''); setStatus('正在请求解除授权…');
     try {
       await accountApi.disconnectGpuAccount(account.account_id, keyFor(operation), activeCount(account) > 0);
-      replaceAccounts(accounts.filter((item) => item.account_id !== account.account_id));
-      finishKey(operation); setDisconnecting(null); setStatus('解除连接请求已确认；历史记录保留匿名快照。');
+      finishKey(operation); setDisconnecting(null);
+      await refresh();
+      setStatus(`已解除「${account.alias || '该账号'}」的 Google 授权；如需移除卡片可点击删除。`);
     } catch (cause) {
-      setError(apiMessage(cause)); setStatus('解除连接未确认；再次重试会复用同一幂等键。');
+      setError(apiMessage(cause)); setStatus('解除授权未确认；再次重试会复用同一幂等键。');
+    } finally { setBusy(null); }
+  }
+
+  async function removeAccount() {
+    const account = deleting;
+    if (!account || busy) return;
+    const operation = `account-delete-${account.account_id}`;
+    setBusy(operation); setError(''); setStatus('正在删除账号…');
+    try {
+      const result = await accountApi.deleteGpuAccount(account.account_id, keyFor(operation));
+      replaceAccounts(accounts.filter((item) => item.account_id !== account.account_id));
+      finishKey(operation); setDeleting(null);
+      const cleared = result?.cleared_defaults?.length
+        ? `（已自动清空 ${result.cleared_defaults.join('、')} 的默认账号）`
+        : '';
+      setStatus(`已删除账号「${account.alias || '未命名账号'}」${cleared}，历史任务与账单不受影响。`);
+    } catch (cause) {
+      setError(apiMessage(cause)); setStatus('删除未确认；再次重试会复用同一幂等键。');
     } finally { setBusy(null); }
   }
 
@@ -351,17 +392,35 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
                     </select>
                   </label>
                 )}
-                <div className="small">
-                  余额 {cuNumber(balance?.balance)} CU · 今日扣费 {cuNumber(balance?.today_actual_cu)} CU
-                  {balance?.below_floor && <span className={styles.warningInline}> · 已触及余额底线</span>}
-                  {balance?.error && <span className="muted"> · 最近查询失败</span>}
-                  {balance?.balance != null && !balance.below_floor && !balance.error && <span className="muted"> · 底线正常</span>}
-                </div>
+                {colab === 'connected' ? (
+                  <div className="small">
+                    余额 {cuNumber(balance?.balance)} CU · 今日扣费 {cuNumber(balance?.today_actual_cu)} CU
+                    {balance?.below_floor && <span className={styles.warningInline}> · 已触及余额底线</span>}
+                    {balance?.error && <span className="muted"> · 最近查询失败</span>}
+                    {balance?.balance != null && !balance.below_floor && !balance.error && <span className="muted"> · 底线正常</span>}
+                  </div>
+                ) : (
+                  <div className={styles.muted}>
+                    {drive === 'connected'
+                      ? '未授权 Colab（仅用于 Google Drive 存储，不参与 CU 余额查询）'
+                      : '尚未授权 Colab，不参与算力分配与 CU 余额查询'}
+                  </div>
+                )}
               </div>
               <div className={styles.cardActions}>
                 <button type="button" className={styles.buttonSecondary} disabled={Boolean(busy)} onClick={() => { setEditingId(account.account_id); setEditAlias(account.alias || ''); }}>改名</button>
-                <button type="button" className={styles.buttonDanger} disabled={Boolean(busy)} onClick={() => setDisconnecting(account)}>解除连接</button>
-                {active > 0 && <span className={styles.warningInline}>活动资源 {active} 个，不能直接解除</span>}
+                {hasOwnAuthorization(account) && (
+                  <button type="button" className={styles.buttonSecondary} disabled={Boolean(busy)} onClick={() => setDisconnecting(account)}>解除授权</button>
+                )}
+                <button
+                  type="button"
+                  className={styles.buttonDanger}
+                  disabled={Boolean(busy)}
+                  onClick={() => setDeleting(account)}
+                >
+                  <Trash2 size={14} strokeWidth={1.8} aria-hidden />删除账号
+                </button>
+                {active > 0 && <span className={styles.warningInline}>活动资源 {active} 个，停止释放后方可解除或删除</span>}
                 {isBusy && <span className={styles.muted}>处理中…</span>}
               </div>
             </article>
@@ -369,7 +428,59 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
         })}
       </div>}
 
-      {disconnecting && <div className={styles.sheetBackdrop} role="presentation"><section className={styles.sheet} role="dialog" aria-modal="true" aria-labelledby="disconnect-title"><h3 id="disconnect-title">确认解除「{disconnecting.alias}」？</h3>{activeCount(disconnecting) > 0 ? <p className={styles.warning}>检测到 {activeCount(disconnecting)} 个活动实例/任务。解除前必须由服务端执行安全停机检查；若仍无法安全停机，操作会失败，历史记录不会丢失。</p> : <p className={styles.muted}>只解除本站授权连接，不会删除历史任务和作品。服务端会再次检查活动资源。</p>}<div className={styles.sheetActions}><button type="button" className={styles.buttonSecondary} onClick={() => setDisconnecting(null)} disabled={Boolean(busy)}>取消</button><button type="button" className={styles.buttonDanger} onClick={() => void disconnect()} disabled={Boolean(busy)}>{activeCount(disconnecting) ? '确认安全检查后解除' : '确认解除连接'}</button></div></section></div>}
+      {disconnecting && (
+        <div className={styles.sheetBackdrop} role="presentation" onClick={() => !busy && setDisconnecting(null)}>
+          <section className={styles.sheet} role="dialog" aria-modal="true" aria-labelledby="disconnect-title" onClick={(event) => event.stopPropagation()}>
+            <h3 id="disconnect-title">确认解除「{disconnecting.alias}」的授权？</h3>
+            {activeCount(disconnecting) > 0 ? (
+              <p className={styles.warning}>检测到 {activeCount(disconnecting)} 个活动实例/任务。解除前必须由服务端执行安全停机检查；若仍无法安全停机，操作会失败，历史记录不会丢失。</p>
+            ) : (
+              <p className={styles.muted}>仅吊销本站的 Google OAuth 授权，账号卡片会保留为「未连接」状态，不会删除历史任务与作品。</p>
+            )}
+            <div className={styles.sheetActions}>
+              <button type="button" className={styles.buttonSecondary} onClick={() => setDisconnecting(null)} disabled={Boolean(busy)}>取消</button>
+              <button type="button" className={styles.buttonDanger} onClick={() => void disconnect()} disabled={Boolean(busy)}>{activeCount(disconnecting) ? '确认安全检查后解除' : '确认解除授权'}</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {deleting && (() => {
+        const deps = driveDependentsOf(deleting);
+        const active = activeCount(deleting);
+        const blocked = deps.length > 0 || active > 0;
+        const ownAuth = hasOwnAuthorization(deleting);
+        return (
+          <div className={styles.sheetBackdrop} role="presentation" onClick={() => !busy && setDeleting(null)}>
+            <section className={styles.sheet} role="dialog" aria-modal="true" aria-labelledby="delete-account-title" onClick={(event) => event.stopPropagation()}>
+              <h3 id="delete-account-title">确认删除账号「{deleting.alias}」？</h3>
+              {deps.length > 0 && (
+                <p className={styles.warning}>
+                  无法删除：以下账号正在复用此账号的 Google Drive 存储 —— <strong>{deps.join('、')}</strong>。请先将它们的「Drive 存储来源」切换为其他账号或本账号独立 Drive 后再删除。
+                </p>
+              )}
+              {active > 0 && (
+                <p className={styles.warning}>
+                  无法删除：检测到 {active} 个活动实例/任务，请先在「算力」页停止并确认释放后再删除。
+                </p>
+              )}
+              {!blocked && (
+                <p className={styles.muted}>
+                  {ownAuth
+                    ? '删除前会先吊销此账号在本站的 Google 授权，并从账号目录中移除。历史任务、作品和 CU 账单不会丢失。'
+                    : '将从账号目录中移除此账号，历史任务、作品和 CU 账单不会丢失。'}
+                </p>
+              )}
+              <div className={styles.sheetActions}>
+                <button type="button" className={styles.buttonSecondary} onClick={() => setDeleting(null)} disabled={Boolean(busy)}>取消</button>
+                <button type="button" className={styles.buttonDanger} onClick={() => void removeAccount()} disabled={Boolean(busy) || blocked}>
+                  确认删除账号
+                </button>
+              </div>
+            </section>
+          </div>
+        );
+      })()}
     </section>
   );
 }

@@ -1010,6 +1010,7 @@ export default function App() {
       const target = e.target as HTMLElement | null;
       const typing = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable);
       if (e.key === 'Escape') {
+        if (document.fullscreenElement) return;
         if (gs.confirmDeleteViewer) gs.setConfirmDeleteViewer(null);
         else if (gs.confirmDeleteNative) gs.setConfirmDeleteNative(null);
         else if (moveDialog) setMoveDialog(null);

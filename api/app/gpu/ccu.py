@@ -175,6 +175,18 @@ def enabled_account(data):
             and data.get("enabled") is not False and not data.get("disabled"))
 
 
+def has_colab_credential(repo, owner, account_id) -> bool:
+    if not account_id or not owner:
+        return False
+    try:
+        from .google import GoogleService
+
+        colab = GoogleService(repo, owner, account_id=account_id).status().get("colab") or {}
+        return bool(colab.get("connected"))
+    except Exception:  # noqa: BLE001 - best-effort capability check
+        return False
+
+
 def accounts(repo, owner):
     return {
         row.get("account_id") or row["id"]: row
@@ -198,10 +210,26 @@ def instance_live_rate(session, owner, account, instance_id):
 
 def snapshots(repo, owner):
     directory = accounts(repo, owner)
+    colab_flags = {key: has_colab_credential(repo, owner, key) for key in directory}
+    real_mode = sample_account_balance is _DEFAULT_SAMPLE_ACCOUNT_BALANCE
     with repo.store.db_lock(), repo.store.Session() as session:
-        return {key: {"alias": row.get("alias"), "balance": None, "rate_hourly": None, "error": None,
-                      **setting(session, _snapshot_key(owner, key))}
-                for key, row in directory.items()}
+        result = {}
+        for key, row in directory.items():
+            saved = setting(session, _snapshot_key(owner, key))
+            colab_connected = colab_flags[key]
+            merged = {
+                "alias": row.get("alias"),
+                "balance": None,
+                "rate_hourly": None,
+                "error": None,
+                **saved,
+                "colab_connected": colab_connected,
+            }
+            # Suppress legacy stale sample_failed errors on accounts that never had Colab authorized.
+            if real_mode and not colab_connected and merged.get("sampled_at") is None:
+                merged["error"] = None
+            result[key] = merged
+        return result
 
 
 def execution_finished(job, now):
@@ -398,27 +426,25 @@ def _sample_lock(repo, owner, account, source):
 def sample_and_record(repo, owner, account, source, *, sampler=None, now=None):
     if not account or (sampler is None and not sampling_enabled()):
         return None
-    if (
-        source == "tick"
-        and sampler is None
-        and sample_account_balance is _DEFAULT_SAMPLE_ACCOUNT_BALANCE
-        and os.getenv("NATIVE_FAST_CONTROL_PLANE", "1").strip().lower() not in {"0", "false", "off", "no"}
-    ):
-        from .google import GoogleService
-
-        # Skip Drive-only or unlinked accounts during periodic background ticks to avoid OAuth log spam.
-        if GoogleService(repo, owner, account_id=account)._credential("colab", account_id=account) is None:
+    real_sampler = sampler is None and sample_account_balance is _DEFAULT_SAMPLE_ACCOUNT_BALANCE
+    if real_sampler:
+        # Never query Colab CU balance for Drive-only or unlinked accounts (manual or tick).
+        if not has_colab_credential(repo, owner, account):
             return None
-        check_now = time.time() if now is None else float(now)
-        with repo.store.db_lock(), repo.store.Session() as session:
-            prev = setting(session, _snapshot_key(owner, account))
         if (
-            prev.get("error") == "sample_failed"
-            and check_now - float(prev.get("attempted_at") or 0) < 300
-            and active_job_count(repo, owner, account) == 0
-            and active_lease_count(repo, owner, account) == 0
+            source == "tick"
+            and os.getenv("NATIVE_FAST_CONTROL_PLANE", "1").strip().lower() not in {"0", "false", "off", "no"}
         ):
-            return None
+            check_now = time.time() if now is None else float(now)
+            with repo.store.db_lock(), repo.store.Session() as session:
+                prev = setting(session, _snapshot_key(owner, account))
+            if (
+                prev.get("error") == "sample_failed"
+                and check_now - float(prev.get("attempted_at") or 0) < 300
+                and active_job_count(repo, owner, account) == 0
+                and active_lease_count(repo, owner, account) == 0
+            ):
+                return None
     with _sample_lock(repo, owner, account, source) as acquired:
         if not acquired:
             return None
@@ -520,9 +546,15 @@ def _detect(snapshots: dict[str, dict], previous: list[dict], now: float) -> lis
 
 
 def balance_snapshots(repo, owner_id, *, sampler=None, source="manual", now=None):
+    real_sampler = sampler is None and sample_account_balance is _DEFAULT_SAMPLE_ACCOUNT_BALANCE
     for account in accounts(repo, owner_id):
+        if real_sampler and not has_colab_credential(repo, owner_id, account):
+            continue
         sample_and_record(repo, owner_id, account, source, sampler=sampler, now=now)
-    return snapshots(repo, owner_id)
+    current = snapshots(repo, owner_id)
+    if real_sampler:
+        return {key: value for key, value in current.items() if value.get("colab_connected")}
+    return current
 
 
 def sync_sessions(repo, owner, now):
@@ -735,6 +767,15 @@ def usage_summary(repo, owner):
     recent_count = recent_page["total"]
     below = {row["account_id"] for row in guard["hard_tripped_accounts"]}
     history = round(sum(entry["actual_cu"] for entry in daily_history), 6)
+    colab_values = {key: value for key, value in values.items() if value.get("colab_connected")}
+    if colab_values:
+        ccu_values = colab_values
+    else:
+        ccu_values = {
+            key: value
+            for key, value in values.items()
+            if value.get("sampled_at") is not None or value.get("balance") is not None
+        }
     return {
         "timezone": settings.studio_timezone, "local_date": date,
         "today_actual_cu": guard["today_actual_cu"], "history_actual_cu": history,
@@ -746,6 +787,7 @@ def usage_summary(repo, owner):
             "account_id": key, "alias": value.get("alias"), "balance": value.get("balance"),
             "rate_hourly": value.get("rate_hourly"), "assignments": value.get("assignments"),
             "sampled_at": value.get("sampled_at"), "error": value.get("error"), "below_floor": key in below,
+            "colab_connected": bool(value.get("colab_connected")),
             **{k: round(by_account.get(key, {}).get(k, 0), 6) for k in ("today_actual_cu", "history_actual_cu")},
         } for key, value in values.items()],
         "actual_units": history, "daily_limit": guard["daily_limit_cu"], "ledger": rows,
@@ -758,5 +800,5 @@ def usage_summary(repo, owner):
                 row["units_actual"] - (row.get("units_estimate", row.get("units")) or 0) for row in legacy_measured
             ), 6) if legacy_measured else None,
         },
-        "ccu": {**summarize(values), "snapshots": values, "anomalies": anomalies},
+        "ccu": {**summarize(ccu_values), "snapshots": ccu_values, "anomalies": anomalies},
     }
