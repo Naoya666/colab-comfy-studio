@@ -216,6 +216,10 @@ test('API key management collapses in weak/open modes, CU UI uses compact popove
   assert.match(viewer, /fullscreenchange/);
   assert.match(viewer, /退出全屏/);
   assert.match(viewer, /styles\.viewerStage/);
+  assert.match(viewer, /styles\.viewerViewport/);
+  assert.match(viewer, /zoomAtPoint/);
+  assert.match(viewer, /toggleDoubleClickZoom/);
   assert.match(app, /if \(document\.fullscreenElement\) return;/);
   assert.match(gpuCss, /\.dialog:fullscreen,[\s\S]*\.assetInspector:fullscreen[\s\S]*--text: #ffffff/);
+  assert.match(gpuCss, /\.dialog:fullscreen \.viewerViewport,[\s\S]*position: absolute;[\s\S]*inset: 0;/);
 });

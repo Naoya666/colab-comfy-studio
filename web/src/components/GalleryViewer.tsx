@@ -1,6 +1,6 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import {
-  ArrowUpRight, ChevronLeft, ChevronRight, Copy, Download, FileCode2, FolderInput, ImagePlus, Maximize2, Minimize2, RotateCcw, Star, Trash2,
+  ArrowUpRight, ChevronLeft, ChevronRight, Copy, Download, FileCode2, FolderInput, ImagePlus, Maximize2, Minimize2, RotateCcw, Star, Trash2, ZoomIn, ZoomOut,
 } from 'lucide-react';
 import {
   apiMessage, assetUrl, fetchNativeOutputBytes,
@@ -11,6 +11,18 @@ import { formatInstanceTime } from '../lib/instance-time';
 import { paramRows } from '../lib/job-detail-copy';
 import { bytesLabel } from '../lib/model-library';
 import { extractPng, MAX_IMAGE, type ExtractedWorkflow } from '../lib/png-workflow';
+import {
+  computeNativeScale,
+  IDENTITY_TRANSFORM,
+  MAX_ZOOM,
+  MIN_ZOOM,
+  panBy,
+  toggleDoubleClickZoom,
+  zoomAtPoint,
+  ZOOM_STEP_FACTOR,
+  type Size2D,
+  type ViewTransform,
+} from '../lib/viewer-zoom';
 import { workflowTitle } from '../lib/workflow-copy';
 import styles from '../gpu.module.css';
 
@@ -75,27 +87,220 @@ export function GalleryViewer({
   const [selectedJson, setSelectedJson] = useState<'workflow' | 'prompt'>('workflow');
   const [importingDraft, setImportingDraft] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [view, setView] = useState<ViewTransform>(IDENTITY_TRANSFORM);
+  const [dragging, setDragging] = useState(false);
+  const [smoothTransform, setSmoothTransform] = useState(false);
+  const [naturalSize, setNaturalSize] = useState<Size2D>({ width: 0, height: 0 });
+  const [stageSize, setStageSize] = useState<Size2D>({ width: 0, height: 0 });
   const headRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const pinchRef = useRef<{ dist: number; scale: number; midX: number; midY: number } | null>(null);
+
+  const assetId = item.asset.id;
+  const mime = item.asset.mime || '';
+  const isImage = mime.startsWith('image/');
+  const canZoom = isFullscreen && isImage;
 
   useEffect(() => {
     function syncFullscreen() {
       const panel = headRef.current?.closest('section') ?? null;
-      setIsFullscreen(Boolean(panel && document.fullscreenElement === panel));
+      const active = Boolean(panel && document.fullscreenElement === panel);
+      setIsFullscreen(active);
+      if (!active) {
+        setView(IDENTITY_TRANSFORM);
+        setDragging(false);
+        setSmoothTransform(false);
+        pointersRef.current.clear();
+        pinchRef.current = null;
+      }
     }
     syncFullscreen();
     document.addEventListener('fullscreenchange', syncFullscreen);
     return () => document.removeEventListener('fullscreenchange', syncFullscreen);
   }, []);
 
-  const assetId = item.asset.id;
   useEffect(() => {
     setExtracted(null);
     setExtractError('');
     setExtracting(false);
+    setView(IDENTITY_TRANSFORM);
+    setDragging(false);
+    setSmoothTransform(false);
+    pointersRef.current.clear();
+    pinchRef.current = null;
+    if (imgRef.current?.complete && imgRef.current.naturalWidth > 0) {
+      setNaturalSize({ width: imgRef.current.naturalWidth, height: imgRef.current.naturalHeight });
+    } else {
+      setNaturalSize({ width: 0, height: 0 });
+    }
   }, [assetId, item.kind]);
 
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el || !isFullscreen) return;
+    if (imgRef.current?.complete && imgRef.current.naturalWidth > 0) {
+      setNaturalSize({ width: imgRef.current.naturalWidth, height: imgRef.current.naturalHeight });
+    }
+    const measure = () => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        setStageSize({ width: rect.width, height: rect.height });
+      }
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [isFullscreen]);
+
+  const getBaseImageSize = useCallback((): Size2D => {
+    const img = imgRef.current;
+    if (img && img.offsetWidth > 0 && img.offsetHeight > 0) {
+      return { width: img.offsetWidth, height: img.offsetHeight };
+    }
+    if (naturalSize.width > 0 && naturalSize.height > 0 && stageSize.width > 0 && stageSize.height > 0) {
+      const fit = Math.min(stageSize.width / naturalSize.width, stageSize.height / naturalSize.height);
+      return { width: naturalSize.width * fit, height: naturalSize.height * fit };
+    }
+    return stageSize;
+  }, [naturalSize, stageSize]);
+
+  const nativeScale = canZoom ? computeNativeScale(naturalSize, getBaseImageSize()) : null;
+
+  const zoomCenterBy = useCallback((factor: number) => {
+    setSmoothTransform(true);
+    setView((curr) => zoomAtPoint(curr, curr.scale * factor, 0, 0, getBaseImageSize()));
+  }, [getBaseImageSize]);
+
+  const zoomToScale = useCallback((target: number) => {
+    setSmoothTransform(true);
+    setView((curr) => zoomAtPoint(curr, target, 0, 0, getBaseImageSize()));
+  }, [getBaseImageSize]);
+
+  const resetZoom = useCallback(() => {
+    setSmoothTransform(true);
+    setView(IDENTITY_TRANSFORM);
+  }, []);
+
+  // Non-passive wheel zoom anchored at cursor position in fullscreen image mode.
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el || !canZoom) return;
+    function onWheel(event: WheelEvent) {
+      event.preventDefault();
+      const rect = el!.getBoundingClientRect();
+      const cx = event.clientX - (rect.left + rect.width / 2);
+      const cy = event.clientY - (rect.top + rect.height / 2);
+      const clampedDelta = Math.max(-240, Math.min(240, event.deltaY));
+      const factor = Math.exp(-clampedDelta * 0.0022);
+      setSmoothTransform(false);
+      setView((curr) => zoomAtPoint(curr, curr.scale * factor, cx, cy, getBaseImageSize()));
+    }
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [canZoom, getBaseImageSize]);
+
+  // Keyboard zoom shortcuts (+, -, 0) in fullscreen image mode.
+  useEffect(() => {
+    if (!canZoom) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === '+' || event.key === '=') {
+        event.preventDefault();
+        zoomCenterBy(ZOOM_STEP_FACTOR);
+      } else if (event.key === '-' || event.key === '_') {
+        event.preventDefault();
+        zoomCenterBy(1 / ZOOM_STEP_FACTOR);
+      } else if (event.key === '0') {
+        event.preventDefault();
+        resetZoom();
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [canZoom, zoomCenterBy, resetZoom]);
+
+  function handleStagePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (!canZoom) return;
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    const el = stageRef.current;
+    if (!el) return;
+    el.setPointerCapture(event.pointerId);
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    setSmoothTransform(false);
+    if (pointersRef.current.size === 2) {
+      const [a, b] = [...pointersRef.current.values()];
+      pinchRef.current = {
+        dist: Math.hypot(b.x - a.x, b.y - a.y) || 1,
+        scale: view.scale,
+        midX: (a.x + b.x) / 2,
+        midY: (a.y + b.y) / 2,
+      };
+      setDragging(true);
+    } else if (pointersRef.current.size === 1 && view.scale > MIN_ZOOM + 0.01) {
+      setDragging(true);
+    }
+  }
+
+  function handleStagePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (!canZoom || !pointersRef.current.has(event.pointerId)) return;
+    const prev = pointersRef.current.get(event.pointerId)!;
+    const currPt = { x: event.clientX, y: event.clientY };
+    pointersRef.current.set(event.pointerId, currPt);
+
+    if (pointersRef.current.size === 2 && pinchRef.current && stageRef.current) {
+      const [a, b] = [...pointersRef.current.values()];
+      const dist = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      const midX = (a.x + b.x) / 2;
+      const midY = (a.y + b.y) / 2;
+      const rect = stageRef.current.getBoundingClientRect();
+      const anchorX = midX - (rect.left + rect.width / 2);
+      const anchorY = midY - (rect.top + rect.height / 2);
+      const dx = midX - pinchRef.current.midX;
+      const dy = midY - pinchRef.current.midY;
+      const targetScale = pinchRef.current.scale * (dist / pinchRef.current.dist);
+      pinchRef.current.midX = midX;
+      pinchRef.current.midY = midY;
+      const baseSize = getBaseImageSize();
+      setView((curr) => {
+        const shifted = panBy(curr, dx, dy, baseSize);
+        return zoomAtPoint(shifted, targetScale, anchorX, anchorY, baseSize);
+      });
+      return;
+    }
+
+    if (pointersRef.current.size === 1) {
+      const dx = currPt.x - prev.x;
+      const dy = currPt.y - prev.y;
+      if (dx !== 0 || dy !== 0) {
+        setView((curr) => panBy(curr, dx, dy, getBaseImageSize()));
+      }
+    }
+  }
+
+  function handleStagePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    pointersRef.current.delete(event.pointerId);
+    if (pointersRef.current.size < 2) {
+      pinchRef.current = null;
+    }
+    if (pointersRef.current.size === 0) {
+      setDragging(false);
+    }
+  }
+
+  function handleStageDoubleClick(event: React.MouseEvent<HTMLDivElement>) {
+    if (!canZoom || !stageRef.current) return;
+    const rect = stageRef.current.getBoundingClientRect();
+    const clickX = event.clientX - (rect.left + rect.width / 2);
+    const clickY = event.clientY - (rect.top + rect.height / 2);
+    setSmoothTransform(true);
+    setView((curr) => toggleDoubleClickZoom(curr, clickX, clickY, getBaseImageSize()));
+  }
+
   const title = item.asset.filename || item.asset.id;
-  const mime = item.asset.mime || '';
   const mediaSrc = item.kind === 'studio' ? assetUrl(item.asset) : item.asset.content_url;
   const downloadHref = item.kind === 'studio'
     ? assetUrl(item.asset)
@@ -191,6 +396,49 @@ export function GalleryViewer({
               </button>
             </div>
           )}
+          {canZoom && (
+            <div className={styles.viewerZoomGroup} role="group" aria-label="图片缩放控制">
+              <button
+                type="button"
+                className="button secondary small"
+                aria-label="缩小"
+                title="缩小 (-)"
+                disabled={view.scale <= MIN_ZOOM + 0.01}
+                onClick={() => zoomCenterBy(1 / ZOOM_STEP_FACTOR)}
+              >
+                <ZoomOut size={14} strokeWidth={1.7} aria-hidden />
+              </button>
+              <button
+                type="button"
+                className={`button secondary small ${styles.viewerZoomPct}`}
+                aria-label="重置缩放为适应屏幕"
+                title="点击复位适应屏幕 (0)"
+                onClick={resetZoom}
+              >
+                {Math.round(view.scale * 100)}%
+              </button>
+              <button
+                type="button"
+                className="button secondary small"
+                aria-label="放大"
+                title="以屏幕中心放大 (+)"
+                disabled={view.scale >= MAX_ZOOM - 0.01}
+                onClick={() => zoomCenterBy(ZOOM_STEP_FACTOR)}
+              >
+                <ZoomIn size={14} strokeWidth={1.7} aria-hidden />
+              </button>
+              {nativeScale !== null && (
+                <button
+                  type="button"
+                  className="button secondary small"
+                  title={Math.abs(view.scale - nativeScale) < 0.08 ? '恢复适应屏幕' : '查看 1:1 原始像素尺寸'}
+                  onClick={() => (Math.abs(view.scale - nativeScale) < 0.08 ? resetZoom() : zoomToScale(nativeScale))}
+                >
+                  {Math.abs(view.scale - nativeScale) < 0.08 ? '适应' : '1:1'}
+                </button>
+              )}
+            </div>
+          )}
           {isFullscreen && (
             <>
               {item.kind === 'studio' ? (
@@ -242,14 +490,39 @@ export function GalleryViewer({
         </div>
       </div>
 
-      <div className={styles.viewerStage}>
-        {mime.startsWith('video/') ? (
-          <video className={styles.viewerVideo} src={mediaSrc} controls autoPlay playsInline />
-        ) : mime.startsWith('image/') ? (
-          <img className={styles.viewerImage} src={mediaSrc} alt="" />
-        ) : (
-          <p className="muted">这是诊断文件，不能直接预览，请下载查看。</p>
-        )}
+      <div
+        ref={stageRef}
+        className={styles.viewerStage}
+        data-zoomable={canZoom}
+        data-zoomed={canZoom && view.scale > MIN_ZOOM + 0.01}
+        data-dragging={canZoom && dragging}
+        onPointerDown={handleStagePointerDown}
+        onPointerMove={handleStagePointerMove}
+        onPointerUp={handleStagePointerUp}
+        onPointerCancel={handleStagePointerUp}
+        onDoubleClick={handleStageDoubleClick}
+      >
+        <div className={styles.viewerViewport}>
+          {mime.startsWith('video/') ? (
+            <video className={styles.viewerVideo} src={mediaSrc} controls autoPlay playsInline />
+          ) : isImage ? (
+            <img
+              ref={imgRef}
+              className={styles.viewerImage}
+              src={mediaSrc}
+              alt=""
+              draggable={false}
+              data-smooth={canZoom && smoothTransform}
+              style={canZoom ? { transform: `translate3d(${view.x}px, ${view.y}px, 0) scale(${view.scale})` } : undefined}
+              onLoad={(event) => {
+                const target = event.currentTarget;
+                setNaturalSize({ width: target.naturalWidth, height: target.naturalHeight });
+              }}
+            />
+          ) : (
+            <p className="muted">这是诊断文件，不能直接预览，请下载查看。</p>
+          )}
+        </div>
       </div>
 
       {!isFullscreen && item.kind === 'studio' && hasStudioInfo && (
