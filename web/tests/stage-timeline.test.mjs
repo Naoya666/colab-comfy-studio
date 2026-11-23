@@ -76,6 +76,21 @@ test('buildNativeStartupStages orders chronologically, denoises fast tail stages
   assert.equal(totalSeconds, 17.4);
   assert.equal(segments.length, 2);
   assert.ok(segments[1].percent > segments[0].percent);
+
+  const failedAlloc = buildNativeStartupStages({
+    state: 'failed',
+    stage: null,
+    timingDetails: {
+      queue: { seconds: 0.6, source: 'events', status: 'completed' },
+      allocate: { seconds: 14.1, source: 'events', status: 'completed' },
+      cleanup: { seconds: 65.6, source: 'events', status: 'completed' },
+    },
+  });
+  assert.deepEqual(failedAlloc.map((s) => [s.key, s.label, s.status]), [
+    ['queue', '排队等待', 'completed'],
+    ['allocate', '分配算力', 'failed'],
+    ['cleanup', '释放算力', 'completed'],
+  ]);
 });
 
 test('buildNativeRestartStages exposes four restart phases with live elapsed and failed phase highlight', async () => {

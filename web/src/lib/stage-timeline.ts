@@ -129,36 +129,53 @@ export function buildNativeStartupStages(params: {
     });
   }
 
-  // Denoise native internal tail stages (upload of native-ready.json & cleanup/retain mark):
-  // hide sub-1.5s framework bookkeeping, or fold slow/active tail into one friendly stage.
-  let finalizeSeconds = 0;
-  let finalizeHasNumeric = false;
-  let finalizeActive = false;
-  for (const key of INTERNAL_FINALIZE_KEYS) {
-    const entry = raw.get(key);
-    if (!entry) continue;
-    if (entry.status === 'in_progress') finalizeActive = true;
-    if (entry.seconds !== null) {
-      finalizeSeconds += entry.seconds;
-      finalizeHasNumeric = true;
-    }
-    raw.delete(key);
-  }
-  if (finalizeActive || (finalizeHasNumeric && finalizeSeconds >= NATIVE_FINALIZE_NOISE_SECONDS)) {
-    raw.set('native_finalize', {
-      seconds: finalizeHasNumeric ? roundTenths(finalizeSeconds) : null,
-      status: finalizeActive ? 'in_progress' : 'completed',
-      source: 'events',
-    });
-  }
-
   const normalizedState = String(state || '').toLowerCase();
   const normalizedStage = String(stage || '').trim();
+  const isFailureOrAbort =
+    normalizedState === 'failed'
+    || normalizedState === 'cancelled'
+    || normalizedState === 'canceled'
+    || normalizedState === 'cancelling'
+    || normalizedState === 'cleanup_pending'
+    || normalizedState === 'cleaning_up';
+
+  // Denoise native internal tail stages (upload of native-ready.json & cleanup/retain mark)
+  // on normal startup paths; on failed/aborted startups keep real cleanup visible as "释放算力".
+  if (!isFailureOrAbort) {
+    let finalizeSeconds = 0;
+    let finalizeHasNumeric = false;
+    let finalizeActive = false;
+    for (const key of INTERNAL_FINALIZE_KEYS) {
+      const entry = raw.get(key);
+      if (!entry) continue;
+      if (entry.status === 'in_progress') finalizeActive = true;
+      if (entry.seconds !== null) {
+        finalizeSeconds += entry.seconds;
+        finalizeHasNumeric = true;
+      }
+      raw.delete(key);
+    }
+    if (finalizeActive || (finalizeHasNumeric && finalizeSeconds >= NATIVE_FINALIZE_NOISE_SECONDS)) {
+      raw.set('native_finalize', {
+        seconds: finalizeHasNumeric ? roundTenths(finalizeSeconds) : null,
+        status: finalizeActive ? 'in_progress' : 'completed',
+        source: 'events',
+      });
+    }
+  } else {
+    // Upload of native-ready.json never succeeds on failure; drop empty/tiny upload noise only.
+    const up = raw.get('upload');
+    if (up && up.status !== 'in_progress' && (up.seconds === null || up.seconds < NATIVE_FINALIZE_NOISE_SECONDS)) {
+      raw.delete('upload');
+    }
+  }
+
   if (normalizedState === 'failed') {
     const orderedForFailure = sortByCanonicalOrder([...raw.keys()]);
+    const nonCleanupOrdered = orderedForFailure.filter((key) => !INTERNAL_FINALIZE_KEYS.has(key));
     const failedKey = normalizedStage && !INTERNAL_FINALIZE_KEYS.has(normalizedStage)
       ? normalizedStage
-      : orderedForFailure[orderedForFailure.length - 1];
+      : (nonCleanupOrdered[nonCleanupOrdered.length - 1] || orderedForFailure[orderedForFailure.length - 1]);
     if (failedKey) {
       const existing = raw.get(failedKey);
       raw.set(failedKey, {

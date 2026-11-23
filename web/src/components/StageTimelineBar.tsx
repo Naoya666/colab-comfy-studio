@@ -19,6 +19,12 @@ export function StageTimelineBar({
   if (!segments.length) return null;
 
   const activeSegment = hoveredKey ? segments.find((seg) => seg.key === hoveredKey) ?? null : null;
+  const formatShare = (seg: { displaySeconds: number; percent: number }) => {
+    if (totalSeconds <= 0) return '';
+    const rounded = Math.round(seg.percent);
+    if (rounded === 0 && seg.displaySeconds > 0) return '<1%';
+    return `${rounded}%`;
+  };
 
   return (
     <div className={styles.stageTimeline} role="group" aria-label={ariaLabel}>
@@ -38,7 +44,7 @@ export function StageTimelineBar({
         {segments.map((seg) => {
           const isHighlighted = hoveredKey === seg.key;
           const isDimmed = hoveredKey !== null && !isHighlighted;
-          const shareLabel = totalSeconds > 0 ? `${Math.round(seg.percent)}%` : '';
+          const shareLabel = formatShare(seg);
           const durationText = seg.seconds !== null ? formatDuration(seg.seconds) : '进行中';
           const tooltip = shareLabel ? `${seg.label} · ${durationText}（${shareLabel}）` : `${seg.label} · ${durationText}`;
           return (
@@ -68,7 +74,7 @@ export function StageTimelineBar({
       <div className={styles.stageLegendRow}>
         <span className={styles.stageLegendHint}>
           {activeSegment
-            ? `${activeSegment.label} · ${activeSegment.seconds !== null ? formatDuration(activeSegment.seconds) : '进行中'}${totalSeconds > 0 ? ` (${Math.round(activeSegment.percent)}%)` : ''}`
+            ? `${activeSegment.label} · ${activeSegment.seconds !== null ? formatDuration(activeSegment.seconds) : '进行中'}${formatShare(activeSegment) ? ` (${formatShare(activeSegment)})` : ''}`
             : '颜色越红代表该阶段耗时越久'}
         </span>
         <span className={styles.stageHeatScale} aria-hidden="true">
@@ -83,7 +89,7 @@ export function StageTimelineBar({
           const isHighlighted = hoveredKey === seg.key;
           const isDimmed = hoveredKey !== null && !isHighlighted;
           const durationText = seg.seconds !== null ? formatDuration(seg.seconds) : '进行中';
-          const shareText = totalSeconds > 0 && seg.seconds !== null ? `${Math.round(seg.percent)}%` : '';
+          const shareText = seg.seconds !== null ? formatShare(seg) : '';
           return (
             <li
               key={seg.key}
