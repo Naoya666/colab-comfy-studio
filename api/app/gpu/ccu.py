@@ -121,6 +121,10 @@ _DEFAULT_SAMPLE_ACCOUNT_BALANCE = sample_account_balance
 def active_lease_count(repo, owner_id: str, account_id: str | None, *, exclude_lease_id: str | None = None) -> int:
     if not account_id:
         return 0
+    if hasattr(repo, "count_active"):
+        return repo.count_active(
+            "leases", owner_id, account_id, states=ACTIVE_LEASE_STATES, exclude_id=exclude_lease_id
+        )
     total = 0
     for lease in repo.list("leases", owner_id):
         if lease.get("account_id") != account_id:
@@ -136,6 +140,8 @@ def active_lease_count(repo, owner_id: str, account_id: str | None, *, exclude_l
 def active_job_count(repo, owner_id: str, account_id: str | None) -> int:
     if not account_id:
         return 0
+    if hasattr(repo, "count_active"):
+        return repo.count_active("jobs", owner_id, account_id, exclude_states=TERMINAL_JOB_STATES)
     total = 0
     for job in repo.list("jobs", owner_id):
         if job.get("account_id") != account_id:
@@ -175,13 +181,13 @@ def enabled_account(data):
             and data.get("enabled") is not False and not data.get("disabled"))
 
 
-def has_colab_credential(repo, owner, account_id) -> bool:
+def has_colab_credential(repo, owner, account_id, *, credentials: list[dict] | None = None) -> bool:
     if not account_id or not owner:
         return False
     try:
         from .google import GoogleService
 
-        colab = GoogleService(repo, owner, account_id=account_id).status().get("colab") or {}
+        colab = GoogleService(repo, owner, account_id=account_id).status(credentials=credentials).get("colab") or {}
         return bool(colab.get("connected"))
     except Exception:  # noqa: BLE001 - best-effort capability check
         return False
@@ -210,7 +216,8 @@ def instance_live_rate(session, owner, account, instance_id):
 
 def snapshots(repo, owner):
     directory = accounts(repo, owner)
-    colab_flags = {key: has_colab_credential(repo, owner, key) for key in directory}
+    creds = repo.list("credentials", owner) if directory else []
+    colab_flags = {key: has_colab_credential(repo, owner, key, credentials=creds) for key in directory}
     real_mode = sample_account_balance is _DEFAULT_SAMPLE_ACCOUNT_BALANCE
     with repo.store.db_lock(), repo.store.Session() as session:
         result = {}

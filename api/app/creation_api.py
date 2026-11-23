@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -597,54 +598,61 @@ def clear_warmups(request: Request, user=Depends(current_user), store=Depends(ge
 async def save_config(body: Config, request: Request, user=Depends(current_user), store=Depends(get_store)):
     admin(user)
     owner = user["id"]
-    cfg = body.model_dump()
-    repo = Repository(store)
-    try:
-        cfg["gpu"] = spec_key(cfg["gpu"])
-        if cfg["gpu"]["variant"] != "VARIANT_GPU":
-            raise ValueError("请选择 GPU 计算规格")
-        execution_policy(cfg)
-    except (ValidationError, ValueError) as exc:
-        raise APIError("CREATION_CONFIG_INVALID", str(exc)) from exc
-    cfg["listen_port"] = validate_listen_port(cfg["listen_port"], kind="creation", store=store, owner=owner)
-    cfg["allowed_origins"] = normalize_origins(cfg["allowed_origins"])
-    cfg["workflow_ids"] = list(dict.fromkeys(cfg["workflow_ids"]))
-    if len(cfg["workflow_ids"]) > 100:
-        raise APIError("CREATION_CONFIG_INVALID", "选择的发布版本数量过多")
-    eligible_ids = {row["id"] for row in eligible(repo, owner)}
-    if set(cfg["workflow_ids"]) - eligible_ids:
-        raise APIError("WORKFLOW_FORBIDDEN", "只能授权仍可执行且通过真实冒烟的发布版本", 409)
-    if cfg["account_id"]:
-        account = repo.get("accounts", cfg["account_id"], owner)
-        if not account or not _account_is_usable(account) or not _google_status(repo, owner, cfg["account_id"])["colab"]["connected"]:
-            raise APIError("ACCOUNT_UNAVAILABLE", "请选择已经授权且允许分配的 Colab 账号", 409)
-    raw_project_id = (cfg.get("project_id") or "").strip()
-    if not raw_project_id or raw_project_id == default_project_id(owner):
-        cfg["project_id"] = None
-    else:
-        target_project = store.get("projects", raw_project_id, owner)
-        if not target_project or target_project.get("archived_at") is not None or target_project.get("system") is True:
-            raise APIError("CREATION_PROJECT_UNAVAILABLE", "请选择有效且未归档的普通项目", 409)
-        cfg["project_id"] = raw_project_id
+    def _validate_cfg():
+        cfg_local = body.model_dump()
+        repo = Repository(store)
+        try:
+            cfg_local["gpu"] = spec_key(cfg_local["gpu"])
+            if cfg_local["gpu"]["variant"] != "VARIANT_GPU":
+                raise ValueError("请选择 GPU 计算规格")
+            execution_policy(cfg_local)
+        except (ValidationError, ValueError) as exc:
+            raise APIError("CREATION_CONFIG_INVALID", str(exc)) from exc
+        cfg_local["listen_port"] = validate_listen_port(cfg_local["listen_port"], kind="creation", store=store, owner=owner)
+        cfg_local["allowed_origins"] = normalize_origins(cfg_local["allowed_origins"])
+        cfg_local["workflow_ids"] = list(dict.fromkeys(cfg_local["workflow_ids"]))
+        if len(cfg_local["workflow_ids"]) > 100:
+            raise APIError("CREATION_CONFIG_INVALID", "选择的发布版本数量过多")
+        eligible_ids = {row["id"] for row in eligible(repo, owner)}
+        if set(cfg_local["workflow_ids"]) - eligible_ids:
+            raise APIError("WORKFLOW_FORBIDDEN", "只能授权仍可执行且通过真实冒烟的发布版本", 409)
+        if cfg_local["account_id"]:
+            account = repo.get("accounts", cfg_local["account_id"], owner)
+            if not account or not _account_is_usable(account) or not _google_status(repo, owner, cfg_local["account_id"])["colab"]["connected"]:
+                raise APIError("ACCOUNT_UNAVAILABLE", "请选择已经授权且允许分配的 Colab 账号", 409)
+        raw_project_id = (cfg_local.get("project_id") or "").strip()
+        if not raw_project_id or raw_project_id == default_project_id(owner):
+            cfg_local["project_id"] = None
+        else:
+            target_project = store.get("projects", raw_project_id, owner)
+            if not target_project or target_project.get("archived_at") is not None or target_project.get("system") is True:
+                raise APIError("CREATION_PROJECT_UNAVAILABLE", "请选择有效且未归档的普通项目", 409)
+            cfg_local["project_id"] = raw_project_id
+        return cfg_local
+
+    cfg = await asyncio.to_thread(_validate_cfg)
 
     mgr = getattr(request.app.state, "port_listeners", None)
     if mgr is not None:
         await mgr.apply("creation", cfg["listen_port"], allow_lan=cfg["allow_lan"], strict=True)
     elif cfg["listen_port"] is not None:
-        probe_port_available(cfg["listen_port"], allow_lan=cfg["allow_lan"])
+        await asyncio.to_thread(probe_port_available, cfg["listen_port"], allow_lan=cfg["allow_lan"])
 
-    ident = f"creation-api:{owner}"
-    with store.admission_lock() as acquired:
-        if not acquired:
-            raise APIError("SCHEDULER_BUSY", "正在保存运行设置，请重试", 503)
-        existing = store.get("settings", ident, owner)
-        patch = {"policy": cfg}
-        if cfg["auth_mode"] in {"url_path", "local_open"} and not (existing and existing.get("path_code")):
-            patch["path_code"] = secrets.token_urlsafe(18)
-        if existing:
-            store.update("settings", ident, patch, owner)
-        else:
-            store.create("settings", owner, patch, record_id=ident)
+    def _persist_cfg():
+        ident = f"creation-api:{owner}"
+        with store.admission_lock() as acquired:
+            if not acquired:
+                raise APIError("SCHEDULER_BUSY", "正在保存运行设置，请重试", 503)
+            existing = store.get("settings", ident, owner)
+            patch = {"policy": cfg}
+            if cfg["auth_mode"] in {"url_path", "local_open"} and not (existing and existing.get("path_code")):
+                patch["path_code"] = secrets.token_urlsafe(18)
+            if existing:
+                store.update("settings", ident, patch, owner)
+            else:
+                store.create("settings", owner, patch, record_id=ident)
+
+    await asyncio.to_thread(_persist_cfg)
     return ok(cfg, request)
 
 
@@ -789,8 +797,13 @@ def models(folder: str | None = None, store=Depends(get_store), key=Depends(auth
 def queue_status(store=Depends(get_store), key=Depends(authorize)):
     repo = Repository(store)
     allowed_wf = set(key["workflow_ids"])
+    active_rows = (
+        repo.list_by_states("jobs", ACTIVE_STATES, key["owner_id"])
+        if hasattr(repo, "list_by_states")
+        else repo.list("jobs", key["owner_id"])
+    )
     rows = [
-        row for row in repo.list("jobs", key["owner_id"])
+        row for row in active_rows
         if row.get("creation_key_id") == key["id"] and row.get("creation_workflow_id") in allowed_wf and is_active(row)
     ]
     rows.sort(key=lambda r: r.get("created_at") or "")
@@ -817,15 +830,18 @@ async def queue_manage(request: Request, store=Depends(get_store), key=Depends(a
         raise APIError("INVALID_JSON", "队列请求必须为有效 JSON") from exc
     deletes = payload.get("delete") if isinstance(payload, dict) else None
     if isinstance(deletes, list):
-        repo = Repository(store)
-        sched = Scheduler(store)
-        allowed_wf = set(key["workflow_ids"])
-        for pid in deletes[:20]:
-            if isinstance(pid, str):
-                job = repo.get("jobs", pid, key["owner_id"])
-                if (job and job.get("creation_key_id") == key["id"]
-                        and job.get("creation_workflow_id") in allowed_wf and is_active(job)):
-                    sched.cancel(key["owner_id"], job["id"])
+        def _cancel_many():
+            repo = Repository(store)
+            sched = Scheduler(store)
+            allowed_wf = set(key["workflow_ids"])
+            for pid in deletes[:20]:
+                if isinstance(pid, str):
+                    job = repo.get("jobs", pid, key["owner_id"])
+                    if (job and job.get("creation_key_id") == key["id"]
+                            and job.get("creation_workflow_id") in allowed_wf and is_active(job)):
+                        sched.cancel(key["owner_id"], job["id"])
+
+        await asyncio.to_thread(_cancel_many)
     return {}
 
 
@@ -901,7 +917,6 @@ def view(filename: str, subfolder: str = "", type: str = "output", store=Depends
 
 @compat.post("/interrupt")
 async def interrupt(request: Request, prompt_id: str | None = None, store=Depends(get_store), key=Depends(authorize)):
-    repo = Repository(store)
     if not prompt_id:
         raw = await request.body()
         if raw and len(raw) <= 8192:
@@ -914,8 +929,13 @@ async def interrupt(request: Request, prompt_id: str | None = None, store=Depend
     if not prompt_id:
         # Tavern 1.19 legacy disconnect sends no prompt ID; BaiBai sends {"prompt_id": "..."}.
         raise APIError("PROMPT_ID_REQUIRED", "取消任务需要明确的 prompt_id", 409)
-    job = own_job(repo, key, prompt_id)
-    Scheduler(store).cancel(key["owner_id"], job["id"])
+
+    def _cancel_one():
+        repo = Repository(store)
+        job = own_job(repo, key, prompt_id)
+        Scheduler(store).cancel(key["owner_id"], job["id"])
+
+    await asyncio.to_thread(_cancel_one)
     return {}
 
 

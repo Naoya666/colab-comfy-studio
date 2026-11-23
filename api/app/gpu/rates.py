@@ -47,9 +47,14 @@ def expected_minutes(
     picked = mode_param(manifest)
     key = picked[0] if picked else None
     # Each run is normalised back to the default size (a 10 s sample must not make 5 s look dear).
+    completed_jobs = (
+        repo.list_by_states("jobs", ("completed",), owner)
+        if hasattr(repo, "list_by_states")
+        else repo.list("jobs", owner)
+    )
     runs = [
         float(j["execution_seconds"]) / 60 / (1.0 if prep else length_factor(manifest, (j.get("snapshot") or {}).get("resolved_params") or {}))
-        for j in sorted(repo.list("jobs", owner), key=lambda j: j.get("execution_ended_at") or 0)
+        for j in sorted(completed_jobs, key=lambda j: j.get("execution_ended_at") or 0)
         if j.get("execution_seconds") and j.get("provider") == "colab"
         and j.get("state") == "completed"
         and bool(j.get("prep")) == prep

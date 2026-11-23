@@ -90,8 +90,13 @@ MODELS.update(
 
 
 def _sqlite_wal(connection, _record) -> None:
-    """WAL 让读不挡写，多个后台循环并发时少很多锁冲突。"""
+    """WAL + memory temp + page cache + mmap to minimize lock contention and disk I/O."""
     connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    connection.execute("PRAGMA cache_size=-16000")
+    connection.execute("PRAGMA mmap_size=67108864")
+    connection.execute("PRAGMA busy_timeout=30000")
 
 
 class Store:
@@ -103,19 +108,32 @@ class Store:
             Path(self.url.removeprefix("sqlite:///")).expanduser().parent.mkdir(parents=True, exist_ok=True)
         # 调度器、看门狗和接口会同时写 SQLite；默认 5 秒锁等待太短，
         # 会直接抛 OperationalError（database is locked）让任务失败（#30）。
-        connect_args = {"check_same_thread": False, "timeout": 30} if self.url.startswith("sqlite") else {}
-        kwargs = {"pool_pre_ping": True}
-        if self.url in {"sqlite:///:memory:", "sqlite://"}:
+        is_sqlite = self.url.startswith("sqlite")
+        is_memory_sqlite = self.url in {"sqlite:///:memory:", "sqlite://"}
+        connect_args = {"check_same_thread": False, "timeout": 30} if is_sqlite else {}
+        kwargs: dict = {}
+        if is_memory_sqlite:
             kwargs["poolclass"] = StaticPool
+        elif is_sqlite:
+            kwargs["pool_size"] = 4
+            kwargs["max_overflow"] = 4
+        else:
+            kwargs["pool_pre_ping"] = True
         self._memory_lock = threading.RLock()
         self._schema_lock = threading.Lock()
         self._gpu_schema_ready = False
+        self._bootstrapped_owners: set[str] = set()
         self._dispatch_state = threading.local()
         self.engine = create_engine(self.url, connect_args=connect_args, **kwargs)
         if self.engine.dialect.name == "sqlite" and self.engine.url.database not in {None, "", ":memory:"}:
             event.listen(self.engine, "connect", _sqlite_wal)
         self.Session = sessionmaker(self.engine, expire_on_commit=False, class_=Session)
         self.create_all()
+
+    def begin_immediate(self, session: Session) -> None:
+        """Acquire SQLite's write lock up front so read-then-write never deadlocks on lock upgrade."""
+        if self.engine.dialect.name == "sqlite":
+            session.execute(text("BEGIN IMMEDIATE"))
 
     def create_all(self) -> None:
         with self.schema_lock():
@@ -188,6 +206,7 @@ class Store:
         )
         with self.db_lock():
             with self.Session.begin() as session:
+                self.begin_immediate(session)
                 session.add(row)
                 session.flush()
         return self._row(row)
@@ -200,6 +219,18 @@ class Store:
                 if owner_id is not None:
                     stmt = stmt.where(model.owner_id == owner_id)
                 return self._row(session.scalar(stmt))
+
+    def get_many(self, kind, ids, owner_id=None) -> dict[str, dict]:
+        unique_ids = list(dict.fromkeys(str(i) for i in ids if isinstance(i, str) and i))
+        if not unique_ids:
+            return {}
+        model = self._model(kind)
+        with self.db_lock():
+            with self.Session() as session:
+                stmt = select(model).where(model.id.in_(unique_ids))
+                if owner_id is not None:
+                    stmt = stmt.where(model.owner_id == owner_id)
+                return {row.id: self._row(row) for row in session.scalars(stmt).all()}
 
     def list(self, kind, owner_id=None, project_id=None):
         model = self._model(kind)
@@ -216,6 +247,7 @@ class Store:
         model = self._model(kind)
         with self.db_lock():
             with self.Session.begin() as session:
+                self.begin_immediate(session)
                 stmt = select(model).where(model.id == id)
                 if owner_id is not None:
                     stmt = stmt.where(model.owner_id == owner_id)
@@ -236,6 +268,7 @@ class Store:
         model = self._model(kind)
         with self.db_lock():
             with self.Session.begin() as session:
+                self.begin_immediate(session)
                 stmt = sql_delete(model).where(model.id == id)
                 if owner_id is not None:
                     stmt = stmt.where(model.owner_id == owner_id)

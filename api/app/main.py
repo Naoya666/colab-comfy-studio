@@ -46,7 +46,7 @@ from .gpu.repository import Repository
 from .gpu.scheduler import Scheduler
 from .history_routes import router as history_router
 from .instance_routes import router as instance_router
-from .job_history import job_timing_details, job_timings
+from .job_history import job_timing_details
 from .job_schemas import JobInput, ReusePreviewInput
 from .model_library_routes import router as model_library_router
 from .native_outputs_routes import router as native_outputs_router
@@ -91,6 +91,10 @@ async def lifespan(app):
         yield
     finally:
         await app.state.port_listeners.shutdown()
+        outputs_client = getattr(app.state, "_native_outputs_http_client", None)
+        if outputs_client is not None:
+            await outputs_client.aclose()
+            app.state._native_outputs_http_client = None
 
 
 app = FastAPI(title="Colab GPU Studio", version=__version__, lifespan=lifespan)
@@ -722,7 +726,7 @@ def clear_job_history(
         target_ids = set(raw_ids)
     include_system = bool(payload.get("include_system"))
     repo = Repository(st)
-    rows = repo.list("jobs", user["id"], project_id)
+    rows = repo.list_by_states("jobs", _TERMINAL_JOB_STATES, user["id"], project_id=project_id)
     now = time.time()
     cleared = 0
     for row in rows:
@@ -752,14 +756,21 @@ def get_job(job_id: str, request: Request, user=Depends(current_user), st=Depend
     repo = Repository(st)
     job = own(repo, "jobs", job_id, user)
     result = public_job(job)
-    result["events"] = [e for e in repo.list("events", user["id"]) if e.get("job_id") == job_id][::-1]
+    result["events"] = repo.list_events_for_job(user["id"], job_id, asc=True)
     result["logs"] = result["events"]
     now = time.time()
-    result["timings"] = job_timings(job, result["events"], now=now)
-    result["timing_details"] = job_timing_details(job, result["events"], now=now)
-    allowed={'id','state','attempt','started_at','finished_at','error_code'}
-    result['attempts']=sorted([{k:v for k,v in row.items() if k in allowed}
-        for row in repo.list('executions',user['id']) if row.get('job_id')==job_id],key=lambda row:row.get('attempt',0))
+    timing_details = job_timing_details(job, result["events"], now=now)
+    result["timing_details"] = timing_details
+    result["timings"] = {
+        name: value["seconds"]
+        for name, value in timing_details.items()
+        if value.get("status") == "completed" and value.get("seconds") is not None
+    }
+    allowed = {"id", "state", "attempt", "started_at", "finished_at", "error_code"}
+    result["attempts"] = sorted(
+        [{k: v for k, v in row.items() if k in allowed} for row in repo.list_executions_for_job(user["id"], job_id)],
+        key=lambda row: row.get("attempt", 0),
+    )
     return ok(result, request)
 
 
@@ -767,7 +778,7 @@ def get_job(job_id: str, request: Request, user=Depends(current_user), st=Depend
 def job_events(job_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
     repo = Repository(st)
     own(repo, "jobs", job_id, user)
-    return ok([e for e in repo.list("events", user["id"]) if e.get("job_id") == job_id][::-1], request)
+    return ok(repo.list_events_for_job(user["id"], job_id, asc=True), request)
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -806,17 +817,19 @@ def retry_attempt(job_id: str, request: Request, user=Depends(current_user), st=
 
 @router.get('/jobs/{job_id}/attempts')
 def job_attempts(job_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
-    repo=Repository(st)
-    own(repo,'jobs',job_id,user)
-    allowed={'id','job_id','state','attempt','started_at','finished_at','error_code','created_at'}
-    rows=[{k:v for k,v in row.items() if k in allowed} for row in repo.list('executions',user['id']) if row.get('job_id')==job_id]
-    return ok(sorted(rows,key=lambda row:row.get('attempt',0)),request)
+    repo = Repository(st)
+    own(repo, "jobs", job_id, user)
+    allowed = {"id", "job_id", "state", "attempt", "started_at", "finished_at", "error_code", "created_at"}
+    rows = [{k: v for k, v in row.items() if k in allowed} for row in repo.list_executions_for_job(user["id"], job_id)]
+    return ok(sorted(rows, key=lambda row: row.get("attempt", 0)), request)
 
 
 @router.get("/jobs/{job_id}/outputs")
 def outputs(job_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
     job = own(Repository(st), "jobs", job_id, user)
-    rows = [own(st, "assets", aid, user) for aid in job.get("output_asset_ids", [])]
+    output_ids = job.get("output_asset_ids", [])
+    asset_map = st.get_many("assets", output_ids, user["id"]) if hasattr(st, "get_many") else {}
+    rows = [asset_map[aid] if aid in asset_map else own(st, "assets", aid, user) for aid in output_ids]
     return ok([public_asset(a) for a in rows], request)
 
 

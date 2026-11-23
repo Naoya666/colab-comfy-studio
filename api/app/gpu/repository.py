@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import Mapping
 
-from sqlalchemy import Index, String, UniqueConstraint, inspect, select, text
+from sqlalchemy import Index, String, UniqueConstraint, func, inspect, literal_column, or_, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -234,6 +234,36 @@ def _initialize_schema(store: Store) -> None:
                         "ON gpu_instances (owner_id, current_job_id)"
                     )
                 )
+                for index_ddl in (
+                    "CREATE INDEX IF NOT EXISTS ix_assets_owner_created ON assets (owner_id, created_at)",
+                    "CREATE INDEX IF NOT EXISTS ix_gpu_jobs_owner_state_created ON gpu_jobs (owner_id, state, created_at)",
+                    "CREATE INDEX IF NOT EXISTS ix_gpu_jobs_state_created ON gpu_jobs (state, created_at)",
+                    "CREATE INDEX IF NOT EXISTS ix_gpu_jobs_owner_instance ON gpu_jobs (owner_id, instance_id)",
+                    "CREATE INDEX IF NOT EXISTS ix_gpu_leases_owner_state ON gpu_leases (owner_id, state)",
+                    "CREATE INDEX IF NOT EXISTS ix_gpu_instances_owner_state ON gpu_instances (owner_id, state)",
+                    "CREATE INDEX IF NOT EXISTS ix_gpu_events_owner_created ON gpu_events (owner_id, created_at)",
+                ):
+                    connection.execute(text(index_ddl))
+                if store.engine.dialect.name == "sqlite":
+                    for expr_ddl in (
+                        "CREATE INDEX IF NOT EXISTS ix_gpu_events_owner_job_id ON gpu_events (owner_id, json_extract(data, '$.job_id'))",
+                        "CREATE INDEX IF NOT EXISTS ix_gpu_events_owner_instance_id ON gpu_events (owner_id, json_extract(data, '$.instance_id'))",
+                        "CREATE INDEX IF NOT EXISTS ix_gpu_executions_owner_job_id ON gpu_executions (owner_id, json_extract(data, '$.job_id'))",
+                    ):
+                        try:
+                            connection.execute(text(expr_ddl))
+                        except OperationalError:
+                            pass
+                elif store.engine.dialect.name == "postgresql":
+                    for expr_ddl in (
+                        "CREATE INDEX IF NOT EXISTS ix_gpu_events_owner_job_id ON gpu_events (owner_id, (data->>'job_id'))",
+                        "CREATE INDEX IF NOT EXISTS ix_gpu_events_owner_instance_id ON gpu_events (owner_id, (data->>'instance_id'))",
+                        "CREATE INDEX IF NOT EXISTS ix_gpu_executions_owner_job_id ON gpu_executions (owner_id, (data->>'job_id'))",
+                    ):
+                        try:
+                            connection.execute(text(expr_ddl))
+                        except OperationalError:
+                            pass
                 # DDL alone cannot reconstruct the v0.2 identity graph.
                 # Keep startup safe and local: this helper only repairs
                 # owner/account/instance identity metadata and never calls
@@ -285,7 +315,11 @@ class Repository:
             "created_at": utc_isoformat(row.created_at),
             "updated_at": utc_isoformat(row.updated_at),
         }
-        result.update({k: copy.deepcopy(v) for k, v in (row.data or {}).items() if k not in reserved})
+        data = row.data
+        if data:
+            for k, v in data.items():
+                if k not in reserved:
+                    result[k] = v
         # v0.2 stores identity in typed columns as well as JSON.  Old rows may
         # have only the typed value after Alembic 0003; expose and reconcile it
         # at the repository boundary instead of silently dropping ownership.
@@ -293,7 +327,7 @@ class Repository:
             if hasattr(row, field):
                 value = getattr(row, field)
                 if value is not None:
-                    result[field] = copy.deepcopy(value)
+                    result[field] = value
         if isinstance(row, GpuWorkflowRow):
             workflow_version = row.workflow_version
             if isinstance(workflow_version, str) and workflow_version.isdigit():
@@ -305,7 +339,8 @@ class Repository:
         if row.version:
             result["version"] = row.version
         if isinstance(row, GpuJobRow):
-            result.update(idempotency_key=row.idempotency_key, body_hash=row.body_hash)
+            result["idempotency_key"] = row.idempotency_key
+            result["body_hash"] = row.body_hash
         return result
 
     def create(self, kind, owner_id, data, project_id=None, record_id=None):
@@ -357,6 +392,7 @@ class Repository:
             )
         try:
             with self.store.db_lock(), self.store.Session.begin() as session:
+                self.store.begin_immediate(session)
                 row = model(**kwargs)
                 session.add(row)
                 session.flush()
@@ -385,6 +421,184 @@ class Repository:
             if kind == "workflows" and not include_deleted:
                 stmt = stmt.where(model.state.is_distinct_from("deleted"))
             return [self._row(row) for row in session.scalars(stmt).all()]
+
+    def list_by_states(
+        self, kind, states, owner_id=None, *, exclude: bool = False, order_asc: bool = False, project_id=None
+    ):
+        model = self._model(kind)
+        state_list = tuple(states)
+        if not state_list and not exclude:
+            return []
+        with self.store.db_lock(), self.store.Session() as session:
+            order_col = model.created_at.asc() if order_asc else model.created_at.desc()
+            stmt = select(model).order_by(order_col)
+            if owner_id is not None:
+                stmt = stmt.where(model.owner_id == owner_id)
+            if project_id is not None:
+                stmt = stmt.where(model.project_id == project_id)
+            if state_list:
+                if exclude:
+                    stmt = stmt.where(or_(model.state.is_(None), model.state.notin_(state_list)))
+                else:
+                    stmt = stmt.where(model.state.in_(state_list))
+            return [self._row(row) for row in session.scalars(stmt).all()]
+
+    def list_jobs_for_instance(self, owner_id: str, instance_id: str) -> list[dict]:
+        with self.store.db_lock(), self.store.Session() as session:
+            stmt = (
+                select(GpuJobRow)
+                .where(GpuJobRow.owner_id == owner_id, GpuJobRow.instance_id == instance_id)
+                .order_by(GpuJobRow.created_at.desc())
+            )
+            return [self._row(row) for row in session.scalars(stmt).all()]
+
+    def list_jobs_by_ids(self, owner_id: str | None, job_ids) -> dict[str, dict]:
+        unique_ids = list(dict.fromkeys(str(j) for j in job_ids if isinstance(j, str) and j))
+        if not unique_ids:
+            return {}
+        with self.store.db_lock(), self.store.Session() as session:
+            stmt = select(GpuJobRow).where(GpuJobRow.id.in_(unique_ids))
+            if owner_id is not None:
+                stmt = stmt.where(GpuJobRow.owner_id == owner_id)
+            return {row.id: self._row(row) for row in session.scalars(stmt).all()}
+
+    def get_by_idempotency_key(self, kind: str, owner_id: str, key: str) -> dict | None:
+        model = self._model(kind)
+        with self.store.db_lock(), self.store.Session() as session:
+            stmt = select(model).where(model.owner_id == owner_id, model.idempotency_key == key)
+            return self._row(session.scalar(stmt))
+
+    def get_workflow(self, owner_id: str, workflow_key: str, workflow_version, *, include_deleted: bool = False) -> dict | None:
+        with self.store.db_lock(), self.store.Session() as session:
+            stmt = select(GpuWorkflowRow).where(
+                GpuWorkflowRow.owner_id == owner_id,
+                GpuWorkflowRow.workflow_key == workflow_key,
+                GpuWorkflowRow.workflow_version == str(workflow_version),
+            )
+            if not include_deleted:
+                stmt = stmt.where(GpuWorkflowRow.state.is_distinct_from("deleted"))
+            row = self._row(session.scalar(stmt))
+            if row is not None and row.get("workflow_version") == workflow_version:
+                return row
+            return None
+
+    def _json_field_expr(self, model, field: str):
+        if self.store.engine.dialect.name == "sqlite":
+            return literal_column(f"json_extract(data, '$.{field}')")
+        return model.data[field].as_string()
+
+    def list_events_for_job(self, owner_id: str, job_id: str, *, asc: bool = True) -> list[dict]:
+        with self.store.db_lock(), self.store.Session() as session:
+            expr = self._json_field_expr(GpuEventRow, "job_id")
+            order_col = GpuEventRow.created_at.asc() if asc else GpuEventRow.created_at.desc()
+            stmt = (
+                select(GpuEventRow)
+                .where(GpuEventRow.owner_id == owner_id, expr == job_id)
+                .order_by(order_col, GpuEventRow.id.asc() if asc else GpuEventRow.id.desc())
+            )
+            return [self._row(row) for row in session.scalars(stmt).all()]
+
+    def list_events_for_jobs(self, owner_id: str, job_ids, *, asc: bool = True) -> list[dict]:
+        unique_ids = list(dict.fromkeys(str(j) for j in job_ids if isinstance(j, str) and j))
+        if not unique_ids:
+            return []
+        with self.store.db_lock(), self.store.Session() as session:
+            expr = self._json_field_expr(GpuEventRow, "job_id")
+            order_col = GpuEventRow.created_at.asc() if asc else GpuEventRow.created_at.desc()
+            stmt = (
+                select(GpuEventRow)
+                .where(GpuEventRow.owner_id == owner_id, expr.in_(unique_ids))
+                .order_by(order_col, GpuEventRow.id.asc() if asc else GpuEventRow.id.desc())
+            )
+            return [self._row(row) for row in session.scalars(stmt).all()]
+
+    def list_events_for_instance(self, owner_id: str, instance_id: str, *, asc: bool = False) -> list[dict]:
+        with self.store.db_lock(), self.store.Session() as session:
+            expr = self._json_field_expr(GpuEventRow, "instance_id")
+            order_col = GpuEventRow.created_at.asc() if asc else GpuEventRow.created_at.desc()
+            stmt = (
+                select(GpuEventRow)
+                .where(GpuEventRow.owner_id == owner_id, expr == instance_id)
+                .order_by(order_col)
+            )
+            return [self._row(row) for row in session.scalars(stmt).all()]
+
+    def list_events_for_instances(self, owner_id: str, instance_ids, *, asc: bool = False) -> list[dict]:
+        unique_ids = list(dict.fromkeys(str(i) for i in instance_ids if isinstance(i, str) and i))
+        if not unique_ids:
+            return []
+        with self.store.db_lock(), self.store.Session() as session:
+            expr = self._json_field_expr(GpuEventRow, "instance_id")
+            order_col = GpuEventRow.created_at.asc() if asc else GpuEventRow.created_at.desc()
+            stmt = (
+                select(GpuEventRow)
+                .where(GpuEventRow.owner_id == owner_id, expr.in_(unique_ids))
+                .order_by(order_col)
+            )
+            return [self._row(row) for row in session.scalars(stmt).all()]
+
+    def list_executions_for_job(self, owner_id: str, job_id: str) -> list[dict]:
+        with self.store.db_lock(), self.store.Session() as session:
+            expr = self._json_field_expr(GpuExecutionRow, "job_id")
+            stmt = (
+                select(GpuExecutionRow)
+                .where(GpuExecutionRow.owner_id == owner_id, expr == job_id)
+                .order_by(GpuExecutionRow.created_at.asc())
+            )
+            return [self._row(row) for row in session.scalars(stmt).all()]
+
+    def count_active(
+        self,
+        kind: str,
+        owner_id: str,
+        account_id: str,
+        *,
+        states=None,
+        exclude_states=None,
+        exclude_id: str | None = None,
+    ) -> int:
+        model = self._model(kind)
+        with self.store.db_lock(), self.store.Session() as session:
+            stmt = select(func.count(model.id)).where(
+                model.owner_id == owner_id,
+                model.account_id == account_id,
+            )
+            if states is not None:
+                stmt = stmt.where(model.state.in_(tuple(states)))
+            if exclude_states is not None:
+                stmt = stmt.where(or_(model.state.is_(None), model.state.notin_(tuple(exclude_states))))
+            if exclude_id is not None:
+                stmt = stmt.where(model.id != exclude_id)
+            return int(session.scalar(stmt) or 0)
+
+    def has_unscoped_legacy_rows(self, owner_id: str) -> bool:
+        """Fast SQL existence check replacing full-table scans in AccountService._ensure_default."""
+        with self.store.db_lock(), self.store.Session() as session:
+            for model in (GpuJobRow, GpuLeaseRow, GpuInstanceRow):
+                stmt = (
+                    select(model.id)
+                    .where(model.owner_id == owner_id, or_(model.account_id.is_(None), model.account_id == ""))
+                    .limit(1)
+                )
+                if session.scalar(stmt) is not None:
+                    return True
+            cred_stmt = (
+                select(GpuCredentialRow)
+                .where(
+                    GpuCredentialRow.owner_id == owner_id,
+                    or_(GpuCredentialRow.account_id.is_(None), GpuCredentialRow.account_id == ""),
+                )
+            )
+            for row in session.scalars(cred_stmt).all():
+                if (row.data or {}).get("purpose") in {"colab", "drive"}:
+                    return True
+            return False
+
+    def distinct_owners(self, kind: str) -> set[str]:
+        model = self._model(kind)
+        with self.store.db_lock(), self.store.Session() as session:
+            rows = session.scalars(select(model.owner_id).where(model.owner_id.is_not(None)).distinct()).all()
+            return {str(owner) for owner in rows if owner}
 
     def delete_workflow(self, owner_id, workflow_id):
         with self.store.db_lock(), self.store.Session.begin() as session:
@@ -434,15 +648,13 @@ class Repository:
     def update(self, kind, id, patch, owner_id=None):
         model = self._model(kind)
         with self.store.db_lock(), self.store.Session.begin() as session:
-            # SQLite ignores FOR UPDATE. Serialize workflow writers before
-            # reading so validation cannot overwrite a concurrent deletion.
-            if kind in {"workflows", "jobs"} and self.store.engine.dialect.name == "sqlite":
-                session.execute(text("BEGIN IMMEDIATE"))
+            # SQLite ignores FOR UPDATE; acquire write lock upfront before read.
+            self.store.begin_immediate(session)
             stmt = select(model).where(model.id == id)
             if owner_id is not None:
                 stmt = stmt.where(model.owner_id == owner_id)
             if kind == "workflows":
-                stmt = stmt.where(model.state.is_distinct_from("deleted")).with_for_update()
+                stmt = stmt.where(model.state.is_distinct_from("deleted"))
             row = session.scalar(stmt.with_for_update())
             if row is None:
                 raise KeyError(id)
@@ -480,6 +692,7 @@ class Repository:
     def delete(self, kind, id, owner_id=None):
         model = self._model(kind)
         with self.store.db_lock(), self.store.Session.begin() as session:
+            self.store.begin_immediate(session)
             stmt = select(model).where(model.id == id)
             if owner_id is not None:
                 stmt = stmt.where(model.owner_id == owner_id)
@@ -495,6 +708,7 @@ class Repository:
         for attempt in range(8):
             try:
                 with self.store.db_lock(), self.store.Session.begin() as session:
+                    self.store.begin_immediate(session)
                     existing = session.scalar(
                         select(GpuJobRow).where(
                             GpuJobRow.owner_id == owner_id, GpuJobRow.idempotency_key == idempotency_key

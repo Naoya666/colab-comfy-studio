@@ -14,6 +14,21 @@ from .common import APIError, current_user, ok
 from .gpu import native_outputs
 
 router = APIRouter(prefix="/api/gpu/native/outputs")
+_ORIGINAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+def _get_stream_client(app) -> tuple[httpx.AsyncClient, bool]:
+    """Reuse a persistent Drive streaming client in production; honor monkeypatches in tests."""
+    if app is not None and httpx.AsyncClient is _ORIGINAL_ASYNC_CLIENT:
+        client = getattr(app.state, "_native_outputs_http_client", None)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=15.0),
+                limits=httpx.Limits(max_connections=40, max_keepalive_connections=20),
+            )
+            app.state._native_outputs_http_client = client
+        return client, False
+    return httpx.AsyncClient(timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=15.0)), True
 
 
 def _etag_matches(header: str | None, etag: str) -> bool:
@@ -138,12 +153,13 @@ async def output_content(
         headers["If-None-Match"] = if_none_match
     url = f"{base_url}/files/{quote(file_id, safe='')}?alt=media"
 
-    client = httpx.AsyncClient(timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=15.0))
+    client, owns_client = _get_stream_client(request.app)
     req = client.build_request("GET", url, headers=headers)
     try:
         upstream = await client.send(req, stream=True)
     except httpx.HTTPError as exc:
-        await client.aclose()
+        if owns_client:
+            await client.aclose()
         raise APIError("DRIVE_STREAM_FAILED", "连接 Google Drive 流式读取失败", 502, True) from exc
 
     if upstream.status_code == 304:
@@ -155,13 +171,15 @@ async def output_content(
         if etag_val:
             not_modified_headers["ETag"] = etag_val
         await upstream.aclose()
-        await client.aclose()
+        if owns_client:
+            await client.aclose()
         return Response(status_code=304, headers=not_modified_headers)
 
     if upstream.status_code not in {200, 206}:
         status = upstream.status_code
         await upstream.aclose()
-        await client.aclose()
+        if owns_client:
+            await client.aclose()
         raise APIError("DRIVE_STREAM_FAILED", f"读取 Drive 原生作品失败（HTTP {status}）", 502 if status >= 500 else status)
 
     resp_headers: dict[str, str] = {
@@ -185,7 +203,8 @@ async def output_content(
                 yield chunk
         finally:
             await upstream.aclose()
-            await client.aclose()
+            if owns_client:
+                await client.aclose()
 
     return StreamingResponse(
         body_stream(),

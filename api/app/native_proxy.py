@@ -168,7 +168,7 @@ class NativeGateway:
                 return await response(scope, receive, send)
 
             if request.method == "OPTIONS" and headers.get("access-control-request-method"):
-                cors_headers = self._preflight_cors(repo, scope, headers, route_token)
+                cors_headers = await asyncio.to_thread(self._preflight_cors, repo, scope, headers, route_token)
                 return await Response(
                     status_code=204 if cors_headers else 403,
                     headers={"Cache-Control": "no-store", **cors_headers},
@@ -570,8 +570,15 @@ class NativeGateway:
             headers = [(k, v) for k, v in headers if k.lower() not in {"origin", "referer"}]
             headers += list(auth.items())
             protocols = scope.get("subprotocols") or None
-            async with connect(url.replace("https://", "wss://", 1), origin=base, additional_headers=headers,
-                               subprotocols=protocols, max_size=None, open_timeout=15) as upstream:
+            async with connect(
+                url.replace("https://", "wss://", 1),
+                origin=base,
+                additional_headers=headers,
+                subprotocols=protocols,
+                max_size=32 * 1024 * 1024,
+                compression=None,
+                open_timeout=15,
+            ) as upstream:
                 await ws.accept(subprotocol=upstream.subprotocol)
 
                 async def browser_to_upstream():

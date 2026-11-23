@@ -113,14 +113,18 @@ class AccountService:
         # Existing explicit accounts must remain untouched, but they do not
         # prove that unscoped pre-v0.2 rows were repaired.  Materialize the
         # deterministic default whenever a legacy row still lacks identity.
-        legacy = [
-            *[row for row in self._rows("credentials") if row.get("purpose") in {"colab", "drive"}],
-            *self._rows("jobs"),
-            *self._rows("leases"),
-            *self._rows("instances"),
-        ]
-        if not any(row.get("account_id") in (None, "") for row in legacy):
-            return
+        if hasattr(self.repo, "has_unscoped_legacy_rows"):
+            if not self.repo.has_unscoped_legacy_rows(self.owner_id):
+                return
+        else:
+            legacy = [
+                *[row for row in self._rows("credentials") if row.get("purpose") in {"colab", "drive"}],
+                *self._rows("jobs"),
+                *self._rows("leases"),
+                *self._rows("instances"),
+            ]
+            if not any(row.get("account_id") in (None, "") for row in legacy):
+                return
         account_id = self.default_account_id(self.owner_id)
         if self._get(account_id) is None:
             data = {
@@ -183,18 +187,27 @@ class AccountService:
                 return str(target.get("account_id") or target.get("id"))
         return account_id
 
-    def _status(self, account_id: str, enabled: bool, drive_account_id: str | None = None) -> tuple[str, dict[str, dict], str | None]:
+    def _status(
+        self,
+        account_id: str,
+        enabled: bool,
+        drive_account_id: str | None = None,
+        *,
+        accounts_by_id: dict[str, dict] | None = None,
+        credentials: list[dict] | None = None,
+    ) -> tuple[str, dict[str, dict], str | None]:
         from .google import GoogleService
 
         google = GoogleService(self.repo, self.owner_id, account_id=account_id)
-        authorization = google.status()
+        authorization = google.status(credentials=credentials)
         drive_alias = None
         if isinstance(drive_account_id, str) and drive_account_id.strip() and drive_account_id.strip() != account_id:
-            target = self._get(drive_account_id.strip())
+            target_key = drive_account_id.strip()
+            target = accounts_by_id.get(target_key) if accounts_by_id is not None else self._get(target_key)
             if target:
                 target_id = str(target.get("account_id") or target.get("id"))
                 drive_alias = self._clean_text(target.get("alias"), 80, "主账号")
-                target_drive = GoogleService(self.repo, self.owner_id, account_id=target_id).status().get("drive") or {}
+                target_drive = GoogleService(self.repo, self.owner_id, account_id=target_id).status(credentials=credentials).get("drive") or {}
                 authorization["drive"] = {
                     **target_drive,
                     "delegated_to": target_id,
@@ -205,7 +218,7 @@ class AccountService:
                     "connected": False,
                     "configured": authorization.get("drive", {}).get("configured", False),
                     "expires_at": None,
-                    "delegated_to": drive_account_id.strip(),
+                    "delegated_to": target_key,
                     "message": "绑定的Drive账号不存在，请重新选择",
                 }
         if not enabled:
@@ -216,20 +229,38 @@ class AccountService:
             return "connected", authorization, drive_alias
         return "not_connected", authorization, drive_alias
 
-    def _drive_dependents(self, account_id: str) -> list[str]:
+    def _drive_dependents(self, account_id: str, *, all_accounts: list[dict] | None = None) -> list[str]:
+        rows = all_accounts if all_accounts is not None else self._rows("accounts")
         return [
             self._clean_text(item.get("alias"), 80, str(item.get("account_id") or item.get("id"))[:8])
-            for item in self._rows("accounts")
+            for item in rows
             if str(item.get("account_id") or item.get("id")) != account_id
             and item.get("drive_account_id") == account_id
         ]
 
-    def _public(self, row: dict) -> dict:
+    def _public(
+        self,
+        row: dict,
+        *,
+        all_accounts: list[dict] | None = None,
+        accounts_by_id: dict[str, dict] | None = None,
+        instances_by_account: dict[str, list[dict]] | None = None,
+        credentials: list[dict] | None = None,
+    ) -> dict:
         account_id = str(row.get("account_id") or row.get("id"))
         raw_drive_id = row.get("drive_account_id")
         drive_account_id = raw_drive_id.strip() if isinstance(raw_drive_id, str) and raw_drive_id.strip() and raw_drive_id.strip() != account_id else None
-        status, authorization, drive_alias = self._status(account_id, row.get("enabled", True) is not False, drive_account_id)
-        instances = [item for item in self._rows("instances") if item.get("account_id") == account_id]
+        status, authorization, drive_alias = self._status(
+            account_id,
+            row.get("enabled", True) is not False,
+            drive_account_id,
+            accounts_by_id=accounts_by_id,
+            credentials=credentials,
+        )
+        if instances_by_account is not None:
+            instances = instances_by_account.get(account_id, [])
+        else:
+            instances = [item for item in self._rows("instances") if item.get("account_id") == account_id]
         result = {
             "account_id": account_id,
             "alias": self._clean_text(row.get("alias"), 80, "未命名账号"),
@@ -237,7 +268,7 @@ class AccountService:
             "allow_allocation": bool(row.get("allow_allocation", False)),
             "drive_account_id": drive_account_id,
             "drive_account_alias": drive_alias,
-            "drive_dependents": self._drive_dependents(account_id),
+            "drive_dependents": self._drive_dependents(account_id, all_accounts=all_accounts),
             "projects": list(row.get("projects") or []),
             "workflows": list(row.get("workflows") or []),
             "budget": dict(row.get("budget") or {}) if isinstance(row.get("budget") or {}, dict) else row.get("budget"),
@@ -254,7 +285,26 @@ class AccountService:
 
     def list(self) -> list[dict]:
         self._ensure_default()
-        return [self._public(row) for row in self._rows("accounts")]
+        all_accounts = self._rows("accounts")
+        if not all_accounts:
+            return []
+        accounts_by_id = {str(item.get("account_id") or item.get("id")): item for item in all_accounts}
+        credentials = self._rows("credentials")
+        instances_by_account: dict[str, list[dict]] = {}
+        for inst in self._rows("instances"):
+            aid = inst.get("account_id")
+            if aid:
+                instances_by_account.setdefault(aid, []).append(inst)
+        return [
+            self._public(
+                row,
+                all_accounts=all_accounts,
+                accounts_by_id=accounts_by_id,
+                instances_by_account=instances_by_account,
+                credentials=credentials,
+            )
+            for row in all_accounts
+        ]
 
     def require(self, account_id: str) -> dict:
         self._ensure_default()

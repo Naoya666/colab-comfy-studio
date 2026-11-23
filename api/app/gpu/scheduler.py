@@ -174,6 +174,17 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
     def _list(self, kind: str, owner_id: str | None = None) -> list[dict]:
         return list(self.store.list(kind, owner_id=owner_id))
 
+    def _list_by_states(
+        self, kind: str, states, owner_id: str | None = None, *, exclude: bool = False
+    ) -> list[dict]:
+        if hasattr(self.store, "list_by_states"):
+            return list(self.store.list_by_states(kind, states, owner_id=owner_id, exclude=exclude))
+        rows = self._list(kind, owner_id)
+        wanted = set(states)
+        if exclude:
+            return [row for row in rows if row.get("state") not in wanted]
+        return [row for row in rows if row.get("state") in wanted]
+
     def _get(self, kind: str, record_id: str, owner_id: str | None = None) -> dict | None:
         return self.store.get(kind, record_id, owner_id=owner_id)
 
@@ -253,7 +264,9 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             job.get("account_id") or policy.get("account_id"), job.get("instance_id") or policy.get("instance_id"),
         )
 
-    def _leases_for(self, owner_id: str | None = None) -> list[dict]:
+    def _leases_for(self, owner_id: str | None = None, *, active_only: bool = False) -> list[dict]:
+        if active_only:
+            return self._list_by_states("leases", ("deleted",), owner_id, exclude=True)
         return self._list("leases", owner_id)
 
     @staticmethod
@@ -261,7 +274,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         return lease.get("state") in {"creating", "active", "busy", "idle", "cleanup_pending", "quarantined", "releasing", "deleting"}
 
     def _has_capacity_blocker(self, job: dict) -> bool:
-        return any(self._lease_blocks(x) and x.get("owner_job_id") != job["id"] for x in self._leases_for())
+        return any(self._lease_blocks(x) and x.get("owner_job_id") != job["id"] for x in self._leases_for(active_only=True))
 
     def _await_prep(self, job: dict) -> bool:
         """A GPU job waits for its workflow's CPU cache prep; the prep job is created on the first miss.
@@ -1592,10 +1605,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         now = self.clock()
         rr = self._rr_state()
         stalled: dict[str, int] = rr["stalled"]
-        jobs = self._list("jobs")
-        active_ids = {job["id"] for job in jobs if job.get("state") in ACTIVE_STATES}
+        jobs = self._list_by_states("jobs", ACTIVE_STATES)
+        active_ids = {job["id"] for job in jobs}
         for stale_id in [jid for jid in stalled if jid not in active_ids]:
             stalled.pop(stale_id, None)
+        if not jobs:
+            return None, None
         jobs.sort(
             key=lambda x: (
                 # Cleanup goes first; a job parked on its cache prep goes last so it cannot starve its prep job.
@@ -1639,7 +1654,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
 
     def _next_job(self) -> dict | None:
         return next(
-            (x for x in self._list("jobs") if x.get("state") in ACTIVE_STATES and not x.get("claim_token")),
+            (x for x in self._list_by_states("jobs", ACTIVE_STATES) if not x.get("claim_token")),
             None,
         )
 
@@ -1688,7 +1703,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
 
     def stop(self, owner_id: str) -> dict:
         count = 0
-        for job in self._list("jobs", owner_id):
+        for job in self._list_by_states("jobs", TERMINAL_STATES, owner_id, exclude=True):
             if job.get("state") not in TERMINAL_STATES:
                 self.cancel(owner_id, job["id"])
                 count += 1

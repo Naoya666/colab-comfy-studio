@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Request
 
 from .common import APIError, current_user, get_store, ok
 from .gpu.repository import Repository
-from .job_history import job_timing_details, job_timings, safe_history_value, safe_log
+from .job_history import job_timing_details, safe_history_value, safe_log
 from .presenters import public_job
 
 router = APIRouter(prefix="/api/gpu")
@@ -29,9 +29,26 @@ def _get(repo, kind: str, record_id: str, owner: str):
         return next((row for row in repo.list(kind, owner) if row.get("id") == record_id), None)
 
 
-def _events(repo, owner: str, job_id: str):
-    rows = [row for row in repo.list("events", owner) if row.get("job_id") == job_id]
-    return sorted(rows, key=lambda row: str(row.get("created_at") or ""))
+def _events_by_job(repo, owner: str, job_ids: list[str]) -> dict[str, list[dict]]:
+    if not job_ids:
+        return {}
+    if hasattr(repo, "list_events_for_jobs"):
+        rows = repo.list_events_for_jobs(owner, job_ids, asc=True)
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            jid = row.get("job_id")
+            if jid:
+                grouped.setdefault(jid, []).append(row)
+        return grouped
+    wanted = set(job_ids)
+    grouped = {}
+    for row in repo.list("events", owner):
+        jid = row.get("job_id")
+        if jid in wanted:
+            grouped.setdefault(jid, []).append(row)
+    for items in grouped.values():
+        items.sort(key=lambda row: str(row.get("created_at") or ""))
+    return grouped
 
 
 def _public_event(event: dict) -> dict:
@@ -56,8 +73,7 @@ def _public_asset(asset: dict) -> dict:
     return result
 
 
-def _history_job(repo, owner: str, job: dict, assets: dict[str, dict], *, now: float | None = None) -> dict:
-    events = _events(repo, owner, job["id"])
+def _history_job(job: dict, events: list[dict], assets: dict[str, dict], *, now: float | None = None) -> dict:
     public = safe_history_value(public_job(job))
     error = None
     if job.get("error_code") or job.get("error_message"):
@@ -69,16 +85,38 @@ def _history_job(repo, owner: str, job: dict, assets: dict[str, dict], *, now: f
     logs = [_public_event(event) for event in events]
     if error and error.get("message"):
         logs.append({"source": "job", "state": job.get("state"), "message": error["message"]})
+    timing_details = job_timing_details(job, events, now=now)
+    timings = {
+        name: value["seconds"]
+        for name, value in timing_details.items()
+        if value.get("status") == "completed" and value.get("seconds") is not None
+    }
     return {
         **public,
         "job_id": job["id"],
-        "timings": job_timings(job, events, now=now),
-        "timing_details": job_timing_details(job, events, now=now),
+        "timings": timings,
+        "timing_details": timing_details,
         "events": logs,
         "logs": logs,
         "error": error,
         "artifacts": output_assets,
     }
+
+
+def _load_assets(st, repo, owner: str, asset_ids: set[str]) -> dict[str, dict]:
+    if not asset_ids:
+        return {}
+    if hasattr(st, "get_many"):
+        return st.get_many("assets", asset_ids, owner)
+    if hasattr(st, "get"):
+        result = {}
+        for aid in asset_ids:
+            row = st.get("assets", aid, owner)
+            if row:
+                result[aid] = row
+        return result
+    # Fallback for minimal unit-test stubs that store assets on a fake repo object.
+    return {asset["id"]: asset for asset in repo.list("assets", owner) if asset.get("id") in asset_ids}
 
 
 @router.get("/instances/{instance_id}/history")
@@ -88,10 +126,14 @@ def instance_history(instance_id: str, request: Request, user=Depends(current_us
     instance = _get(repo, "instances", instance_id, owner)
     if not isinstance(instance, dict):
         raise APIError("NOT_FOUND", "实例不存在或不属于当前用户", 404)
-    jobs = [row for row in repo.list("jobs", owner) if row.get("instance_id") == instance_id]
+    if hasattr(repo, "list_jobs_for_instance"):
+        jobs = repo.list_jobs_for_instance(owner, instance_id)
+    else:
+        jobs = [row for row in repo.list("jobs", owner) if row.get("instance_id") == instance_id]
     jobs.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
     asset_ids = {asset_id for job in jobs for asset_id in (job.get("output_asset_ids") or []) if isinstance(asset_id, str)}
-    assets = {asset_id: asset for asset_id in asset_ids for asset in repo.list("assets", owner) if asset.get("id") == asset_id}
+    assets = _load_assets(st, repo, owner, asset_ids)
+    events_map = _events_by_job(repo, owner, [job["id"] for job in jobs])
     now = time.time()
     return ok({
         "instance_id": instance_id,
@@ -99,7 +141,7 @@ def instance_history(instance_id: str, request: Request, user=Depends(current_us
         "source": "persisted_job_history",
         "live_runtime": False,
         "remote_actions": False,
-        "jobs": [_history_job(repo, owner, job, assets, now=now) for job in jobs],
+        "jobs": [_history_job(job, events_map.get(job["id"], []), assets, now=now) for job in jobs],
     }, request)
 
 

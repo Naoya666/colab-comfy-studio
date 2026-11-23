@@ -7,7 +7,8 @@ import io
 import re
 import threading
 import time
-from collections import deque
+import uuid
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -47,10 +48,22 @@ LIST_CACHE_TTL = 60.0
 MAX_OUTPUT_FILES = 3000
 MAX_OUTPUT_FOLDERS = 250
 MAX_OUTPUT_DEPTH = 6
+MAX_BULK_PAGES = 25
 MAX_THUMB_SOURCE_BYTES = 32 * 1024 * 1024
 
 _LIST_LOCK = threading.Lock()
 _LIST_CACHE: dict[tuple[str, str], tuple[float, list[dict[str, Any]], str | None]] = {}
+_SCAN_LOCKS_GUARD = threading.Lock()
+_SCAN_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+
+
+def _scan_lock_for(cache_key: tuple[str, str]) -> threading.Lock:
+    with _SCAN_LOCKS_GUARD:
+        lock = _SCAN_LOCKS.get(cache_key)
+        if lock is None:
+            lock = threading.Lock()
+            _SCAN_LOCKS[cache_key] = lock
+        return lock
 
 
 def invalidate_native_outputs_cache(owner_id: str | None = None) -> None:
@@ -125,9 +138,15 @@ def _clear_thumbs(owner_id: str, file_id: str) -> None:
         item.unlink(missing_ok=True)
 
 
-def _find_output_folder(drive: DriveStorage, owner_id: str) -> str | None:
+def _find_owner_folder(drive: DriveStorage, owner_id: str) -> str | None:
     root_id = None
-    for row in drive._repo_files():
+    files = drive._repo_files()
+    for row in files:
+        if row.get("kind") == "drive_folder" and row.get("folder_key") == "owner" and drive._account_matches(row):
+            remote_id = row.get("remote_id")
+            if isinstance(remote_id, str) and remote_id:
+                return remote_id
+    for row in files:
         if row.get("kind") == "drive_root" and drive._account_matches(row):
             remote_id = row.get("remote_id") or row.get("root_id")
             if isinstance(remote_id, str) and remote_id:
@@ -137,13 +156,140 @@ def _find_output_folder(drive: DriveStorage, owner_id: str) -> str | None:
         root_id = drive._find_folder("AI-Studio", "root")
     if not root_id:
         return None
-    owner_folder = drive._find_folder(owner_id, root_id)
+    return drive._find_folder(owner_id, root_id)
+
+
+def _find_output_folder(drive: DriveStorage, owner_id: str) -> str | None:
+    owner_folder = _find_owner_folder(drive, owner_id)
     if not owner_folder:
         return None
     native_folder = drive._find_folder("native-comfy", owner_folder)
     if not native_folder:
         return None
     return drive._find_folder("output", native_folder)
+
+
+def _build_output_item(
+    entry: dict[str, Any],
+    subfolder: str,
+    account_id: str | None,
+    account_alias: str | None,
+) -> dict[str, Any] | None:
+    fid = str(entry.get("id") or "")
+    name = str(entry.get("name") or "")
+    raw_mime = str(entry.get("mimeType") or "")
+    if not fid or not name:
+        return None
+    mime = _infer_media_mime(name, raw_mime)
+    if not mime:
+        return None
+    img_meta = entry.get("imageMediaMetadata") if isinstance(entry.get("imageMediaMetadata"), dict) else {}
+    vid_meta = entry.get("videoMediaMetadata") if isinstance(entry.get("videoMediaMetadata"), dict) else {}
+    width = _int_or_none(img_meta.get("width") or vid_meta.get("width"))
+    height = _int_or_none(img_meta.get("height") or vid_meta.get("height"))
+    rel_path = f"{subfolder}/{name}" if subfolder else name
+    md5 = entry.get("md5Checksum")
+    modified = entry.get("modifiedTime") or entry.get("createdTime")
+    rev = str(md5 or modified or "0")
+    return {
+        "id": fid,
+        "filename": name,
+        "subfolder": subfolder,
+        "path": rel_path,
+        "mime": mime,
+        "size": _int_or_none(entry.get("size")) or 0,
+        "width": width,
+        "height": height,
+        "md5": md5,
+        "modified_at": modified,
+        "created_at": entry.get("createdTime"),
+        "thumbnail_link": entry.get("thumbnailLink"),
+        "revision": rev,
+        "thumbnail_url": f"/api/gpu/native/outputs/{quote(fid, safe='')}/thumbnail?v={quote(rev[:16], safe='')}",
+        "content_url": f"/api/gpu/native/outputs/{quote(fid, safe='')}/content",
+        "account_id": account_id,
+        "account_alias": account_alias,
+    }
+
+
+def _bulk_scan_output_tree(
+    drive: DriveStorage,
+    owner_folder: str,
+    account_id: str | None,
+    account_alias: str | None,
+) -> tuple[list[dict[str, Any]], str | None] | None:
+    """Fetch app-visible Drive entries in bulk (1-2 API calls instead of N subfolder BFS calls)."""
+    fields = (
+        "nextPageToken,files("
+        "id,name,mimeType,size,parents,md5Checksum,createdTime,modifiedTime,thumbnailLink,"
+        "imageMediaMetadata(width,height),videoMediaMetadata(width,height,durationMillis)"
+        ")"
+    )
+    children: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    page_token: str | None = None
+    pages = 0
+    while True:
+        if pages >= MAX_BULK_PAGES:
+            return None
+        params: dict[str, str] = {
+            "q": "trashed = false",
+            "pageSize": "1000",
+            "fields": fields,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        response = drive._request("GET", drive.base_url + "/files", params=params)
+        payload = drive._ensure_ok(response, "原生作品目录读取")
+        pages += 1
+        for entry in payload.get("files") or []:
+            if not isinstance(entry, dict):
+                continue
+            parents = entry.get("parents")
+            if isinstance(parents, list):
+                for parent_id in parents:
+                    if isinstance(parent_id, str) and parent_id:
+                        children[parent_id].append(entry)
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            break
+
+    native_folder = next(
+        (e["id"] for e in children.get(owner_folder, ()) if e.get("mimeType") == FOLDER_MIME and e.get("name") == "native-comfy" and e.get("id")),
+        None,
+    )
+    if not native_folder:
+        return [], None
+    output_folder = next(
+        (e["id"] for e in children.get(native_folder, ()) if e.get("mimeType") == FOLDER_MIME and e.get("name") == "output" and e.get("id")),
+        None,
+    )
+    if not output_folder:
+        return [], None
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    queue: deque[tuple[str, str, int]] = deque([(output_folder, "", 0)])
+    visited_folders = 0
+    while queue and visited_folders < MAX_OUTPUT_FOLDERS and len(items) < MAX_OUTPUT_FILES:
+        folder_id, subfolder, depth = queue.popleft()
+        visited_folders += 1
+        for entry in children.get(folder_id, ()):
+            fid = str(entry.get("id") or "")
+            name = str(entry.get("name") or "")
+            if not fid or not name or fid in seen:
+                continue
+            if entry.get("mimeType") == FOLDER_MIME:
+                if depth < MAX_OUTPUT_DEPTH:
+                    next_sub = f"{subfolder}/{name}" if subfolder else name
+                    queue.append((fid, next_sub, depth + 1))
+                continue
+            built = _build_output_item(entry, subfolder, account_id, account_alias)
+            if built is not None:
+                seen.add(fid)
+                items.append(built)
+                if len(items) >= MAX_OUTPUT_FILES:
+                    break
+    return items, output_folder
 
 
 def _scan_output_tree(
@@ -162,93 +308,93 @@ def _scan_output_tree(
             if cached and now - cached[0] < LIST_CACHE_TTL:
                 return cached[1], cached[2], cached[0]
 
-    output_folder = _find_output_folder(drive, owner_id)
-    if not output_folder:
-        with _LIST_LOCK:
-            _LIST_CACHE[cache_key] = (now, [], None)
-        return [], None, now
+    # Single-flight lock per (owner, account) prevents concurrent thumbnail requests
+    # from triggering duplicate Drive directory scans on a cold cache.
+    with _scan_lock_for(cache_key):
+        now = time.time()
+        if not force_refresh:
+            with _LIST_LOCK:
+                cached = _LIST_CACHE.get(cache_key)
+                if cached and now - cached[0] < LIST_CACHE_TTL:
+                    return cached[1], cached[2], cached[0]
 
-    items: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    queue: deque[tuple[str, str, int]] = deque([(output_folder, "", 0)])
-    visited_folders = 0
-    fields = (
-        "nextPageToken,files("
-        "id,name,mimeType,size,md5Checksum,createdTime,modifiedTime,thumbnailLink,"
-        "imageMediaMetadata(width,height),videoMediaMetadata(width,height,durationMillis)"
-        ")"
-    )
+        owner_folder = _find_owner_folder(drive, owner_id)
+        if not owner_folder:
+            with _LIST_LOCK:
+                _LIST_CACHE[cache_key] = (now, [], None)
+            return [], None, now
 
-    while queue and visited_folders < MAX_OUTPUT_FOLDERS and len(items) < MAX_OUTPUT_FILES:
-        folder_id, subfolder, depth = queue.popleft()
-        visited_folders += 1
-        page_token: str | None = None
-        while len(items) < MAX_OUTPUT_FILES:
-            params: dict[str, str] = {
-                "q": f"'{drive._q(folder_id)}' in parents and trashed = false",
-                "pageSize": "200",
-                "orderBy": "modifiedTime desc",
-                "fields": fields,
-            }
-            if page_token:
-                params["pageToken"] = page_token
-            response = drive._request("GET", drive.base_url + "/files", params=params)
-            payload = drive._ensure_ok(response, "原生作品目录读取")
-            for entry in payload.get("files") or []:
-                if not isinstance(entry, dict):
-                    continue
-                fid = str(entry.get("id") or "")
-                name = str(entry.get("name") or "")
-                raw_mime = str(entry.get("mimeType") or "")
-                if not fid or not name or fid in seen:
-                    continue
-                if raw_mime == FOLDER_MIME:
-                    if depth < MAX_OUTPUT_DEPTH:
-                        next_sub = f"{subfolder}/{name}" if subfolder else name
-                        queue.append((fid, next_sub, depth + 1))
-                    continue
-                mime = _infer_media_mime(name, raw_mime)
-                if not mime:
-                    continue
-                seen.add(fid)
-                img_meta = entry.get("imageMediaMetadata") if isinstance(entry.get("imageMediaMetadata"), dict) else {}
-                vid_meta = entry.get("videoMediaMetadata") if isinstance(entry.get("videoMediaMetadata"), dict) else {}
-                width = _int_or_none(img_meta.get("width") or vid_meta.get("width"))
-                height = _int_or_none(img_meta.get("height") or vid_meta.get("height"))
-                rel_path = f"{subfolder}/{name}" if subfolder else name
-                md5 = entry.get("md5Checksum")
-                modified = entry.get("modifiedTime") or entry.get("createdTime")
-                rev = str(md5 or modified or "0")
-                items.append({
-                    "id": fid,
-                    "filename": name,
-                    "subfolder": subfolder,
-                    "path": rel_path,
-                    "mime": mime,
-                    "size": _int_or_none(entry.get("size")) or 0,
-                    "width": width,
-                    "height": height,
-                    "md5": md5,
-                    "modified_at": modified,
-                    "created_at": entry.get("createdTime"),
-                    "thumbnail_link": entry.get("thumbnailLink"),
-                    "revision": rev,
-                    "thumbnail_url": f"/api/gpu/native/outputs/{quote(fid, safe='')}/thumbnail?v={quote(rev[:16], safe='')}",
-                    "content_url": f"/api/gpu/native/outputs/{quote(fid, safe='')}/content",
-                    "account_id": account_id,
-                    "account_alias": account_alias,
-                })
-                if len(items) >= MAX_OUTPUT_FILES:
+        bulk = _bulk_scan_output_tree(drive, owner_folder, account_id, account_alias)
+        if bulk is not None:
+            items, output_folder = bulk
+            items.sort(key=lambda row: str(row.get("modified_at") or ""), reverse=True)
+            scanned_at = time.time()
+            with _LIST_LOCK:
+                _LIST_CACHE[cache_key] = (scanned_at, items, output_folder)
+            return items, output_folder, scanned_at
+
+        native_folder = drive._find_folder("native-comfy", owner_folder)
+        output_folder = drive._find_folder("output", native_folder) if native_folder else None
+        if not output_folder:
+            with _LIST_LOCK:
+                _LIST_CACHE[cache_key] = (now, [], None)
+            return [], None, now
+
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        queue: deque[tuple[str, str, int]] = deque([(output_folder, "", 0)])
+        visited_folders = 0
+        fields = (
+            "nextPageToken,files("
+            "id,name,mimeType,size,md5Checksum,createdTime,modifiedTime,thumbnailLink,"
+            "imageMediaMetadata(width,height),videoMediaMetadata(width,height,durationMillis)"
+            ")"
+        )
+
+        while queue and visited_folders < MAX_OUTPUT_FOLDERS and len(items) < MAX_OUTPUT_FILES:
+            folder_id, subfolder, depth = queue.popleft()
+            visited_folders += 1
+            page_token: str | None = None
+            while len(items) < MAX_OUTPUT_FILES:
+                params: dict[str, str] = {
+                    "q": f"'{drive._q(folder_id)}' in parents and trashed = false",
+                    "pageSize": "200",
+                    "orderBy": "modifiedTime desc",
+                    "fields": fields,
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                response = drive._request("GET", drive.base_url + "/files", params=params)
+                payload = drive._ensure_ok(response, "原生作品目录读取")
+                for entry in payload.get("files") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    fid = str(entry.get("id") or "")
+                    name = str(entry.get("name") or "")
+                    raw_mime = str(entry.get("mimeType") or "")
+                    if not fid or not name or fid in seen:
+                        continue
+                    if raw_mime == FOLDER_MIME:
+                        if depth < MAX_OUTPUT_DEPTH:
+                            next_sub = f"{subfolder}/{name}" if subfolder else name
+                            queue.append((fid, next_sub, depth + 1))
+                        continue
+                    built = _build_output_item(entry, subfolder, account_id, account_alias)
+                    if built is None:
+                        continue
+                    seen.add(fid)
+                    items.append(built)
+                    if len(items) >= MAX_OUTPUT_FILES:
+                        break
+                page_token = payload.get("nextPageToken")
+                if not page_token:
                     break
-            page_token = payload.get("nextPageToken")
-            if not page_token:
-                break
 
-    items.sort(key=lambda row: str(row.get("modified_at") or ""), reverse=True)
-    scanned_at = time.time()
-    with _LIST_LOCK:
-        _LIST_CACHE[cache_key] = (scanned_at, items, output_folder)
-    return items, output_folder, scanned_at
+        items.sort(key=lambda row: str(row.get("modified_at") or ""), reverse=True)
+        scanned_at = time.time()
+        with _LIST_LOCK:
+            _LIST_CACHE[cache_key] = (scanned_at, items, output_folder)
+        return items, output_folder, scanned_at
 
 
 def _public_output_item(item: dict[str, Any], favorites: set[str]) -> dict[str, Any]:
@@ -426,6 +572,18 @@ def _encode_webp_thumbnail(raw_bytes: bytes) -> bytes:
         return out.getvalue()
 
 
+def _cached_item_for_owner(owner_id: str, file_id: str) -> dict[str, Any] | None:
+    now = time.time()
+    with _LIST_LOCK:
+        for (cached_owner, _account), (cached_at, items, _folder) in _LIST_CACHE.items():
+            if cached_owner != owner_id or now - cached_at >= LIST_CACHE_TTL:
+                continue
+            for row in items:
+                if row.get("id") == file_id:
+                    return row
+    return None
+
+
 def get_native_output_thumbnail(
     repo,
     owner_id: str,
@@ -433,6 +591,17 @@ def get_native_output_thumbnail(
     *,
     drive: DriveStorage | None = None,
 ) -> tuple[bytes, str]:
+    if not FILE_ID_RE.fullmatch(file_id or ""):
+        raise APIError("INVALID_FILE_ID", "无效的原生作品文件 ID", 400)
+    # Fast path: if the owner's fresh directory index confirms file_id and the WebP
+    # thumbnail already exists on disk, serve directly without Drive/Account DB lookups.
+    if drive is None:
+        cached_item = _cached_item_for_owner(owner_id, file_id)
+        if cached_item is not None:
+            fast_file = _thumb_path(owner_id, file_id, str(cached_item.get("revision") or "0"))
+            if fast_file.is_file():
+                return fast_file.read_bytes(), "image/webp"
+
     item, storage, owns = resolve_output_item(repo, owner_id, file_id, drive=drive)
     try:
         cache_file = _thumb_path(owner_id, file_id, str(item.get("revision") or "0"))
@@ -474,9 +643,12 @@ def get_native_output_thumbnail(
         except Exception as exc:  # noqa: BLE001
             raise APIError("THUMBNAIL_UNAVAILABLE", "无法解码原生作品缩略图", 404) from exc
 
-        tmp = cache_file.with_suffix(".webp.tmp")
-        tmp.write_bytes(webp)
-        tmp.replace(cache_file)
+        tmp = cache_file.with_name(f"{cache_file.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_bytes(webp)
+            tmp.replace(cache_file)
+        except OSError:
+            tmp.unlink(missing_ok=True)
         return webp, "image/webp"
     finally:
         if owns and storage._owns_client:

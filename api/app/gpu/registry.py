@@ -79,6 +79,11 @@ class Registry:
         return [row for row in rows if model_id is None or row.get("model_id") == model_id]
 
     def get_workflow(self, owner_id, key, version):
+        if hasattr(self.repo, "get_workflow"):
+            row = self.repo.get_workflow(owner_id, key, version)
+            if row is not None:
+                return row
+            raise KeyError(f"workflow {key}@{version}不存在")
         for row in self.workflows(owner_id):
             if row.get("workflow_key") == key and row.get("workflow_version") == version:
                 return row
@@ -162,6 +167,15 @@ class Registry:
         seed_builtin_templates(self, owner_id)
         return {"models": self.models(owner_id), "demo_workflow": demo}
 
+    def ensure_bootstrapped(self, owner_id):
+        bootstrapped = getattr(self.repo.store, "_bootstrapped_owners", None)
+        if bootstrapped is not None and owner_id in bootstrapped:
+            return None
+        result = self.bootstrap(owner_id)
+        if bootstrapped is not None:
+            bootstrapped.add(owner_id)
+        return result
+
     def bootstrap(self, owner_id):
         # Store.dispatch_lock is cross-process for file SQLite/Postgres and
         # shared across in-memory Store instances.  Retry rather than allowing
@@ -169,7 +183,11 @@ class Registry:
         for attempt in range(100):
             with self.repo.dispatch_lock() as acquired:
                 if acquired:
-                    return self._bootstrap_locked(owner_id)
+                    result = self._bootstrap_locked(owner_id)
+                    bootstrapped = getattr(self.repo.store, "_bootstrapped_owners", None)
+                    if bootstrapped is not None:
+                        bootstrapped.add(owner_id)
+                    return result
             time.sleep(0.005 * min(attempt + 1, 10))
         raise RuntimeError("workflow bootstrap锁获取失败")
 

@@ -43,6 +43,7 @@ _SAFE_HEADER_RE = re.compile(r"^[\x21-\x7e]{4,512}$")
 _CACHE_TTL_SECONDS = 2.0
 _CACHE_LOCK = threading.Lock()
 _ROW_CACHE: dict[tuple[int, str], tuple[float, dict | None]] = {}
+_RESOLVED_CACHE: dict[tuple[int | None, str, bool], tuple[float, ResolvedNativeConfig]] = {}
 
 
 @dataclass(frozen=True)
@@ -102,11 +103,15 @@ def invalidate_cache(store_or_repo=None, owner: str | None = None) -> None:
     with _CACHE_LOCK:
         if store is None and owner is None:
             _ROW_CACHE.clear()
+            _RESOLVED_CACHE.clear()
             return
         store_id = id(store) if store is not None else None
         for key in list(_ROW_CACHE):
             if (store_id is None or key[0] == store_id) and (owner is None or key[1] == owner):
                 _ROW_CACHE.pop(key, None)
+        for key in list(_RESOLVED_CACHE):
+            if (store_id is None or key[0] == store_id) and (owner is None or key[1] == owner):
+                _RESOLVED_CACHE.pop(key, None)
 
 
 def _load_db_row(store_or_repo, owner: str = "owner", *, use_cache: bool = True) -> dict | None:
@@ -186,6 +191,15 @@ def resolve(
     file_reader: Callable[[str], str] | None = None,
     strict_decrypt: bool = True,
 ) -> ResolvedNativeConfig:
+    store = _unwrap_store(store_or_repo)
+    can_cache = use_cache and file_reader is None and _cache_allowed()
+    resolved_key = (id(store) if store is not None else None, owner, strict_decrypt)
+    now = time.monotonic()
+    if can_cache:
+        with _CACHE_LOCK:
+            cached_resolved = _RESOLVED_CACHE.get(resolved_key)
+            if cached_resolved is not None and now - cached_resolved[0] < _CACHE_TTL_SECONDS:
+                return cached_resolved[1]
     row = _load_db_row(store_or_repo, owner, use_cache=use_cache)
     has_db = row is not None
 
@@ -251,7 +265,7 @@ def resolve(
         tunnel = env_tunnel
         tunnel_source = "environment" if tunnel else "unconfigured"
 
-    return ResolvedNativeConfig(
+    resolved = ResolvedNativeConfig(
         native_comfy_url=url,
         native_comfy_url_source=url_source,
         native_comfy_backend_url=backend_url,
@@ -267,6 +281,10 @@ def resolve(
         has_db_override=has_db,
         updated_at=(row or {}).get("updated_at"),
     )
+    if can_cache:
+        with _CACHE_LOCK:
+            _RESOLVED_CACHE[resolved_key] = (now, resolved)
+    return resolved
 
 
 def public_url(store_or_repo=None, owner: str = "owner", *, use_cache: bool = True) -> str:

@@ -72,10 +72,21 @@ class SchedulerInstancesMixin:
             return job
         return self._update("jobs", job["id"], patch, job.get("owner_id"))
 
-    def _service_instances(self) -> list[dict]:
+    def _service_instances(self, *, states: tuple[str, ...] | None = None) -> list[dict]:
         if self.instance_service is None:
             return []
-        owners = {job.get("owner_id") for job in self._list("jobs") if job.get("owner_id")}
+        if hasattr(self.store, "distinct_owners"):
+            owners = self.store.distinct_owners("instances")
+        else:
+            owners = {job.get("owner_id") for job in self._list("jobs") if job.get("owner_id")}
+        if not owners:
+            return []
+        if states is not None:
+            result = []
+            for owner in owners:
+                for state in states:
+                    result.extend(self.instance_service.list(owner, state=state))
+            return result
         return [item for owner in owners for item in self.instance_service.list(owner)]
 
     def _service_instance_for_job(self, job: dict) -> dict | None:

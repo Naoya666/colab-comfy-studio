@@ -80,7 +80,8 @@ def lease_storage(repo, lease):
 def model_channel(lease_id, tunnel_token=None, *, repo=None, owner="owner"):
     token = tunnel_token
     if not token:
-        cfg = native_config.resolve(repo, owner, use_cache=False, file_reader=secret_file)
+        reader = None if secret_file is _default_secret_file else secret_file
+        cfg = native_config.resolve(repo, owner, use_cache=True, file_reader=reader)
         token = cfg.tunnel_token or secret_file("NATIVE_COMFY_TUNNEL_TOKEN_FILE")
     return hmac.new(token.encode(), ("native-models:" + lease_id).encode(), hashlib.sha256).hexdigest()
 
@@ -107,8 +108,12 @@ def secret_file(name):
     return value
 
 
+_default_secret_file = secret_file
+
+
 def backend(repo=None, owner="owner"):
-    cfg = native_config.resolve(repo, owner, use_cache=False, file_reader=secret_file)
+    reader = None if secret_file is _default_secret_file else secret_file
+    cfg = native_config.resolve(repo, owner, use_cache=True, file_reader=reader)
     url = cfg.native_comfy_backend_url.rstrip("/")
     p = urlsplit(url)
     if p.scheme != "https" or not p.hostname or p.username or p.password or p.path or p.query or p.fragment:
@@ -137,9 +142,15 @@ def backend_for(repo=None, owner="owner"):
     return backend(repo, owner)
 
 
+_INACTIVE_LEASE_STATES = ("deleted", "quarantined", "releasing", "deleting")
+
+
 def active_lease(repo, owner="owner"):
-    return next((x for x in repo.list("leases", owner)
-                 if x.get("native_comfy") and x.get("state") not in {"deleted", "quarantined", "releasing", "deleting"}), None)
+    if hasattr(repo, "list_by_states"):
+        rows = repo.list_by_states("leases", _INACTIVE_LEASE_STATES, owner, exclude=True)
+    else:
+        rows = repo.list("leases", owner)
+    return next((x for x in rows if x.get("native_comfy") and x.get("state") not in _INACTIVE_LEASE_STATES), None)
 
 
 def restart_active(lease):
@@ -221,14 +232,22 @@ def admit(repo, owner, body, key, *, api_key_id=None):
     with repo.store.dispatch_lock() as acquired:
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "调度正在同步，请使用相同幂等键重试", 503)
-        previous = next((j for j in repo.list("jobs", owner) if j.get("idempotency_key") == key), None)
+        if hasattr(repo, "get_by_idempotency_key"):
+            previous = repo.get_by_idempotency_key("jobs", owner, key)
+        else:
+            previous = next((j for j in repo.list("jobs", owner) if j.get("idempotency_key") == key), None)
         if previous:
             if previous.get("native_request_hash") != digest(body):
                 raise APIError("IDEMPOTENCY_CONFLICT", "幂等键参数冲突", 409)
             return previous
         from .cu_guard import CuGuardService
         CuGuardService(repo).check(owner, "colab", account, body.get("instance_id"))
-        running = next((j for j in repo.list("jobs", owner)
+        active_jobs = (
+            repo.list_by_states("jobs", TERMINAL, owner, exclude=True)
+            if hasattr(repo, "list_by_states")
+            else repo.list("jobs", owner)
+        )
+        running = next((j for j in active_jobs
                         if (j.get("snapshot") or {}).get("native_comfy") and j["state"] not in TERMINAL), None)
         live = active_lease(repo, owner)
         if running or live:

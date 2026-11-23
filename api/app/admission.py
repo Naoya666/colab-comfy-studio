@@ -25,7 +25,7 @@ from .job_schemas import normalize_policy
 def repo_registry(st, user):
     repo = Repository(st)
     registry = Registry(repo)
-    registry.bootstrap(user["id"])
+    registry.ensure_bootstrapped(user["id"])
     return repo, registry
 
 
@@ -141,7 +141,10 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
     repo, registry = repo_registry(st, user)
     if not key or len(key) > 200:
         raise APIError("IDEMPOTENCY_REQUIRED", "必须提供 Idempotency-Key，重试必须沿用原值")
-    existing = next((j for j in repo.list("jobs", user["id"]) if j.get("idempotency_key") == key), None)
+    if hasattr(repo, "get_by_idempotency_key"):
+        existing = repo.get_by_idempotency_key("jobs", user["id"], key)
+    else:
+        existing = next((j for j in repo.list("jobs", user["id"]) if j.get("idempotency_key") == key), None)
     if existing:
         same = (existing.get("creation_body_hash") == creation["creation_body_hash"]
                 if creation and creation.get("creation_key_id") else existing.get("body_hash") == digest(body))

@@ -66,7 +66,7 @@ class SchedulerWatchdogMixin:
             other.get("id") != lease.get("id")
             and other.get("instance_id") == instance_id
             and self._lease_blocks(other)
-            for other in self._leases_for(owner_id)
+            for other in self._leases_for(owner_id, active_only=True)
         ):
             return False
 
@@ -144,7 +144,7 @@ class SchedulerWatchdogMixin:
                 other.get("id") != lease.get("id")
                 and other.get("instance_id") == instance_id
                 and self._lease_blocks(other)
-                for other in self._leases_for(owner_id)
+                for other in self._leases_for(owner_id, active_only=True)
             ):
                 finish(False, "same instance acquired by another live lease")
                 return False
@@ -281,13 +281,16 @@ class SchedulerWatchdogMixin:
             self._close_cu_session(instance["owner_id"], self._instance_id(instance), self.clock(), "orphan_reconciliation")
         return finished
 
-    def _reconcile_deleted_lease_instances(self, leases: list[dict]) -> int:
+    def _reconcile_deleted_lease_instances(self, leases: list[dict] | None = None) -> int:
         """Converge old releasing rows only with durable remote-delete evidence."""
         if self.instance_service is None:
             return 0
-        by_lease = {row.get("id"): row for row in leases if row.get("id")}
+        service_instances = self._service_instances(states=("releasing", "cleanup_pending"))
+        if not service_instances:
+            return 0
+        all_leases = leases if leases is not None else self._leases_for()
+        by_lease = {row.get("id"): row for row in all_leases if row.get("id")}
         recovered = 0
-        service_instances = self._service_instances()
         jobs = None
         for instance in service_instances:
             if instance.get("state") not in {"releasing", "cleanup_pending"}:
@@ -300,7 +303,7 @@ class SchedulerWatchdogMixin:
             if source in (None, ""):
                 if jobs is None:
                     jobs = self._list("jobs")
-                if self._cleanup_historical_orphan_instance(instance, lease, leases, jobs):
+                if self._cleanup_historical_orphan_instance(instance, lease, all_leases, jobs):
                     recovered += 1
                 continue
             if lease.get("remote_deleted") is not True or source not in {
@@ -367,21 +370,21 @@ class SchedulerWatchdogMixin:
         with self.db_store.dispatch_lock() as acquired:
             if not acquired:
                 return {"acquired": False, "recovered": 0, "reason": "busy"}
-            candidates = self._leases_for()
+            candidates = self._leases_for(active_only=True)
         owners = {lease["owner_id"] for lease in candidates if lease.get("provider") == "colab"}
         guard = CuGuardService(self.store, self.clock)
         for owner in owners:
             ccu.sync_sessions(self.store, owner, self.clock())
             guard.enforce(owner)
         if owners:
-            candidates = self._leases_for()
+            candidates = self._leases_for(active_only=True)
         recovered = 0
         observations = {lease["id"]: self._inspect_runtime(lease) for lease in candidates if not lease.get("force_stop")}
         recovered += sum(result == "missing" for result in observations.values())
-        all_jobs = self._list("jobs")
+        active_jobs = self._list_by_states("jobs", ACTIVE_STATES)
         jobs = [
-            job for job in all_jobs if job.get("state") in ACTIVE_STATES
-            and (job.get("state") in {"cleanup_pending", "cleaning_up"} or self._expired(job))
+            job for job in active_jobs
+            if job.get("state") in {"cleanup_pending", "cleaning_up"} or self._expired(job)
         ]
         for job in jobs:
             with self.db_store.dispatch_lock() as acquired:
@@ -400,8 +403,15 @@ class SchedulerWatchdogMixin:
                 recovered += self._advance(claimed).get("state") != claimed.get("state")
             finally:
                 self._release_claim(job["id"], token, job["owner_id"])
-        job_by_id = {job["id"]: job for job in self._list("jobs")}
-        all_leases = self._leases_for()
+        all_leases = self._leases_for(active_only=True)
+        owner_job_ids = [lease.get("owner_job_id") for lease in all_leases if lease.get("owner_job_id")]
+        if owner_job_ids:
+            if hasattr(self.store, "list_jobs_by_ids"):
+                job_by_id = self.store.list_jobs_by_ids(None, owner_job_ids)
+            else:
+                job_by_id = {job["id"]: job for job in self._list("jobs")}
+        else:
+            job_by_id = {}
         for lease in all_leases:
             observation = observations.get(lease["id"])
             associated = job_by_id.get(lease.get("owner_job_id"))
@@ -459,5 +469,5 @@ class SchedulerWatchdogMixin:
             ):
                 if self._cleanup_orphan_lease(lease):
                     recovered += 1
-        recovered += self._reconcile_deleted_lease_instances(all_leases)
+        recovered += self._reconcile_deleted_lease_instances()
         return {"acquired": True, "recovered": recovered}

@@ -57,6 +57,44 @@ _PURPOSES = {
 _STATE_CONSUME_LOCK = threading.Lock()
 _REFRESH_FALLBACK_LOCKS: dict[str, threading.Lock] = {}
 _REFRESH_FALLBACK_GUARD = threading.Lock()
+_ORIGINAL_HTTPX_CLIENT = httpx.Client
+_SHARED_CLIENT_LOCK = threading.Lock()
+_SHARED_HTTPX_CLIENT: httpx.Client | None = None
+_CLI_AVAIL_CACHE: dict[tuple[str, str, str], bool] = {}
+_TOKEN_CACHE_LOCK = threading.Lock()
+_TOKEN_CACHE: dict[tuple[int, str, str | None, str], tuple[str, float]] = {}
+
+
+def _shared_httpx_client() -> httpx.Client:
+    global _SHARED_HTTPX_CLIENT
+    client = _SHARED_HTTPX_CLIENT
+    if client is not None and not client.is_closed:
+        return client
+    with _SHARED_CLIENT_LOCK:
+        if _SHARED_HTTPX_CLIENT is None or _SHARED_HTTPX_CLIENT.is_closed:
+            _SHARED_HTTPX_CLIENT = httpx.Client(
+                timeout=httpx.Timeout(10.0),
+                follow_redirects=False,
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            )
+        return _SHARED_HTTPX_CLIENT
+
+
+def _token_cache_allowed(clock) -> bool:
+    return clock is _now and not os.getenv("PYTEST_CURRENT_TEST") and os.getenv("STUDIO_OFFLINE_TEST") != "1"
+
+
+def invalidate_token_cache(store=None, owner_id: str | None = None, account_id: str | None = None, purpose: str | None = None) -> None:
+    store_id = id(store) if store is not None else None
+    with _TOKEN_CACHE_LOCK:
+        for key in list(_TOKEN_CACHE):
+            if (
+                (store_id is None or key[0] == store_id)
+                and (owner_id is None or key[1] == owner_id)
+                and (account_id is None or key[2] == account_id)
+                and (purpose is None or key[3] == purpose)
+            ):
+                _TOKEN_CACHE.pop(key, None)
 
 
 def _safe_id(value: str) -> str:
@@ -101,11 +139,21 @@ def load_colab_cli_oauth_client() -> tuple[str, str, str]:
 
 
 def colab_cli_oauth_available() -> bool:
+    key = (
+        os.getenv("GPU_COLAB_CLI_CLIENT_ID", "").strip(),
+        os.getenv("GPU_COLAB_CLI_CLIENT_SECRET", "").strip(),
+        os.getenv("GPU_COLAB_CLI_REDIRECT_URI", "").strip(),
+    )
+    if key in _CLI_AVAIL_CACHE and not os.getenv("PYTEST_CURRENT_TEST"):
+        return _CLI_AVAIL_CACHE[key]
     try:
         load_colab_cli_oauth_client()
-        return True
+        available = True
     except GoogleConfigurationError:
-        return False
+        available = False
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        _CLI_AVAIL_CACHE[key] = available
+    return available
 
 
 def _extract_authorization_code(raw: Any) -> str:
@@ -151,10 +199,26 @@ class GoogleService:
         # None is the legacy single-account slot. Explicit account ids never
         # fall back to that slot or to another account.
         self.account_id = account_id
-        self.client = client or httpx.Client(timeout=httpx.Timeout(10.0), follow_redirects=False)
-        self._owns_client = client is None
+        self._client = client
+        self._owns_client = False
         self.clock = clock
         self.state_ttl_seconds = state_ttl_seconds
+
+    @property
+    def client(self) -> httpx.Client:
+        if self._client is None:
+            if httpx.Client is _ORIGINAL_HTTPX_CLIENT:
+                self._client = _shared_httpx_client()
+                self._owns_client = False
+            else:
+                self._client = httpx.Client(timeout=httpx.Timeout(10.0), follow_redirects=False)
+                self._owns_client = True
+        return self._client
+
+    @client.setter
+    def client(self, value: httpx.Client | None) -> None:
+        self._client = value
+        self._owns_client = False
 
     @staticmethod
     def callback_uri() -> str:
@@ -192,12 +256,15 @@ class GoogleService:
         default = self.store.get("accounts", default_id, owner_id)
         return bool(default and (default.get("legacy_default") is True or default.get("legacy_trusted") is True))
 
-    def _client_config(self, owner_id: str | None = None, account_id: str | None = None) -> dict | None:
+    def _client_config(
+        self, owner_id: str | None = None, account_id: str | None = None, *, credentials: list[dict] | None = None
+    ) -> dict | None:
         owner = self.owner_id if owner_id is None else owner_id
         if not owner:
             return None
+        source_rows = credentials if credentials is not None else self._list("credentials", owner)
         rows = [
-            row for row in self._list("credentials", owner)
+            row for row in source_rows
             if row.get("provider") == "google"
             and row.get("purpose") == "oauth_client_config"
             and not row.get("revoked")
@@ -239,10 +306,12 @@ class GoogleService:
 
         return AccountService.default_account_id(owner_id)
 
-    def _config(self, owner_id: str | None = None, account_id: str | None = None) -> tuple[str, str, str]:
+    def _config(
+        self, owner_id: str | None = None, account_id: str | None = None, *, credentials: list[dict] | None = None
+    ) -> tuple[str, str, str]:
         effective_owner = self.owner_id if owner_id is None else owner_id
         effective_account = self.account_id if account_id is None else account_id
-        database = self._client_config(effective_owner, effective_account)
+        database = self._client_config(effective_owner, effective_account, credentials=credentials)
         if database:
             client_id, client_secret = database["client_id"], database["client_secret"]
         else:
@@ -270,13 +339,21 @@ class GoogleService:
         return self.store.update(kind, record_id, patch, owner_id)
 
 
-    def _credential(self, purpose: str, owner_id: str | None = None, account_id: str | None = None) -> dict | None:
+    def _credential(
+        self,
+        purpose: str,
+        owner_id: str | None = None,
+        account_id: str | None = None,
+        *,
+        credentials: list[dict] | None = None,
+    ) -> dict | None:
         owner = self.owner_id if owner_id is None else owner_id
         if not owner:
             return None
+        source_rows = credentials if credentials is not None else self._list("credentials", owner)
         rows = [
             r
-            for r in self._list("credentials", owner)
+            for r in source_rows
             if r.get("purpose") == purpose
             and r.get("provider", "google") == "google"
             and not r.get("revoked")
@@ -284,12 +361,13 @@ class GoogleService:
         ]
         return rows[0] if rows else None
 
-    def status(self) -> dict:
-        configured = all(self._config_value())
+    def status(self, *, credentials: list[dict] | None = None) -> dict:
+        creds = credentials if credentials is not None else (self._list("credentials", self.owner_id) if self.owner_id else [])
+        configured = all(self._config_value(credentials=creds))
         cli_available = colab_cli_oauth_available()
         result: dict[str, dict[str, Any]] = {}
         for purpose in _PURPOSES:
-            credential = self._credential(purpose, account_id=self.account_id)
+            credential = self._credential(purpose, account_id=self.account_id, credentials=creds)
             scope_ok = bool(credential and self._scope_sufficient(purpose, credential.get("scope")))
             connected = bool(credential and credential.get("encrypted_refresh_token") and scope_ok)
             cred_configured = bool(
@@ -327,9 +405,9 @@ class GoogleService:
             values = set(str(scope).split())
         return _PURPOSES[purpose] in values
 
-    def _config_value(self) -> tuple[str, str, str]:
+    def _config_value(self, *, credentials: list[dict] | None = None) -> tuple[str, str, str]:
         try:
-            return self._config(self.owner_id, self.account_id)
+            return self._config(self.owner_id, self.account_id, credentials=credentials)
         except GoogleConfigurationError:
             return "", "", self.callback_uri()
 
@@ -473,6 +551,7 @@ class GoogleService:
             self._update("credentials", old["id"], data, row.get("owner_id"))
         else:
             self._create("credentials", row["owner_id"], data)
+        invalidate_token_cache(self.store, row.get("owner_id"), row.get("account_id"), row["oauth_purpose"])
         connected = self._scope_sufficient(row["oauth_purpose"], data["scope"])
         result = {"purpose": row["oauth_purpose"], "connected": connected, "owner_id": row["owner_id"]}
         if row.get("account_id") is not None:
@@ -590,6 +669,7 @@ class GoogleService:
             self._update("credentials", old["id"], data, self.owner_id)
         else:
             self._create("credentials", self.owner_id, data)
+        invalidate_token_cache(self.store, self.owner_id, self.account_id, "colab")
         result: dict[str, Any] = {
             "purpose": "colab",
             "auth_channel": "colab_cli",
@@ -757,6 +837,13 @@ class GoogleService:
     def access_token(self, purpose: str) -> str:
         if purpose not in _PURPOSES:
             raise ValueError("Google OAuth purpose无效")
+        cache_enabled = _token_cache_allowed(self.clock) and bool(self.owner_id)
+        cache_key = (id(self.store), str(self.owner_id or ""), self.account_id, purpose)
+        if cache_enabled:
+            with _TOKEN_CACHE_LOCK:
+                cached = _TOKEN_CACHE.get(cache_key)
+                if cached and cached[1] > self.clock() + 60:
+                    return cached[0]
         credential = self._credential(purpose, account_id=self.account_id)
         if not credential:
             raise GoogleOAuthError("Google OAuth未连接，真实GPU能力已关闭")
@@ -767,7 +854,11 @@ class GoogleService:
             refresh = decrypt_secret(credential["encrypted_refresh_token"])
         except (KeyError, ValueError) as exc:
             raise GoogleOAuthError("Google OAuth凭证不可用") from exc
-        if float(credential.get("expires_at", 0)) > self.clock() + 60:
+        expires_at = float(credential.get("expires_at", 0))
+        if expires_at > self.clock() + 60:
+            if cache_enabled:
+                with _TOKEN_CACHE_LOCK:
+                    _TOKEN_CACHE[cache_key] = (access, min(expires_at, self.clock() + 300))
             return access
         cred_client_id = str(credential.get("client_id", "")).strip()
         if cred_client_id and credential.get("encrypted_client_secret"):
@@ -801,6 +892,7 @@ class GoogleService:
         except (ValueError, TypeError, AttributeError):
             raise GoogleOAuthError("Google OAuth刷新响应无效")
         new_refresh = payload.get("refresh_token")
+        new_expires_at = self.clock() + max(0, expires_in - 60)
         self._update(
             "credentials",
             credential["id"],
@@ -809,10 +901,13 @@ class GoogleService:
                 "encrypted_refresh_token": encrypt_secret(new_refresh)
                 if new_refresh
                 else credential["encrypted_refresh_token"],
-                "expires_at": self.clock() + max(0, expires_in - 60),
+                "expires_at": new_expires_at,
             },
             self.owner_id,
         )
+        if cache_enabled:
+            with _TOKEN_CACHE_LOCK:
+                _TOKEN_CACHE[cache_key] = (new_access, min(new_expires_at, self.clock() + 300))
         return new_access
 
     def disconnect(self, purpose: str, *, revoke_remote: bool = True) -> bool:
@@ -850,11 +945,13 @@ class GoogleService:
             },
             self.owner_id,
         )
+        invalidate_token_cache(self.store, self.owner_id, self.account_id, purpose)
         return True
 
     def close(self) -> None:
-        if self._owns_client:
-            self.client.close()
+        if self._owns_client and self._client is not None:
+            self._client.close()
+            self._client = None
 
 
 __all__ = [

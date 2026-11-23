@@ -3,6 +3,7 @@ import asyncio
 import re
 import threading
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -15,15 +16,27 @@ from .api_access import build_access_urls, get_or_create_path_code, peek_path_co
 from .common import APIError, admin, current_user, ok
 from .gpu import native, native_config, native_restart
 from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
-from .job_history import job_timing_details, job_timings
+from .job_history import job_timing_details
+from .native_proxy import get_native_gateway
 from .port_listeners import probe_port_available
 from .security import sign_session
 
 router = APIRouter(prefix="/api/gpu/native")
 
+_ORIGINAL_ASYNC_CLIENT = httpx.AsyncClient
 _TELEMETRY_CACHE_TTL = 4.0
 _TELEMETRY_LOCK = threading.Lock()
 _TELEMETRY_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
+@asynccontextmanager
+async def _http_client(app, *, timeout: float | None = None):
+    if app is not None and httpx.AsyncClient is _ORIGINAL_ASYNC_CLIENT:
+        yield get_native_gateway(app).http_client()
+        return
+    kwargs = {"timeout": timeout} if timeout is not None else {}
+    async with httpx.AsyncClient(**kwargs) as client:
+        yield client
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -114,7 +127,9 @@ def _parse_telemetry(
     }
 
 
-async def _fetch_native_telemetry(repo, owner_id: str, lease: dict, *, force_refresh: bool = False) -> dict[str, Any] | None:
+async def _fetch_native_telemetry(
+    repo, owner_id: str, lease: dict, *, force_refresh: bool = False, app=None
+) -> dict[str, Any] | None:
     cache_key = (owner_id, str(lease.get("instance_id") or lease.get("id") or ""))
     now = time.monotonic()
     if not force_refresh:
@@ -124,13 +139,13 @@ async def _fetch_native_telemetry(repo, owner_id: str, lease: dict, *, force_ref
                 return cached[1]
 
     try:
-        url, headers = native.backend_for(repo, owner_id)
+        url, headers = await asyncio.to_thread(native.backend_for, repo, owner_id)
     except APIError:
         return None
 
     async def _get_json(client: httpx.AsyncClient, path: str) -> dict | None:
         try:
-            resp = await client.get(url + path, headers=headers)
+            resp = await client.get(url + path, headers=headers, timeout=8)
             if resp.status_code == 200:
                 data = resp.json()
                 return data if isinstance(data, dict) else None
@@ -139,7 +154,7 @@ async def _fetch_native_telemetry(repo, owner_id: str, lease: dict, *, force_ref
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
+        async with _http_client(app, timeout=8) as client:
             stats_data, queue_data, state_data = await asyncio.gather(
                 _get_json(client, "/system_stats"),
                 _get_json(client, "/queue"),
@@ -148,7 +163,7 @@ async def _fetch_native_telemetry(repo, owner_id: str, lease: dict, *, force_ref
     except httpx.HTTPError:
         return None
 
-    storage_cfg = native.lease_storage(repo, lease)
+    storage_cfg = await asyncio.to_thread(native.lease_storage, repo, lease)
     telemetry = _parse_telemetry(lease, storage_cfg, stats_data, queue_data, state_data)
     if telemetry is not None:
         with _TELEMETRY_LOCK:
@@ -300,7 +315,7 @@ def revoke_api_key(key_id: str, request: Request, user=Depends(current_user)):
 @router.get("/telemetry")
 async def telemetry(request: Request, refresh: bool = False, user=Depends(current_user)):
     repo = request.app.state.repo
-    lease = native.active_lease(repo, user["id"])
+    lease = await asyncio.to_thread(native.active_lease, repo, user["id"])
     if not lease:
         return ok({"active": False, "ready": False, "restarting": False, "instance_id": None, "telemetry": None}, request)
     restarting = native.restart_active(lease)
@@ -315,7 +330,7 @@ async def telemetry(request: Request, refresh: bool = False, user=Depends(curren
             },
             request,
         )
-    data = await _fetch_native_telemetry(repo, user["id"], lease, force_refresh=refresh)
+    data = await _fetch_native_telemetry(repo, user["id"], lease, force_refresh=refresh, app=request.app)
     return ok(
         {
             "active": True,
@@ -328,53 +343,94 @@ async def telemetry(request: Request, refresh: bool = False, user=Depends(curren
     )
 
 
-@router.get("/status")
-async def status(request: Request, user=Depends(current_user)):
-    repo = request.app.state.repo
-    lease = native.active_lease(repo, user["id"])
+def _load_status_snapshot(repo, owner_id: str):
+    lease = native.active_lease(repo, owner_id)
     restart_lease = lease or max(
-        (row for row in repo.list("leases", user["id"]) if row.get("native_restart")),
+        (row for row in repo.list("leases", owner_id) if row.get("native_restart")),
         key=lambda row: row["native_restart"]["created_at"], default=None,
     )
     now = time.time()
     restart = native_restart.public_restart(restart_lease, now=now)
-    native_jobs = [j for j in repo.list("jobs", user["id"]) if (j.get("snapshot") or {}).get("native_comfy")]
+    native_jobs = [j for j in repo.list("jobs", owner_id) if (j.get("snapshot") or {}).get("native_comfy")]
     job = max(native_jobs, key=lambda j: j.get("created_at") or "", default=None)
     last_instance_id = (job or {}).get("instance_id")
-    instance = repo.get("instances", last_instance_id, user["id"]) if not lease and last_instance_id else None
+    instance = repo.get("instances", last_instance_id, owner_id) if not lease and last_instance_id else None
+    job_events = (
+        repo.list_events_for_job(owner_id, job["id"], asc=False)
+        if job and hasattr(repo, "list_events_for_job")
+        else ([e for e in repo.list("events", owner_id) if e.get("job_id") == job["id"]] if job else [])
+    )
+    reader = None if native.secret_file is native._default_secret_file else native.secret_file
+    ncfg = native_config.resolve(repo, owner_id, use_cache=True, file_reader=reader, strict_decrypt=False)
+    model_storage = (
+        native.lease_storage(repo, lease)
+        if lease
+        else (native.model_storage(job.get("execution_policy")) if job and job["state"] not in native.TERMINAL else None)
+    )
+    can_restart_base = bool(lease) and native_restart.can_restart(repo, lease)
+    backend_info = None
+    if lease and lease.get("native_ready") and not native.restart_active(lease):
+        try:
+            backend_info = native.backend_for(repo, owner_id)
+        except APIError:
+            backend_info = None
+    return lease, restart, job, instance, job_events, ncfg, model_storage, can_restart_base, backend_info, now
+
+
+@router.get("/status")
+async def status(request: Request, user=Depends(current_user)):
+    repo = request.app.state.repo
+    (
+        lease,
+        restart,
+        job,
+        instance,
+        job_events,
+        ncfg,
+        model_storage,
+        can_restart_base,
+        backend_info,
+        now,
+    ) = await asyncio.to_thread(_load_status_snapshot, repo, user["id"])
     reclaimed = bool(instance and instance.get("state") == "deleted"
                      and instance.get("remote_delete_source") == RUNTIME_MISSING)
     ready = False
     disk = {}
-    if lease and lease.get("native_ready") and not native.restart_active(lease):
+    if backend_info is not None:
+        url, headers = backend_info
         try:
-            url, headers = native.backend_for(repo, user["id"])
-            async with httpx.AsyncClient(timeout=8) as client:
-                response = await client.get(url + "/system_stats", headers=headers)
-                ready = response.status_code == 200 and isinstance(response.json().get("system"), dict)
-                if ready and lease.get("native_model_storage"):
-                    metrics = await client.get(url + "/studio_native/state", headers=headers)
-                    if metrics.is_success:
-                        state = metrics.json()
+            async with _http_client(request.app, timeout=8) as client:
+                if lease.get("native_model_storage"):
+                    stats_res, metrics_res = await asyncio.gather(
+                        client.get(url + "/system_stats", headers=headers, timeout=8),
+                        client.get(url + "/studio_native/state", headers=headers, timeout=8),
+                        return_exceptions=True,
+                    )
+                    if not isinstance(stats_res, Exception):
+                        ready = stats_res.status_code == 200 and isinstance(stats_res.json().get("system"), dict)
+                    if ready and not isinstance(metrics_res, Exception) and metrics_res.is_success:
+                        state = metrics_res.json()
                         disk = {k: state[k] for k in ("disk_free_bytes", "vfs_cache_bytes") if type(state.get(k)) is int}
+                else:
+                    response = await client.get(url + "/system_stats", headers=headers, timeout=8)
+                    ready = response.status_code == 200 and isinstance(response.json().get("system"), dict)
         except (httpx.HTTPError, ValueError, AttributeError, APIError):
             pass
-    events = repo.list("events", user["id"]) if job else []
-    job_events = [e for e in events if e.get("job_id") == job["id"]] if job else []
     timing_details = job_timing_details(job, job_events, now=now) if job else {}
-    timings = job_timings(job, job_events, now=now) if job else {}
+    timings = {
+        name: value["seconds"]
+        for name, value in timing_details.items()
+        if value.get("status") == "completed" and value.get("seconds") is not None
+    }
     gpu_reported = (job or {}).get("gpu_reported") or (lease or {}).get("gpu_reported") or (instance or {}).get("gpu_reported")
-    can_restart = ready and native_restart.can_restart(repo, lease)
-    ncfg = native_config.resolve(repo, user["id"], use_cache=False, file_reader=native.secret_file, strict_decrypt=False)
+    can_restart = ready and can_restart_base
     return ok({"configured": bool(ncfg.tunnel_configured or (not ncfg.has_db_override and ncfg.any_configured)),
                "tunnel_configured": ncfg.tunnel_configured,
                "web_ui_configured": ncfg.web_ui_configured,
                "url": ncfg.native_comfy_url,
                "timeouts": native.timeout_options(), "model_storage_defaults": native.model_storage_defaults(),
                "model_storage_known": not lease or bool(lease.get("native_model_storage")),
-               "model_storage": native.lease_storage(repo, lease) if lease else (
-                   native.model_storage(job.get("execution_policy")) if job and job["state"] not in native.TERMINAL else None
-               ), "disk": disk,
+               "model_storage": model_storage, "disk": disk,
                "ready": ready, "instance_id": lease.get("instance_id") if lease else None,
                "job_id": job["id"] if job else None, "state": job["state"] if job else "stopped",
                "stage": (job or {}).get("stage"), "gpu_reported": gpu_reported,
@@ -416,9 +472,9 @@ def _local_lease(request, owner):
 @router.get("/workflows")
 async def list_workflows(request: Request, refresh: bool = False, user=Depends(current_user)):
     repo, lease = await asyncio.to_thread(_local_lease, request, user["id"])
-    base, auth = native.backend_for(repo, user["id"])
+    base, auth = await asyncio.to_thread(native.backend_for, repo, user["id"])
     suffix = "/workflows?refresh=1" if refresh else "/workflows"
-    async with httpx.AsyncClient() as client:
+    async with _http_client(request.app) as client:
         result = await native_model_api.rpc(client, "GET", base, native_model_api.headers(base, auth, lease, repo=repo), suffix)
     return ok(result, request)
 
@@ -434,8 +490,8 @@ async def save_workflow(body: dict, request: Request, user=Depends(current_user)
     write_id = uuid4().hex
     await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
     try:
-        base, auth = native.backend_for(repo, user["id"])
-        async with httpx.AsyncClient() as client:
+        base, auth = await asyncio.to_thread(native.backend_for, repo, user["id"])
+        async with _http_client(request.app) as client:
             result = await native_model_api.rpc(
                 client, "POST", base, native_model_api.headers(base, auth, lease, repo=repo), "/workflows",
                 body={"name": body["name"], "workflow": body["workflow"], "overwrite": body.get("overwrite", False)},
@@ -453,8 +509,8 @@ async def delete_workflow(source: str, path: str, request: Request, user=Depends
     write_id = uuid4().hex
     await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
     try:
-        base, auth = native.backend_for(repo, user["id"])
-        async with httpx.AsyncClient() as client:
+        base, auth = await asyncio.to_thread(native.backend_for, repo, user["id"])
+        async with _http_client(request.app) as client:
             result = await native_model_api.rpc(
                 client, "POST", base, native_model_api.headers(base, auth, lease, repo=repo), "/workflows/delete",
                 body={"source": source, "path": path},
@@ -489,8 +545,8 @@ async def prepare_models(body: dict, request: Request, user=Depends(current_user
     write_id = uuid4().hex
     await asyncio.to_thread(native.begin_write, repo, lease, write_id=write_id)
     try:
-        base, auth = native.backend_for(repo, user["id"])
-        async with httpx.AsyncClient() as client:
+        base, auth = await asyncio.to_thread(native.backend_for, repo, user["id"])
+        async with _http_client(request.app) as client:
             result = await native_model_api.start(
                 client, base, native_model_api.headers(base, auth, lease, repo=repo), repo, lease,
                 workflow, body.get("dependencies", []), visual=True, workflow_ref=workflow_ref,
@@ -505,8 +561,8 @@ async def model_preparation(ident: str, request: Request, user=Depends(current_u
     repo, lease = await asyncio.to_thread(_local_lease, request, user["id"])
     if ident != "latest" and not re.fullmatch(r"[0-9a-f]{32}", ident):
         raise APIError("NATIVE_MODEL_PREPARATION_MISSING", "准备记录不存在", 404)
-    base, auth = native.backend_for(repo, user["id"])
-    async with httpx.AsyncClient() as client:
+    base, auth = await asyncio.to_thread(native.backend_for, repo, user["id"])
+    async with _http_client(request.app) as client:
         result = await native_model_api.rpc(client, "GET", base, native_model_api.headers(base, auth, lease, repo=repo),
                                             "/prepare/" + ident)
     return ok(result, request)

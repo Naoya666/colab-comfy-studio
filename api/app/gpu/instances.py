@@ -2072,22 +2072,38 @@ class InstanceService:
         return {k: self._redact(v) for k, v in row.items() if k in allowed}
 
     def public(self, instance):
-        source = dict(instance) if isinstance(instance, Mapping) else self._dict(instance)
-        result = {k: self._redact(copy.deepcopy(source[k])) for k in self._PUBLIC if k in source}
+        source = instance if isinstance(instance, Mapping) else self._dict(instance)
+        result = {k: self._redact(source[k]) for k in self._PUBLIC if k in source}
         if "instance_pool" not in result:
             result["instance_pool"] = instance_pool_of(source)
         return result
 
+    def _dict_fast(self, row) -> dict:
+        data = row.data or {}
+        result = {"id": row.id, "owner_id": row.owner_id, "project_id": row.project_id}
+        result.update(data)
+        result.update(
+            state=row.state,
+            version=row.version,
+            created_at=utc_isoformat(row.created_at),
+            updated_at=utc_isoformat(row.updated_at),
+        )
+        return result
+
     def get(self, owner, id):
-        with self._tx() as session:
+        with self.store.db_lock(), self.store.Session() as session:
             row = self._find(session, "instances", id, owner)
-            return None if row is None else self.public(self._dict(row))
+            return None if row is None else self.public(self._dict_fast(row))
 
     def list(self, owner, state=None):
-        with self._tx() as session:
-            rows = self._rows(session, "instances", owner)
-            rows.sort(key=lambda row: (row.created_at, row.id), reverse=True)
-            return [self.public(self._dict(row)) for row in rows if state is None or row.state == state]
+        model = self._model("instances")
+        with self.store.db_lock(), self.store.Session() as session:
+            stmt = select(model).where(model.owner_id == owner)
+            if state is not None:
+                stmt = stmt.where(model.state == state)
+            stmt = stmt.order_by(model.created_at.desc(), model.id.desc())
+            rows = session.scalars(stmt).all()
+            return [self.public(self._dict_fast(row)) for row in rows]
 
     def clear_history(self, owner):
         with self._admission(), self._tx() as session:
@@ -2103,9 +2119,31 @@ class InstanceService:
             return cleared
 
     def events(self, owner, id):
-        with self._tx() as session:
+        if hasattr(self.repo, "list_events_for_instance"):
+            return [self._redact(row) for row in self.repo.list_events_for_instance(owner, id)]
+        with self.store.db_lock(), self.store.Session() as session:
             rows = self._rows(session, "events", owner)
-            return [self._redact(self._dict(row)) for row in rows if self._data(row).get("instance_id") == id]
+            return [self._redact(self._dict_fast(row)) for row in rows if (row.data or {}).get("instance_id") == id]
+
+    def events_by_instance(self, owner, instance_ids) -> dict[str, list[dict]]:
+        ids = [str(i) for i in instance_ids if isinstance(i, str) and i]
+        if not ids:
+            return {}
+        grouped: dict[str, list[dict]] = {iid: [] for iid in ids}
+        if hasattr(self.repo, "list_events_for_instances"):
+            rows = self.repo.list_events_for_instances(owner, ids)
+            for row in rows:
+                iid = row.get("instance_id")
+                if iid in grouped:
+                    grouped[iid].append(self._redact(row))
+            return grouped
+        wanted = set(ids)
+        with self.store.db_lock(), self.store.Session() as session:
+            for row in self._rows(session, "events", owner):
+                iid = (row.data or {}).get("instance_id")
+                if iid in wanted:
+                    grouped[iid].append(self._redact(self._dict_fast(row)))
+        return grouped
 
     def usage(self, owner, id=None):
         with self._tx() as session:

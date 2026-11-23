@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import re
 import uuid
@@ -69,13 +70,16 @@ def gallery(
 ):
     if project_id:
         own(st, "projects", project_id, user)
-    # Index across all owner jobs so assets moved to another project retain workflow/batch metadata.
-    job_map = {job["id"]: job for job in Repository(st).list("jobs", user["id"])}
+    raw_assets = st.list("assets", user["id"], project_id)
+    sourced = [
+        (a, source_job_id)
+        for a in raw_assets
+        if (source_job_id := (a.get("source_job_id") or a.get("gpu_job_id")))
+    ]
+    # Load only jobs actually referenced by gallery assets instead of scanning all historical jobs.
+    job_map = Repository(st).list_jobs_by_ids(user["id"], [jid for _, jid in sourced]) if sourced else {}
     result = []
-    for a in st.list("assets", user["id"], project_id):
-        source_job_id = a.get("source_job_id") or a.get("gpu_job_id")
-        if not source_job_id:
-            continue
+    for a, source_job_id in sourced:
         item = public_asset(a)
         job = job_map.get(source_job_id)
         if job:
@@ -117,13 +121,10 @@ async def upload_asset(
     user=Depends(current_user),
     st=Depends(get_store),
 ):
-    own(st, "projects", project_id, user)
+    await asyncio.to_thread(own, st, "projects", project_id, user)
     content = await file.read(settings.max_upload_bytes + 1)
-    return ok(
-        public_asset(save_asset(st, user["id"], project_id, content, file.filename or "upload.bin")),
-        request,
-        201,
-    )
+    saved = await asyncio.to_thread(save_asset, st, user["id"], project_id, content, file.filename or "upload.bin")
+    return ok(public_asset(saved), request, 201)
 
 
 @assets_router.get("/api/assets/{asset_id}/download")
@@ -224,7 +225,8 @@ def batch_move_assets(body: dict, request: Request, user=Depends(current_user), 
         raise APIError("VALIDATION_ERROR", "请提供 1~200 个待移动的素材编号")
     target = _require_target_project(st, target_project_id, user)
     unique_ids = list(dict.fromkeys(raw_ids))
-    assets = [own(st, "assets", aid, user) for aid in unique_ids]
+    asset_map = st.get_many("assets", unique_ids, user["id"]) if hasattr(st, "get_many") else {}
+    assets = [asset_map[aid] if aid in asset_map else own(st, "assets", aid, user) for aid in unique_ids]
     moved_ids = []
     for asset in assets:
         if asset.get("project_id") != target["id"]:
@@ -248,7 +250,8 @@ def batch_delete_assets(body: dict, request: Request, user=Depends(current_user)
     if not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 200 or any(not isinstance(item, str) for item in raw_ids):
         raise APIError("VALIDATION_ERROR", "请提供 1~200 个待删除的素材编号")
     unique_ids = list(dict.fromkeys(raw_ids))
-    assets = [own(st, "assets", aid, user) for aid in unique_ids]
+    asset_map = st.get_many("assets", unique_ids, user["id"]) if hasattr(st, "get_many") else {}
+    assets = [asset_map[aid] if aid in asset_map else own(st, "assets", aid, user) for aid in unique_ids]
     deleted_ids = []
     for asset in assets:
         delete_asset_file(asset)

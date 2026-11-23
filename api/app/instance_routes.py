@@ -115,13 +115,22 @@ def _public(service, row):
     return _safe_public(service.public(row))
 
 
-def _related(request: Request, instance_id: str, owner: str):
-    jobs = [row for row in _repo(request).list("jobs", owner) if row.get("instance_id") == instance_id]
+def _jobs_for_instance(request: Request, instance_id: str, owner: str) -> list[dict]:
+    repo = _repo(request)
+    if hasattr(repo, "list_jobs_for_instance"):
+        return repo.list_jobs_for_instance(owner, instance_id)
+    return [row for row in repo.list("jobs", owner) if row.get("instance_id") == instance_id]
+
+
+def _events_for_instance(request: Request, instance_id: str, owner: str) -> list[dict]:
     try:
-        events = _service(request).events(owner, instance_id)
+        return _service(request).events(owner, instance_id)
     except (InstanceServiceError, KeyError) as exc:
         raise _domain_error(exc) from exc
-    return jobs, events
+
+
+def _related(request: Request, instance_id: str, owner: str):
+    return _jobs_for_instance(request, instance_id, owner), _events_for_instance(request, instance_id, owner)
 
 
 def _public_job_item(job: dict):
@@ -137,14 +146,36 @@ def instances(
     user=Depends(current_user),
 ):
     service = _service(request)
-    rows = service.list(user["id"], state=state)
+    owner = user["id"]
+    rows = [
+        row
+        for row in service.list(owner, state=state)
+        if include_cleared or not (row.get("state") == "deleted" and row.get("history_cleared_at") is not None)
+    ]
+    jobs_by_instance: dict[str, list[dict]] | None = None
+    events_by_instance: dict[str, list[dict]] | None = None
+    if detail and rows:
+        instance_ids = [row["id"] for row in rows]
+        wanted_ids = set(instance_ids)
+        jobs_by_instance = {iid: [] for iid in instance_ids}
+        for job in _repo(request).list("jobs", owner):
+            iid = job.get("instance_id")
+            if iid in wanted_ids:
+                jobs_by_instance[iid].append(job)
+        if hasattr(service, "events_by_instance"):
+            try:
+                events_by_instance = service.events_by_instance(owner, instance_ids)
+            except (InstanceServiceError, KeyError) as exc:
+                raise _domain_error(exc) from exc
     result = []
     for row in rows:
-        if not include_cleared and row.get("state") == "deleted" and row.get("history_cleared_at") is not None:
-            continue
         item = _public(service, row)
         if detail:
-            jobs, events = _related(request, row["id"], user["id"])
+            if jobs_by_instance is not None and events_by_instance is not None:
+                jobs = jobs_by_instance.get(row["id"], [])
+                events = events_by_instance.get(row["id"], [])
+            else:
+                jobs, events = _related(request, row["id"], owner)
             item["jobs"] = [_public_job_item(job) for job in jobs]
             item["events"] = [_safe_public(event) for event in events]
         result.append(item)
@@ -175,7 +206,7 @@ def instance_detail(instance_id: str, request: Request, user=Depends(current_use
 def instance_jobs(instance_id: str, request: Request, user=Depends(current_user)):
     service = _service(request)
     _instance(service, instance_id, user["id"])
-    jobs, _ = _related(request, instance_id, user["id"])
+    jobs = _jobs_for_instance(request, instance_id, user["id"])
     return ok([_public_job_item(job) for job in jobs], request)
 
 
@@ -183,7 +214,7 @@ def instance_jobs(instance_id: str, request: Request, user=Depends(current_user)
 def instance_events(instance_id: str, request: Request, user=Depends(current_user)):
     service = _service(request)
     _instance(service, instance_id, user["id"])
-    _, events = _related(request, instance_id, user["id"])
+    events = _events_for_instance(request, instance_id, user["id"])
     return ok([_safe_public(event) for event in events], request)
 
 
