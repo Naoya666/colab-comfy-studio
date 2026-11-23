@@ -8,9 +8,9 @@ Colab GPU Studio 是一个自托管的 ComfyUI 与 Google Colab 算力创作工�
 
 | 手机创作页 | 桌面创作页 |
 | --- | --- |
-| <img src="docs/demo/screenshots/mobile-create.png" width="240" alt="手机上的创作页面"> | <img src="docs/demo/screenshots/desktop-create.png" width="640" alt="桌面上的创作页面"> |
+| <img src="docs/screenshots/mobile-create.png" width="240" alt="手机上的创作页面"> | <img src="docs/screenshots/desktop-create.jpg" width="640" alt="桌面上的创作页面"> |
 
-> 截图来自上游原项目的演示版本，当前分支已进一步扩展桌面工作区、算力遥测仪表盘、原生 Drive 作品库与 PWA 支持。[演示说明与更多截图](docs/DEMO.md)
+> 当前版本真实界面截图（浅色主题），支持桌面 / 移动端响应式布局与深色、浅色、跟随系统主题切换。上游原项目只读演示见 [演示说明](docs/DEMO.md)。
 
 ---
 
