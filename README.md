@@ -85,7 +85,7 @@ Docker Compose 默认由 4 个职责分离的容器协作（共享 `studio-data`
 
 ### 方式一：拉取 GHCR 云端镜像部署（推荐，免本机编译）
 
-需要 Git、Docker、Docker Compose 和 `uv`。云端预构建镜像发布于 GitHub Container Registry（`linux/amd64`），无需在本机或低配 VPS 编译前端与 Python 依赖：
+需要 Git、Docker、Docker Compose 和 `uv`。云端预构建镜像发布于 GitHub Container Registry，原生支持 **`linux/amd64`** 与 **`linux/arm64`** 双架构（Docker 自动匹配 x86_64 VPS、ARM 服务器、树莓派与 Apple Silicon 宿主机），无需在本机或低配 VPS 编译前端与 Python 依赖：
 
 ```bash
 git clone https://github.com/Naoya666/colab-comfy-studio.git
@@ -96,7 +96,7 @@ docker compose pull
 docker compose up -d --no-build
 ```
 
-- **镜像地址与标签**：默认拉取 `ghcr.io/naoya666/colab-comfy-studio:latest`（与 `main` 分支最新通过 CI 的提交保持同步）。如需锁定版本，可在 `.env` 中设置 `STUDIO_IMAGE`（支持 `:main`、`:sha-<7位提交SHA>` 或版本 Tag），或手动执行 `docker pull ghcr.io/naoya666/colab-comfy-studio:latest`。
+- **镜像地址与标签**：默认拉取多架构清单 `ghcr.io/naoya666/colab-comfy-studio:latest`（与 `main` 分支最新通过 CI 的提交保持同步）。如需锁定版本，可在 `.env` 中设置 `STUDIO_IMAGE`（多架构支持 `:main`、`:sha-<7位提交SHA>` 或版本 Tag；单架构可使用 `:sha-<7位提交SHA>-amd64` / `-arm64`），或手动执行 `docker pull ghcr.io/naoya666/colab-comfy-studio:latest`。
 - **GHCR 权限提示**：若拉取时提示 `unauthorized` / `denied`，说明该镜像包在 GitHub Packages 中为私有状态——仓库管理员可在 GitHub `Packages → colab-comfy-studio → Package settings` 将可见性设为 **Public** 以支持免登录拉取，或使用含 `read:packages` 权限的 PAT 登录：`echo <GITHUB_PAT> | docker login ghcr.io -u <GitHub用户名> --password-stdin`。
 
 启动后访问 `http://127.0.0.1:8788`，使用 `.env` 中的 `STUDIO_PASSWORD` 登录：
@@ -110,7 +110,7 @@ docker compose up -d --no-build
 
 ### 方式二：从源码本地构建 Docker 镜像
 
-适用于需要自行修改代码，或在 ARM64 等非 `amd64` 主机上部署的场景（完成上述 `.env` 与 `docker-compose.yml` 初始化后执行）：
+适用于需要自行修改代码、定制镜像或在无法访问 GHCR 的环境中构建的场景（完成上述 `.env` 与 `docker-compose.yml` 初始化后执行）：
 
 ```bash
 docker compose up -d --build
@@ -228,10 +228,10 @@ docker compose exec api alembic upgrade head
 
 后端采用 **Python 3.11+ / FastAPI / SQLAlchemy 2 / Alembic**（`uv` 管理依赖），前端采用 **React 19 / TypeScript / Vite 6**（`npm` 管理依赖）。
 
-每次推送（及手动触发 `workflow_dispatch`）都会运行 GitHub Actions。前后端测试均通过后，CI 使用根目录的 `Dockerfile` 构建镜像：
+每次推送（及手动触发 `workflow_dispatch`）都会运行 GitHub Actions。前后端测试均通过后，CI 在 `ubuntu-latest`（`amd64`）与 `ubuntu-24.04-arm`（`arm64`）上原生并行构建根目录的 `Dockerfile`：
 
-- **推送到 GHCR**：自动发布至 `ghcr.io/naoya666/colab-comfy-studio`，附带 `:sha-<7位提交SHA>` 标签（默认分支同步更新 `:latest` 与 `:main`，Tag 推送同步发布对应版本标签）。
-- **离线 Artifact 归档**：同时导出 `colab-gpu-studio.tar.gz` 到该次运行的 **Artifacts**（保留 14 天）。离线或受限网络环境可下载解压 ZIP 后执行 `docker load -i colab-gpu-studio.tar.gz`，并以 `STUDIO_IMAGE=colab-gpu-studio:<完整提交SHA> docker compose up -d --no-build` 启动。
+- **推送双架构镜像到 GHCR**：两路架构各自推送 `:sha-<7位提交SHA>-amd64` / `:sha-<7位提交SHA>-arm64`，随后通过 `docker buildx imagetools create` 合并发布为多架构清单 `ghcr.io/naoya666/colab-comfy-studio:sha-<7位提交SHA>`（默认分支同步更新 `:latest` 与 `:main`，Tag 推送同步发布对应版本标签）。
+- **双架构离线 Artifact 归档**：同时分别导出 `colab-gpu-studio-amd64.tar.gz` 与 `colab-gpu-studio-arm64.tar.gz` 到该次运行的 **Artifacts**（保留 14 天）。离线或受限网络环境可下载对应架构的产物 ZIP 并解压，执行 `docker load -i colab-gpu-studio-<arch>.tar.gz`，再以 `STUDIO_IMAGE=colab-gpu-studio:<完整提交SHA>-<arch> docker compose up -d --no-build` 启动。
 
 在仓库根目录执行完整离线自动化验证与构建：
 
