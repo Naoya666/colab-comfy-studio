@@ -400,6 +400,7 @@ class GoogleColabProvider:
             {
                 "operation_name": op_name,
                 "operation_done": True,
+                "last_create_error": None,
                 "requested_spec": key,
                 "tunnel_endpoint": endpoint,
                 "tunnel_nbh": nbh,
@@ -445,7 +446,12 @@ class GoogleColabProvider:
         self.store.update(
             "leases",
             lease["id"],
-            {"operation_name": name, "operation_done": operation.get("done") is True, "requested_spec": key},
+            {
+                "operation_name": name,
+                "operation_done": operation.get("done") is True,
+                "last_create_error": None,
+                "requested_spec": key,
+            },
             self.owner_id,
         )
         self._raise_operation_error(operation)
@@ -544,6 +550,13 @@ class GoogleColabProvider:
             shape = "SHAPE_STANDARD"
         return {"variant": variant, "accelerator": accelerator, "shape": shape}
 
+    def _persist_lease_patch(self, lease: dict, patch: dict) -> dict:
+        store = getattr(self, "store", None)
+        lease_id = lease.get("id")
+        if store is not None and lease_id and hasattr(store, "update"):
+            return store.update("leases", lease_id, patch, getattr(self, "owner_id", None))
+        return {**lease, **patch}
+
     def inspect(self, handle):
         lease = self._owned(handle)
         if self._is_cli_tunnel(lease):
@@ -572,6 +585,8 @@ class GoogleColabProvider:
         operation = self._operation(handle, lease)
         if operation is not None and operation.get("done") is not True:
             return {"ready": False, "deleted": False, "operation_pending": True}
+        if operation is not None and operation.get("done") is True and not lease.get("operation_done"):
+            lease = self._persist_lease_patch(lease, {"operation_done": True})
         # A failed Operation still needs the runtime GET: a runtime that exists must be cleaned up.
         failure = self._operation_failure(operation) if operation is not None else {}
         response = self._request("GET", "/v1beta/" + handle["runtime_name"])
@@ -581,13 +596,24 @@ class GoogleColabProvider:
                 operation is None
                 and int(lease.get("create_attempts", 0)) > 0
                 and not lease.get("operation_done")
+                and lease.get("allocation_confirmed") is not True
             )
             return {"ready": False, "deleted": not unknown, "allocation_unknown": unknown, **failure}
         if failure:
             return {"ready": False, "deleted": False, **failure}
         runtime = self._json(response)
+        ready = bool(runtime.get("connectionInfo"))
+        if ready and (
+            not lease.get("operation_done")
+            or lease.get("allocation_confirmed") is not True
+            or lease.get("last_create_error")
+        ):
+            lease = self._persist_lease_patch(
+                lease,
+                {"operation_done": True, "allocation_confirmed": True, "last_create_error": None},
+            )
         return {
-            "ready": bool(runtime.get("connectionInfo")),
+            "ready": ready,
             "deleted": False,
             "runtime_name": handle["runtime_name"],
             "runtime_spec": runtime.get("runtimeSpec"),
@@ -863,6 +889,8 @@ class GoogleColabProvider:
         if operation is not None and operation.get("done") is not True:
             # Deleting a missing runtime during a still-pending create is not release confirmation.
             return False
+        if operation is not None and operation.get("done") is True and not lease.get("operation_done"):
+            lease = self._persist_lease_patch(lease, {"operation_done": True})
         # A failed completed Operation may still have allocated transient state; GET/DELETE regardless.
         current = self._request("GET", "/v1beta/" + handle["runtime_name"])
         if current.status_code == 404:
@@ -870,6 +898,7 @@ class GoogleColabProvider:
                 operation is None
                 and int(lease.get("create_attempts", 0)) > 0
                 and not lease.get("operation_done")
+                and lease.get("allocation_confirmed") is not True
             ):
                 # Reconcile lost create response by looking for only our deterministic runtime metadata.
                 response = self._request("GET", "/v1/operations")

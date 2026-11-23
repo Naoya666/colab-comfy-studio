@@ -657,7 +657,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         lease = self._update(
             "leases",
             lease["id"],
-            {"state": "active", "handle": handle, "last_seen": self.clock()},
+            {"state": "active", "handle": handle, "last_create_error": None, "last_seen": self.clock()},
             job.get("owner_id"),
         )
         ccu.open_instance_session(self.store, job, lease, self.clock())
@@ -746,8 +746,16 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 if job.get("instance_id"):
                     self._update("instances", job["instance_id"], {"runtime_spec_reported": reported}, job["owner_id"])
                 self._event(job, "preparing", "实际分配规格：" + str(reported), None)
-            if self._provider_name(job) == "colab" and lease.get("allocation_confirmed") is not True:
-                self._update("leases", lease["id"], {"allocation_confirmed": True}, job["owner_id"])
+            if self._provider_name(job) == "colab":
+                lease_patch = {}
+                if lease.get("allocation_confirmed") is not True:
+                    lease_patch["allocation_confirmed"] = True
+                if not lease.get("operation_done"):
+                    lease_patch["operation_done"] = True
+                if lease.get("last_create_error"):
+                    lease_patch["last_create_error"] = None
+                if lease_patch:
+                    self._update("leases", lease["id"], lease_patch, job["owner_id"])
             job = self._mark_instance("mark_ready", job)
             return self._set_state(job, "loading", "GPU runtime is ready")
         return job
@@ -1605,30 +1613,47 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
     def _rr_state(self) -> dict[str, Any]:
         rr = getattr(self.db_store, "_scheduler_rr", None)
         if rr is None:
-            rr = {"seq": 0, "stalled": {}}
+            rr = {"seq": 0, "fresh_seq": 0, "stalled": {}}
             self.db_store._scheduler_rr = rr
+        else:
+            rr.setdefault("fresh_seq", 0)
         return rr
 
     def _claim_next_job(self) -> tuple[dict | None, str | None]:
         now = self.clock()
         rr = self._rr_state()
-        stalled: dict[str, int] = rr["stalled"]
+        stalled: dict[str, tuple[int, int] | int] = rr["stalled"]
         jobs = self._list_by_states("jobs", ACTIVE_STATES)
         active_ids = {job["id"] for job in jobs}
         for stale_id in [jid for jid in stalled if jid not in active_ids]:
             stalled.pop(stale_id, None)
         if not jobs:
             return None, None
+
+        def _stalled_meta(job_id: str) -> tuple[int, int] | None:
+            entry = stalled.get(job_id)
+            if entry is None:
+                return None
+            if isinstance(entry, tuple):
+                return entry
+            return int(entry), 0
+
         def priority(job):
-            last_poll = stalled.get(job["id"])
-            if job.get("state") in {"cleanup_pending", "cleaning_up"}:
-                group = 0
-            elif last_poll is not None and rr["seq"] - last_poll >= _MAX_STALLED_JOB_DEFERRALS:
-                # A stream of new jobs must not indefinitely delay a due poll.
-                group = 1
-            else:
-                group = 3 if job.get("awaiting_prep") else 2
-            return group, last_poll or 0, job.get("created_epoch", job.get("created_at", ""))
+            state = job.get("state")
+            created = job.get("created_epoch", job.get("created_at", ""))
+            if state in {"cleanup_pending", "cleaning_up"}:
+                return 0, 0, created
+            meta = _stalled_meta(job["id"])
+            if job.get("awaiting_prep"):
+                # A job parked on its cache prep always stays last so it can never starve its prep job.
+                return 3, meta[0] if meta is not None else 0, created
+            if meta is not None:
+                last_seq, last_fresh = meta
+                if rr["fresh_seq"] - last_fresh >= _MAX_STALLED_JOB_DEFERRALS or job.get("cancel_requested"):
+                    # A stream of new/advancing jobs must not indefinitely delay a due poll or cancellation.
+                    return 1, last_seq, created
+                return 2, last_seq, created
+            return 2, 0, created
 
         jobs.sort(key=priority)
         for job in jobs:
@@ -1653,7 +1678,14 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 {"claim_token": token, "claim_until": now + self.config.claim_ttl_seconds},
                 job.get("owner_id"),
             )
+            was_stalled = job["id"] in stalled
             rr["seq"] += 1
+            if (
+                not was_stalled
+                and state not in {"cleanup_pending", "cleaning_up"}
+                and not job.get("awaiting_prep")
+            ):
+                rr["fresh_seq"] += 1
             return claimed, token
         return None, None
 
@@ -1690,7 +1722,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         if after.get("state") in TERMINAL_STATES or advanced:
             rr["stalled"].pop(job["id"], None)
         else:
-            rr["stalled"][job["id"]] = rr["seq"]
+            rr["stalled"][job["id"]] = (rr["seq"], rr["fresh_seq"])
         return {
             "acquired": True,
             "advanced": advanced,

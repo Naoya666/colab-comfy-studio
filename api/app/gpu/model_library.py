@@ -106,8 +106,15 @@ class ModelLibrary:
         ident = hashlib.sha256(f"model-storage:{self.owner}".encode()).hexdigest()
         data = {"kind": "model_library_storage", "account_id": resolved}
         if old.get("id"):
-            return self.repo.update("files", ident, data, self.owner)
-        return self.repo.create("files", self.owner, data, record_id=ident)
+            saved = self.repo.update("files", ident, data, self.owner)
+        else:
+            saved = self.repo.create("files", self.owner, data, record_id=ident)
+        from .drive_usage import invalidate_drive_usage_cache
+        from .native_outputs import invalidate_native_outputs_cache
+
+        invalidate_native_outputs_cache(self.owner)
+        invalidate_drive_usage_cache(self.owner)
+        return saved
 
     def storage_account(self):
         from .accounts import AccountService

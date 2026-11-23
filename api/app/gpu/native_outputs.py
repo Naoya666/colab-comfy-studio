@@ -426,6 +426,9 @@ def _open_drive(repo, owner_id: str, *, drive: DriveStorage | None = None) -> tu
     return storage, account_id, account_alias, True
 
 
+_DEFAULT_OPEN_DRIVE = _open_drive
+
+
 def list_native_outputs(
     repo,
     owner_id: str,
@@ -570,6 +573,18 @@ def _encode_webp_thumbnail(raw_bytes: bytes) -> bytes:
         return out.getvalue()
 
 
+def _cached_item_for_account(owner_id: str, account_id: str | None, file_id: str) -> dict[str, Any] | None:
+    now = time.time()
+    with _LIST_LOCK:
+        cached = _LIST_CACHE.get((owner_id, account_id))
+        if not cached or now - cached[0] >= LIST_CACHE_TTL:
+            return None
+        for row in cached[1]:
+            if row.get("id") == file_id:
+                return row
+    return None
+
+
 def get_native_output_thumbnail(
     repo,
     owner_id: str,
@@ -577,6 +592,20 @@ def get_native_output_thumbnail(
     *,
     drive: DriveStorage | None = None,
 ) -> tuple[bytes, str]:
+    if not FILE_ID_RE.fullmatch(file_id or ""):
+        raise APIError("INVALID_FILE_ID", "无效的原生作品文件 ID", 400)
+    # Fast path: verify the owner's current Drive binding first, then serve from the
+    # matching account's warm directory cache + local disk thumbnail without opening DriveStorage.
+    if drive is None and _open_drive is _DEFAULT_OPEN_DRIVE:
+        account_id, account_alias = resolve_owner_drive_account(repo, owner_id)
+        if account_id is None and account_alias is None:
+            raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号，请先在「设置」中完成授权", 409)
+        cached_item = _cached_item_for_account(owner_id, account_id, file_id)
+        if cached_item is not None:
+            fast_file = _thumb_path(owner_id, file_id, str(cached_item.get("revision") or "0"))
+            if fast_file.is_file():
+                return fast_file.read_bytes(), "image/webp"
+
     item, storage, owns = resolve_output_item(repo, owner_id, file_id, drive=drive)
     try:
         cache_file = _thumb_path(owner_id, file_id, str(item.get("revision") or "0"))

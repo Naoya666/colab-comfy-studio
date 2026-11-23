@@ -195,26 +195,58 @@ def test_native_outputs_single_flight_and_disk_thumb_fast_path(tmp_path, monkeyp
     assert scan_calls == 1
     assert all(len(r[0]) == 1 and r[0][0]["id"] == "img-sf-1" for r in results)
 
-    # A warm lookup checks the current binding and uses the account's cached directory.
+    # A warm lookup checks the current binding and hits the matching account cache + disk file
+    # WITHOUT constructing a new DriveStorage / httpx.Client.
     thumb_file = native_outputs._thumb_path("owner-sf", "img-sf-1", "rev123")
     thumb_file.write_bytes(b"RIFF\x00\x00\x00\x00WEBP")
     binding = ("acc-1", "主盘")
+    drive_inits = 0
+
+    def _counting_drive(*_a, **_kw):
+        nonlocal drive_inits
+        drive_inits += 1
+        return drive
+
     monkeypatch.setattr(native_outputs, "resolve_owner_drive_account", lambda *_: binding)
-    monkeypatch.setattr(native_outputs, "DriveStorage", lambda *_a, **_kw: drive)
+    monkeypatch.setattr(native_outputs, "DriveStorage", _counting_drive)
     data, ctype = native_outputs.get_native_output_thumbnail(object(), "owner-sf", "img-sf-1")
     assert ctype == "image/webp"
     assert data.startswith(b"RIFF")
     assert scan_calls == 1
+    assert drive_inits == 0
 
     binding = (None, None)
     with pytest.raises(APIError) as disconnected:
         native_outputs.get_native_output_thumbnail(object(), "owner-sf", "img-sf-1")
     assert disconnected.value.code == "DRIVE_NOT_CONNECTED"
+    assert drive_inits == 0
 
     binding = ("acc-2", "另一块盘")
     with pytest.raises(APIError) as switched:
         native_outputs.get_native_output_thumbnail(object(), "owner-sf", "img-sf-1")
     assert switched.value.code == "NOT_FOUND"
+    assert drive_inits >= 1
+
+    # Disconnecting Google Drive also invalidates cached directory entries for the same account slot.
+    from app.gpu.google import GoogleService
+    from app.gpu.repository import Repository
+
+    repo = Repository(Store("sqlite://"))
+    repo.create(
+        "credentials",
+        "owner-sf",
+        {
+            "provider": "google",
+            "purpose": "drive",
+            "account_id": "acc-1",
+            "revoked": False,
+            "encrypted_access_token": "x",
+            "encrypted_refresh_token": "y",
+        },
+    )
+    assert ("owner-sf", "acc-1") in native_outputs._LIST_CACHE
+    assert GoogleService(repo, "owner-sf", account_id="acc-1").disconnect("drive", revoke_remote=False) is True
+    assert ("owner-sf", "acc-1") not in native_outputs._LIST_CACHE
     native_outputs.invalidate_native_outputs_cache()
 
 

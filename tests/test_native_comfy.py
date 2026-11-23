@@ -2167,8 +2167,14 @@ async def test_native_state_route_fails_closed_fast_during_boot_scan_without_dup
     assert status_calls == [True]
     assert resp3.data["busy"] is False
 
-    # Reboot uses a fresh read even if a concurrent status poll reported the old archive.
+    # ?fresh=1 forces an uncached durability read on /studio_native/state before rebooting.
     durable = False
+    resp_fresh = await handler(SimpleNamespace(query={"fresh": "1"}))
+    assert status_calls[-1] is False
+    assert resp_fresh.data["busy"] is True
+    assert resp_fresh.data["busy_reason"] == "plugins"
+
+    # Reboot middleware also rejects non-durable plugin state with 423 (using stat-validated status).
     ns["LEASE_ID"] = "lease"
     reboot_request = SimpleNamespace(path="/v2/manager/reboot", headers={
         "X-Studio-Restart-Id": "restart", "X-Studio-Restart-Lease": "lease",
@@ -2180,9 +2186,14 @@ async def test_native_state_route_fails_closed_fast_during_boot_scan_without_dup
         forwarded.append(request)
         return SimpleNamespace(status=200)
 
+    def strict_status(*, use_cache=False):
+        status_calls.append(use_cache)
+        return {"durable": durable, "error": None}
+
+    fake_persistence.status = strict_status
     refused = await ns["bind_restart"](reboot_request, reboot_handler)
     assert refused.status == 423
-    assert status_calls[-1] is False
+    assert status_calls[-1] is True
     assert not forwarded and ns["REBOOT_ID"] is None
 
     durable = True

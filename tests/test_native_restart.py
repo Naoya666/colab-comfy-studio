@@ -150,6 +150,41 @@ def test_releasing_lease_reports_stop_reason(session, monkeypatch):
     assert runtime.calls == 0
 
 
+def test_restart_uses_fresh_state_check_and_handles_423_rejection(session, monkeypatch):
+    repo, _ = session
+    state_queries = []
+    reboot_calls = []
+
+    def handler(request):
+        if request.url.path == "/queue":
+            return httpx.Response(200, json={"queue_running": [], "queue_pending": []})
+        if request.url.path == "/studio_native/state":
+            state_queries.append(request.url.params.get("fresh"))
+            return httpx.Response(200, json={
+                "boot_id": "old-boot", "lease_id": "lease", "busy": False, "busy_reason": None,
+            })
+        if request.url.path == "/studio_native/index":
+            return httpx.Response(200, json={"missing": []})
+        assert request.url.path == "/v2/manager/reboot" and request.method == "POST"
+        reboot_calls.append(1)
+        return httpx.Response(423, json={"error": "Manager 插件归档尚未同步至 Drive"})
+
+    client_cls = httpx.Client
+    monkeypatch.setattr(restart.httpx, "Client", lambda **kwargs: client_cls(
+        transport=httpx.MockTransport(handler), **kwargs
+    ))
+    monkeypatch.setattr(restart, "_sync_models", lambda *args: [])
+
+    restart.submit(repo, "owner", "instance", "fresh-key")
+    assert state_queries == ["1"]
+    restart.tick(repo)
+    assert state_queries == ["1", "1"]
+    assert reboot_calls == [1]
+    op = restart.public_restart(repo.get("leases", "lease", "owner"))
+    assert op["phase"] == "failed"
+    assert "尚未同步至 Drive" in op["error"]
+
+
 def test_crashed_worker_does_not_resend_manager_request(session, monkeypatch):
     repo, _ = session
     runtime = Runtime(monkeypatch)

@@ -130,6 +130,69 @@ def test_scheduler_repolls_running_job_during_continuous_submissions(monkeypatch
     assert running["id"] in picked[:9]
 
 
+def test_scheduler_many_stalled_and_awaiting_prep_jobs_never_starve_prep_or_new_jobs(monkeypatch):
+    # 1) >= 9 stalled awaiting_prep jobs must never starve the prep job they wait on.
+    repo = Repository(Store("sqlite://"))
+    scheduler = Scheduler(repo, clock=lambda: 1000.0)
+    monkeypatch.setattr(scheduler, "_advance", lambda job: job)
+
+    for i in range(12):
+        repo.create(
+            "jobs",
+            "owner",
+            {
+                "state": "waiting_for_capacity",
+                "awaiting_prep": True,
+                "provider": "mock",
+                "created_epoch": 100.0 + i,
+            },
+        )
+    for _ in range(12):
+        scheduler.tick()
+
+    prep_job = repo.create(
+        "jobs",
+        "owner",
+        {"state": "queued", "prep": True, "provider": "mock", "created_epoch": 200.0},
+    )
+    assert scheduler.tick()["job_id"] == prep_job["id"]
+
+    # 2) >= 9 normal stalled jobs must never form a closed loop that starves a new queued job.
+    repo2 = Repository(Store("sqlite://"))
+    scheduler2 = Scheduler(repo2, clock=lambda: 1000.0)
+    monkeypatch.setattr(scheduler2, "_advance", lambda job: job)
+
+    for i in range(12):
+        repo2.create(
+            "jobs",
+            "owner",
+            {"state": "waiting_for_capacity", "provider": "mock", "created_epoch": 100.0 + i},
+        )
+    for _ in range(12):
+        scheduler2.tick()
+
+    fresh_job = repo2.create(
+        "jobs",
+        "owner",
+        {"state": "queued", "provider": "mock", "created_epoch": 200.0},
+    )
+    picked2 = [scheduler2.tick()["job_id"] for _ in range(20)]
+    assert fresh_job["id"] in picked2
+
+    # 3) A stalled running job with cancel_requested preempts a stream of new queued jobs.
+    repo3 = Repository(Store("sqlite://"))
+    scheduler3 = Scheduler(repo3, clock=lambda: 1000.0)
+    monkeypatch.setattr(scheduler3, "_run", lambda job: job)
+    running = repo3.create("jobs", "owner", {"state": "running", "provider": "mock", "created_epoch": 100.0})
+    assert scheduler3.tick()["job_id"] == running["id"]
+
+    repo3.create("jobs", "owner", {"state": "queued", "provider": "mock", "created_epoch": 200.0})
+    repo3.update("jobs", running["id"], {"cancel_requested": True, "requested_outcome": "cancelled"}, "owner")
+    cancel_tick = scheduler3.tick()
+    assert cancel_tick["job_id"] == running["id"]
+    assert cancel_tick["state"] == "cancelled"
+
+
 def test_media_cache_headers_thumbnail_disk_cache_etag_304_and_gzip(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "studio_api_token", "test-batch1-token")

@@ -51,11 +51,12 @@ def _save_default_project(st, owner_id: str, target_id: str | None = None, *, pa
                 session.add(target)
             else:
                 target = next((row for row in rows if row.id == target_id), None)
-                if target is None or target.data.get("archived_at") is not None:
+                target_data = target.data or {} if target is not None else {}
+                if target is None or target_data.get("archived_at") is not None:
                     raise APIError("NOT_FOUND", "项目不存在或已归档", 404)
-                if target.data.get("system") is True:
+                if target_data.get("system") is True:
                     raise APIError("PROJECT_SYSTEM_PROTECTED", "系统内部项目不能设为默认项目", 409)
-                target.data = {**target.data, **changes}
+                target.data = {**target_data, **changes}
                 target.version += 1
                 target.updated_at = utcnow()
             for row in rows:

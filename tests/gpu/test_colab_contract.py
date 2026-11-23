@@ -231,12 +231,84 @@ def test_rest_allocation_retention_requires_runtime_readiness(ready, expected):
     lease = repo.get("leases", "lease", "owner")
     assert result["state"] == ("loading" if ready else "preparing")
     assert lease.get("allocation_confirmed") is (True if ready else None)
+    assert lease.get("operation_done") is ready
+    if ready:
+        assert lease.get("last_create_error") is None
 
     # A restarted scheduler can make the decision from the stored allocation evidence.
     if ready:
         repo.update("instances", "instance", {"state": "allocating"}, "owner")
     instance = Scheduler(repo, clock=lambda: 1000.0).instance_service.complete(result, success=ready)
     assert instance["state"] == expected
+
+
+def test_rest_inspect_persists_operation_done_so_expired_op_and_404_runtime_confirm_deletion():
+    repo = Repository(Store("sqlite://"))
+    repo.create("leases", "owner", {
+        "state": "active", "provider": "colab", "account_id": "acc",
+        "owner_job_id": "job", "runtime_id": "studio-test",
+        "request_id": "11111111-1111-4111-8111-111111111111",
+        "create_attempts": 2, "operation_name": "operations/op-1", "operation_done": False,
+        "last_create_error": "previous timeout",
+        "handle": {
+            "runtime_name": "runtimes/studio-test", "runtime_id": "studio-test",
+            "request_id": "11111111-1111-4111-8111-111111111111",
+            "owner_id": "owner", "job_id": "job", "operation_name": "operations/op-1",
+        },
+    }, record_id="lease")
+    phase = {"expired": False}
+
+    def handler(request):
+        if request.url.path == "/v1/operations/op-1":
+            if phase["expired"]:
+                return httpx.Response(404)
+            return httpx.Response(200, json={"name": "operations/op-1", "done": True})
+        if request.url.path == "/v1beta/runtimes/studio-test":
+            if phase["expired"]:
+                return httpx.Response(404)
+            return httpx.Response(200, json={
+                "name": "runtimes/studio-test",
+                "connectionInfo": {"url": "https://runtime", "token": "tok"},
+            })
+        if request.url.path == "/v1/operations":
+            return httpx.Response(200, json={"operations": []})
+        raise AssertionError(request.url.path)
+
+    provider = GoogleColabProvider(
+        repo, "owner", account_id="acc",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        google=type("G", (), {"access_token": lambda self, _: "tok"})(),
+    )
+    provider._is_cli_tunnel = lambda lease=None: False
+    handle = repo.get("leases", "lease", "owner")["handle"]
+    try:
+        ready_status = provider.inspect(handle)
+        assert ready_status["ready"] is True
+        lease = repo.get("leases", "lease", "owner")
+        assert lease["operation_done"] is True
+        assert lease["allocation_confirmed"] is True
+        assert lease["last_create_error"] is None
+
+        # Later, once both the Operation and Runtime expire (404), inspect & delete confirm absence.
+        phase["expired"] = True
+        missing = provider.inspect(handle)
+        assert missing["deleted"] is True
+        assert missing.get("allocation_unknown") is False
+        assert provider.delete(handle) is True
+    finally:
+        provider.close()
+
+
+def test_pre_upgrade_rest_lease_with_operation_done_true_is_not_treated_as_unconfirmed():
+    from app.gpu.instances import lease_allocation_unconfirmed
+
+    legacy_lease = {
+        "state": "active",
+        "operation_name": "operations/op-legacy",
+        "operation_done": True,
+        "handle": {"runtime_name": "runtimes/legacy"},
+    }
+    assert lease_allocation_unconfirmed("active", legacy_lease, instance_state="allocating") is False
 
 
 def test_delete_requires_owner_and_get_404_confirmation():

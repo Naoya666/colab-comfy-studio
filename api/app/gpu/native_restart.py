@@ -99,8 +99,9 @@ def _validate(repo, lease, instance_id, operation=None, *, check_jobs=True):
                 raise _busy("Studio 生成或启动任务仍在排队")
 
 
-def _upstream_state(client, url, headers, lease):
-    response = client.get(url + "/studio_native/state", headers=headers, timeout=12)
+def _upstream_state(client, url, headers, lease, *, fresh=False):
+    path = "/studio_native/state?fresh=1" if fresh else "/studio_native/state"
+    response = client.get(url + path, headers=headers, timeout=30 if fresh else 12)
     response.raise_for_status()
     state = response.json()
     if not isinstance(state.get("boot_id"), str) or not state["boot_id"] or not state.get("lease_id"):
@@ -110,7 +111,7 @@ def _upstream_state(client, url, headers, lease):
     return state
 
 
-def _idle(client, url, headers, lease):
+def _idle(client, url, headers, lease, *, fresh=False):
     response = client.get(url + "/queue", headers=headers)
     response.raise_for_status()
     queue = response.json()
@@ -118,7 +119,7 @@ def _idle(client, url, headers, lease):
         raise _busy("无法确认 ComfyUI 生成队列状态")
     if queue["queue_running"] or queue["queue_pending"]:
         raise _busy("ComfyUI 生成仍在执行或排队")
-    state = _upstream_state(client, url, headers, lease)
+    state = _upstream_state(client, url, headers, lease, fresh=fresh)
     if state.get("busy") is not False:
         reason = {
             "manager": "Manager 安装任务仍在执行或排队",
@@ -203,7 +204,7 @@ def submit(repo, owner, instance_id, key):
             time.sleep(0.2)
         url, headers = native.backend_for(repo, owner)
         with httpx.Client(timeout=8, follow_redirects=False) as client:
-            state = _idle(client, url, headers, lease)
+            state = _idle(client, url, headers, lease, fresh=True)
         with _transition(repo):
             fresh = _fresh(repo, lease)
             _validate(repo, fresh, instance_id, operation)
@@ -275,7 +276,7 @@ def _sync_and_reboot(repo, lease, operation, client, url, headers):
             message = "无法同步 Drive 模型快捷方式或刷新运行时挂载"
         return _fail(repo, lease, operation, message)
 
-    state = _idle(client, url, headers, lease)
+    state = _idle(client, url, headers, lease, fresh=True)
     if state["boot_id"] != operation["boot_id"]:
         return _fail(repo, lease, operation, "同步期间 ComfyUI 进程已切换，请重新检查会话")
     # Persist the send boundary first. A dying worker may leave the outcome
@@ -285,11 +286,15 @@ def _sync_and_reboot(repo, lease, operation, client, url, headers):
     if not operation:
         return None
     try:
-        response = client.post(url + "/v2/manager/reboot", headers={
-            **headers, "Origin": url,
-            "X-Studio-Restart-Id": operation["id"], "X-Studio-Restart-Lease": lease["id"],
-            "X-Studio-Restart-Boot": operation["boot_id"],
-        })
+        response = client.post(
+            url + "/v2/manager/reboot",
+            headers={
+                **headers, "Origin": url,
+                "X-Studio-Restart-Id": operation["id"], "X-Studio-Restart-Lease": lease["id"],
+                "X-Studio-Restart-Boot": operation["boot_id"],
+            },
+            timeout=30,
+        )
         if response.status_code == 423:
             return _fail(repo, lease, operation, "Manager 插件归档尚未同步至 Drive")
         if 400 <= response.status_code < 500 and response.status_code not in {408, 409, 429}:

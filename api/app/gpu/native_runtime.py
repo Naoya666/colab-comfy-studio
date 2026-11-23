@@ -168,12 +168,14 @@ async def state(request):
         if not result.get("busy"):
             result.update(busy=True, busy_reason="plugins")
     elif has_status:
-        def _cached_status():
+        query = getattr(request, "query", None) or {}
+        fresh = str(query.get("fresh") or "").lower() in {"1", "true"}
+        def _plugin_status():
             try:
-                return PERSISTENCE.status(use_cache=True)
+                return PERSISTENCE.status(use_cache=not fresh)
             except TypeError:
                 return PERSISTENCE.status()
-        result["plugins"] = await asyncio.to_thread(_cached_status)
+        result["plugins"] = await asyncio.to_thread(_plugin_status)
         if not result["busy"] and (not result["plugins"].get("durable") or result["plugins"].get("error")):
             result.update(busy=True, busy_reason="plugins")
     result.update(boot_id=BOOT_ID, lease_id=LEASE_ID, reboot_id=REBOOT_ID)
@@ -207,7 +209,12 @@ async def bind_restart(request, handler):
             or request.headers.get("X-Studio-Restart-Boot") != BOOT_ID or REBOOT_ID):
         return web.json_response({"error": "会话或进程已切换，或已受理重启"}, status=409)
     if PERSISTENCE is not None:
-        plugins = await asyncio.to_thread(PERSISTENCE.status)
+        def _reboot_status():
+            try:
+                return PERSISTENCE.status(use_cache=True)
+            except TypeError:
+                return PERSISTENCE.status()
+        plugins = await asyncio.to_thread(_reboot_status)
         if not plugins.get("durable") or plugins.get("error"):
             return web.json_response({"error": "Manager 插件归档尚未同步至 Drive"}, status=423)
     if REBOOT_ID:

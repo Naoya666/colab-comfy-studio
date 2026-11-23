@@ -1206,8 +1206,8 @@ class Persistence:
         try:
             tree_stamp = _full_tree_stat_fingerprint(self.nodes)
             cached = None
-            use_cache = use_cache and env_flag('NATIVE_FAST_SCAN', True) and SECRET is _DEFAULT_SECRET
-            if use_cache:
+            cache_allowed = env_flag('NATIVE_FAST_SCAN', True) and SECRET is _DEFAULT_SECRET
+            if use_cache and cache_allowed:
                 with self._inv_lock:
                     cached = self._inv_cache
             if cached and cached[0] == tree_stamp and time.monotonic() - cached[2] < 15.0:
@@ -1216,7 +1216,7 @@ class Persistence:
             else:
                 current_fp = digest(inventory(self.nodes))
                 stable = _full_tree_stat_fingerprint(self.nodes) == tree_stamp
-                if use_cache and stable:
+                if cache_allowed and stable:
                     with self._inv_lock:
                         self._inv_cache = (tree_stamp, current_fp, time.monotonic())
             durable = stable and pending_doc.get('source') == current_fp

@@ -552,6 +552,12 @@ class GoogleService:
         else:
             self._create("credentials", row["owner_id"], data)
         invalidate_token_cache(self.store, row.get("owner_id"), row.get("account_id"), row["oauth_purpose"])
+        if row["oauth_purpose"] == "drive" and row.get("owner_id"):
+            from .drive_usage import invalidate_drive_usage_cache
+            from .native_outputs import invalidate_native_outputs_cache
+
+            invalidate_native_outputs_cache(row["owner_id"])
+            invalidate_drive_usage_cache(row["owner_id"])
         connected = self._scope_sufficient(row["oauth_purpose"], data["scope"])
         result = {"purpose": row["oauth_purpose"], "connected": connected, "owner_id": row["owner_id"]}
         if row.get("account_id") is not None:
@@ -946,6 +952,12 @@ class GoogleService:
             self.owner_id,
         )
         invalidate_token_cache(self.store, self.owner_id, self.account_id, purpose)
+        if purpose == "drive" and self.owner_id:
+            from .drive_usage import invalidate_drive_usage_cache
+            from .native_outputs import invalidate_native_outputs_cache
+
+            invalidate_native_outputs_cache(self.owner_id)
+            invalidate_drive_usage_cache(self.owner_id)
         return True
 
     def close(self) -> None:

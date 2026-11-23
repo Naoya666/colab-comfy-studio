@@ -92,7 +92,7 @@ def lease_allocation_unconfirmed(
         or (handle and (instance_state in {"ready", "busy", "retained_idle"} or state == "idle"))
     ):
         return False
-    if data.get("operation_name") and isinstance(data.get("operation_done"), bool):
+    if data.get("operation_name") and not data.get("operation_done"):
         return True
     if data.get("last_create_error") and not data.get("operation_done"):
         return True
@@ -1073,6 +1073,7 @@ class InstanceService:
                 account_id=self._account_id(account),
             )
             if isinstance(handle, dict):
+                lease_data["allocation_confirmed"] = True
                 lease_data["handle"] = {
                     **handle,
                     "job_id": job["id"],

@@ -364,6 +364,12 @@ class AccountService:
         if "drive_account_id" in patch:
             patch["drive_account_id"], _ = self._validate_drive_account(patch["drive_account_id"], self_account_id=account_id)
         updated = self.repo.update("accounts", account_id, patch, self.owner_id)
+        if "drive_account_id" in patch or "enabled" in patch:
+            from .drive_usage import invalidate_drive_usage_cache
+            from .native_outputs import invalidate_native_outputs_cache
+
+            invalidate_native_outputs_cache(self.owner_id)
+            invalidate_drive_usage_cache(self.owner_id)
         return self._save_operation(idempotency_key, {"account_id": account_id, **body}, self._public(updated), operation="update")
 
     def disconnect(self, account_id: str, idempotency_key: str | None = None, body: dict | None = None) -> dict:
@@ -412,6 +418,11 @@ class AccountService:
                 "revoke_remote": revoke_remote,
                 "status": "local_only" if not revoke_remote else "remote_unconfirmed",
             }
+            from .drive_usage import invalidate_drive_usage_cache
+            from .native_outputs import invalidate_native_outputs_cache
+
+            invalidate_native_outputs_cache(self.owner_id)
+            invalidate_drive_usage_cache(self.owner_id)
             return self._save_operation(idempotency_key, op_body, result, operation="disconnect")
         from .google import GoogleService
 
@@ -549,6 +560,11 @@ class AccountService:
                     store.update("settings", anomaly_key, {"items": kept}, self.owner_id)
 
         self.repo.delete("accounts", account_id, self.owner_id)
+        from .drive_usage import invalidate_drive_usage_cache
+        from .native_outputs import invalidate_native_outputs_cache
+
+        invalidate_native_outputs_cache(self.owner_id)
+        invalidate_drive_usage_cache(self.owner_id)
         result = {
             "account_id": account_id,
             "deleted": True,
