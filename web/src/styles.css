@@ -20,6 +20,8 @@
   --warning-bg: rgba(255, 210, 125, 0.08);
   --warning-line: rgba(255, 210, 125, 0.38);
   --workspace-accent: #83cdb4;
+  --stage-heat-s: 74%;
+  --stage-heat-l: 54%;
   --overlay: rgba(0, 0, 0, 0.7);
 
   --r-sm: 8px;
@@ -55,6 +57,8 @@
   --warning-bg: #fff8e6;
   --warning-line: rgba(154, 92, 0, 0.35);
   --workspace-accent: #1b634c;
+  --stage-heat-s: 76%;
+  --stage-heat-l: 45%;
   --overlay: rgba(0, 0, 0, 0.45);
   color-scheme: light;
 }
@@ -79,6 +83,8 @@
     --warning-bg: #fff8e6;
     --warning-line: rgba(154, 92, 0, 0.35);
     --workspace-accent: #1b634c;
+    --stage-heat-s: 76%;
+    --stage-heat-l: 45%;
     --overlay: rgba(0, 0, 0, 0.45);
     color-scheme: light;
   }

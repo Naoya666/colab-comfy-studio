@@ -190,8 +190,19 @@ def job_timing_details(job: Mapping, events, *, now: float | None = None) -> dic
     state = str(job.get("state") or "").lower()
     if state not in _TERMINAL_STATES:
         current = str(job.get("stage") or "").strip()
-        if current in _WORKER_KEYS and current not in details:
-            details[current] = {"seconds": None, "source": "worker", "status": "in_progress"}
+        proxy_wait_started = _number(job.get("native_proxy_wait_started"))
+        if current == "native_tunnel" and proxy_wait_started is not None:
+            base_seconds = details.get("native_tunnel", {}).get("seconds")
+            elapsed = (
+                _round((base_seconds if isinstance(base_seconds, (int, float)) else 0.0) + max(0.0, now - proxy_wait_started))
+                if now is not None
+                else None
+            )
+            details["native_tunnel"] = {"seconds": elapsed, "source": "events", "status": "in_progress"}
+        elif current in _WORKER_KEYS and current not in details:
+            stage_started = _number(job.get("stage_started"))
+            elapsed = _round(max(0.0, now - stage_started)) if now is not None and stage_started is not None else None
+            details[current] = {"seconds": elapsed, "source": "worker", "status": "in_progress"}
         event_stage = _event_stage(state)
         if event_stage:
             details[event_stage] = {"seconds": None, "source": "events", "status": "in_progress"}

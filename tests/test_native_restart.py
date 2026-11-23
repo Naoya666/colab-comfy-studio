@@ -206,3 +206,40 @@ def test_drive_shortcut_target_verified_before_reuse():
     with pytest.raises(ValueError, match="目标冲突"):
         _index_models(secret, worker)
     assert len(cache.created) == 1
+
+
+def test_restart_records_phase_timings_and_live_in_progress_elapsed(session, monkeypatch):
+    repo, _lease = session
+    runtime = Runtime(monkeypatch)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(restart.time, "time", lambda: clock["now"])
+
+    # Submit transitions checking -> syncing immediately after idle probe.
+    restart.submit(repo, "owner", "instance", "timed-restart")
+    fresh = repo.get("leases", "lease", "owner")
+    clock["now"] = 1004.5
+    pub = restart.public_restart(fresh, now=clock["now"])
+    assert pub["phase"] == "syncing"
+    assert pub["timing_details"]["restart_checking"] == {"seconds": 0.0, "source": "events", "status": "completed"}
+    assert pub["timing_details"]["restart_syncing"] == {"seconds": 4.5, "source": "events", "status": "in_progress"}
+
+    # Advance through syncing -> rebooting -> recovering.
+    clock["now"] = 1006.0
+    restart.tick(repo)
+    fresh = repo.get("leases", "lease", "owner")
+    pub = restart.public_restart(fresh, now=1018.3)
+    assert pub["phase"] == "recovering"
+    assert pub["timing_details"]["restart_syncing"]["status"] == "completed"
+    assert pub["timing_details"]["restart_syncing"]["seconds"] == 6.0
+    assert pub["timing_details"]["restart_rebooting"]["status"] == "completed"
+    assert pub["timing_details"]["restart_recovering"] == {"seconds": 12.3, "source": "events", "status": "in_progress"}
+
+    # Complete recovery on new boot_id.
+    clock["now"] = 1020.4
+    runtime.boot = "new-boot-2"
+    restart.tick(repo)
+    fresh = repo.get("leases", "lease", "owner")
+    pub = restart.public_restart(fresh, now=1050.0)
+    assert pub["phase"] == "succeeded"
+    assert pub["timing_details"]["restart_recovering"] == {"seconds": 14.4, "source": "events", "status": "completed"}
+    assert pub["completed_at"] == 1020.4

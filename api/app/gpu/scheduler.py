@@ -914,15 +914,25 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                         "native_run_wait job=%s stage=%s poll_s=%.3f ready_s=%.3f worker_completed_age_s=%s",
                         job["id"], job.get("stage"), poll_s, ready_s, worker_age_s,
                     )
+                    wait_started = job.get("native_proxy_wait_started") or self.clock()
+                    wait_patch: dict[str, Any] = {
+                        "stage": "native_tunnel",
+                        "native_proxy_wait_started": wait_started,
+                    }
+                    if timings:
+                        wait_patch["worker_timings"] = timings
                     if not job.get("native_proxy_wait_logged"):
                         self._event(job, "running", "等待代理健康检查及内部隧道鉴权验证", None)
-                        return self._update(
-                            "jobs",
-                            job["id"],
-                            {"stage": "native_tunnel", "native_proxy_wait_logged": True},
-                            job["owner_id"],
-                        )
+                        wait_patch["native_proxy_wait_logged"] = True
+                        return self._update("jobs", job["id"], wait_patch, job["owner_id"])
+                    if job.get("native_proxy_wait_started") is None or (timings and timings != job.get("worker_timings")):
+                        return self._update("jobs", job["id"], wait_patch, job["owner_id"])
                     return job
+                if job.get("native_proxy_wait_started") is not None:
+                    extra_tunnel = max(0.0, self.clock() - float(job["native_proxy_wait_started"]))
+                    timings = dict(timings or job.get("worker_timings") or {})
+                    base_tunnel = float(timings.get("native_tunnel") or 0.0)
+                    timings["native_tunnel"] = round(base_tunnel + extra_tunnel, 1)
                 t_mark0 = time.monotonic()
                 deadline = min(float(lease["deadline_epoch"]),
                                float(job.get("native_session_deadline_epoch") or lease["deadline_epoch"]))
@@ -939,6 +949,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 }, job["owner_id"])
                 job = self._update("jobs", job["id"], {
                     "deadline_epoch": deadline, "hard_deadline_at": deadline,
+                    "native_proxy_wait_started": None,
                 }, job["owner_id"])
                 logging.getLogger(__name__).info(
                     "native_run_ready job=%s poll_s=%.3f ready_s=%.3f mark_ready_s=%.3f worker_completed_age_s=%s",
@@ -952,12 +963,35 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             )
         if state == "running":
             stage = result.get("stage")
+            now_epoch = self.clock()
+            raw_stage_started = result.get("stage_started")
+            valid_stage_started = (
+                float(raw_stage_started)
+                if isinstance(raw_stage_started, (int, float))
+                and not isinstance(raw_stage_started, bool)
+                and raw_stage_started > 0
+                and abs(now_epoch - float(raw_stage_started)) <= 3600
+                else None
+            )
+            resolved_stage_started = (
+                min(valid_stage_started, now_epoch) if valid_stage_started is not None else now_epoch
+            )
             if stage in _STAGE_TEXT and stage != job.get("stage"):
                 updated = self._update(
-                    "jobs", job["id"], {"stage": stage, "worker_timings": timings or {}}, job.get("owner_id")
+                    "jobs",
+                    job["id"],
+                    {"stage": stage, "stage_started": resolved_stage_started, "worker_timings": timings or {}},
+                    job.get("owner_id"),
                 )
                 self._event(updated, "running", _STAGE_TEXT[stage], None)
                 return updated
+            patch: dict[str, Any] = {}
+            if stage in _STAGE_TEXT and job.get("stage_started") is None:
+                patch["stage_started"] = resolved_stage_started
+            if timings and timings != job.get("worker_timings"):
+                patch["worker_timings"] = timings
+            if patch:
+                return self._update("jobs", job["id"], patch, job.get("owner_id"))
             return job
         if state == "failed":
             detail = str(result.get("message") or "")[:1400]

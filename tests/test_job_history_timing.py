@@ -126,6 +126,30 @@ def test_native_split_worker_stages_are_preserved_in_job_timings():
     assert timings["native_tunnel"] == 1.1
 
 
+def test_timing_details_computes_live_worker_stage_elapsed_when_stage_started_present():
+    job = {
+        "state": "running",
+        "stage": "native_env_cache",
+        "stage_started": 100.0,
+        "worker_timings": {"native_system": 5.4},
+    }
+    details = job_timing_details(job, [], now=118.6)
+    assert details["native_system"] == {"seconds": 5.4, "source": "worker", "status": "completed"}
+    assert details["native_env_cache"] == {"seconds": 18.6, "source": "worker", "status": "in_progress"}
+
+
+def test_timing_details_tracks_native_proxy_wait_as_in_progress_tunnel():
+    job = {
+        "state": "running",
+        "stage": "native_tunnel",
+        "native_proxy_wait_started": 200.0,
+        "worker_timings": {"comfy_start": 22.0, "native_tunnel": 1.2},
+    }
+    details = job_timing_details(job, [], now=206.5)
+    assert details["comfy_start"] == {"seconds": 22.0, "source": "worker", "status": "completed"}
+    assert details["native_tunnel"] == {"seconds": 7.7, "source": "events", "status": "in_progress"}
+
+
 def test_safe_history_value_drops_credentials_inside_nested_metadata():
     value = safe_history_value({
         "api_key": "api-secret",

@@ -11,9 +11,14 @@ const stages: Array<[string, string]> = [
   ['warm_reuse', '复用已就绪环境'],
   ['start_comfy', '启动 ComfyUI'], ['comfy_start', '启动 ComfyUI'],
   ['native_tunnel', '建立代理连接'],
+  ['native_finalize', '服务就绪收尾'],
   ['creation_warming', '预热加载模型'],
   ['sampling', '采样生成'], ['upload', '保存产物'], ['cleanup', '释放算力'], ['delete', '释放算力'],
   ['prep_env', '准备运行环境'], ['prep_weights', '准备模型权重'],
+  ['restart_checking', '检查会话空闲状态'],
+  ['restart_syncing', '同步模型索引'],
+  ['restart_rebooting', '重启 ComfyUI'],
+  ['restart_recovering', '等待服务恢复'],
 ];
 
 const stageLabels = new Map([

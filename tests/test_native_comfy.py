@@ -381,6 +381,49 @@ def test_native_status_keeps_latest_30_events_newest_first(proxy):
     assert messages[-1] == "event-11"
 
 
+def test_native_status_exposes_timing_details_gpu_reported_and_event_timestamps(proxy):
+    from app.native_routes import router
+
+    proxy.include_router(router)
+    repo = proxy.state.repo
+    repo.lease["native_ready"] = False
+    repo.job = {
+        "id": "job-timed",
+        "state": "running",
+        "stage": "comfy_start",
+        "stage_started": time.time() - 12.0,
+        "gpu_reported": "NVIDIA L4 (23034 MiB)",
+        "worker_timings": {"native_system": 4.2, "native_env_cache": 18.5},
+        "snapshot": {"native_comfy": True},
+    }
+    repo.lease["owner_job_id"] = "job-timed"
+    # More than 30 events so we verify timing_details uses full job events before slicing to 30.
+    newest_first = [
+        {"job_id": "job-timed", "state": "running", "message": f"tick-{i}", "created_at": f"2026-11-23T00:00:{50 - i:02d}Z"}
+        for i in range(32)
+    ] + [
+        {"job_id": "job-timed", "state": "allocating", "message": "alloc", "created_at": "2026-11-23T00:00:05Z"},
+        {"job_id": "job-timed", "state": "queued", "message": "queued", "created_at": "2026-11-23T00:00:00Z"},
+    ]
+    orig_list = repo.list
+    repo.list = lambda kind, owner=None: (
+        newest_first if kind == "events" else [repo.job] if kind == "jobs" else orig_list(kind, owner)
+    )
+    with TestClient(proxy) as client:
+        response = client.get("/api/gpu/native/status", headers={"Authorization": "Bearer api-test-token"})
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["stage"] == "comfy_start"
+    assert data["gpu_reported"] == "NVIDIA L4 (23034 MiB)"
+    assert data["timing_details"]["queue"]["seconds"] == 5.0
+    assert data["timing_details"]["native_system"]["seconds"] == 4.2
+    assert data["timing_details"]["native_env_cache"]["seconds"] == 18.5
+    assert data["timing_details"]["comfy_start"]["status"] == "in_progress"
+    assert data["timing_details"]["comfy_start"]["seconds"] >= 11.0
+    assert len(data["events"]) == 30
+    assert data["events"][0]["created_at"] == "2026-11-23T00:00:50Z"
+
+
 def test_creation_worker_ignores_native_marker_and_uses_own_service_dir(monkeypatch, tmp_path):
     import json
 

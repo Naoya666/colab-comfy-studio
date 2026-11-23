@@ -1,20 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUpRight } from 'lucide-react';
+import { ArrowUpRight, Loader2 } from 'lucide-react';
 import { apiFetch, apiMessage, type GpuUsage } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import { NativeModelSettings, type ModelStorage } from '../components/NativeModelSettings';
 import { NativeModelPreparation } from '../components/NativeModelPreparation';
 import { NativeApiSettings } from '../components/NativeApiSettings';
 import { NativeSetupWizard } from '../components/NativeSetupWizard';
+import { StageTimelineBar } from '../components/StageTimelineBar';
 import type { GpuAccount, GpuInstance } from '../components/AccountDirectory';
 import { formatInstanceTime } from '../lib/instance-time';
+import type { TimingDetail } from '../lib/job-history';
 import { submitNativeHandoff } from '../lib/native-handoff';
 import { jobStateLabel } from '../lib/job-stage-rows';
+import {
+  buildNativeRestartStages,
+  buildNativeStartupStages,
+  type NativeRestartInfo,
+} from '../lib/stage-timeline';
 import { cuNumber, terminalStates } from '../lib/ui-helpers';
 import { useSmartPoll } from '../lib/smart-poll';
 import styles from '../gpu.module.css';
 
-const EVENTS_COLLAPSED_LIMIT = 5;
 const NATIVE_PREFS_KEY = 'studio-native-comfy-prefs';
 
 type Timeouts = { retain_idle_minutes: number; max_runtime_minutes: number };
@@ -63,9 +69,39 @@ function loadNativePrefs(): NativePrefs {
 function saveNativePrefs(prefs: NativePrefs) {
   try { localStorage.setItem(NATIVE_PREFS_KEY, JSON.stringify(prefs)); } catch { /* browser storage unavailable */ }
 }
+function formatEventClock(value?: string): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
 type RestartPhase = 'checking' | 'syncing' | 'rebooting' | 'recovering' | 'succeeded' | 'failed';
-type NativeRestart = { restart_id: string; instance_id: string; phase: RestartPhase; failed_phase?: RestartPhase; error?: string };
-type NativeStatus = { configured: boolean; tunnel_configured?: boolean; web_ui_configured?: boolean; url?: string; ready: boolean; can_restart: boolean; restart?: NativeRestart; state: string; instance_id?: string; job_id?: string | null; error?: string; timeouts: { defaults: Timeouts }; model_storage_defaults: ModelStorage; model_storage?: ModelStorage; model_storage_known?: boolean; disk?: { disk_free_bytes?: number; vfs_cache_bytes?: number }; events: { state?: string; message?: string }[] };
+type NativeRestart = NativeRestartInfo & { created_at?: number; completed_at?: number };
+type NativeEvent = { state?: string; message?: string; created_at?: string };
+type NativeStatus = {
+  configured: boolean;
+  tunnel_configured?: boolean;
+  web_ui_configured?: boolean;
+  url?: string;
+  ready: boolean;
+  can_restart: boolean;
+  restart?: NativeRestart;
+  state: string;
+  stage?: string | null;
+  gpu_reported?: string | null;
+  timings?: Record<string, number>;
+  timing_details?: Record<string, TimingDetail>;
+  instance_id?: string;
+  job_id?: string | null;
+  error?: string;
+  timeouts: { defaults: Timeouts };
+  model_storage_defaults: ModelStorage;
+  model_storage?: ModelStorage;
+  model_storage_known?: boolean;
+  disk?: { disk_free_bytes?: number; vfs_cache_bytes?: number };
+  events: NativeEvent[];
+};
 const restartMessages: Record<RestartPhase, string> = {
   checking: '检查生成、安装和 Drive 同步状态',
   syncing: '同步模型索引',
@@ -99,7 +135,8 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const [submittingRestart, setSubmittingRestart] = useState(false);
   const [pendingRestart, setPendingRestart] = useState<{ id: string; previous?: string }>();
   const [autoOpen, setAutoOpen] = useState(false);
-  const [showAllEvents, setShowAllEvents] = useState(false);
+  const [statusFetchedAtMs, setStatusFetchedAtMs] = useState(() => Date.now());
+  const [clockMs, setClockMs] = useState(() => Date.now());
   const [storage, setStorage] = useState<ModelStorage | undefined>(() => initialPrefs.storage);
   const [idleMinutes, setIdleMinutes] = useState(() => initialPrefs.idleMinutes ?? '');
   const [runtimeMinutes, setRuntimeMinutes] = useState(() => initialPrefs.runtimeMinutes ?? '');
@@ -164,7 +201,10 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     try {
       const data = await apiFetch<NativeStatus>('/api/gpu/native/status', { signal });
       if (signal.aborted) return;
+      const nowMs = Date.now();
       setStatus(data);
+      setStatusFetchedAtMs(nowMs);
+      setClockMs(nowMs);
       setPendingStart(false);
       setPendingRestart(pending => {
         const observed = data.restart?.restart_id;
@@ -201,6 +241,70 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const restartError = restart?.phase === 'failed'
     ? `${restartMessages[restart.failed_phase || 'failed']}：${restart.error || 'ComfyUI 重启失败'}`
     : '';
+  const hasLiveTiming = useMemo(() => {
+    const startupLive = Object.values(status?.timing_details || {}).some((item) => item?.status === 'in_progress');
+    const restartLive = Object.values(restart?.timing_details || {}).some((item) => item?.status === 'in_progress');
+    return startupLive || restartLive || startupPending || restartInProgress;
+  }, [status?.timing_details, restart?.timing_details, startupPending, restartInProgress]);
+
+  useEffect(() => {
+    if (!hasLiveTiming) return;
+    const timer = window.setInterval(() => setClockMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasLiveTiming]);
+
+  const fallbackActiveRef = useRef<{ key: string; sinceMs: number } | null>(null);
+  const activeStageIdentity = useMemo(() => {
+    const restartActiveKey = Object.entries(restart?.timing_details || {}).find(([, item]) => item?.status === 'in_progress')?.[0];
+    if (restartActiveKey) return `restart:${restart?.restart_id || ''}:${restartActiveKey}`;
+    const startupActiveKey = Object.entries(status?.timing_details || {}).find(([, item]) => item?.status === 'in_progress')?.[0];
+    if (startupActiveKey) return `startup:${status?.job_id || ''}:${startupActiveKey}`;
+    if (restartInProgress) return `restart:${pendingRestart?.id || restart?.restart_id || 'pending'}:checking`;
+    if (pendingStart) return 'startup:pending:queue';
+    return '';
+  }, [restart?.restart_id, restart?.timing_details, status?.job_id, status?.timing_details, restartInProgress, pendingRestart?.id, pendingStart]);
+
+  if (activeStageIdentity) {
+    if (fallbackActiveRef.current?.key !== activeStageIdentity) {
+      fallbackActiveRef.current = { key: activeStageIdentity, sinceMs: statusFetchedAtMs };
+    }
+  } else {
+    fallbackActiveRef.current = null;
+  }
+
+  const elapsedDeltaSeconds = hasLiveTiming ? Math.max(0, (clockMs - statusFetchedAtMs) / 1000) : 0;
+  const fallbackActiveSeconds = fallbackActiveRef.current
+    ? Math.max(0, (clockMs - fallbackActiveRef.current.sinceMs) / 1000)
+    : undefined;
+
+  const startupStages = useMemo(() => buildNativeStartupStages({
+    state: status?.state,
+    stage: status?.stage,
+    timings: status?.timings,
+    timingDetails: status?.timing_details,
+    elapsedDeltaSeconds,
+    fallbackActiveSeconds,
+  }), [status?.state, status?.stage, status?.timings, status?.timing_details, elapsedDeltaSeconds, fallbackActiveSeconds]);
+
+  const restartStages = useMemo(() => buildNativeRestartStages({
+    restart,
+    elapsedDeltaSeconds,
+    fallbackActiveSeconds,
+  }), [restart, elapsedDeltaSeconds, fallbackActiveSeconds]);
+
+  const restartMatchesCurrent = Boolean(
+    restart && (
+      restartInProgress
+      || (status?.instance_id && restart.instance_id === status.instance_id)
+    ),
+  );
+  const showRestartPrimary = Boolean(restartMatchesCurrent && restartStages.length);
+
+  const refreshStatusNow = useCallback(() => {
+    const controller = new AbortController();
+    void pollStatus(controller.signal);
+  }, [pollStatus]);
+
   async function restartNative() {
     const instance = status?.instance_id;
     if (!instance || !status?.can_restart || sendingRestart.current) return;
@@ -215,6 +319,7 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
         body: JSON.stringify({ instance_id: instance }),
       }, 40_000);
       setPendingRestart({ id: result.restart_id, previous: restart?.restart_id });
+      refreshStatusNow();
     } catch (cause) { setError(apiMessage(cause)); }
     finally { sendingRestart.current = false; setSubmittingRestart(false); }
   }
@@ -228,16 +333,13 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
       key.current = crypto.randomUUID();
       setPendingStart(true);
       setAutoOpen(!desktop);
+      refreshStatusNow();
     } catch (cause) { setError(apiMessage(cause)); }
     finally { sendingStart.current = false; setStarting(false); }
   }
   const openSetupWizard = useCallback((step?: 1 | 2 | 3 | 4 | 5) => {
     setWizardRequest(current => ({ seq: (current?.seq || 0) + 1, step }));
   }, []);
-  const refreshStatusNow = useCallback(() => {
-    const controller = new AbortController();
-    void pollStatus(controller.signal);
-  }, [pollStatus]);
   const webUiReady = status?.web_ui_configured !== false;
   return <section className={styles.nativeWorkspace}>
     <div className="actions nativeApiHeading">
@@ -347,25 +449,61 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
       </div>
       <section className={styles.nativeActivity} aria-label="会话活动">
         {desktop && <h2>会话活动</h2>}
-        <p role="status">{restartInProgress
-          ? (restart && !['failed', 'succeeded'].includes(restart.phase) ? restartMessages[restart.phase] : restartMessages.checking)
-          : status?.ready && restart?.phase === 'succeeded' ? restartMessages.succeeded
-          : status?.ready ? '服务就绪' : pendingStart ? '启动请求已提交' : !status ? '正在读取会话状态…'
-          : status.state === 'stopped' ? '当前没有原生会话' : `当前状态：${jobStateLabel(status.state)}`}</p>
+        <div className={styles.activityStatusRow}>
+          <p className={styles.activityStatusText} role="status">
+            {(startupPending || restartInProgress) && <Loader2 size={14} className={styles.spin} aria-hidden />}
+            <span>{restartInProgress
+              ? (restart && !['failed', 'succeeded'].includes(restart.phase) ? restartMessages[restart.phase] : restartMessages.checking)
+              : status?.ready && restart?.phase === 'succeeded' ? restartMessages.succeeded
+              : status?.ready ? '服务就绪' : pendingStart ? '启动请求已提交' : !status ? '正在读取会话状态…'
+              : status.state === 'stopped' ? '当前没有原生会话' : `当前状态：${jobStateLabel(status.state)}`}</span>
+          </p>
+          {status?.gpu_reported && (!desktop || !instance) && (
+            <span className={styles.activityGpuTag} title="实测 GPU 型号">{status.gpu_reported}</span>
+          )}
+        </div>
         {(error || restartError || status?.error) &&
           <p className="status error" role="alert">{error || restartError || status?.error}</p>}
-        {Boolean(status?.events.length) && (() => {
-          const events = status?.events || [];
-          const hidden = Math.max(0, events.length - EVENTS_COLLAPSED_LIMIT);
-          const shownEvents = showAllEvents || hidden === 0 ? events : events.slice(0, EVENTS_COLLAPSED_LIMIT);
-          return <>
-            <ol aria-label="启动进度">{shownEvents.map((event, i) => <li key={i}>{event.message}</li>)}</ol>
-            {hidden > 0 && (
-              <button type="button" className="button ghost small" onClick={() => setShowAllEvents(v => !v)}>
-                {showAllEvents ? `收起早期事件，仅显示最新 ${EVENTS_COLLAPSED_LIMIT} 条` : `展开更早的 ${hidden} 条启动事件`}
-              </button>
+        {showRestartPrimary ? (
+          <>
+            <StageTimelineBar title="重启阶段耗时" items={restartStages} ariaLabel="重启阶段耗时" />
+            {startupStages.length > 0 && (
+              <details className={styles.activityFold}>
+                <summary>查看本次启动阶段耗时（{startupStages.length} 个阶段）</summary>
+                <div className={styles.activityFoldBody}>
+                  <StageTimelineBar title="启动阶段耗时" items={startupStages} ariaLabel="启动阶段耗时" />
+                </div>
+              </details>
             )}
-          </>;
+          </>
+        ) : (
+          startupStages.length > 0 && (
+            <StageTimelineBar title="启动阶段耗时" items={startupStages} ariaLabel="启动阶段耗时" />
+          )
+        )}
+        {Boolean(status?.events.length) && (() => {
+          const chronologicalEvents = [...(status?.events || [])].reverse();
+          const hasTimeline = showRestartPrimary || startupStages.length > 0;
+          return (
+            <details className={styles.activityFold} open={!hasTimeline}>
+              <summary>查看原始事件日志（{chronologicalEvents.length} 条）</summary>
+              <ul className={styles.activityLogList} aria-label="启动进度">
+                {chronologicalEvents.map((event, i) => {
+                  const isActiveLog = startupPending && i === chronologicalEvents.length - 1;
+                  const clockText = formatEventClock(event.created_at);
+                  return (
+                    <li key={`${event.created_at || ''}-${i}`} className={styles.activityLogItem}>
+                      <span className={styles.activityLogMarker} data-active={isActiveLog ? 'true' : undefined} aria-hidden="true">
+                        {isActiveLog ? <Loader2 size={12} className={styles.spin} /> : '●'}
+                      </span>
+                      <span className={styles.activityLogText}>{event.message}</span>
+                      {clockText && <span className={styles.activityLogTime}>{clockText}</span>}
+                    </li>
+                  );
+                })}
+              </ul>
+            </details>
+          );
         })()}
         {status?.instance_id && <div className="actions">
           <button className="button secondary" onClick={() => { setAutoOpen(false); setStopConfirm(true); }}>停止当前原生实例</button>

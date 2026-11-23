@@ -292,8 +292,200 @@
 .desktopTitle { display: none; }
 .nativeWorkspace, .nativeColumns, .nativeControls, .nativeActivity, .nativeFieldPair { display: grid; gap: 12px; min-width: 0; align-content: start; }
 .nativeControls > button { justify-self: start; }
-.nativeActivity ol { margin: 0; padding-inline-start: 20px; }
-.nativeActivity li + li { margin-top: 6px; }
+.activityStatusRow { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.activityStatusText { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; }
+.activityGpuTag {
+  font-size: 12px;
+  color: var(--text-2);
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line);
+  background: var(--bg);
+}
+
+/* 阶段耗时彩色时间条 */
+.stageTimeline {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  min-width: 0;
+}
+.stageTimelineHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.stageTimelineTitle { font-size: 13px; font-weight: 600; color: var(--text); }
+.stageTimelineTotal { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.stageTimelineTotal strong { color: var(--text); font-weight: 600; }
+.stageBarTrack {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  height: 14px;
+  padding: 2px;
+  border-radius: var(--r-full);
+  background: var(--card-2);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.stageBarSegment {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 8px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-full);
+  overflow: hidden;
+  cursor: pointer;
+  transition: flex-grow 0.6s ease, background-color 0.6s ease, opacity 0.18s ease, filter 0.18s ease;
+}
+.stageBarSegment[data-highlighted='true'] { filter: brightness(1.12); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.5); }
+.stageBarSegment[data-dimmed='true'] { opacity: 0.34; }
+.stageBarSegment[data-status='in_progress']::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.38) 50%, transparent 100%);
+  transform: translateX(-100%);
+  animation: stageShimmer 1.5s ease-in-out infinite;
+}
+.stageBarSegment[data-status='failed'] {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent 0 4px,
+    rgba(255, 255, 255, 0.28) 4px 8px
+  );
+}
+@keyframes stageShimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.stageLegendRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  min-height: 18px;
+}
+.stageLegendHint { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stageHeatScale { display: inline-flex; align-items: center; gap: 5px; flex: none; }
+.stageHeatGradient {
+  display: inline-block;
+  width: 44px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: linear-gradient(
+    90deg,
+    hsl(152 var(--stage-heat-s, 74%) var(--stage-heat-l, 50%)),
+    hsl(80 var(--stage-heat-s, 74%) calc(var(--stage-heat-l, 50%) - 6%)),
+    hsl(34 var(--stage-heat-s, 74%) var(--stage-heat-l, 50%)),
+    hsl(2 calc(var(--stage-heat-s, 74%) + 6%) var(--stage-heat-l, 50%))
+  );
+}
+.stageList { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.stageListItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 6px;
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  line-height: 1.35;
+  transition: background-color 0.15s ease, opacity 0.18s ease;
+}
+.stageListItem[data-highlighted='true'] { background: var(--card-2); }
+.stageListItem[data-dimmed='true'] { opacity: 0.45; }
+.stageListItem[data-status='failed'] .stageItemLabel { color: var(--danger); }
+.stageItemMain { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.stageMarker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  font-size: 10px;
+  line-height: 1;
+}
+.stageItemLabel { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stageItemMeta { display: inline-flex; align-items: baseline; gap: 8px; flex: none; }
+.stageItemDuration { font-variant-numeric: tabular-nums; font-weight: 500; color: var(--text-2); }
+.stageListItem[data-status='in_progress'] .stageItemDuration { color: var(--text); }
+.stageItemShare { font-variant-numeric: tabular-nums; font-size: 11px; color: var(--muted); min-width: 28px; text-align: right; }
+
+/* 折叠原始事件日志 */
+.activityFold {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  padding: 8px 12px;
+  min-width: 0;
+}
+.activityFold > summary {
+  font-size: 13px;
+  color: var(--text-2);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  user-select: none;
+}
+.activityFold > summary::-webkit-details-marker { display: none; }
+.activityFold > summary::after {
+  content: '展开';
+  font-size: 12px;
+  color: var(--muted);
+}
+.activityFold[open] > summary::after { content: '收起'; }
+.activityFoldBody { margin-top: 10px; }
+.activityFoldBody .stageTimeline { border: 0; padding: 0; background: transparent; }
+.activityLogList {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 8px 0 0;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 6px;
+  max-height: 36dvh;
+  overflow: auto;
+}
+.activityLogItem {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+.activityLogMarker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  font-size: 8px;
+  color: var(--workspace-accent);
+}
+.activityLogMarker[data-active='true'] { color: var(--text); }
+.activityLogText { min-width: 0; overflow-wrap: anywhere; }
+.activityLogTime { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  .stageBarSegment[data-status='in_progress']::after { animation: none; }
+  .stageBarSegment { transition: none; }
+}
 
 @media (min-width: 1100px) {
   .workspaceGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
@@ -410,7 +602,7 @@
   .nativeColumns { grid-template-columns: minmax(0, 1.18fr) minmax(250px, .82fr); align-items: start; gap: 20px; }
   .nativeControls, .nativeActivity { padding: 16px; background: var(--card); border: 1px solid var(--line); border-radius: var(--r-lg); }
   .nativeActivity { position: sticky; top: calc(var(--desktop-header-height) + 24px); }
-  .nativeActivity ol { max-height: 42dvh; overflow: auto; }
+  .nativeActivity .activityLogList { max-height: 40dvh; }
   .nativeControls .nativeFieldPair { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
   .dialog:has(.viewerImage), .dialog:has(.viewerVideo) { max-width: min(960px, calc(100vw - 48px)); }
   .dialog:fullscreen { max-width: 100vw; }

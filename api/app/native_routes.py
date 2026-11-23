@@ -15,6 +15,7 @@ from .api_access import build_access_urls, get_or_create_path_code, peek_path_co
 from .common import APIError, admin, current_user, ok
 from .gpu import native, native_config, native_restart
 from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
+from .job_history import job_timing_details, job_timings
 from .port_listeners import probe_port_available
 from .security import sign_session
 
@@ -335,7 +336,8 @@ async def status(request: Request, user=Depends(current_user)):
         (row for row in repo.list("leases", user["id"]) if row.get("native_restart")),
         key=lambda row: row["native_restart"]["created_at"], default=None,
     )
-    restart = native_restart.public_restart(restart_lease)
+    now = time.time()
+    restart = native_restart.public_restart(restart_lease, now=now)
     native_jobs = [j for j in repo.list("jobs", user["id"]) if (j.get("snapshot") or {}).get("native_comfy")]
     job = max(native_jobs, key=lambda j: j.get("created_at") or "", default=None)
     last_instance_id = (job or {}).get("instance_id")
@@ -358,6 +360,10 @@ async def status(request: Request, user=Depends(current_user)):
         except (httpx.HTTPError, ValueError, AttributeError, APIError):
             pass
     events = repo.list("events", user["id"]) if job else []
+    job_events = [e for e in events if e.get("job_id") == job["id"]] if job else []
+    timing_details = job_timing_details(job, job_events, now=now) if job else {}
+    timings = job_timings(job, job_events, now=now) if job else {}
+    gpu_reported = (job or {}).get("gpu_reported") or (lease or {}).get("gpu_reported") or (instance or {}).get("gpu_reported")
     can_restart = ready and native_restart.can_restart(repo, lease)
     ncfg = native_config.resolve(repo, user["id"], use_cache=False, file_reader=native.secret_file, strict_decrypt=False)
     return ok({"configured": bool(ncfg.tunnel_configured or (not ncfg.has_db_override and ncfg.any_configured)),
@@ -371,11 +377,13 @@ async def status(request: Request, user=Depends(current_user)):
                ), "disk": disk,
                "ready": ready, "instance_id": lease.get("instance_id") if lease else None,
                "job_id": job["id"] if job else None, "state": job["state"] if job else "stopped",
+               "stage": (job or {}).get("stage"), "gpu_reported": gpu_reported,
+               "timings": timings, "timing_details": timing_details,
                "restart": restart, "can_restart": can_restart,
                "reason": RUNTIME_MISSING if reclaimed else None,
                "error": RUNTIME_MISSING_MESSAGE if reclaimed else (job or {}).get("error_message"),
-               "events": [{"message": e.get("message"), "state": e.get("state")}
-                          for e in events if e.get("job_id") == (job or {}).get("id")][:30]}, request)
+               "events": [{"message": e.get("message"), "state": e.get("state"), "created_at": e.get("created_at")}
+                          for e in job_events[:30]]}, request)
 
 
 @router.post("/restart", status_code=202)

@@ -36,5 +36,10 @@ test('history labels translate known states and stages while preserving unknown 
   assert.equal(jobStageLabel('creation_python'), '安装基础依赖');
   assert.equal(jobStageLabel('restore_loras'), '恢复用户 LoRA');
   assert.equal(jobStageLabel('creation_warming'), '预热加载模型');
+  assert.equal(jobStageLabel('native_finalize'), '服务就绪收尾');
+  assert.equal(jobStageLabel('restart_checking'), '检查会话空闲状态');
+  assert.equal(jobStageLabel('restart_syncing'), '同步模型索引');
+  assert.equal(jobStageLabel('restart_rebooting'), '重启 ComfyUI');
+  assert.equal(jobStageLabel('restart_recovering'), '等待服务恢复');
   assert.equal(jobStageLabel('future_stage'), 'future_stage');
 });

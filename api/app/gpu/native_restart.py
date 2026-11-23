@@ -16,6 +16,33 @@ from .native_runtime import _index_models
 
 RECOVERY_SECONDS = 2100
 WAIT_HINT = "请等当前操作完成后重试"
+RESTART_PHASES = ("checking", "syncing", "rebooting", "recovering")
+
+
+def _apply_phase_timings(current_op: dict, changes: dict, now: float) -> dict:
+    """Record completed restart phase duration and start clock for the next phase."""
+    result = {**current_op, **changes}
+    old_phase = current_op.get("phase")
+    new_phase = result.get("phase")
+    timings = dict(current_op.get("phase_timings") or {})
+    if isinstance(changes.get("phase_timings"), dict):
+        timings.update(changes["phase_timings"])
+    if new_phase and new_phase != old_phase:
+        if old_phase in RESTART_PHASES:
+            started = current_op.get("phase_started_at")
+            if not isinstance(started, (int, float)) or isinstance(started, bool):
+                started = current_op.get("created_at")
+            if isinstance(started, (int, float)) and not isinstance(started, bool):
+                prev = timings.get(old_phase)
+                base = float(prev) if isinstance(prev, (int, float)) and not isinstance(prev, bool) else 0.0
+                timings[old_phase] = round(base + max(0.0, now - float(started)), 1)
+        if new_phase in RESTART_PHASES:
+            result["phase_started_at"] = now
+        elif new_phase in {"succeeded", "failed"}:
+            result["phase_started_at"] = None
+            result["completed_at"] = now
+    result["phase_timings"] = timings
+    return result
 
 
 def _busy(message):
@@ -115,10 +142,11 @@ def _save(repo, lease, operation, *, validate=False, **changes):
             return None
         if validate:
             _validate(repo, fresh, operation["instance_id"], operation)
-        result = {**fresh["native_restart"], **changes}
+        now = time.time()
+        result = _apply_phase_timings(fresh["native_restart"], changes, now)
         patch = {"native_restart": result}
         if changes.get("phase") == "succeeded":
-            patch["native_last_busy"] = time.time()
+            patch["native_last_busy"] = now
         repo.update("leases", fresh["id"], patch, lease["owner_id"])
         return result
 
@@ -159,10 +187,11 @@ def submit(repo, owner, instance_id, key):
             keys[key] = operation["id"]
             repo.update("leases", lease["id"], {"native_restart_keys": keys}, owner)
             return operation["id"]
+        now = time.time()
         operation = {
             "id": str(uuid.uuid4()), "instance_id": instance_id, "phase": "checking",
             "runtime_id": lease.get("runtime_id"), "lease_deadline": lease.get("deadline_epoch"),
-            "created_at": time.time(), "checking_key": key,
+            "created_at": now, "phase_started_at": now, "phase_timings": {}, "checking_key": key,
         }
         repo.update("leases", lease["id"], {"native_restart": operation}, owner)
 
@@ -182,9 +211,12 @@ def submit(repo, owner, instance_id, key):
             if current.get("id") != operation["id"] or current.get("phase") != "checking":
                 raise _busy("会话状态已更新")
             keys[key] = operation["id"]
+            next_op = _apply_phase_timings(
+                current, {"phase": "syncing", "boot_id": state["boot_id"]}, time.time()
+            )
             repo.update("leases", lease["id"], {
                 "native_restart_keys": keys,
-                "native_restart": {**operation, "phase": "syncing", "boot_id": state["boot_id"]},
+                "native_restart": next_op,
             }, owner)
     except (APIError, httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
         error = exc if isinstance(exc, APIError) else _busy("无法确认 ComfyUI 当前是否空闲")
@@ -337,12 +369,50 @@ def tick(repo):
                     _fail(repo, lease, operation, "无法复核 ComfyUI 生成、Manager 或 Drive 同步状态")
 
 
-def public_restart(lease):
+def restart_timing_details(state: dict, *, now: float | None = None) -> dict[str, dict]:
+    details: dict[str, dict] = {}
+    raw_timings = state.get("phase_timings") if isinstance(state.get("phase_timings"), dict) else {}
+    for phase in RESTART_PHASES:
+        val = raw_timings.get(phase)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
+            details[f"restart_{phase}"] = {
+                "seconds": round(float(val), 1),
+                "source": "events",
+                "status": "completed",
+            }
+    current = state.get("phase")
+    if current in RESTART_PHASES:
+        started = state.get("phase_started_at")
+        if not isinstance(started, (int, float)) or isinstance(started, bool):
+            started = state.get("created_at")
+        elapsed = None
+        if now is not None and isinstance(started, (int, float)) and not isinstance(started, bool):
+            prev = details.get(f"restart_{current}", {}).get("seconds")
+            base = float(prev) if isinstance(prev, (int, float)) else 0.0
+            elapsed = round(base + max(0.0, now - float(started)), 1)
+        details[f"restart_{current}"] = {
+            "seconds": elapsed,
+            "source": "events",
+            "status": "in_progress",
+        }
+    return details
+
+
+def public_restart(lease, *, now: float | None = None):
     state = (lease or {}).get("native_restart") or {}
     if not state:
         return None
-    return {"restart_id": state["id"], "instance_id": state["instance_id"],
-            "phase": state["phase"], "failed_phase": state.get("failed_phase"), "error": state.get("error")}
+    current_now = time.time() if now is None else now
+    return {
+        "restart_id": state["id"],
+        "instance_id": state["instance_id"],
+        "phase": state["phase"],
+        "failed_phase": state.get("failed_phase"),
+        "error": state.get("error"),
+        "created_at": state.get("created_at"),
+        "completed_at": state.get("completed_at"),
+        "timing_details": restart_timing_details(state, now=current_now),
+    }
 
 
 def can_restart(repo, lease):

@@ -1134,6 +1134,7 @@ print(json.dumps({{"interrupted": interrupted}}))
         }
         if state in {"reserved", "starting", "running", None}:
             stage = result.get("stage")
+            stage_started = result.get("stage_started")
             if status_poll_s >= 2.0:
                 log.info("mcp_poll job=%s state=running stage=%s status_poll_s=%.3f", job["id"], stage, status_poll_s)
             return {
@@ -1141,6 +1142,11 @@ print(json.dumps({{"interrupted": interrupted}}))
                 "state": "running",
                 "outputs": [],
                 "stage": stage if isinstance(stage, str) else None,
+                "stage_started": (
+                    float(stage_started)
+                    if isinstance(stage_started, (int, float)) and not isinstance(stage_started, bool)
+                    else None
+                ),
                 "timings": result.get("timings") if isinstance(result.get("timings"), dict) else {},
             }
         if state == "failed":

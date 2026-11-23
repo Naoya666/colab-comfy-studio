@@ -1302,7 +1302,8 @@ class Repository:
                 'instance_completion_recorded','instance_id','instance_state','instance_bound','account_id',
                 'requested_instance_id',
                 'account_alias_snapshot','selection_reason','allocation_key','attempt_id','runtime_id','request_id',
-                'stage','worker_timings','output_bytes','started_at','finished_at','poll_retry_count','poll_retry_at',
+                'stage','stage_started','worker_timings','native_proxy_wait_started','native_proxy_wait_logged',
+                'output_bytes','started_at','finished_at','poll_retry_count','poll_retry_at',
                 'gpu_reported','gpu_diagnostics',
             }
             for k in transient:
