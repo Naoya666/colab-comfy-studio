@@ -72,7 +72,7 @@ Colab 初始化安装 fuse3、固定 rclone v1.70.3（核对 [官方 release SHA
 
 ComfyUI 健康检查成功后，还要求本次启动的 `comfy.log` 包含官方 `[START] ComfyUI-Manager` 标记，并且本机 `/v2/manager/queue/status`（兼容 `/manager/queue/status`）返回布尔 `is_processing`。通过后 `worker.log` 输出 `[studio-native] Manager loaded: …`，之后才继续 tunnel/watchdog 和就绪报告。校验失败会报错并回收本次启动的 ComfyUI 子进程；历史日志中的标记不能冒充本次成功。日志位于 `/content/ai-studio/<execution_id>/comfy.log`，其路径和本次日志起点保存在 `native/state.json`；复用时校验原进程的日志及实时 Manager API，不另起进程。升级前缺少日志元数据的旧会话需正常停止后重新启动。
 
-Colab 回收后 `/content` 中的状态和 Python 包不再保留；下一次初始化会再次安装官方和 Manager requirements，并携带 `--enable-manager`。Drive 用户数据保持恢复；自定义节点从校验归档恢复到本地 SSD，再通过官方 Manager 恢复依赖，详见 [Custom Nodes 持久化](CUSTOM_NODES_PERSISTENCE.md)。
+Colab 回收后 `/content` 中的状态和 Python 包不再保留；下一次初始化会再次安装官方和 Manager requirements，并携带 `--enable-manager`。Drive 用户数据保持恢复；自定义节点从校验归档恢复到 Colab 实例本地 SSD，再通过官方 Manager 恢复依赖，详见 [Custom Nodes 持久化](CUSTOM_NODES_PERSISTENCE.md)。
 
 安全边界为公网 Comfy 域名的 Studio 登录/Bearer 鉴权与写请求 Origin 校验，加内部 tunnel 全路径的 Access Service Auth。Manager 自身的 security level 不能替代这些鉴权。就绪检查除了 `/system_stats`，还对 Manager 队列及安装路径发起**无凭据 GET**，要求得到 401/403/302；不会提交安装操作。不要给 `/manager/*`、`/v2/*`、`/customnode/*` 或 `/api/*` 配置 Access Bypass，也不要降低 Manager 安全等级来绕过安装限制。
 
@@ -118,7 +118,7 @@ AI-Studio/<owner>/
 
 本地 `/content/ai-studio/native/drive` 为 rclone 挂载，模型按实际读取下载到有上限的本地 VFS 缓存；模型文件在执行时真实可读，不做仅名称占位。不预复制整个 Drive，不强行加载显存。`extra_model_paths.yaml` 保留 `unet/diffusion_models`、`clip/text_encoders` 等别名。
 
-用户目录、输入输出沿用 Drive VFS。Drive 挂载模式下，Manager 下载的模型也保存在挂载目录。自定义节点从本地 SSD 执行，稳定后以压缩对象直接写入 Drive，重启加载验证后更新 VPS 清单；正常释放会等待候选同步完成。依赖通过同一 Python 环境下的官方 Manager restore-dependencies 恢复，同一 VM 指纹不变时复用安装结果，不共享不同 GPU 的整个 site-packages。完整协议、回滚接口和八项验收见 [Custom Nodes 持久化](CUSTOM_NODES_PERSISTENCE.md)。
+用户目录、输入输出沿用 Drive VFS。Drive 挂载模式下，Manager 下载的模型也保存在挂载目录。自定义节点从 Colab 实例本地 SSD 执行，稳定后以压缩对象直接写入 Drive，重启加载验证后更新 VPS 清单；正常释放会等待候选同步完成。依赖通过同一 Python 环境下的官方 Manager restore-dependencies 恢复，同一 VM 指纹不变时复用安装结果，不共享不同 GPU 的整个 site-packages。完整协议、回滚接口和八项验收见 [Custom Nodes 持久化](CUSTOM_NODES_PERSISTENCE.md)。
 
 临时预览/中间文件在本地 `native/temp`，VFS 缓存和未完成下载也属于临时数据。突然被 Colab 强制回收、断电或手工外部删除 VM 时，尚未上传完成的数据仍可能丢失；代码不能保证未落盘数据在基础设施强制终止后恢复。已确认写入 Drive 的工作流、模型与结果保留。不要把配置了挂载等同于已经验证了真实持久化恢复。
 
@@ -186,14 +186,14 @@ AI-Studio/<owner>/
 
 ## 模型存储模式
 
-在「原生 ComfyUI」启动页选择模式。「API 设置」也可以为 API 自动开机保存独立的启动配置。现有实例继续使用启动时的参数。切换模式或修改挂载缓存参数需停止实例并重新启动。同实例的「重启原生 ComfyUI」只重启 ComfyUI 进程。
+在「原生 ComfyUI」启动页选择模式。「API 设置」也可以为 API 自动开机保存独立的启动配置；两者默认均使用 **本地模式**（模型存放于 **Colab 实例本地 SSD**，而非本机或 VPS 磁盘）。现有实例继续使用启动时的参数。切换模式或修改挂载缓存参数需停止实例并重新启动。同实例的「重启原生 ComfyUI」只重启 ComfyUI 进程。
 
 | 模式 | 运行方式 |
 | --- | --- |
-| Drive 挂载模式（默认） | 模型沿用 Drive FUSE 路径和 rclone VFS 按需缓存。模型库已有 Drive 快捷方式继续可用。 |
-| 本地模式 | 权重保存在 Colab 的 `/content/ai-studio/native/ComfyUI/models`。完整下载并校验后才出现在实际文件列表。模型目录和本项目的模型路径配置均使用本地磁盘。工作流、设置、输入输出和自定义节点持久化继续使用现有 Drive 机制。 |
+| 本地模式（默认） | 权重保存在 Colab 实例的 `/content/ai-studio/native/ComfyUI/models`（Colab 运行时本地 SSD，不占用本机或 VPS 磁盘）。完整下载并校验后才出现在实际文件列表。模型目录和本项目的模型路径配置均使用 Colab 实例本地磁盘。工作流、设置、输入输出和自定义节点持久化继续使用现有 Drive 机制。 |
+| Drive 挂载模式 | 模型沿用 Drive FUSE 路径和 rclone VFS 按需缓存。模型库已有 Drive 快捷方式继续可用。 |
 
-启动 API 可传 `model_storage_mode`（`drive_mount` 或 `local`）、`cache_gb`、`cache_max_age_minutes`。省略时使用挂载模式、`NATIVE_COMFY_CACHE_GB`（默认 20）与 `NATIVE_COMFY_CACHE_MAX_AGE_MINUTES`（默认 60）。容量按 rclone 的二进制 GB 计，属于缓存清理目标。保留时间从 VFS 文件上次访问起算，另受容量和磁盘空间回收影响。原生页面在运行时可获取指标时展示 VFS 占用与本地磁盘剩余。升级前启动的旧会话继续沿用其挂载，重新启动后可查看保存的实际配置。空闲回收和会话上限由各自的原生会话参数控制。
+原生启动页与「API 设置」自动开机默认使用 `local`（本地模式）。直接调用启动 API（`POST /api/gpu/native/start`）可传 `model_storage_mode`（`local` 或 `drive_mount`）、`cache_gb`、`cache_max_age_minutes`；为兼容旧调用方与历史会话，直接调用该接口省略 `model_storage_mode` 时仍回退为 `drive_mount`，缓存参数分别默认使用 `NATIVE_COMFY_CACHE_GB`（默认 20）与 `NATIVE_COMFY_CACHE_MAX_AGE_MINUTES`（默认 60）。容量按 rclone 的二进制 GB 计，属于缓存清理目标。保留时间从 VFS 文件上次访问起算，另受容量和磁盘空间回收影响。原生页面在运行时可获取指标时展示 VFS 占用与 Colab 实例本地磁盘剩余。升级前启动的旧会话继续沿用其挂载，重新启动后可查看保存的实际配置。空闲回收和会话上限由各自的原生会话参数控制。
 
 本地模式先检查同类别、相对路径与可用内容校验信息是否匹配。命中时无需查询 Drive。缺失时 Colab 优先从绑定的外部来源或工作流的明确模型下载元数据读取，接着尝试已登记的 Drive 文件。对于旧的 Drive 模型目录，还会按准确类别及相对路径查询。外链失败时，只有存在符合所需 SHA-256 的 Drive 副本才尝试回退。多个版本或不确定来源会列出具体路径和原因。对于已经存在的本地同路径文件，版本冲突时应给所需版本选用不同路径。实例内的完整文件可重复使用，新 Colab 实例按需重新下载。
 

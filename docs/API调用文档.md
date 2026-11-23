@@ -594,4 +594,4 @@ DOCS_SOURCE_ROOT=/path/to/colab-gpu-studio \
 
 ## 原生 ComfyUI 本地模型预准备
 
-在本地模型模式中，网页与外部客户端的原生 `POST /prompt` 会在入队前准备模型。首次调用前可在 Studio 预下载工作流所需模型，再按原生 API 协议提交和查询。操作、请求字段与支持边界见[模型存储模式](NATIVE_COMFYUI.md#模型存储模式)。
+在本地模型模式（默认）中，网页与外部客户端的原生 `POST /prompt` 会在入队前将所需模型准备到 Colab 实例本地 SSD。首次调用前可在 Studio 预下载工作流所需模型，再按原生 API 协议提交和查询。操作、请求字段与支持边界见[模型存储模式](NATIVE_COMFYUI.md#模型存储模式)。

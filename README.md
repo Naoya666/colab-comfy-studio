@@ -32,7 +32,7 @@ Colab GPU Studio 是一个自托管的 ComfyUI 与 Google Colab 算力创作工�
 
 - **透明代理官方编辑器**：通过独立 HTTPS 域名代理 Colab 上的官方 ComfyUI（含内置 `--enable-manager` 与完整 HTTP/WebSocket），由 Studio 鉴权与 Cloudflare Access Service Auth 组成双层安全边界。
 - **网页配置向导与零 GPU 预检**：在「原生 ComfyUI」页提供分步配置向导，支持填写 Cloudflare Named Tunnel、Access Service Token、ComfyUI 锁定提交与独立域名，自动生成 Nginx / Caddy 反代配置并执行免开 GPU 的 6 项预检；凭据经 `ENCRYPTION_KEY` 加密存库并自动兼容 `.env` 与 `./secrets/*` 回退。
-- **双模型存储模式与同实例重启**：支持 **Drive 挂载模式（rclone VFS 按需缓存）** 与 **本地磁盘模式（按需下载校验 + 工作流模型预热）**；可在保留当前 GPU 实例与租约的前提下，一键同步模型库索引并重启 ComfyUI 进程。
+- **双模型存储模式与同实例重启**：原生会话与 API 自动开机默认使用 **本地模式（按需完整下载校验至 Colab 实例本地 SSD + 工作流模型预热）**，也支持切换为 **Drive 挂载模式（rclone VFS 按需缓存）**；可在保留当前 GPU 实例与租约的前提下，一键同步模型库索引并重启 ComfyUI 进程。
 - **节点持久化与冷启动加速**：自定义节点以校验归档方式持久化至 Google Drive 并在新实例自动恢复依赖；内置并行系统/插件恢复、`uv` 合并与插件依赖快速路径、`.dist-info` 精确增量 Python 环境缓存（`env-cache`）、异步启动扫描、IPv4 优先隧道轮询与小产物内联回传等多阶段优化（均配独立环境变量开关）。
 
 ### 统一模型库（免 GPU 准备）
@@ -166,7 +166,7 @@ uv run python scripts/offline_server.py --port 18788
 - **配置向导与安全架构**：在「原生 ComfyUI」页打开**配置向导**，填入 Cloudflare Named Tunnel Token、Access Service Auth 凭据、锁定 ComfyUI 提交与可选独立 HTTPS 域名，并执行零 GPU 消耗的 6 项预检；也可继续使用 `.env` + `./secrets/*` 只读挂载配置。[部署与验收说明](docs/NATIVE_COMFYUI.md) · [Nginx 反代示例](docs/deploy/native-comfy.nginx.conf.example)
 - **会话策略与保活**：支持自定义任意正整数分钟的「空闲回收时间」（默认 120 分钟）与「会话上限时间」（默认 720 分钟），看门狗按周期维持 Colab 保活并在到期或空闲后等待生成与 Drive 同步完成再安全释放。
 - **统一模型库与双存储模式**：
-  - 通过独立 `model-worker` 将权重预先准备到 Drive，原生会话默认以 **Drive 挂载（rclone VFS 缓存）** 即插即用，也可切换为 **本地模式** 配合「检查并下载此工作流所需模型」预热直读本地 SSD。
+  - 通过独立 `model-worker` 将权重预先准备到 Drive（或登记外部来源），原生会话与 API 自动开机默认采用 **本地模式**，配合「检查并下载此工作流所需模型」将权重按需下载校验并预热直读 **Colab 实例本地 SSD**（不占用本机或 VPS 磁盘）；也可按需切换为 **Drive 挂载模式（rclone VFS 缓存）** 即插即用。
   - 新模型入库后，可在原生页点击「重启原生 ComfyUI」，在不释放当前 GPU 实例的前提下刷新模型索引并重载进程。[模型库配置](docs/model-library-phase3.md) · [下载恢复与原生重启](docs/specs/NATIVE_COMFYUI_RESTART.md)
 - **自定义节点与启动加速**：自定义节点经校验归档保存至 Google Drive 并自动恢复依赖；冷启动优化（`NATIVE_FAST_SCAN`、`NATIVE_PARALLEL_RESTORE`、`NATIVE_USE_UV`、`NATIVE_FAST_CONTROL_PLANE`、`NATIVE_ENV_CACHE`、`NATIVE_BATCH_PLUGIN_PIP`、`NATIVE_PARALLEL_BOOTSTRAP`）默认开启，可按需通过环境变量独立开关。[自定义节点持久化](docs/CUSTOM_NODES_PERSISTENCE.md) · [启动优化设计 V1](docs/specs/NATIVE_COMFYUI_STARTUP_OPTIMIZATION.md) · [启动优化设计 V2](docs/specs/NATIVE_COMFYUI_STARTUP_OPTIMIZATION_V2.md)
 

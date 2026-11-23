@@ -47,7 +47,7 @@ def policy(store, owner):
         "weak_workflow": None,
         "allowed_origins": [],
         **native.timeout_options()["defaults"],
-        **native.model_storage(),
+        **native.model_storage_defaults(),
         **saved,
     }
 

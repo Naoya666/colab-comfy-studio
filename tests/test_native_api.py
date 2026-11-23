@@ -104,6 +104,7 @@ def test_native_key_isolation_and_template(server, monkeypatch):
 
     assert used == ["/prompt", "/history/p-1", "/view"]
     listed = client.get("/api/gpu/native/api-settings", headers=ADMIN).json()["data"]
+    assert listed["policy"]["model_storage_mode"] == "local"
     assert "token" not in str(listed) and "digest" not in str(listed)
     assert repo.store.get(native_api.KEYS, first["id"])["token_digest"] != first["token"]
     assert next(key for key in listed["keys"] if key["id"] == first["id"])["submitted"] == 1
@@ -370,3 +371,23 @@ def test_drive_workflows_routes_and_ref_preparation_control_plane(server, monkey
     deleted = client.delete("/api/gpu/native/workflows?source=warmup&path=tavern.json", headers=ADMIN)
     assert deleted.status_code == 200 and deleted.json()["data"]["deleted"] is True
     assert not repo.get("leases", lease["id"], "owner").get("native_writes")
+
+
+def test_native_api_settings_defaults_to_local_and_allows_drive_mount_override(server):
+    client, _, _ = server
+    initial = client.get("/api/gpu/native/api-settings", headers=ADMIN)
+    assert initial.status_code == 200
+    assert initial.json()["data"]["policy"]["model_storage_mode"] == "local"
+
+    # Saving unrelated fields keeps the default local storage mode.
+    keep_default = client.put("/api/gpu/native/api-settings", headers=ADMIN, json={"retain_idle_minutes": 45})
+    assert keep_default.status_code == 200
+    assert keep_default.json()["data"]["model_storage_mode"] == "local"
+
+    # Explicitly switching to drive_mount persists across reads.
+    switched = client.put("/api/gpu/native/api-settings", headers=ADMIN, json={"model_storage_mode": "drive_mount"})
+    assert switched.status_code == 200
+    assert switched.json()["data"]["model_storage_mode"] == "drive_mount"
+    reloaded = client.get("/api/gpu/native/api-settings", headers=ADMIN)
+    assert reloaded.status_code == 200
+    assert reloaded.json()["data"]["policy"]["model_storage_mode"] == "drive_mount"
