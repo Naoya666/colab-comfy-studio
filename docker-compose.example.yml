@@ -1,6 +1,6 @@
 name: colab-gpu-studio
 x-studio: &studio
-  image: colab-gpu-studio:0.3.1
+  image: ${STUDIO_IMAGE:-ghcr.io/naoya666/colab-comfy-studio:latest}
   build: .
   env_file: .env
   environment:

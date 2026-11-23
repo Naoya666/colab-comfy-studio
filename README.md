@@ -83,19 +83,21 @@ Docker Compose 默认由 4 个职责分离的容器协作（共享 `studio-data`
 
 ## 快速开始
 
-### 方式一：Docker Compose 部署（推荐，适用于 VPS / 本机）
+### 方式一：拉取 GHCR 云端镜像部署（推荐，免本机编译）
 
-需要 Git、Docker、Docker Compose 和 `uv`。
+需要 Git、Docker、Docker Compose 和 `uv`。云端预构建镜像发布于 GitHub Container Registry（`linux/amd64`），无需在本机或低配 VPS 编译前端与 Python 依赖：
 
 ```bash
 git clone https://github.com/Naoya666/colab-comfy-studio.git
 cd colab-comfy-studio
 uv run python scripts/init_env.py --site-url http://127.0.0.1:8788
 cp docker-compose.example.yml docker-compose.yml
-docker compose up -d --build
+docker compose pull
+docker compose up -d --no-build
 ```
 
-也可以在生成 `.env` 后直接运行 `./scripts/deploy.sh` 完成配置校验、镜像构建与等待就绪启动。
+- **镜像地址与标签**：默认拉取 `ghcr.io/naoya666/colab-comfy-studio:latest`（与 `main` 分支最新通过 CI 的提交保持同步）。如需锁定版本，可在 `.env` 中设置 `STUDIO_IMAGE`（支持 `:main`、`:sha-<7位提交SHA>` 或版本 Tag），或手动执行 `docker pull ghcr.io/naoya666/colab-comfy-studio:latest`。
+- **GHCR 权限提示**：若拉取时提示 `unauthorized` / `denied`，说明该镜像包在 GitHub Packages 中为私有状态——仓库管理员可在 GitHub `Packages → colab-comfy-studio → Package settings` 将可见性设为 **Public** 以支持免登录拉取，或使用含 `read:packages` 权限的 PAT 登录：`echo <GITHUB_PAT> | docker login ghcr.io -u <GitHub用户名> --password-stdin`。
 
 启动后访问 `http://127.0.0.1:8788`，使用 `.env` 中的 `STUDIO_PASSWORD` 登录：
 
@@ -106,7 +108,17 @@ docker compose up -d --build
 > - 将 `--site-url` 改为实际访问的 HTTPS 地址（例如 `https://studio.example.com`），通过 Nginx / Caddy 反向代理转发默认监听的 `127.0.0.1:8788`。
 > - 数据库与本地产物保存在 `studio-data` 数据卷；迁移或升级前请同时备份数据卷与 `.env`（其中的 `ENCRYPTION_KEY` 用于解密已保存的 OAuth 令牌与原生隧道凭据，切勿丢失或提交到 Git）。
 
-### 方式二：本机一体化启动 / Android Termux
+### 方式二：从源码本地构建 Docker 镜像
+
+适用于需要自行修改代码，或在 ARM64 等非 `amd64` 主机上部署的场景（完成上述 `.env` 与 `docker-compose.yml` 初始化后执行）：
+
+```bash
+docker compose up -d --build
+# 或直接运行构建与健康检查脚本
+./scripts/deploy.sh
+```
+
+### 方式三：本机一体化启动 / Android Termux
 
 如果希望在单机直接运行（不含独立 `model-worker` 容器，自动拉起 `api`、`worker` 与 `watchdog` 并在首次运行时自动生成 `.env`）：
 
@@ -123,7 +135,7 @@ Android Termux 环境可直接在仓库根目录执行一键安装与启动脚�
 bash scripts/termux_setup.sh
 ```
 
-### 方式三：离线 Mock 演示（零云端依赖）
+### 方式四：离线 Mock 演示（零云端依赖）
 
 需要 Python 3.11+、`uv`、Node.js 与 npm。使用临时数据库和本地文件，不发起任何外网或 Google 调用：
 
@@ -180,6 +192,7 @@ uv run python scripts/offline_server.py --port 18788
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `STUDIO_IMAGE` | `ghcr.io/naoya666/colab-comfy-studio:latest` | Docker Compose 使用的镜像地址与标签，可用于锁定特定提交或版本 |
 | `SITE_URL` | `http://localhost:8788` | 工作台外部访问地址，需与 Google OAuth 回调域一致 |
 | `STUDIO_PASSWORD` | `init_env.py` 自动生成 | Web 工作台登录密码 |
 | `ENCRYPTION_KEY` | `init_env.py` 自动生成 | 数据库敏感凭据（OAuth 令牌、隧道密钥等）加密主密钥 |
@@ -193,7 +206,15 @@ uv run python scripts/offline_server.py --port 18788
 ### 备份与版本升级
 
 - **数据备份**：SQLite 部署可运行 `PYTHONPATH=api uv run python scripts/backup.py` 生成一致性快照与本地产物归档（脚本不会打包 `.env`，请单独安全保管 `.env` 与 `ENCRYPTION_KEY`）；PostgreSQL 请使用 `pg_dump -Fc`。
-- **升级部署**：拉取最新代码后重建并启动容器，涉及表结构更新时执行数据库迁移：
+- **云端镜像升级（推荐）**：直接拉取最新 GHCR 镜像并重启容器，涉及表结构更新时执行数据库迁移：
+
+```bash
+docker compose pull
+docker compose up -d --no-build
+docker compose exec api alembic upgrade head
+```
+
+- **源码构建升级**：若采用本地构建方式，拉取代码后重建并执行迁移：
 
 ```bash
 git pull
@@ -207,7 +228,10 @@ docker compose exec api alembic upgrade head
 
 后端采用 **Python 3.11+ / FastAPI / SQLAlchemy 2 / Alembic**（`uv` 管理依赖），前端采用 **React 19 / TypeScript / Vite 6**（`npm` 管理依赖）。
 
-每次推送都会触发 GitHub Actions。前后端测试均通过后，CI 使用根目录的 `Dockerfile` 构建镜像，并将其保存到该次运行的 **Artifacts**，保留 14 天。下载并解压产物 ZIP 后，运行 `docker load -i colab-gpu-studio.tar.gz` 即可导入镜像，镜像标签为 `colab-gpu-studio:<提交 SHA>`。
+每次推送（及手动触发 `workflow_dispatch`）都会运行 GitHub Actions。前后端测试均通过后，CI 使用根目录的 `Dockerfile` 构建镜像：
+
+- **推送到 GHCR**：自动发布至 `ghcr.io/naoya666/colab-comfy-studio`，附带 `:sha-<7位提交SHA>` 标签（默认分支同步更新 `:latest` 与 `:main`，Tag 推送同步发布对应版本标签）。
+- **离线 Artifact 归档**：同时导出 `colab-gpu-studio.tar.gz` 到该次运行的 **Artifacts**（保留 14 天）。离线或受限网络环境可下载解压 ZIP 后执行 `docker load -i colab-gpu-studio.tar.gz`，并以 `STUDIO_IMAGE=colab-gpu-studio:<完整提交SHA> docker compose up -d --no-build` 启动。
 
 在仓库根目录执行完整离线自动化验证与构建：
 

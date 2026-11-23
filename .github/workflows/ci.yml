@@ -1,6 +1,8 @@
 name: CI
 
-on: push
+on:
+  push:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -43,17 +45,57 @@ jobs:
       - run: npm run build
 
   image:
-    name: Build Docker image
+    name: Build and publish Docker image
     needs: [backend, frontend]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Build image
-        run: docker build --tag "colab-gpu-studio:${GITHUB_SHA}" .
-      - name: Export image
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+        shell: bash
+      - name: Build and push image
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+          TAGS=(
+            "${IMAGE}:sha-${SHORT_SHA}"
+          )
+          if [ "${GITHUB_REF_TYPE}" = "branch" ] && [ "${GITHUB_REF_NAME}" = "${DEFAULT_BRANCH}" ]; then
+            SAFE_BRANCH="${DEFAULT_BRANCH//[^A-Za-z0-9_.-]/-}"
+            TAGS+=("${IMAGE}:latest" "${IMAGE}:${SAFE_BRANCH}")
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            SAFE_TAG="${GITHUB_REF_NAME//[^A-Za-z0-9_.-]/-}"
+            TAGS+=("${IMAGE}:${SAFE_TAG}")
+          fi
+
+          BUILD_ARGS=(
+            --tag "colab-gpu-studio:${GITHUB_SHA}"
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}"
+            --label "org.opencontainers.image.licenses=AGPL-3.0-only"
+          )
+          for tag in "${TAGS[@]}"; do
+            BUILD_ARGS+=(--tag "${tag}")
+          done
+
+          docker build "${BUILD_ARGS[@]}" .
+          for tag in "${TAGS[@]}"; do
+            docker push "${tag}"
+          done
+        shell: bash
+      - name: Export image artifact
         run: docker save "colab-gpu-studio:${GITHUB_SHA}" | gzip > "${RUNNER_TEMP}/colab-gpu-studio.tar.gz"
         shell: bash
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
