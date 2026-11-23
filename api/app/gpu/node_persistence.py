@@ -1911,11 +1911,20 @@ def upload_env_cache_from_plan(root: Path, plan_path: Path, remote: Remote | Non
             tar_final.unlink(missing_ok=True)
 
 
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+_LOG_PREFIX_RE = re.compile(
+    r'^(?:\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s+)?(?:\[(?:INFO|WARN|WARNING|ERROR|DEBUG)\]\s*)+'
+)
 _IMPORT_TIME_RE = re.compile(
     r'^\s*([0-9]+(?:\.[0-9]+)?)\s+seconds(?:\s+\((IMPORT FAILED)\))?:\s+(.+?)\s*$'
 )
 _INTERNAL_CUSTOM_NODES = frozenset({'studio_native_state.py', 'studio_native_guard', '__pycache__'})
 _JS_SKIP_DIRS = frozenset({'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'tests', 'test', 'examples'})
+
+
+def _clean_log_line(line: str) -> str:
+    stripped = _ANSI_ESCAPE_RE.sub('', line)
+    return _LOG_PREFIX_RE.sub('', stripped.lstrip())
 
 
 def _normalize_imported_plugin_path(raw_path: str, nodes_dir: Path) -> str | None:
@@ -1937,15 +1946,18 @@ def _normalize_imported_plugin_path(raw_path: str, nodes_dir: Path) -> str | Non
 
 
 def parse_import_times(startup_log: str, nodes_dir: str | Path) -> tuple[dict[str, float], list[str]]:
-    """Extract per-plugin import times from ComfyUI startup stdout log."""
+    """Extract per-plugin import times from ComfyUI startup stdout log (handles ANSI/[INFO] prefixes)."""
     nodes_path = Path(nodes_dir)
     import_times: dict[str, float] = {}
     import_failed: list[str] = []
     in_section = False
-    for line in startup_log.splitlines():
-        stripped = line.strip()
-        if 'Import times for custom nodes:' in line:
+    for raw_line in startup_log.splitlines():
+        cleaned = _clean_log_line(raw_line)
+        stripped = cleaned.strip()
+        if 'Import times for custom nodes:' in cleaned:
             in_section = True
+            import_times.clear()
+            import_failed.clear()
             continue
         if not in_section:
             continue
@@ -1953,7 +1965,7 @@ def parse_import_times(startup_log: str, nodes_dir: str | Path) -> tuple[dict[st
             if import_times or import_failed:
                 in_section = False
             continue
-        match = _IMPORT_TIME_RE.match(line)
+        match = _IMPORT_TIME_RE.match(cleaned)
         if not match:
             if import_times or import_failed:
                 in_section = False
@@ -2047,6 +2059,31 @@ def _resolve_class_plugin(cls, nodes_dir: Path, known_plugins: dict[str, str]) -
     return None
 
 
+def _plugin_from_python_module(mod: object, known_plugins: dict[str, str]) -> str | None:
+    if not isinstance(mod, str) or not mod.startswith('custom_nodes.'):
+        return None
+    rest = mod[len('custom_nodes.'):]
+    top = rest.split('.', 1)[0]
+    if not top or top in _INTERNAL_CUSTOM_NODES:
+        return None
+    if top in known_plugins:
+        return known_plugins[top]
+    if (top + '.py') in known_plugins:
+        return known_plugins[top + '.py']
+    return top
+
+
+def _fetch_local_object_info(url: str = 'http://127.0.0.1:8188/object_info', timeout: float = 10.0) -> dict:
+    from urllib.request import urlopen
+
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            data = json.load(response)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def collect_plugin_telemetry(
     root: Path,
     comfy: Path,
@@ -2054,11 +2091,12 @@ def collect_plugin_telemetry(
     *,
     node_class_mappings: dict | None = None,
     extension_web_dirs: dict | None = None,
+    object_info: dict | None = None,
     gpu_reported: str | None = None,
     comfy_commit: str | None = None,
     generation: str | None = None,
 ) -> dict:
-    """Build compact plugin startup telemetry (import times, node_map, JS/dependency profile)."""
+    """Build compact plugin startup telemetry (import times, V1+V3 node_map, JS/dependency profile)."""
     nodes_dir = Path(comfy) / 'custom_nodes'
     import_times, import_failed = parse_import_times(startup_log, nodes_dir)
 
@@ -2096,16 +2134,31 @@ def collect_plugin_telemetry(
             mappings = mappings or {}
             web_dirs = web_dirs or {}
 
+    oi = object_info
+    if oi is None and node_class_mappings is None:
+        # Local loopback /object_info includes both V1 NODE_CLASS_MAPPINGS and V3 ComfyExtension nodes (e.g. zml-image).
+        oi = _fetch_local_object_info()
+
     node_map: dict[str, str] = {}
-    node_counts: dict[str, int] = {}
+    if isinstance(oi, dict):
+        for node_type, info in oi.items():
+            if not isinstance(node_type, str) or not node_type or not isinstance(info, dict):
+                continue
+            plugin_path = _plugin_from_python_module(info.get('python_module'), known_lookup)
+            if plugin_path:
+                node_map[node_type] = plugin_path
+
     if isinstance(mappings, dict):
         for node_type, cls in mappings.items():
-            if not isinstance(node_type, str) or not node_type:
+            if not isinstance(node_type, str) or not node_type or node_type in node_map:
                 continue
             plugin_path = _resolve_class_plugin(cls, nodes_dir, known_lookup)
             if plugin_path:
                 node_map[node_type] = plugin_path
-                node_counts[plugin_path] = node_counts.get(plugin_path, 0) + 1
+
+    node_counts: dict[str, int] = {}
+    for plugin_path in node_map.values():
+        node_counts[plugin_path] = node_counts.get(plugin_path, 0) + 1
 
     plugins_meta: dict[str, dict] = {}
     all_paths = sorted(set(installed_paths) | set(import_times) | set(node_counts))

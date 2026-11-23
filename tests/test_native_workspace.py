@@ -308,19 +308,23 @@ def test_parse_import_times_and_collect_plugin_telemetry(tmp_path: Path):
     (nodes / "studio_native_state.py").write_text("# internal\n")
 
     startup_log = f"""
-[START] ComfyUI-Manager
+\x1b[32m[INFO]\x1b[0m Prestartup times for custom nodes:
+\x1b[32m[INFO]\x1b[0m    0.8 seconds: {nodes}/studio_native_guard
+\x1b[32m[INFO]\x1b[0m [START] ComfyUI-Manager
+\x1b[32m[INFO]\x1b[0m
 Import times for custom nodes:
-   0.0 seconds: {nodes}/websocket_image_save.py
-   0.1 seconds: {nodes}/studio_native_state.py
-   5.4 seconds: {nodes}/comfyui-impact-pack
-   8.4 seconds: {nodes}/comfyui-easy-use
-   1.2 seconds (IMPORT FAILED): {nodes}/broken-node
-
-Starting server
+\x1b[32m[INFO]\x1b[0m    0.0 seconds: {nodes}/websocket_image_save.py
+\x1b[32m[INFO]\x1b[0m    0.1 seconds: {nodes}/studio_native_state.py
+\x1b[32m[INFO]\x1b[0m    0.7 seconds: {nodes}/zml-image
+\x1b[32m[INFO]\x1b[0m    5.4 seconds: {nodes}/comfyui-impact-pack
+\x1b[32m[INFO]\x1b[0m    8.4 seconds: {nodes}/comfyui-easy-use
+\x1b[32m[INFO]\x1b[0m    1.2 seconds (IMPORT FAILED): {nodes}/broken-node
+\x1b[32m[INFO]\x1b[0m Starting server
 """
     times, failed = np_mod.parse_import_times(startup_log, nodes)
     assert times == {
         "websocket_image_save.py": 0.0,
+        "zml-image": 0.7,
         "comfyui-impact-pack": 5.4,
         "comfyui-easy-use": 8.4,
         "broken-node": 1.2,
@@ -339,14 +343,18 @@ Starting server
         comfy,
         startup_log,
         node_class_mappings={"easy pipeIn": FakeEasyNode, "SaveImageWebsocket": FakeWsNode},
+        object_info={"ZML_PresetResolution": {"python_module": "custom_nodes.zml-image"}},
         extension_web_dirs={},
         gpu_reported="NVIDIA L4",
         comfy_commit="423cbd20511b",
     )
     assert tel["schema"] == 1
     assert tel["import_times"]["comfyui-easy-use"] == 8.4
+    assert tel["import_times"]["zml-image"] == 0.7
     assert tel["node_map"]["easy pipeIn"] == "comfyui-easy-use"
     assert tel["node_map"]["SaveImageWebsocket"] == "websocket_image_save.py"
+    assert tel["node_map"]["ZML_PresetResolution"] == "zml-image"
+    assert tel["plugins"]["zml-image"]["node_count"] == 1
     assert tel["plugins"]["comfyui-easy-use"] == {
         "node_count": 1,
         "js_count": 1,
