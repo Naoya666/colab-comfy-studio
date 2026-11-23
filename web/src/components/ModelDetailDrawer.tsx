@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Check,
   ChevronDown,
@@ -92,29 +92,33 @@ export function ModelDetailDrawer({
     return () => { active = false; };
   }, [modelId]);
 
+  const keyStateRef = useRef({ busy, confirmAction, registerOpen, hasPrev, hasNext, onPrev, onNext, onClose });
+  keyStateRef.current = { busy, confirmAction, registerOpen, hasPrev, hasNext, onPrev, onNext, onClose };
+
   useEffect(() => {
-    if (!model) return;
+    if (!modelId) return;
     const onKey = (e: KeyboardEvent) => {
-      if (confirmAction || registerOpen) return;
-      if (e.key === 'Escape' && !busy) {
+      const s = keyStateRef.current;
+      if (s.confirmAction || s.registerOpen) return;
+      if (e.key === 'Escape' && !s.busy) {
         e.stopPropagation();
-        onClose();
+        s.onClose();
         return;
       }
       const target = e.target as HTMLElement | null;
       const inFormField = Boolean(target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
       if (inFormField) return;
-      if (e.key === 'ArrowUp' && hasPrev) {
+      if (e.key === 'ArrowUp' && s.hasPrev) {
         e.preventDefault();
-        onPrev();
-      } else if (e.key === 'ArrowDown' && hasNext) {
+        s.onPrev();
+      } else if (e.key === 'ArrowDown' && s.hasNext) {
         e.preventDefault();
-        onNext();
+        s.onNext();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [model, busy, confirmAction, registerOpen, hasPrev, hasNext, onPrev, onNext, onClose]);
+  }, [modelId]);
 
   if (!model) return null;
 

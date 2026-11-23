@@ -43,6 +43,7 @@ export function CuDailyChart({
   );
 
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const stageLeftRef = useRef<number | null>(null);
   const [stageWidth, setStageWidth] = useState(560);
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   const [touchPinnedIdx, setTouchPinnedIdx] = useState<number | null>(null);
@@ -53,7 +54,9 @@ export function CuDailyChart({
     const el = stageRef.current;
     if (!el) return;
     const update = () => {
-      const w = Math.floor(el.getBoundingClientRect().width);
+      const rect = el.getBoundingClientRect();
+      stageLeftRef.current = rect.left;
+      const w = Math.floor(rect.width);
       if (w >= 200) setStageWidth(w);
     };
     update();
@@ -88,8 +91,6 @@ export function CuDailyChart({
     [summary.peakCu, dailyLimitCu, limitOverride],
   );
 
-  if (!points.length) return null;
-
   const isNarrow = stageWidth < 430;
   const chartW = stageWidth;
   const chartH = isNarrow ? 156 : 188;
@@ -101,16 +102,20 @@ export function CuDailyChart({
   const plotH = Math.max(60, chartH - padT - padB);
   const baselineY = padT + plotH;
 
-  const coords = points.map((point, index) => {
-    const x = points.length === 1
-      ? padL + plotW / 2
-      : padL + (plotW * index) / (points.length - 1);
-    const ratio = scale.yMax > 0 ? Math.min(1, Math.max(0, point.actual_cu / scale.yMax)) : 0;
-    const y = baselineY - ratio * plotH;
-    return { x, y };
-  });
+  const { coords, linePath, areaPath } = useMemo(() => {
+    const nextCoords = points.map((point, index) => {
+      const x = points.length === 1
+        ? padL + plotW / 2
+        : padL + (plotW * index) / (points.length - 1);
+      const ratio = scale.yMax > 0 ? Math.min(1, Math.max(0, point.actual_cu / scale.yMax)) : 0;
+      const y = baselineY - ratio * plotH;
+      return { x, y };
+    });
+    const paths = buildSmoothLinePath(nextCoords, baselineY);
+    return { coords: nextCoords, linePath: paths.linePath, areaPath: paths.areaPath };
+  }, [points, padL, plotW, plotH, baselineY, scale.yMax]);
 
-  const { linePath, areaPath } = buildSmoothLinePath(coords, baselineY);
+  if (!points.length) return null;
 
   const activeIdx = hoveredIdx ?? touchPinnedIdx;
   const activePoint = activeIdx !== null ? points[activeIdx] ?? null : null;
@@ -129,19 +134,31 @@ export function CuDailyChart({
     ? (summary.peakCu / dailyLimitCu) * 100
     : null;
 
-  function resolveIndexFromClientX(clientX: number): number {
+  function refreshStageLeft() {
+    const el = stageRef.current;
+    if (el) stageLeftRef.current = el.getBoundingClientRect().left;
+  }
+
+  function resolveIndexFromClientX(clientX: number, refresh = false): number {
     const el = stageRef.current;
     if (!el || points.length <= 1) return 0;
-    const rect = el.getBoundingClientRect();
-    const relX = clientX - rect.left;
+    if (refresh || stageLeftRef.current === null) {
+      stageLeftRef.current = el.getBoundingClientRect().left;
+    }
+    const relX = clientX - stageLeftRef.current;
     const ratio = (relX - padL) / plotW;
     const clamped = Math.max(0, Math.min(1, ratio));
     return Math.round(clamped * (points.length - 1));
   }
 
+  function handlePointerEnter() {
+    refreshStageLeft();
+  }
+
   function handlePointerMove(event: React.PointerEvent<SVGSVGElement>) {
     if (event.pointerType === 'touch') return;
-    setHoveredIdx(resolveIndexFromClientX(event.clientX));
+    const nextIdx = resolveIndexFromClientX(event.clientX);
+    setHoveredIdx((curr) => (curr === nextIdx ? curr : nextIdx));
   }
 
   function handlePointerLeave(event: React.PointerEvent<SVGSVGElement>) {
@@ -150,7 +167,7 @@ export function CuDailyChart({
   }
 
   function handlePointerUp(event: React.PointerEvent<SVGSVGElement>) {
-    const idx = resolveIndexFromClientX(event.clientX);
+    const idx = resolveIndexFromClientX(event.clientX, true);
     const point = points[idx];
     if (!point) return;
     if (event.pointerType === 'touch') {
@@ -241,6 +258,7 @@ export function CuDailyChart({
           role="img"
           aria-label={`每日 CU 消耗面积折线图，共 ${points.length} 天`}
           style={{ cursor: activePoint && activePoint.sessions > 0 && onSelectDate ? 'pointer' : 'crosshair' }}
+          onPointerEnter={handlePointerEnter}
           onPointerMove={handlePointerMove}
           onPointerLeave={handlePointerLeave}
           onPointerUp={handlePointerUp}
@@ -396,7 +414,11 @@ export function CuDailyChart({
             className={styles.chartTooltip}
             data-side={tooltipPlaceLeft ? 'left' : 'right'}
             data-interactive={touchPinnedIdx !== null}
-            style={{ left: `${tooltipLeftPx}px`, top: `${tooltipTopPx}px` }}
+            style={{
+              transform: tooltipPlaceLeft
+                ? `translate3d(${tooltipLeftPx}px, ${tooltipTopPx}px, 0) translateX(-100%)`
+                : `translate3d(${tooltipLeftPx}px, ${tooltipTopPx}px, 0)`,
+            }}
             role="status"
             aria-live="polite"
           >

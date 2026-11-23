@@ -92,12 +92,13 @@ function autoLayout(nodes: PreviewNode[], edges: PreviewEdge[]): void {
     });
     frontier = next;
   }
-  nodes.forEach((item, index) => {
+  const levelCounts = new Map<number, number>();
+  nodes.forEach((item) => {
     const level = levels.get(item.id) || 0;
-    const row = nodes.filter((candidate) => (levels.get(candidate.id) || 0) === level).findIndex((candidate) => candidate.id === item.id);
-    const fallbackRow = row < 0 ? index : row;
+    const row = levelCounts.get(level) || 0;
+    levelCounts.set(level, row + 1);
     item.x = 40 + level * 260;
-    item.y = 40 + fallbackRow * 128;
+    item.y = 40 + row * 128;
   });
 }
 
@@ -119,10 +120,14 @@ export function normalisePreviewGraph(graph: unknown, source?: 'ui' | 'api'): Pr
   });
   const ids = new Set(nodes.map((item) => item.id));
   const edges: PreviewEdge[] = [];
+  const edgeKeys = new Set<string>();
   nodes.forEach((node) => {
     Object.entries(node.inputs).forEach(([key, value]) => {
       const sourceId = linkSource(value);
-      if (sourceId && ids.has(sourceId)) edges.push({ id: `${sourceId}-${node.id}-${key}`, source: sourceId, target: node.id, label: key });
+      if (sourceId && ids.has(sourceId)) {
+        edges.push({ id: `${sourceId}-${node.id}-${key}`, source: sourceId, target: node.id, label: key });
+        edgeKeys.add(`${sourceId}\0${node.id}`);
+      }
     });
   });
   if (raw.source === 'ui') {
@@ -134,7 +139,9 @@ export function normalisePreviewGraph(graph: unknown, source?: 'ui' | 'api'): Pr
         : record(link);
       const sourceId = text(item.source ?? item.origin_id, '');
       const targetId = text(item.target ?? item.target_id, '');
-      if (ids.has(sourceId) && ids.has(targetId) && !edges.some((edge) => edge.source === sourceId && edge.target === targetId)) {
+      const pairKey = `${sourceId}\0${targetId}`;
+      if (ids.has(sourceId) && ids.has(targetId) && !edgeKeys.has(pairKey)) {
+        edgeKeys.add(pairKey);
         edges.push({ id: `ui-${index}`, source: sourceId, target: targetId });
       }
     });

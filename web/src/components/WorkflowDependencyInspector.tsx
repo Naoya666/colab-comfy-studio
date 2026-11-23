@@ -14,6 +14,7 @@ import {
 import { apiMessage } from '../lib/gpu-api';
 import {
   ACTIVE_MODEL_STATES,
+  buildCatalogIndex,
   bytesLabel,
   inspectWorkflowDependencies,
   libraryApi,
@@ -456,10 +457,12 @@ export function WorkflowDependencyInspector({
     if (!result) setShowDropzone(true);
   }, [result]);
 
+  const catalogIndex = useMemo(() => buildCatalogIndex(models, tasks), [models, tasks]);
+
   const reconciled = useMemo(() => {
     if (!result) return [];
-    return result.dependencies.map((dep) => reconcileDependencyWithCatalog(dep, models, tasks, importedMap[dep.id]));
-  }, [result, models, tasks, importedMap]);
+    return result.dependencies.map((dep) => reconcileDependencyWithCatalog(dep, models, tasks, importedMap[dep.id], catalogIndex));
+  }, [result, models, tasks, importedMap, catalogIndex]);
 
   const stats = useMemo(() => {
     let ready = 0;

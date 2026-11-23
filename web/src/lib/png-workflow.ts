@@ -14,11 +14,19 @@ export type ExtractedWorkflow = {
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const utf8 = (v: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(v);
 const ascii = (v: Uint8Array) => Array.from(v, c => String.fromCharCode(c)).join('');
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ ((c & 1) ? 0xedb88320 : 0);
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
 export function crc32(bytes: Uint8Array): number {
   let crc = 0xffffffff;
-  for (const b of bytes) {
-    crc ^= b;
-    for (let k = 0; k < 8; k++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+  for (let i = 0; i < bytes.length; i++) {
+    crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
   }
   return (crc ^ 0xffffffff) >>> 0;
 }

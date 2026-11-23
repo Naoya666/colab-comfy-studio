@@ -76,8 +76,9 @@ export function useGalleryState({
     () => (galleryProjectFilter ? gallery.filter((asset) => asset.project_id === galleryProjectFilter) : gallery),
     [gallery, galleryProjectFilter],
   );
+  const galleryById = useMemo(() => new Map(gallery.map((g) => [g.id, g])), [gallery]);
   const viewer = viewerSelection
-    ? gallery.find((asset) => asset.id === viewerSelection.id) ?? viewerSelection
+    ? galleryById.get(viewerSelection.id) ?? viewerSelection
     : null;
   const nativeViewer = useMemo(() => {
     if (!nativeViewerSelection || nativeDeletedIds.has(nativeViewerSelection.id)) return null;
@@ -95,9 +96,14 @@ export function useGalleryState({
   const inlineViewer = desktop && tab === '作品';
 
   const studioNavList = useMemo(() => {
-    const base = viewerList.length ? viewerList.filter((a) => gallery.some((g) => g.id === a.id)) : projectGallery;
-    return base.map((item) => gallery.find((g) => g.id === item.id) || item);
-  }, [viewerList, gallery, projectGallery]);
+    if (!viewerList.length) return projectGallery;
+    const out: GalleryAsset[] = [];
+    for (const item of viewerList) {
+      const live = galleryById.get(item.id);
+      if (live) out.push(live);
+    }
+    return out;
+  }, [viewerList, galleryById, projectGallery]);
 
   const nativeNavList = useMemo(
     () => nativeViewerList

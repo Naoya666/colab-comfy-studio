@@ -1,12 +1,13 @@
 import { ModelDependencies } from '../components/ModelDependencies';
 import { ImageWorkflowImport } from '../components/ImageWorkflowImport';
 import { ImageDraftConfiguration } from '../components/ImageDraftConfiguration';
-import { Fragment, useCallback, useMemo, useRef, useState } from 'react';
+import { Fragment, Suspense, lazy, useCallback, useMemo, useRef, useState } from 'react';
 import { ChevronDown, Search, Trash2 } from 'lucide-react';
 import type { GpuWorkflow } from '../lib/gpu-api';
 import { Pager } from '../components/ui';
 import { WorkflowActivationPanel } from '../components/WorkflowActivation';
-import { WorkflowGraphPreview, type WorkflowGraphPreviewData } from '../components/WorkflowGraphPreview';
+import type { WorkflowGraphPreviewData } from '../components/WorkflowGraphPreview';
+const WorkflowGraphPreview = lazy(() => import('../components/WorkflowGraphPreview').then((m) => ({ default: m.WorkflowGraphPreview })));
 import { ConfirmDialog } from '../components/Feedback';
 import { readActivationWatch, writeActivationWatch, type ActivationWatch } from '../lib/activation-resume';
 import { workflowSearchText, workflowTitle, workflowUsage } from '../lib/workflow-copy';
@@ -212,7 +213,11 @@ export function WorkflowsPanel({
       )}
 
       <Pager page={safePage} pages={pages} onChange={setPage} />
-      {previewing && <WorkflowGraphPreview workflow={previewing} loadPreview={() => fetchWorkflowGraphPreview(previewing)} onClose={() => setPreviewing(null)} />}
+      {previewing && (
+        <Suspense fallback={null}>
+          <WorkflowGraphPreview workflow={previewing} loadPreview={() => fetchWorkflowGraphPreview(previewing)} onClose={() => setPreviewing(null)} />
+        </Suspense>
+      )}
       <ConfirmDialog
         open={Boolean(deletingTarget)}
         title="删除工作流版本？"

@@ -634,40 +634,86 @@ export interface ReconciledDependency {
   sourceUrl: string | null;
 }
 
+export interface CatalogIndex {
+  byId: Map<string, LibraryModel>;
+  bySha: Map<string, LibraryModel[]>;
+  byUrl: Map<string, LibraryModel[]>;
+  byFilename: Map<string, LibraryModel[]>;
+  activeTaskByModelId: Map<string, ModelTask>;
+}
+
+export function buildCatalogIndex(models: LibraryModel[], tasks: ModelTask[] = []): CatalogIndex {
+  const byId = new Map<string, LibraryModel>();
+  const bySha = new Map<string, LibraryModel[]>();
+  const byUrl = new Map<string, LibraryModel[]>();
+  const byFilename = new Map<string, LibraryModel[]>();
+  const push = (map: Map<string, LibraryModel[]>, key: string, item: LibraryModel) => {
+    const bucket = map.get(key);
+    if (bucket) bucket.push(item);
+    else map.set(key, [item]);
+  };
+  for (const m of models) {
+    byId.set(m.id, m);
+    const sha = m.sha256?.toLowerCase();
+    const expSha = m.expected_sha256?.toLowerCase();
+    if (sha) push(bySha, sha, m);
+    if (expSha && expSha !== sha) push(bySha, expSha, m);
+    const seenUrls = new Set<string>();
+    for (const u of [m.external_source?.url, m.original_source_url, m.source_url, m.download_url]) {
+      if (u && !seenUrls.has(u)) {
+        seenUrls.add(u);
+        push(byUrl, u, m);
+      }
+    }
+    if (m.filename) push(byFilename, m.filename, m);
+  }
+  const activeTaskByModelId = new Map<string, ModelTask>();
+  for (const t of tasks) {
+    if (ACTIVE_MODEL_STATES.has(t.state) && !activeTaskByModelId.has(t.model_id)) {
+      activeTaskByModelId.set(t.model_id, t);
+    }
+  }
+  return { byId, bySha, byUrl, byFilename, activeTaskByModelId };
+}
+
 export function reconcileDependencyWithCatalog(
   dep: Dependency,
   models: LibraryModel[],
   tasks: ModelTask[] = [],
   knownModelId?: string | null,
+  index?: CatalogIndex,
 ): ReconciledDependency {
   const sourceUrl = dependencySourceUrl(dep);
   const typeCompatible = (m: LibraryModel) => dep.model_type === 'unknown' || m.model_type === dep.model_type;
   const preferredId = knownModelId || dep.model_id || null;
 
-  let bound = preferredId ? models.find((m) => m.id === preferredId) : undefined;
+  let bound = preferredId
+    ? (index ? index.byId.get(preferredId) : models.find((m) => m.id === preferredId))
+    : undefined;
   if (!bound && dep.expected_sha256) {
     const targetSha = dep.expected_sha256.toLowerCase();
-    const matches = models.filter(
-      (m) => typeCompatible(m) && (m.sha256?.toLowerCase() === targetSha || m.expected_sha256?.toLowerCase() === targetSha),
+    const pool = index ? (index.bySha.get(targetSha) || []) : models.filter(
+      (m) => m.sha256?.toLowerCase() === targetSha || m.expected_sha256?.toLowerCase() === targetSha,
     );
+    const matches = pool.filter(typeCompatible);
     bound = matches.find((m) => m.state === 'ready') || matches[0];
   }
   if (!bound && sourceUrl) {
-    const matches = models.filter((m) => {
-      if (!typeCompatible(m)) return false;
+    const pool = index ? (index.byUrl.get(sourceUrl) || []) : models.filter((m) => {
       const urls = [m.external_source?.url, m.original_source_url, m.source_url, m.download_url].filter(Boolean);
       return urls.includes(sourceUrl);
     });
+    const matches = pool.filter(typeCompatible);
     bound = matches.find((m) => m.state === 'ready') || matches[0];
   }
 
   const baseName = modelBasename(dep.reference);
   const candidates = bound
     ? []
-    : models.filter((m) => typeCompatible(m) && m.filename === baseName);
+    : (index ? (index.byFilename.get(baseName) || []) : models.filter((m) => m.filename === baseName)).filter(typeCompatible);
 
   const task = bound
-    ? tasks.find((t) => t.model_id === bound.id && ACTIVE_MODEL_STATES.has(t.state))
+    ? (index ? index.activeTaskByModelId.get(bound.id) : tasks.find((t) => t.model_id === bound.id && ACTIVE_MODEL_STATES.has(t.state)))
     : undefined;
 
   let effectiveStatus = dep.status;

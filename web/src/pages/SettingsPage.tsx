@@ -1,4 +1,4 @@
-import { ModelSourceSettings, ModelStorageSettings } from './ModelLibraryPage';
+import { ModelSourceSettings, ModelStorageSettings } from '../components/ModelLibrarySettings';
 import { useEffect, useState } from 'react';
 import { Settings, ChevronLeft, Monitor, Moon, Sun, Plug, LogOut } from 'lucide-react';
 import type { GpuSettings, GpuSpecKey, GpuUsage } from '../lib/gpu-api';

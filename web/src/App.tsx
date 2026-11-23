@@ -1,22 +1,24 @@
-import { WorkflowsPanel } from './pages/WorkflowManager';
-import { CreationApiPage } from './pages/CreationApiPage';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ModelRunOverrides, type ModelOverride } from './components/ModelDependencies';
-import { NativeComfyPage } from './pages/NativeComfyPage';
-import { ModelLibraryPage } from './pages/ModelLibraryPage';
-import { SettingsPanel } from './pages/SettingsPage';
-import { GalleryPanel } from './pages/GalleryPage';
-import { TasksPanel, type JobClearRequest } from './pages/JobsPage';
 import { WorkflowGpuSelection, computeLabel } from './components/WorkflowGpuSelection';
 import { CreatePanel } from './pages/CreatePage';
 import { CreateResults } from './components/CreateResults';
-import { ComputePage } from './pages/ComputePage';
 import { LoginScreen } from './components/LoginScreen';
 import { MoveProjectDialog, NewProjectDialog, ProjectSheet } from './components/ProjectDialogs';
-import { JobDetailInspector } from './components/JobDetailInspector';
-import { GalleryViewer } from './components/GalleryViewer';
-import { NativeGalleryPanel } from './components/NativeGalleryPanel';
+import type { JobClearRequest } from './pages/JobsPage';
 import { useGalleryState, type GallerySource } from './hooks/useGalleryState';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+const WorkflowsPanel = lazy(() => import('./pages/WorkflowManager').then((m) => ({ default: m.WorkflowsPanel })));
+const CreationApiPage = lazy(() => import('./pages/CreationApiPage').then((m) => ({ default: m.CreationApiPage })));
+const NativeComfyPage = lazy(() => import('./pages/NativeComfyPage').then((m) => ({ default: m.NativeComfyPage })));
+const ModelLibraryPage = lazy(() => import('./pages/ModelLibraryPage').then((m) => ({ default: m.ModelLibraryPage })));
+const SettingsPanel = lazy(() => import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPanel })));
+const GalleryPanel = lazy(() => import('./pages/GalleryPage').then((m) => ({ default: m.GalleryPanel })));
+const TasksPanel = lazy(() => import('./pages/JobsPage').then((m) => ({ default: m.TasksPanel })));
+const ComputePage = lazy(() => import('./pages/ComputePage').then((m) => ({ default: m.ComputePage })));
+const JobDetailInspector = lazy(() => import('./components/JobDetailInspector').then((m) => ({ default: m.JobDetailInspector })));
+const GalleryViewer = lazy(() => import('./components/GalleryViewer').then((m) => ({ default: m.GalleryViewer })));
+const NativeGalleryPanel = lazy(() => import('./components/NativeGalleryPanel').then((m) => ({ default: m.NativeGalleryPanel })));
 import {
   Sparkles, Zap, Image as ImageIcon, Cpu, Settings as SettingsIcon, Folder, ChevronDown, Plus,
   Triangle, Boxes, Workflow, Layers, KeyRound, ArrowLeft, HardDrive,
@@ -461,7 +463,18 @@ export default function App() {
 
   useEffect(() => {
     if (draftReady.current !== `${projectId}:${workflowId}` || !workflowId || !projectId) return;
-    writeWorkflowDraft(projectId, workflowId, params);
+    const pid = projectId;
+    const wid = workflowId;
+    const snapshot = params;
+    const timer = window.setTimeout(() => {
+      writeWorkflowDraft(pid, wid, snapshot);
+    }, 250);
+    const flush = () => writeWorkflowDraft(pid, wid, paramsRef.current);
+    window.addEventListener('pagehide', flush);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('pagehide', flush);
+    };
   }, [params, projectId, workflowId]);
 
   const refreshJobs = useCallback(async (signal?: AbortSignal) => {
@@ -1005,28 +1018,36 @@ export default function App() {
     });
   }
 
+  const keyStateRef = useRef({
+    gs, detailId, tab, moveDialog, confirm, showProjectSheet, showNewProject,
+  });
+  keyStateRef.current = {
+    gs, detailId, tab, moveDialog, confirm, showProjectSheet, showNewProject,
+  };
+
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
+      const state = keyStateRef.current;
       const target = e.target as HTMLElement | null;
       const typing = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable);
       if (e.key === 'Escape') {
         if (document.fullscreenElement) return;
-        if (gs.confirmDeleteViewer) gs.setConfirmDeleteViewer(null);
-        else if (gs.confirmDeleteNative) gs.setConfirmDeleteNative(null);
-        else if (moveDialog) setMoveDialog(null);
-        else if (confirm) setConfirm(null);
-        else if (showNewProject) setShowNewProject(false);
-        else if (showProjectSheet) setShowProjectSheet(false);
-        else if (gs.activeViewerItem) gs.closeViewers();
-        else if (detailId && tab === '任务') setDetailId('');
-      } else if (!typing && gs.activeViewerItem && !moveDialog && !confirm && !gs.confirmDeleteViewer && !gs.confirmDeleteNative && !showNewProject && !showProjectSheet) {
-        if (e.key === 'ArrowLeft') { e.preventDefault(); gs.stepActiveViewer(-1); }
-        else if (e.key === 'ArrowRight') { e.preventDefault(); gs.stepActiveViewer(1); }
+        if (state.gs.confirmDeleteViewer) state.gs.setConfirmDeleteViewer(null);
+        else if (state.gs.confirmDeleteNative) state.gs.setConfirmDeleteNative(null);
+        else if (state.moveDialog) setMoveDialog(null);
+        else if (state.confirm) setConfirm(null);
+        else if (state.showNewProject) setShowNewProject(false);
+        else if (state.showProjectSheet) setShowProjectSheet(false);
+        else if (state.gs.activeViewerItem) state.gs.closeViewers();
+        else if (state.detailId && state.tab === '任务') setDetailId('');
+      } else if (!typing && state.gs.activeViewerItem && !state.moveDialog && !state.confirm && !state.gs.confirmDeleteViewer && !state.gs.confirmDeleteNative && !state.showNewProject && !state.showProjectSheet) {
+        if (e.key === 'ArrowLeft') { e.preventDefault(); state.gs.stepActiveViewer(-1); }
+        else if (e.key === 'ArrowRight') { e.preventDefault(); state.gs.stepActiveViewer(1); }
       }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [gs, detailId, tab, moveDialog, confirm, showProjectSheet, showNewProject]);
+  }, []);
 
   if (!loggedIn) {
     return <LoginScreen onLoggedIn={() => { setLoggedIn(true); setLoginRefresh((c) => c + 1); }} />;
@@ -1083,34 +1104,36 @@ export default function App() {
 
   const studioViewerAsset = gs.activeViewerItem?.kind === 'studio' ? gs.activeViewerItem.asset : null;
   const viewerNode = gs.activeViewerItem && (
-    <GalleryViewer
-      item={gs.activeViewerItem}
-      workflows={workflows}
-      projectName={studioViewerAsset ? projectTitleById(studioViewerAsset.project_id, projects) : undefined}
-      navCount={gs.activeNavCount}
-      navIndex={gs.activeNavIndex}
-      inlineViewer={gs.inlineViewer}
-      viewerJob={gs.viewerJob}
-      viewerJobError={gs.viewerJobError}
-      error={gs.galleryError}
-      importingRef={gs.importingNativeRef}
-      onStep={gs.stepActiveViewer}
-      onClose={gs.closeViewers}
-      onError={gs.setGalleryError}
-      onToast={pushToast}
-      onOpenJob={openJobFromViewer}
-      onFavoriteStudio={(asset) => void gs.favorite(asset)}
-      onReuseStudio={(asset) => void gs.reuseAsset(asset)}
-      onUseStudioAsReference={useAssetAsReference}
-      onMoveStudio={studioViewerAsset && projects.some((p) => p.id !== studioViewerAsset.project_id)
-        ? (asset) => setMoveDialog({ ids: [asset.id], currentProjectId: asset.project_id })
-        : undefined}
-      onDeleteStudio={gs.setConfirmDeleteViewer}
-      onFavoriteNative={(asset) => void gs.favoriteNative(asset)}
-      onImportNativeReference={gs.importNativeRef}
-      onImportWorkflowBundle={importWorkflow}
-      onDeleteNative={gs.setConfirmDeleteNative}
-    />
+    <Suspense fallback={<p className="muted small" role="status">正在加载预览…</p>}>
+      <GalleryViewer
+        item={gs.activeViewerItem}
+        workflows={workflows}
+        projectName={studioViewerAsset ? projectTitleById(studioViewerAsset.project_id, projects) : undefined}
+        navCount={gs.activeNavCount}
+        navIndex={gs.activeNavIndex}
+        inlineViewer={gs.inlineViewer}
+        viewerJob={gs.viewerJob}
+        viewerJobError={gs.viewerJobError}
+        error={gs.galleryError}
+        importingRef={gs.importingNativeRef}
+        onStep={gs.stepActiveViewer}
+        onClose={gs.closeViewers}
+        onError={gs.setGalleryError}
+        onToast={pushToast}
+        onOpenJob={openJobFromViewer}
+        onFavoriteStudio={(asset) => void gs.favorite(asset)}
+        onReuseStudio={(asset) => void gs.reuseAsset(asset)}
+        onUseStudioAsReference={useAssetAsReference}
+        onMoveStudio={studioViewerAsset && projects.some((p) => p.id !== studioViewerAsset.project_id)
+          ? (asset) => setMoveDialog({ ids: [asset.id], currentProjectId: asset.project_id })
+          : undefined}
+        onDeleteStudio={gs.setConfirmDeleteViewer}
+        onFavoriteNative={(asset) => void gs.favoriteNative(asset)}
+        onImportNativeReference={gs.importNativeRef}
+        onImportWorkflowBundle={importWorkflow}
+        onDeleteNative={gs.setConfirmDeleteNative}
+      />
+    </Suspense>
   );
 
   return (
@@ -1207,6 +1230,7 @@ export default function App() {
       />
 
       <main className={styles.page}>
+        <Suspense fallback={<p className="muted small" role="status">正在加载页面…</p>}>
         {tab === '创作' && (
           <section className={styles.createWorkspace} aria-label="创作工作区">
             <div className={styles.createHeader}>
@@ -1556,6 +1580,7 @@ export default function App() {
             onBack={() => setTab('创作')}
           />
         )}
+        </Suspense>
       </main>
 
       {confirm === 'submit' && activeWorkflow && (() => {
@@ -1687,14 +1712,16 @@ export default function App() {
       {detailId && tab === '任务' && !desktop && (
         <div className={styles.dialogBackdrop} role="presentation" onClick={() => setDetailId('')}>
           <section className={styles.dialog} role="dialog" aria-modal="true" aria-label="任务详情" onClick={(event) => event.stopPropagation()}>
-            <JobDetailInspector
-              detailId={detailId}
-              detailError={detailError}
-              inspectedJob={inspectedJob}
-              workflows={workflows}
-              onOpenOutput={openOutputAsset}
-              onClose={() => setDetailId('')}
-            />
+            <Suspense fallback={<p className="muted small" role="status">正在加载详情…</p>}>
+              <JobDetailInspector
+                detailId={detailId}
+                detailError={detailError}
+                inspectedJob={inspectedJob}
+                workflows={workflows}
+                onOpenOutput={openOutputAsset}
+                onClose={() => setDetailId('')}
+              />
+            </Suspense>
           </section>
         </div>
       )}

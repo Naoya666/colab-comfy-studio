@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowUpRight, ChevronLeft, ChevronRight, Copy, Download, FileCode2, FolderInput, ImagePlus, Maximize2, Minimize2, RotateCcw, Star, Trash2, ZoomIn, ZoomOut,
 } from 'lucide-react';
@@ -97,6 +97,16 @@ export function GalleryViewer({
   const imgRef = useRef<HTMLImageElement>(null);
   const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const pinchRef = useRef<{ dist: number; scale: number; midX: number; midY: number } | null>(null);
+  const moveRafRef = useRef<number | null>(null);
+  const pendingPanRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
+  const pendingPinchRef = useRef<{ dx: number; dy: number; targetScale: number; anchorX: number; anchorY: number } | null>(null);
+
+  useEffect(() => () => {
+    if (moveRafRef.current !== null) {
+      window.cancelAnimationFrame(moveRafRef.current);
+      moveRafRef.current = null;
+    }
+  }, []);
 
   const assetId = item.asset.id;
   const mime = item.asset.mime || '';
@@ -156,11 +166,7 @@ export function GalleryViewer({
     return () => ro.disconnect();
   }, [isFullscreen]);
 
-  const getBaseImageSize = useCallback((): Size2D => {
-    const img = imgRef.current;
-    if (img && img.offsetWidth > 0 && img.offsetHeight > 0) {
-      return { width: img.offsetWidth, height: img.offsetHeight };
-    }
+  const baseImageSize = useMemo<Size2D>(() => {
     if (naturalSize.width > 0 && naturalSize.height > 0 && stageSize.width > 0 && stageSize.height > 0) {
       const fit = Math.min(stageSize.width / naturalSize.width, stageSize.height / naturalSize.height);
       return { width: naturalSize.width * fit, height: naturalSize.height * fit };
@@ -168,7 +174,21 @@ export function GalleryViewer({
     return stageSize;
   }, [naturalSize, stageSize]);
 
-  const nativeScale = canZoom ? computeNativeScale(naturalSize, getBaseImageSize()) : null;
+  const getBaseImageSize = useCallback((): Size2D => {
+    if (baseImageSize.width > 0 && baseImageSize.height > 0) {
+      return baseImageSize;
+    }
+    const img = imgRef.current;
+    if (img && img.offsetWidth > 0 && img.offsetHeight > 0) {
+      return { width: img.offsetWidth, height: img.offsetHeight };
+    }
+    return stageSize;
+  }, [baseImageSize, stageSize]);
+
+  const nativeScale = useMemo(
+    () => (canZoom ? computeNativeScale(naturalSize, baseImageSize) : null),
+    [canZoom, naturalSize, baseImageSize],
+  );
 
   const zoomCenterBy = useCallback((factor: number) => {
     setSmoothTransform(true);
@@ -245,6 +265,29 @@ export function GalleryViewer({
     }
   }
 
+  function schedulePointerFlush() {
+    if (moveRafRef.current !== null) return;
+    moveRafRef.current = window.requestAnimationFrame(() => {
+      moveRafRef.current = null;
+      const pinch = pendingPinchRef.current;
+      if (pinch) {
+        pendingPinchRef.current = null;
+        pendingPanRef.current = { dx: 0, dy: 0 };
+        const baseSize = getBaseImageSize();
+        setView((curr) => {
+          const shifted = panBy(curr, pinch.dx, pinch.dy, baseSize);
+          return zoomAtPoint(shifted, pinch.targetScale, pinch.anchorX, pinch.anchorY, baseSize);
+        });
+        return;
+      }
+      const { dx, dy } = pendingPanRef.current;
+      if (dx !== 0 || dy !== 0) {
+        pendingPanRef.current = { dx: 0, dy: 0 };
+        setView((curr) => panBy(curr, dx, dy, getBaseImageSize()));
+      }
+    });
+  }
+
   function handleStagePointerMove(event: React.PointerEvent<HTMLDivElement>) {
     if (!canZoom || !pointersRef.current.has(event.pointerId)) return;
     const prev = pointersRef.current.get(event.pointerId)!;
@@ -264,11 +307,15 @@ export function GalleryViewer({
       const targetScale = pinchRef.current.scale * (dist / pinchRef.current.dist);
       pinchRef.current.midX = midX;
       pinchRef.current.midY = midY;
-      const baseSize = getBaseImageSize();
-      setView((curr) => {
-        const shifted = panBy(curr, dx, dy, baseSize);
-        return zoomAtPoint(shifted, targetScale, anchorX, anchorY, baseSize);
-      });
+      const prevPinch = pendingPinchRef.current;
+      pendingPinchRef.current = {
+        dx: (prevPinch?.dx || 0) + dx,
+        dy: (prevPinch?.dy || 0) + dy,
+        targetScale,
+        anchorX,
+        anchorY,
+      };
+      schedulePointerFlush();
       return;
     }
 
@@ -276,7 +323,9 @@ export function GalleryViewer({
       const dx = currPt.x - prev.x;
       const dy = currPt.y - prev.y;
       if (dx !== 0 || dy !== 0) {
-        setView((curr) => panBy(curr, dx, dy, getBaseImageSize()));
+        pendingPanRef.current.dx += dx;
+        pendingPanRef.current.dy += dy;
+        schedulePointerFlush();
       }
     }
   }
@@ -285,8 +334,14 @@ export function GalleryViewer({
     pointersRef.current.delete(event.pointerId);
     if (pointersRef.current.size < 2) {
       pinchRef.current = null;
+      pendingPinchRef.current = null;
     }
     if (pointersRef.current.size === 0) {
+      pendingPanRef.current = { dx: 0, dy: 0 };
+      if (moveRafRef.current !== null) {
+        window.cancelAnimationFrame(moveRafRef.current);
+        moveRafRef.current = null;
+      }
       setDragging(false);
     }
   }

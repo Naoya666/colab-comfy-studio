@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUpRight, Loader2 } from 'lucide-react';
 import { apiFetch, apiMessage, type GpuUsage } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
@@ -111,6 +111,106 @@ const restartMessages: Record<RestartPhase, string> = {
   failed: 'ComfyUI 重启失败',
 };
 
+const NativeStageTimelines = memo(function NativeStageTimelines({
+  status,
+  restart,
+  statusFetchedAtMs,
+  startupPending,
+  restartInProgress,
+  submittingRestart,
+  pendingRestart,
+  pendingStart,
+  restartMatchesCurrent,
+}: {
+  status: NativeStatus | null;
+  restart: NativeRestart | undefined;
+  statusFetchedAtMs: number;
+  startupPending: boolean;
+  restartInProgress: boolean;
+  submittingRestart: boolean;
+  pendingRestart: { id: string; previous?: string } | undefined;
+  pendingStart: boolean;
+  restartMatchesCurrent: boolean;
+}) {
+  const [clockMs, setClockMs] = useState(() => statusFetchedAtMs);
+  useEffect(() => {
+    setClockMs(statusFetchedAtMs);
+  }, [statusFetchedAtMs]);
+
+  const hasLiveTiming = useMemo(() => {
+    const startupLive = Object.values(status?.timing_details || {}).some((item) => item?.status === 'in_progress');
+    const restartLive = Object.values(restart?.timing_details || {}).some((item) => item?.status === 'in_progress');
+    return startupLive || restartLive || startupPending || restartInProgress;
+  }, [status?.timing_details, restart?.timing_details, startupPending, restartInProgress]);
+
+  useEffect(() => {
+    if (!hasLiveTiming) return;
+    const timer = window.setInterval(() => setClockMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasLiveTiming]);
+
+  const fallbackActiveRef = useRef<{ key: string; sinceMs: number } | null>(null);
+  const activeStageIdentity = useMemo(() => {
+    const restartActiveKey = Object.entries(restart?.timing_details || {}).find(([, item]) => item?.status === 'in_progress')?.[0];
+    if (restartActiveKey) return `restart:${restart?.restart_id || ''}:${restartActiveKey}`;
+    const startupActiveKey = Object.entries(status?.timing_details || {}).find(([, item]) => item?.status === 'in_progress')?.[0];
+    if (startupActiveKey) return `startup:${status?.job_id || ''}:${startupActiveKey}`;
+    if (restartInProgress) return `restart:${pendingRestart?.id || restart?.restart_id || 'pending'}:checking`;
+    if (pendingStart) return 'startup:pending:queue';
+    return '';
+  }, [restart?.restart_id, restart?.timing_details, status?.job_id, status?.timing_details, restartInProgress, pendingRestart?.id, pendingStart]);
+
+  if (activeStageIdentity) {
+    if (fallbackActiveRef.current?.key !== activeStageIdentity) {
+      fallbackActiveRef.current = { key: activeStageIdentity, sinceMs: statusFetchedAtMs };
+    }
+  } else {
+    fallbackActiveRef.current = null;
+  }
+
+  const elapsedDeltaSeconds = hasLiveTiming ? Math.max(0, (clockMs - statusFetchedAtMs) / 1000) : 0;
+  const fallbackActiveSeconds = fallbackActiveRef.current
+    ? Math.max(0, (clockMs - fallbackActiveRef.current.sinceMs) / 1000)
+    : undefined;
+
+  const startupStages = useMemo(() => buildNativeStartupStages({
+    state: status?.state,
+    stage: status?.stage,
+    timings: status?.timings,
+    timingDetails: status?.timing_details,
+    elapsedDeltaSeconds,
+    fallbackActiveSeconds,
+  }), [status?.state, status?.stage, status?.timings, status?.timing_details, elapsedDeltaSeconds, fallbackActiveSeconds]);
+
+  const restartStages = useMemo(() => buildNativeRestartStages({
+    restart: submittingRestart || pendingRestart ? undefined : restart,
+    pending: submittingRestart || Boolean(pendingRestart),
+    elapsedDeltaSeconds,
+    fallbackActiveSeconds,
+  }), [restart, submittingRestart, pendingRestart, elapsedDeltaSeconds, fallbackActiveSeconds]);
+
+  const showRestartPrimary = Boolean(restartMatchesCurrent && restartStages.length);
+
+  if (showRestartPrimary) {
+    return (
+      <>
+        <StageTimelineBar title="重启阶段耗时" items={restartStages} ariaLabel="重启阶段耗时" />
+        {startupStages.length > 0 && (
+          <details className={styles.activityFold}>
+            <summary>查看本次启动阶段耗时（{startupStages.length} 个阶段）</summary>
+            <div className={styles.activityFoldBody}>
+              <StageTimelineBar title="启动阶段耗时" items={startupStages} ariaLabel="启动阶段耗时" />
+            </div>
+          </details>
+        )}
+      </>
+    );
+  }
+  return startupStages.length > 0
+    ? <StageTimelineBar title="启动阶段耗时" items={startupStages} ariaLabel="启动阶段耗时" />
+    : null;
+});
+
 export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, desktop, onOpenSettings }: {
   usage: GpuUsage | null; accounts: GpuAccount[]; accountsLoaded: boolean; instances: GpuInstance[]; desktop: boolean; onOpenSettings?: () => void;
 }) {
@@ -136,7 +236,6 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const [pendingRestart, setPendingRestart] = useState<{ id: string; previous?: string }>();
   const [autoOpen, setAutoOpen] = useState(false);
   const [statusFetchedAtMs, setStatusFetchedAtMs] = useState(() => Date.now());
-  const [clockMs, setClockMs] = useState(() => Date.now());
   const [storage, setStorage] = useState<ModelStorage | undefined>(() => initialPrefs.storage);
   const [idleMinutes, setIdleMinutes] = useState(() => initialPrefs.idleMinutes ?? '');
   const [runtimeMinutes, setRuntimeMinutes] = useState(() => initialPrefs.runtimeMinutes ?? '');
@@ -204,7 +303,6 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
       const nowMs = Date.now();
       setStatus(data);
       setStatusFetchedAtMs(nowMs);
-      setClockMs(nowMs);
       setPendingStart(false);
       setPendingRestart(pending => {
         const observed = data.restart?.restart_id;
@@ -248,63 +346,17 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const restartError = restart?.phase === 'failed'
     ? `${restartMessages[restart.failed_phase || 'failed']}：${restart.error || 'ComfyUI 重启失败'}`
     : '';
-  const hasLiveTiming = useMemo(() => {
-    const startupLive = Object.values(status?.timing_details || {}).some((item) => item?.status === 'in_progress');
-    const restartLive = Object.values(restart?.timing_details || {}).some((item) => item?.status === 'in_progress');
-    return startupLive || restartLive || startupPending || restartInProgress;
-  }, [status?.timing_details, restart?.timing_details, startupPending, restartInProgress]);
-
-  useEffect(() => {
-    if (!hasLiveTiming) return;
-    const timer = window.setInterval(() => setClockMs(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [hasLiveTiming]);
-
-  const fallbackActiveRef = useRef<{ key: string; sinceMs: number } | null>(null);
-  const activeStageIdentity = useMemo(() => {
-    const restartActiveKey = Object.entries(restart?.timing_details || {}).find(([, item]) => item?.status === 'in_progress')?.[0];
-    if (restartActiveKey) return `restart:${restart?.restart_id || ''}:${restartActiveKey}`;
-    const startupActiveKey = Object.entries(status?.timing_details || {}).find(([, item]) => item?.status === 'in_progress')?.[0];
-    if (startupActiveKey) return `startup:${status?.job_id || ''}:${startupActiveKey}`;
-    if (restartInProgress) return `restart:${pendingRestart?.id || restart?.restart_id || 'pending'}:checking`;
-    if (pendingStart) return 'startup:pending:queue';
-    return '';
-  }, [restart?.restart_id, restart?.timing_details, status?.job_id, status?.timing_details, restartInProgress, pendingRestart?.id, pendingStart]);
-
-  if (activeStageIdentity) {
-    if (fallbackActiveRef.current?.key !== activeStageIdentity) {
-      fallbackActiveRef.current = { key: activeStageIdentity, sinceMs: statusFetchedAtMs };
-    }
-  } else {
-    fallbackActiveRef.current = null;
-  }
-
-  const elapsedDeltaSeconds = hasLiveTiming ? Math.max(0, (clockMs - statusFetchedAtMs) / 1000) : 0;
-  const fallbackActiveSeconds = fallbackActiveRef.current
-    ? Math.max(0, (clockMs - fallbackActiveRef.current.sinceMs) / 1000)
-    : undefined;
-
-  const startupStages = useMemo(() => buildNativeStartupStages({
-    state: status?.state,
-    stage: status?.stage,
-    timings: status?.timings,
-    timingDetails: status?.timing_details,
-    elapsedDeltaSeconds,
-    fallbackActiveSeconds,
-  }), [status?.state, status?.stage, status?.timings, status?.timing_details, elapsedDeltaSeconds, fallbackActiveSeconds]);
-
-  const restartStages = useMemo(() => buildNativeRestartStages({
-    restart: submittingRestart || pendingRestart ? undefined : restart,
-    pending: submittingRestart || Boolean(pendingRestart),
-    elapsedDeltaSeconds,
-    fallbackActiveSeconds,
-  }), [restart, submittingRestart, pendingRestart, elapsedDeltaSeconds, fallbackActiveSeconds]);
-
   const restartMatchesCurrent = Boolean(
     restartInProgress
     || (restart && status?.instance_id && restart.instance_id === status.instance_id),
   );
-  const showRestartPrimary = Boolean(restartMatchesCurrent && restartStages.length);
+  const hasTimeline = Boolean(
+    restartMatchesCurrent
+    || startupPending
+    || status?.stage
+    || Object.keys(status?.timings || {}).length
+    || Object.keys(status?.timing_details || {}).length,
+  );
 
   const refreshStatusNow = useCallback(() => {
     const controller = new AbortController();
@@ -470,26 +522,19 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
         </div>
         {(error || restartError || status?.error) &&
           <p className="status error" role="alert">{error || restartError || status?.error}</p>}
-        {showRestartPrimary ? (
-          <>
-            <StageTimelineBar title="重启阶段耗时" items={restartStages} ariaLabel="重启阶段耗时" />
-            {startupStages.length > 0 && (
-              <details className={styles.activityFold}>
-                <summary>查看本次启动阶段耗时（{startupStages.length} 个阶段）</summary>
-                <div className={styles.activityFoldBody}>
-                  <StageTimelineBar title="启动阶段耗时" items={startupStages} ariaLabel="启动阶段耗时" />
-                </div>
-              </details>
-            )}
-          </>
-        ) : (
-          startupStages.length > 0 && (
-            <StageTimelineBar title="启动阶段耗时" items={startupStages} ariaLabel="启动阶段耗时" />
-          )
-        )}
+        <NativeStageTimelines
+          status={status}
+          restart={restart}
+          statusFetchedAtMs={statusFetchedAtMs}
+          startupPending={startupPending}
+          restartInProgress={restartInProgress}
+          submittingRestart={submittingRestart}
+          pendingRestart={pendingRestart}
+          pendingStart={pendingStart}
+          restartMatchesCurrent={restartMatchesCurrent}
+        />
         {Boolean(status?.events.length) && (() => {
           const chronologicalEvents = [...(status?.events || [])].reverse();
-          const hasTimeline = showRestartPrimary || startupStages.length > 0;
           return (
             <details className={styles.activityFold} open={!hasTimeline}>
               <summary>查看原始事件日志（{chronologicalEvents.length} 条）</summary>

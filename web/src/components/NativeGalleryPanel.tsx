@@ -309,6 +309,7 @@ export function NativeGalleryPanel({
                         ) : (
                           <img
                             loading="lazy"
+                            decoding="async"
                             src={thumbBroken ? asset.content_url : asset.thumbnail_url}
                             alt={asset.filename}
                             onError={() => {

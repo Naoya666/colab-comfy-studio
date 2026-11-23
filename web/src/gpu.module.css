@@ -301,14 +301,14 @@
 
 /* ───── 作品 ───── */
 .galleryGrid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
-.tile { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--card); }
+.tile { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--card); content-visibility: auto; contain-intrinsic-size: 220px 260px; }
 .tile[data-selected="true"] { border-color: var(--text); box-shadow: 0 0 0 1px var(--text); }
 .tileMedia { position: relative; aspect-ratio: 1 / 1; overflow: hidden; background: var(--card-2); }
 .tileCover { position: absolute; inset: 0; display: block; width: 100%; height: 100%; margin: 0; padding: 0; border: 0; border-radius: 0; background: var(--card-2); overflow: hidden; }
 .tileCover img, .tileCover video { display: block; width: 100%; height: 100%; object-fit: cover; object-position: center; border: 0; background: var(--card-2); }
 .tileJson { display: grid; place-items: center; align-content: center; height: 100%; gap: 2px; color: var(--muted); font-weight: 600; }
 .tileJson small { font-weight: 400; font-size: 0.7rem; }
-.tileType { position: absolute; top: 8px; left: 8px; display: inline-flex; align-items: center; gap: 3px; padding: 2px 8px; border-radius: var(--r-full); background: rgba(0, 0, 0, 0.62); color: #fff; font-size: 0.68rem; backdrop-filter: blur(6px); pointer-events: none; }
+.tileType { position: absolute; top: 8px; left: 8px; display: inline-flex; align-items: center; gap: 3px; padding: 2px 8px; border-radius: var(--r-full); background: rgba(0, 0, 0, 0.78); color: #fff; font-size: 0.68rem; pointer-events: none; }
 .tileCheck { position: absolute; top: 8px; right: 8px; display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 1.5px solid rgba(255, 255, 255, 0.85); border-radius: 50%; background: rgba(0, 0, 0, 0.35); color: #000; }
 .tileCheck[data-on="true"] { background: #fff; border-color: #fff; }
 .tileHud { position: absolute; left: 8px; bottom: 8px; display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border-radius: 6px; background: rgba(0, 0, 0, 0.62); color: #fff; font-size: 0.66rem; pointer-events: none; font-variant-numeric: tabular-nums; }
@@ -863,10 +863,9 @@
   padding: 2px 8px;
   border: 1px solid rgba(255, 255, 255, 0.35);
   border-radius: var(--r-full);
-  background: rgba(0, 0, 0, 0.76);
+  background: rgba(0, 0, 0, 0.84);
   color: #fff;
   font-size: 0.7rem;
-  backdrop-filter: blur(6px);
 }
 .expandedStackBar {
   grid-column: 1 / -1;
@@ -2037,6 +2036,8 @@
 }
 .chartTooltip {
   position: absolute;
+  top: 0;
+  left: 0;
   z-index: 3;
   min-width: 136px;
   display: grid;
@@ -2050,10 +2051,8 @@
   font-variant-numeric: tabular-nums;
   pointer-events: none;
   white-space: nowrap;
-  transition: left 0.08s ease-out, top 0.08s ease-out;
-}
-.chartTooltip[data-side="left"] {
-  transform: translateX(-100%);
+  will-change: transform;
+  transition: transform 0.08s ease-out;
 }
 .chartTooltip[data-interactive="true"] {
   pointer-events: auto;

@@ -112,29 +112,49 @@ export function GalleryPanel({
 
   const activeWorkflowFilter = workflowOptions.some((o) => o.key === workflowFilter) ? workflowFilter : '';
 
-  const filtered = useMemo(() => gallery.filter((asset) => {
-    const isDiag = isDiagnosticAsset(asset);
-    if (isDiag && !showDiagnostics) return false;
-    const isVideo = asset.mime.startsWith('video/');
-    const isImage = asset.mime.startsWith('image/');
-    if (filter === 'image' && !isImage) return false;
-    if (filter === 'video' && !isVideo) return false;
-    if (filter === 'favorite' && !asset.favorite) return false;
-    if (filter === 'unfavorited' && asset.favorite) return false;
-    if (activeWorkflowFilter && asset.workflow_key !== activeWorkflowFilter) return false;
-    const wfName = workflowLabel(asset.workflow_key);
-    const projName = projectTitleById(asset.project_id, projects);
-    return `${asset.filename || ''} ${asset.source_job_id || ''} ${asset.workflow_key || ''} ${wfName} ${projName}`.toLowerCase().includes(query.toLowerCase());
-  }), [gallery, filter, activeWorkflowFilter, query, showDiagnostics, workflowLabel, projects]);
+  const galleryById = useMemo(() => new Map(gallery.map((a) => [a.id, a])), [gallery]);
+  const projectTitleMap = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of projects) map.set(p.id, projectTitleById(p.id, projects));
+    return map;
+  }, [projects]);
+  const getProjectTitle = useCallback(
+    (pid?: string) => (pid ? (projectTitleMap.get(pid) ?? projectTitleById(pid, projects)) : ''),
+    [projectTitleMap, projects],
+  );
+
+  const filtered = useMemo(() => {
+    const needle = query.toLowerCase();
+    return gallery.filter((asset) => {
+      const isDiag = isDiagnosticAsset(asset);
+      if (isDiag && !showDiagnostics) return false;
+      const isVideo = asset.mime.startsWith('video/');
+      const isImage = asset.mime.startsWith('image/');
+      if (filter === 'image' && !isImage) return false;
+      if (filter === 'video' && !isVideo) return false;
+      if (filter === 'favorite' && !asset.favorite) return false;
+      if (filter === 'unfavorited' && asset.favorite) return false;
+      if (activeWorkflowFilter && asset.workflow_key !== activeWorkflowFilter) return false;
+      if (!needle) return true;
+      const wfName = workflowLabel(asset.workflow_key);
+      const projName = getProjectTitle(asset.project_id);
+      return `${asset.filename || ''} ${asset.source_job_id || ''} ${asset.workflow_key || ''} ${wfName} ${projName}`.toLowerCase().includes(needle);
+    });
+  }, [gallery, filter, activeWorkflowFilter, query, showDiagnostics, workflowLabel, getProjectTitle]);
+
+  const unfavoritedIds = useMemo(
+    () => filtered.filter((a) => !a.favorite).map((a) => a.id),
+    [filtered],
+  );
 
   const stacks = useMemo(() => groupGalleryAssets(filtered), [filtered]);
   const hasMultiStacks = useMemo(() => stacks.some((s) => s.items.length > 1), [stacks]);
 
-  const selected = useMemo(() => gallery.find((a) => a.id === selectedId) || null, [gallery, selectedId]);
-  const activeCheckedIds = useMemo(() => {
-    const valid = new Set(gallery.map((a) => a.id));
-    return [...checkedIds].filter((id) => valid.has(id));
-  }, [checkedIds, gallery]);
+  const selected = useMemo(() => (selectedId ? galleryById.get(selectedId) || null : null), [galleryById, selectedId]);
+  const activeCheckedIds = useMemo(
+    () => [...checkedIds].filter((id) => galleryById.has(id)),
+    [checkedIds, galleryById],
+  );
 
   function toggleChecked(ids: string[]) {
     setBatchMode(true);
@@ -228,7 +248,7 @@ export function GalleryPanel({
             ) : isJson ? (
               <span className={styles.tileJson}>JSON<small>诊断文件</small></span>
             ) : (
-              <img loading="lazy" src={assetUrl(asset, true)} alt={asset.filename || '作品'} />
+              <img loading="lazy" decoding="async" src={assetUrl(asset, true)} alt={asset.filename || '作品'} />
             )}
           </button>
           <span className={styles.tileType}>
@@ -274,7 +294,7 @@ export function GalleryPanel({
           <div>
             {(() => {
               const wfName = workflowLabel(asset.workflow_key);
-              const projName = showProjectTag ? projectTitleById(asset.project_id, projects) : '';
+              const projName = showProjectTag ? getProjectTitle(asset.project_id) : '';
               const primary = wfName || asset.filename || `作品 ${asset.id.slice(0, 6)}`;
               const versionTag = asset.workflow_version != null ? `v${asset.workflow_version}` : '';
               const jobTag = asset.source_job_id ? `任务 ${asset.source_job_id.slice(0, 6)}` : '';
@@ -356,9 +376,9 @@ export function GalleryPanel({
             <button
               type="button"
               className="button secondary small"
-              onClick={() => setCheckedIds(new Set(filtered.filter((a) => !a.favorite).map((a) => a.id)))}
+              onClick={() => setCheckedIds(new Set(unfavoritedIds))}
             >
-              选中未收藏 ({filtered.filter((a) => !a.favorite).length})
+              选中未收藏 ({unfavoritedIds.length})
             </button>
             <button
               type="button"
@@ -369,7 +389,7 @@ export function GalleryPanel({
               清空选择
             </button>
             {onRequestMove && projects.length > 0 && (
-              projects.length > 1 || activeCheckedIds.some((id) => gallery.find((a) => a.id === id)?.project_id !== projects[0]?.id)
+              projects.length > 1 || activeCheckedIds.some((id) => galleryById.get(id)?.project_id !== projects[0]?.id)
             ) && (
               <button
                 type="button"
@@ -377,7 +397,7 @@ export function GalleryPanel({
                 disabled={!activeCheckedIds.length}
                 onClick={() => onRequestMove(activeCheckedIds, {
                   currentProjectId: activeCheckedIds.length === 1
-                    ? gallery.find((a) => a.id === activeCheckedIds[0])?.project_id
+                    ? galleryById.get(activeCheckedIds[0])?.project_id
                     : undefined,
                   onMoved: (movedIds) => {
                     const moved = new Set(movedIds);

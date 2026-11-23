@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import { ArrowUpRight, Download, Film, Image as ImageIcon, ImagePlus, Maximize2, Star, Trash2 } from 'lucide-react';
 import { assetUrl, type GalleryAsset, type GpuJob } from '../lib/gpu-api';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
@@ -10,7 +10,7 @@ function isMedia(asset: GalleryAsset) {
   return asset.mime.startsWith('image/') || asset.mime.startsWith('video/');
 }
 
-export function CreateResults({ jobs, count, gallery, error, onOpen, onJobs, onFavorite, onDelete, onUseAsReference }: {
+export const CreateResults = memo(function CreateResults({ jobs, count, gallery, error, onOpen, onJobs, onFavorite, onDelete, onUseAsReference }: {
   jobs: GpuJob[];
   count: number;
   gallery: GalleryAsset[];
@@ -56,7 +56,7 @@ export function CreateResults({ jobs, count, gallery, error, onOpen, onJobs, onF
           <video key={preview.id} src={assetUrl(preview)} controls playsInline preload="metadata" aria-label={preview.filename || '结果视频'} />
         ) : (
           <button type="button" onClick={() => onOpen(preview)} aria-label={`查看 ${preview.filename || '结果图片'}`}>
-            <img src={assetUrl(preview)} alt={preview.filename || '结果图片'} />
+            <img src={assetUrl(preview)} decoding="async" alt={preview.filename || '结果图片'} />
           </button>
         ) : (
           <div className={styles.resultEmpty}>
@@ -98,7 +98,7 @@ export function CreateResults({ jobs, count, gallery, error, onOpen, onJobs, onF
         {outputs.map((asset, index) => (
           <button key={asset.id} type="button" aria-pressed={preview?.id === asset.id}
             aria-label={`结果 ${index + 1}${asset.filename ? ` · ${asset.filename}` : ''}`} onClick={() => setSelectedId(asset.id)}>
-            {asset.mime.startsWith('video/') ? <Film size={18} aria-hidden /> : <img src={assetUrl(asset, true)} alt="" loading="lazy" />}
+            {asset.mime.startsWith('video/') ? <Film size={18} aria-hidden /> : <img src={assetUrl(asset, true)} alt="" loading="lazy" decoding="async" />}
           </button>
         ))}
       </div>}
@@ -117,4 +117,4 @@ export function CreateResults({ jobs, count, gallery, error, onOpen, onJobs, onF
       />
     </section>
   );
-}
+});
