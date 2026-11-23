@@ -466,11 +466,6 @@ def test_frontend_reuse_action_new_and_gentle_replace(tmp_path):
 
     # 2. reuse_action="replace": gentle stop marks manual_stop_requested=True without killing running-old;
     #    new job waits until old_t4 is deleted, then allocates fresh L4!
-    service.request_gentle_stop(owner, old_t4["id"], "replace:job-rep")
-    old_row = repo.get("instances", old_t4["id"], owner)
-    assert old_row["manual_stop_requested"] is True
-    assert old_row["state"] == "busy"  # running job NOT killed!
-
     j_rep = {
         "id": "job-rep",
         "owner_id": owner,
@@ -491,6 +486,22 @@ def test_frontend_reuse_action_new_and_gentle_replace(tmp_path):
     }
     with pytest.raises(CreationInstancePending):
         service.allocate(j_rep)
+    old_row = repo.get("instances", old_t4["id"], owner)
+    assert old_row["manual_stop_requested"] is True
+    assert old_row["state"] == "busy"
+
+    # The API must wait for the draining card even when another account is available.
+    api_job = {
+        "id": "api-during-replace",
+        "owner_id": owner,
+        "project_id": proj["id"],
+        "requested_spec": {"key": L4},
+        "snapshot": {"manifest": {"compute_spec": L4}, "creation_api": True},
+        "execution_policy": {"provider": "colab"},
+    }
+    assert service.inspect_creation_api_admission(api_job, [])["status"] == "releasing"
+    with pytest.raises(CreationInstancePending):
+        service.allocate(api_job)
 
     # Running job finishes -> complete() sees manual_stop_requested=True and transitions to releasing
     done_old = service.complete({"id": "running-old", "owner_id": owner, "instance_id": old_t4["id"],
@@ -562,7 +573,8 @@ def test_last_job_wins_and_failure_or_cancel_does_not_destroy_smart_or_retain(tm
     assert res4["state"] == "releasing"
 
 
-def test_scheduler_cleanup_on_cancelled_smart_creation_job_preserves_vm_and_attempts_interrupt(tmp_path, monkeypatch):
+@pytest.mark.parametrize("interrupt_confirmed", [True, False])
+def test_scheduler_reuses_cancelled_creation_job_vm_only_after_confirmed_interrupt(tmp_path, interrupt_confirmed):
     store, repo, owner, proj, aid, _, wf, _ = _seed_env(tmp_path, wf_spec=L4)
     inst, lease = _add_creation_instance(
         repo, owner, aid, spec=L4, state="busy", current_job_id="j-cancel",
@@ -601,7 +613,7 @@ def test_scheduler_cleanup_on_cancelled_smart_creation_job_preserves_vm_and_atte
     class FakeExecutor:
         def interrupt_creation_service(self, handle, job):
             interrupted.append(job["id"])
-            return True
+            return interrupt_confirmed
 
     sched = Scheduler(
         repo,
@@ -614,9 +626,9 @@ def test_scheduler_cleanup_on_cancelled_smart_creation_job_preserves_vm_and_atte
     result = sched.tick()
     assert result["state"] == "cancelled"
     assert interrupted == ["j-cancel"]
-    assert deleted == []  # VM MUST NOT be destroyed!
-    assert repo.get("instances", inst["id"], owner)["state"] == "retained_idle"
-    assert repo.get("leases", lease["id"], owner)["state"] == "idle"
+    assert len(deleted) == (0 if interrupt_confirmed else 1)
+    assert repo.get("instances", inst["id"], owner)["state"] == ("retained_idle" if interrupt_confirmed else "deleted")
+    assert repo.get("leases", lease["id"], owner)["state"] == ("idle" if interrupt_confirmed else "deleted")
     assert repo.get("executions", "exec-cancel", owner)["state"] == "cancelled"
 
 

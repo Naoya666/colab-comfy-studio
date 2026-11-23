@@ -898,22 +898,29 @@ print(json.dumps({{"healthy": healthy}}))
         return result.get("healthy") if isinstance(result, dict) else None
 
     def interrupt_creation_service(self, handle: dict, job: dict) -> bool:
-        """Best-effort interrupt of an active prompt on the resident ComfyUI service."""
+        """Interrupt a resident prompt and confirm the worker can no longer submit work."""
+        if not job.get("execution_id"):
+            return False
+        execution_id = _uuid4(job["execution_id"])
         interrupt_url = _service_api_url("/interrupt")
         queue_url = _service_api_url("/queue")
         session = self._session(handle, job["id"])
         code = f"""import json, time, urllib.request
+from pathlib import Path
+status_path = Path("/content/ai-studio") / {execution_id!r} / "status.json"
 interrupted = False
 try:
     req = urllib.request.Request({interrupt_url!r}, data=b"{{}}", method="POST",
                                  headers={{"Content-Type": "application/json"}})
     with urllib.request.urlopen(req, timeout=3) as resp:
-        interrupted = 200 <= resp.status < 300
-    deadline = time.time() + 4.0
-    while time.time() < deadline:
+        accepted = 200 <= resp.status < 300
+    deadline = time.monotonic() + 4.0
+    while accepted and time.monotonic() < deadline:
+        status = json.loads(status_path.read_text()) if status_path.is_file() else {{}}
         with urllib.request.urlopen({queue_url!r}, timeout=2) as qresp:
             qdata = json.loads(qresp.read().decode("utf-8"))
-        if not qdata.get("queue_running"):
+        if status.get("state") in {{"completed", "failed"}} and qdata.get("queue_running") == qdata.get("queue_pending") == []:
+            interrupted = True
             break
         time.sleep(0.3)
 except Exception:

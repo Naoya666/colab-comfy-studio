@@ -298,7 +298,7 @@ def _read_service_state(service_dir: Path) -> dict | None:
 
 
 def _service_api_url(path: str) -> str:
-    if path not in {"/system_stats", "/interrupt"}:
+    if path not in {"/system_stats", "/interrupt", "/queue"}:
         raise WorkerError("Comfy service endpoint is not allowed")
     return f"http://{COMFY_SERVICE_HOST}:{COMFY_SERVICE_PORT}{path}"
 

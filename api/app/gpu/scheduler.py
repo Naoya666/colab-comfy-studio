@@ -1294,16 +1294,22 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             and job_pool(job) == POOL_CREATION
             and self._lifecycle(job) in {"smart", "retain"}
             and retention_allowed
-            and not job.get("creation_interrupt_attempted")
+            and not lease.get("force_stop")
+            and not job.get("creation_interrupt_confirmed")
         ):
+            interrupted = False
             try:
                 executor = self._executor(job)
                 interrupt_fn = getattr(executor, "interrupt_creation_service", None)
                 if callable(interrupt_fn):
-                    interrupt_fn(self._lease_handle(lease), job)
+                    interrupted = interrupt_fn(self._lease_handle(lease), job) is True
             except Exception:
                 pass
-            job = self._update("jobs", job["id"], {"creation_interrupt_attempted": True}, job.get("owner_id"))
+            if interrupted:
+                job = self._update("jobs", job["id"], {"creation_interrupt_confirmed": True}, job.get("owner_id"))
+            else:
+                # Keep the lease unavailable until the provider confirms deletion.
+                lease = self._update("leases", lease["id"], {"force_stop": True}, job["owner_id"])
         owns_instance = bool(
             instance is None
             or instance.get("current_job_id") in {None, job["id"]}

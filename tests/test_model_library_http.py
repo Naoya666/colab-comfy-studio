@@ -212,3 +212,29 @@ def test_http_inspect_workflow_stateless_and_search_warnings(client, monkeypatch
     search_data = search_resp.json()["data"]
     assert search_data["candidates"] == [{"name": "Comfy-Org/flux1-dev", "source": "huggingface", "url": "https://huggingface.co/Comfy-Org/flux1-dev"}]
     assert len(search_data["warnings"]) == 1
+
+
+@pytest.mark.parametrize("payload", [
+    {"api_graph": {"1": {"class_typo": "VAELoader", "inputs": {"vae_name": "v.safetensors"}}}},
+    {"image_extraction": {"prompt": ["invalid"]}},
+    {"nodes": [{"id": 1, "type": "VAELoader", "widgets_values": ["v.safetensors"], "properties": ["invalid"]}]},
+])
+def test_inspector_rejects_malformed_graph(client, payload):
+    c, _ = client
+    response = c.post("/api/gpu/model-library/inspect-workflow", json=payload)
+    assert response.status_code == 422, response.text
+
+
+def test_inspector_recovers_valid_visual_graph_from_bundle(client):
+    c, _ = client
+    response = c.post("/api/gpu/model-library/inspect-workflow", json={
+        "image_extraction": {
+            "prompt": ["invalid"],
+            "workflow": {"nodes": [{"id": 1, "type": "VAELoader", "widgets_values": ["v.safetensors"]}]},
+        },
+    })
+    assert response.status_code == 200, response.text
+    result = response.json()["data"]
+    assert result["warnings"]
+    assert result["dependencies"][0]["reference"] == "v.safetensors"
+    assert result["models_ready"] is False

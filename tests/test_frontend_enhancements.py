@@ -212,6 +212,11 @@ def _build_mock_drive(repo, tree_folders: dict[str, list[dict]], file_bytes: dic
                         },
                     )
                 return httpx.Response(200, content=raw, headers={"Content-Length": str(len(raw))})
+            if request.method == "GET":
+                for parent_id, entries in tree_folders.items():
+                    for entry in entries:
+                        if entry["id"] == fid and fid not in trashed_out:
+                            return httpx.Response(200, json={**entry, "parents": [parent_id], "trashed": False})
         return httpx.Response(404)
 
     http_client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -412,6 +417,15 @@ def test_native_outputs_gallery_full_lifecycle(studio_client, monkeypatch):
 
     refs = client.get(f"/api/assets?project_id={project_id}", headers=headers).json()["data"]
     assert any(a["id"] == imported["id"] for a in refs)
+
+    # A folder moved outside output after listing must no longer authorize deletion.
+    moved_folder = tree["f-out"].pop(0)
+    tree["f-owner"].append(moved_folder)
+    moved = client.delete("/api/gpu/native/outputs/img-1", headers=headers)
+    assert moved.status_code == 404, moved.text
+    assert trashed == []
+    tree["f-owner"].remove(moved_folder)
+    tree["f-out"].append(moved_folder)
 
     # 7. Trash output clears favorite & thumbnail cache
     r_del = client.delete("/api/gpu/native/outputs/img-1", headers=headers)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -10,7 +11,9 @@ import tarfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
+from urllib.request import Request
 
 import httpx
 import pytest
@@ -40,6 +43,42 @@ class _FakeRangeResponse:
 
     def __exit__(self, *args):
         return False
+
+
+@pytest.mark.parametrize(("worker_state", "pending", "expected"), [
+    ("failed", [], True),
+    ("failed", ["prompt"], False),
+    ("running", [], False),
+])
+def test_interrupt_creation_checks_queue_and_worker_state(monkeypatch, worker_state, pending, expected):
+    executor = object.__new__(mcp.MCPGPUExecutor)
+    monkeypatch.setattr(executor, "_session", lambda *_: "session")
+    paths = []
+
+    def urlopen(request, *, timeout):
+        if isinstance(request, Request):
+            assert request.get_method() == "POST"
+            paths.append(request.full_url)
+            return _FakeRangeResponse(200, b"")
+        paths.append(request)
+        return _FakeRangeResponse(200, json.dumps({"queue_running": [], "queue_pending": pending}).encode())
+
+    def execute(_handle, _session, _exec_id, code):
+        output = io.StringIO()
+        times = iter([0.0, 1.0, 5.0])
+        with monkeypatch.context() as patch, contextlib.redirect_stdout(output):
+            patch.setattr(Path, "is_file", lambda _: True)
+            patch.setattr(Path, "read_text", lambda _: json.dumps({"state": worker_state}))
+            patch.setattr(time, "monotonic", lambda: next(times))
+            patch.setattr(time, "sleep", lambda _: None)
+            patch.setattr("urllib.request.urlopen", urlopen)
+            exec(code, {})
+        return json.loads(output.getvalue())
+
+    monkeypatch.setattr(executor, "_exec_code_on_handle", execute)
+    job = {"id": "test-job", "execution_id": str(uuid.uuid4())}
+    assert executor.interrupt_creation_service({}, job) is expected
+    assert paths == ["http://127.0.0.1:8188/interrupt", "http://127.0.0.1:8188/queue"]
 
 
 def test_pip_install_uses_uv_with_constraints_and_falls_back_to_pip(tmp_path, monkeypatch):

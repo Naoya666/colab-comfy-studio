@@ -599,6 +599,17 @@ class InstanceService:
             active.append(inst)
         return active
 
+    def _creation_instance_stopping(self, session, instance, provider, account_ids):
+        data = self._data(instance)
+        return (
+            instance.state != "deleted"
+            and not data.get("runtime_deleted")
+            and (instance.state in {"releasing", "cleanup_pending"} or data.get("manual_stop_requested"))
+            and data.get("provider", provider) == provider
+            and data.get("account_id") in account_ids
+            and self._instance_pool(session, instance) == POOL_CREATION
+        )
+
     def _inflight_compatible_creation_jobs(self, jobs, job, account_ids: set[str], order_table) -> bool:
         from .specs import check_requirements, compare_specs
 
@@ -682,10 +693,7 @@ class InstanceService:
                 )
                 return {"status": "compatible_instance", "instance_id": compatible[0].id}
             releasing = any(
-                inst.state == "releasing"
-                and self._instance_pool(session, inst) == POOL_CREATION
-                and self._data(inst).get("provider", provider) == provider
-                and self._data(inst).get("account_id") in account_ids
+                self._creation_instance_stopping(session, inst, provider, account_ids)
                 for inst in self._rows(session, "instances", owner)
             )
             if active:
@@ -1220,6 +1228,28 @@ class InstanceService:
             self._finish_operation(operation, self.public(result), session)
             return result
 
+    @contextmanager
+    def _allocation_tx(self, owner, provider, replacement_id):
+        with self._admission():
+            if replacement_id:
+                with self._tx() as session:
+                    old = self._find(session, "instances", replacement_id, owner)
+                    pending = old is not None and old.state != "deleted"
+                    if pending:
+                        data = self._data(old)
+                        if (
+                            self._instance_pool(session, old) != POOL_CREATION
+                            or data.get("provider", provider) != provider
+                            or old.state in {"unknown", "quarantined"}
+                        ):
+                            raise AllocationError("待替换旧实例不兼容或状态异常，请先在算力页处理")
+                        if not data.get("manual_stop_requested"):
+                            self._apply_gentle_stop_in_tx(session, old)
+                if pending:
+                    raise CreationInstancePending("等待旧实例停止并释放完成后再启动新规格实例")
+            with self._tx() as session:
+                yield session
+
     def allocate(self, job) -> dict:
         if not isinstance(job, Mapping):
             raise AllocationError("job must be an object")
@@ -1232,12 +1262,14 @@ class InstanceService:
         requested_instance = self._requested(job, "instance_id")
         requested_account = self._requested(job, "account_id")
         reuse_action = str(policy.get("reuse_action") or job.get("reuse_action") or "auto")
-        wait_delete_id = job.get("wait_for_deleted_instance_id") or policy.get("replace_instance_id")
+        wait_delete_id = job.get("wait_for_deleted_instance_id")
+        if reuse_action == "replace":
+            wait_delete_id = wait_delete_id or policy.get("replace_instance_id")
         provider = self._provider(job)
         pool = job_pool(job)
         is_creation_api = bool((job.get("snapshot") or {}).get("creation_api"))
 
-        with self._admission(), self._tx() as session:
+        with self._allocation_tx(owner_id, provider, wait_delete_id if pool == POOL_CREATION else None) as session:
             model = self._model("instances")
             existing = session.scalar(select(model).where(model.owner_id == owner_id, model.id == stable_id))
             if existing is not None and self._data(existing).get("allocation_key") == key:
@@ -1291,14 +1323,6 @@ class InstanceService:
 
             # 3a) Gentle replace: wait for old instance to be deleted, then create new instance.
             if reuse_action == "replace" or wait_delete_id:
-                if wait_delete_id:
-                    old = self._find(session, "instances", wait_delete_id, owner_id)
-                    if old is not None and old.state != "deleted":
-                        if old.state in {"unknown", "quarantined"}:
-                            raise AllocationError("待替换旧实例状态异常，请先在算力页处理")
-                        if not self._data(old).get("manual_stop_requested"):
-                            self._apply_gentle_stop_in_tx(session, old)
-                        raise CreationInstancePending("等待旧实例停止并释放完成后再启动新规格实例")
                 self._validate_new_creation_spec(job, order_table)
                 account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
                 return self._create_instance(
@@ -1419,10 +1443,7 @@ class InstanceService:
                     raise CreationInstancePending("等待当前创作实例完成启动或任务")
                 # No compatible creation instance: check releasing or lower-spec instances (NEVER auto multi-GPU!)
                 releasing = any(
-                    r.state == "releasing"
-                    and self._instance_pool(session, r) == POOL_CREATION
-                    and self._data(r).get("provider", provider) == provider
-                    and self._data(r).get("account_id") in account_ids
+                    self._creation_instance_stopping(session, r, provider, account_ids)
                     for r in all_rows
                 )
                 if releasing:

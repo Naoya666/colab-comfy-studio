@@ -84,17 +84,55 @@ def _is_api_prompt_graph(value):
     )
 
 
-def _is_visual_workflow(value):
+def _is_visual_node(node):
+    return (
+        isinstance(node, dict)
+        and isinstance(node.get("id"), (int, str))
+        and isinstance(node.get("type"), str)
+        and (node.get("mode") is None or isinstance(node["mode"], int))
+        and (node.get("properties") is None or isinstance(node["properties"], dict))
+        and (node.get("inputs") is None or (
+            isinstance(node["inputs"], list)
+            and all(
+                isinstance(slot, dict)
+                and (slot.get("link") is None or isinstance(slot["link"], (int, str)))
+                and (slot.get("name") is None or isinstance(slot["name"], str))
+                for slot in node["inputs"]
+            )
+        ))
+    )
+
+
+def _is_visual_subgraph(value):
     return (
         isinstance(value, dict)
+        and isinstance(value.get("id"), str)
         and isinstance(value.get("nodes"), list)
+        and all(_is_visual_node(node) for node in value["nodes"])
+        and isinstance(value.get("inputs") or [], list)
         and all(
-            isinstance(node, dict)
-            and isinstance(node.get("id"), (int, str))
-            and isinstance(node.get("type"), str)
-            for node in value["nodes"]
+            isinstance(slot, dict)
+            and isinstance(slot.get("name"), str)
+            and isinstance(slot.get("linkIds") or [], list)
+            and all(isinstance(link, (int, str)) for link in slot.get("linkIds") or [])
+            for slot in value.get("inputs") or []
         )
+    )
+
+
+def _is_visual_workflow(value):
+    if not isinstance(value, dict):
+        return False
+    definitions = value.get("definitions")
+    if definitions is not None and not isinstance(definitions, dict):
+        return False
+    subgraphs = (definitions or {}).get("subgraphs") or []
+    return (
+        isinstance(value.get("nodes"), list)
+        and all(_is_visual_node(node) for node in value["nodes"])
         and (value.get("links") is None or isinstance(value.get("links"), list))
+        and isinstance(subgraphs, list)
+        and all(_is_visual_subgraph(subgraph) for subgraph in subgraphs)
     )
 
 
@@ -290,7 +328,8 @@ def _subgraph_link_values(outer_node, subgraph, parent_link_values, parent_passt
                 in_name = sg_in.get("name")
                 if not isinstance(in_name, str) or in_name in slots_by_name:
                     continue
-                if sg_in.get("type") in _WIDGET_PRIMITIVES and widget_idx < len(values):
+                kind = sg_in.get("type")
+                if isinstance(kind, str) and kind in _WIDGET_PRIMITIVES and widget_idx < len(values):
                     slot_values[in_name] = values[widget_idx]
                     widget_idx += 1
 
@@ -664,22 +703,43 @@ def _normalize_inspect_payload(payload):
     if not isinstance(payload, dict) or not payload:
         raise ModelError("请提供有效的工作流 JSON 对象")
     warnings = []
+    def select_graph(candidates, validate):
+        for key, graph in candidates:
+            if graph is None or graph == {}:
+                continue
+            if validate(graph):
+                return graph
+            warnings.append(f"{key} 字段不是有效的节点图，已跳过")
+        return None
+
     # Studio bundle or image extraction wrapper
     if any(k in payload for k in ("api_graph", "editable_graph", "image_extraction", "manifest")):
         normalized = {}
-        if isinstance(payload.get("manifest"), dict):
-            normalized["manifest"] = payload["manifest"]
-        if isinstance(payload.get("api_graph"), dict):
-            normalized["api_graph"] = payload["api_graph"]
-        if isinstance(payload.get("editable_graph"), dict):
-            normalized["editable_graph"] = payload["editable_graph"]
-        if isinstance(payload.get("image_extraction"), dict):
-            normalized["image_extraction"] = payload["image_extraction"]
-        api_graph = normalized.get("api_graph") or (normalized.get("image_extraction") or {}).get("prompt")
-        visual = (normalized.get("image_extraction") or {}).get("workflow") or normalized.get("editable_graph")
+        manifest = payload.get("manifest")
+        if manifest is not None:
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("dependencies") or {}, dict):
+                raise ModelError("工作流包的 manifest 格式无效")
+            normalized["manifest"] = manifest
+            weights = weights_of(normalized)
+            if not isinstance(weights, list) or not all(isinstance(weight, dict) for weight in weights):
+                raise ModelError("工作流包的 weight_files 必须为对象数组")
+        extraction = payload.get("image_extraction")
+        if extraction is not None and not isinstance(extraction, dict):
+            warnings.append("image_extraction 字段不是有效的对象，已跳过")
+            extraction = None
+        extraction = extraction or {}
+        api_graph = select_graph(
+            (("api_graph", payload.get("api_graph")), ("image_extraction.prompt", extraction.get("prompt"))),
+            _is_api_prompt_graph,
+        )
+        visual = select_graph(
+            (("image_extraction.workflow", extraction.get("workflow")), ("editable_graph", payload.get("editable_graph"))),
+            _is_visual_workflow,
+        )
         if not api_graph and not visual:
             raise ModelError("工作流包中未找到可识别的节点图（缺少 api_graph / editable_graph / workflow）")
-        node_count = len(api_graph) if isinstance(api_graph, dict) else len((visual or {}).get("nodes") or [])
+        normalized.update(api_graph=api_graph, editable_graph=visual)
+        node_count = len(api_graph) if api_graph else len(visual["nodes"])
         fmt = "bundle" if "manifest" in normalized else ("both" if api_graph and visual else ("api" if api_graph else "visual"))
     elif "workflow" in payload or "prompt" in payload:
         visual = payload.get("workflow")

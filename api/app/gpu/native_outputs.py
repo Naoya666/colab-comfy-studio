@@ -540,6 +540,34 @@ def import_native_output_as_reference(
     return public_asset(asset)
 
 
+def _verify_output_parent_chain(storage: DriveStorage, owner_id: str, file_id: str) -> None:
+    output_folder = _find_output_folder(storage, owner_id)
+    current_id = file_id
+    # The gallery scans at most MAX_OUTPUT_DEPTH folders beneath the output root.
+    for depth in range(MAX_OUTPUT_DEPTH + 1):
+        if not output_folder or not FILE_ID_RE.fullmatch(current_id):
+            break
+        response = storage._request(
+            "GET",
+            f"{storage.base_url}/files/{quote(current_id, safe='')}",
+            params={"fields": "name,parents,trashed,mimeType"},
+        )
+        if response.status_code == 404:
+            break
+        metadata = storage._ensure_ok(response, "原生作品目录验证")
+        mime = metadata.get("mimeType") or ""
+        expected_type = _infer_media_mime(metadata.get("name") or "", mime) if depth == 0 else mime == FOLDER_MIME
+        if metadata.get("trashed") or not expected_type:
+            break
+        parents = metadata.get("parents")
+        if not isinstance(parents, list) or len(parents) != 1 or not isinstance(parents[0], str):
+            break
+        current_id = parents[0]
+        if current_id == output_folder:
+            return
+    raise APIError("NOT_FOUND", "原生作品不存在或不在 native-comfy/output 目录内", 404)
+
+
 def trash_native_output(
     repo,
     owner_id: str,
@@ -549,6 +577,7 @@ def trash_native_output(
 ) -> dict[str, Any]:
     item, storage, owns = resolve_output_item(repo, owner_id, file_id, drive=drive)
     try:
+        _verify_output_parent_chain(storage, owner_id, file_id)
         response = storage._request(
             "PATCH",
             f"{storage.base_url}/files/{quote(file_id, safe='')}",
