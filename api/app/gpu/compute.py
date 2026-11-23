@@ -39,7 +39,7 @@ class GpuConfig:
     monthly_units: float = 100.0
     max_job_units: float = 5.0
     create_retries: int = 2
-    create_timeout_seconds: float = 30.0
+    create_timeout_seconds: float = 60.0
     cleanup_retry_base_seconds: float = 2.0
     cleanup_retry_max_seconds: float = 300.0
     claim_ttl_seconds: float = 120.0
@@ -88,7 +88,7 @@ class GpuConfig:
             real_enabled=False if os.getenv("STUDIO_OFFLINE_TEST") == "1" else cls._bool("GPU_REAL_ENABLED", False),
             unit_rate=unit_rate,
             create_retries=retries,
-            create_timeout_seconds=cls._number("GPU_CREATE_TIMEOUT_SECONDS", 30),
+            create_timeout_seconds=max(15.0, cls._number("GPU_CREATE_TIMEOUT_SECONDS", 60.0)),
             cleanup_retry_base_seconds=max(0.0, cls._number("GPU_CLEANUP_RETRY_BASE_SECONDS", 2)),
             cleanup_retry_max_seconds=max(0.0, cls._number("GPU_CLEANUP_RETRY_MAX_SECONDS", 300)),
             claim_ttl_seconds=max(1.0, cls._number("GPU_CLAIM_TTL_SECONDS", 120)),
@@ -352,9 +352,18 @@ def default_provider_factory(
     if name == "colab" and (os.getenv("STUDIO_OFFLINE_TEST") == "1" or not config.real_enabled):
         return DisabledProvider("real GPU provider is disabled or unconfigured")
     if name == "colab":
+        import inspect
+
         from .colab import GoogleColabProvider
 
-        return GoogleColabProvider(store, owner_id or job.get("owner_id"), account_id=_job_account_id(job))
+        kwargs = {"account_id": _job_account_id(job)}
+        try:
+            params = inspect.signature(GoogleColabProvider.__init__).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "create_timeout" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            kwargs["create_timeout"] = config.create_timeout_seconds
+        return GoogleColabProvider(store, owner_id or job.get("owner_id"), **kwargs)
     return DisabledProvider(f"unknown GPU provider: {name}")
 
 

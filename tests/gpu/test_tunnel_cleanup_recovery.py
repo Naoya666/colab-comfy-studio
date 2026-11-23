@@ -63,6 +63,109 @@ def test_watchdog_reconciles_stuck_cli_allocation(monkeypatch, confirmed):
     assert instance["state"] == ("deleted" if confirmed else "releasing")
 
 
+@pytest.mark.parametrize("lifecycle", ["smart", "retain"])
+def test_creation_unconfirmed_tunnel_allocation_never_retains_idle_and_reconciles_remote(monkeypatch, lifecycle):
+    """If POST /tun/m/assign times out on a creation-pool smart/retain job, cleanup must
+    never mark the unconfirmed lease/instance retained_idle; it must reconcile and delete."""
+    repo = Repository(Store("sqlite://"))
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("app.gpu.colab.time.time", lambda: clock["now"])
+    request_id = "22222222-2222-4222-8222-222222222222"
+    nbh = _uuid_to_web_safe_base64(uuid.UUID(request_id))
+    repo.create("accounts", "owner", {"account_id": "account", "alias": "acc", "enabled": True, "allow_allocation": True}, record_id="account")
+    repo.create("jobs", "owner", {
+        "state": "cleaning_up",
+        "provider": "colab",
+        "account_id": "account",
+        "instance_id": "instance",
+        "lease_id": "lease",
+        "instance_pool": "creation",
+        "cleanup_final_state": "failed",
+        "error_code": "gpu_allocation_aborted",
+        "error_message": "GPU allocation entered cleanup before execution; retry after release",
+        "execution_policy": {"provider": "colab", "lifecycle": lifecycle, "retain_idle_minutes": 15},
+    }, record_id="job")
+    repo.create("instances", "owner", {
+        "state": "allocating",
+        "provider": "colab",
+        "account_id": "account",
+        "instance_pool": "creation",
+        "current_job_id": "job",
+        "lease_id": "lease",
+        "retention_mode": lifecycle,
+        "retain_idle_minutes": 15,
+    }, record_id="instance")
+    repo.create("leases", "owner", {
+        "state": "cleanup_pending",
+        "provider": "colab",
+        "account_id": "account",
+        "instance_id": "instance",
+        "instance_pool": "creation",
+        "owner_job_id": "job",
+        "create_attempts": 1,
+        "create_started": clock["now"] - 14.0,
+        "runtime_id": "studio-timedout",
+        "request_id": request_id,
+        "tunnel_nbh": nbh,
+        "tunnel_assign_params": {"nbh": nbh, "variant": "GPU", "accelerator": "L4"},
+        "last_create_error": "Colab 隧道网络异常，远端结果可能未知，将保留租约进行协调",
+        "handle": {
+            "runtime_name": "runtimes/studio-timedout",
+            "runtime_id": "studio-timedout",
+            "request_id": request_id,
+            "owner_id": "owner",
+            "job_id": "job",
+            "owner_job_id": "job",
+            "intent": "gpu-studio",
+        },
+    }, record_id="lease")
+
+    provider = GoogleColabProvider(repo, "owner", account_id="account")
+    deleted_endpoints = []
+    remote_assignments = [{"endpoint": "gpu-l4-late-created", "nbh": nbh, "variant": 1, "accelerator": "L4", "machineShape": 0}]
+
+    def fake_request(method, path, *, params=None, headers=None, timeout=None):
+        if method == "GET" and path == "/tun/m/assign":
+            return {"endpoint": "gpu-l4-late-created", "nbh": nbh}
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    def fake_delete(handle):
+        saved = repo.get("leases", "lease", "owner")
+        if not saved.get("tunnel_endpoint"):
+            return False
+        deleted_endpoints.append(saved["tunnel_endpoint"])
+        remote_assignments.clear()
+        return True
+
+    monkeypatch.setattr(provider, "_is_cli_tunnel", lambda lease=None: True)
+    monkeypatch.setattr(provider, "_tunnel_request", fake_request)
+    monkeypatch.setattr(provider, "_tunnel_json", lambda value: value)
+    monkeypatch.setattr(provider, "_tunnel_assignments", lambda: list(remote_assignments))
+    monkeypatch.setattr(provider, "delete", fake_delete)
+
+    scheduler = Scheduler(repo, provider_factory=lambda job: provider, clock=lambda: clock["now"])
+    try:
+        # 1) Right after timeout (<60s): instance must enter releasing (NOT retained_idle) and lease stays cleanup_pending.
+        scheduler.tick()
+        inst1 = repo.get("instances", "instance", "owner")
+        lease1 = repo.get("leases", "lease", "owner")
+        assert inst1["state"] == "releasing", f"Unconfirmed allocation must not retain_idle: {inst1}"
+        assert lease1["state"] == "cleanup_pending", f"Lease must remain cleanup_pending: {lease1}"
+
+        # 2) After 60s reconciliation window: discovers late remote endpoint and deletes it cleanly.
+        clock["now"] += 70.0
+        scheduler.tick()
+        inst2 = repo.get("instances", "instance", "owner")
+        lease2 = repo.get("leases", "lease", "owner")
+        job2 = repo.get("jobs", "job", "owner")
+        assert deleted_endpoints == ["gpu-l4-late-created"]
+        assert lease2["state"] == "deleted"
+        assert inst2["state"] == "deleted"
+        assert job2["state"] == "failed"
+    finally:
+        provider.close()
+
+
 class IntentRecoveryTests(unittest.TestCase):
     def setup_provider(self, response, assignments=None, age=120):
         lease = {

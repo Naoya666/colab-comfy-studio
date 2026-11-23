@@ -227,3 +227,51 @@ def test_delete_requires_owner_and_get_404_confirmation():
     assert paths == [("GET", "/v1beta/runtimes/atelier-runtime-1")]
     with pytest.raises(Exception, match="归属"):
         provider.delete({"runtime_name": "runtimes/other", "runtime_id": "other", "owner_id": "other-owner"})
+
+
+def test_create_requests_use_extended_create_timeout_while_reads_stay_fast(monkeypatch):
+    from app.gpu.compute import GpuConfig, default_provider_factory
+
+    recorded = []
+
+    def handler(request):
+        recorded.append((request.method, request.url.path, request.extensions.get("timeout")))
+        if request.url.path == "/tun/m/ccu-info":
+            return httpx.Response(200, json={"eligibleGpus": ["L4"]})
+        if request.url.path == "/tun/m/assign" and request.method == "GET":
+            return httpx.Response(200, json={"token": "xsrf-1"})
+        if request.url.path == "/tun/m/assign" and request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "endpoint": "gpu-l4-test",
+                    "runtimeProxyInfo": {"url": "https://proxy.colab.test", "token": "ptok", "tokenExpiresInSeconds": 3600},
+                },
+            )
+        return httpx.Response(200, json={"name": "operations/op-1", "done": True})
+
+    provider = make(handler)
+    assert provider.create_timeout == 60.0
+    monkeypatch.setattr(provider, "_is_cli_tunnel", lambda lease=None: True)
+    provider.list_specs()
+    provider.create(
+        {"key": {"variant": "GPU", "accelerator": "L4", "shape": "STANDARD"}, "eligible": True},
+        "11111111-1111-4111-8111-111111111111",
+        "job-1",
+        "atelier-runtime-1",
+    )
+    assert recorded[0][1] == "/tun/m/ccu-info"
+    assert recorded[0][2]["read"] == 5.0 or recorded[0][2]["read"] <= 10.0
+    assert recorded[1][0:2] == ("GET", "/tun/m/assign") and recorded[1][2]["read"] == 60.0
+    assert recorded[2][0:2] == ("POST", "/tun/m/assign") and recorded[2][2]["read"] == 60.0
+
+    monkeypatch.setenv("STUDIO_OFFLINE_TEST", "0")
+    monkeypatch.setenv("GPU_REAL_ENABLED", "1")
+    monkeypatch.setenv("GPU_CREATE_TIMEOUT_SECONDS", "90")
+    cfg = GpuConfig.from_env()
+    assert cfg.create_timeout_seconds == 90.0
+    wired = default_provider_factory({"provider": "colab", "owner_id": "owner-1"}, cfg, store=provider.store)
+    try:
+        assert wired.create_timeout == 90.0
+    finally:
+        wired.close()

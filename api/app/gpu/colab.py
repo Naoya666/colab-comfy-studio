@@ -79,8 +79,10 @@ class GoogleColabProvider:
         google=None,
         base_url="https://colaboratory.googleapis.com",
         timeout=10.0,
+        create_timeout=60.0,
     ):
         self.store, self.owner_id, self.account_id = store, owner_id, account_id
+        self.create_timeout = max(float(timeout), float(create_timeout))
         if client is not None:
             self.client = client
         else:
@@ -91,16 +93,20 @@ class GoogleColabProvider:
         self.google = google or GoogleService(store, owner_id, account_id=account_id, client=self.client)
         self.base_url = base_url.rstrip("/")
 
-    def _request(self, method, path, *, params=None, json=None):
+    def _create_http_timeout(self) -> httpx.Timeout:
+        return httpx.Timeout(connect=10.0, read=self.create_timeout, write=15.0, pool=10.0)
+
+    def _request(self, method, path, *, params=None, json=None, timeout=None):
         token = self.google.access_token("colab")
+        kwargs = {
+            "params": params,
+            "json": json,
+            "headers": {"Authorization": "Bearer " + token, "Accept": "application/json"},
+        }
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         try:
-            response = self.client.request(
-                method,
-                self.base_url + path,
-                params=params,
-                json=json,
-                headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
-            )
+            response = self.client.request(method, self.base_url + path, **kwargs)
         except httpx.HTTPError as exc:
             raise ColabError("Colab API 网络异常，远端结果可能未知，将保留租约进行协调") from exc
         if response.status_code >= 400 and response.status_code != 404:
@@ -130,7 +136,7 @@ class GoogleColabProvider:
                 return True
         return False
 
-    def _tunnel_request(self, method: str, path: str, *, params: dict | None = None, headers: dict | None = None):
+    def _tunnel_request(self, method: str, path: str, *, params: dict | None = None, headers: dict | None = None, timeout=None):
         token = self.google.access_token("colab")
         req_params = {"authuser": "0"}
         if params:
@@ -142,12 +148,14 @@ class GoogleColabProvider:
         }
         if headers:
             req_headers.update(headers)
+        req_kwargs = {"params": req_params, "headers": req_headers}
+        if timeout is not None:
+            req_kwargs["timeout"] = timeout
         try:
             response = self.client.request(
                 method,
                 _TUNNEL_BASE_URL + path,
-                params=req_params,
-                headers=req_headers,
+                **req_kwargs,
             )
         except httpx.HTTPError as exc:
             raise ColabError("Colab 隧道网络异常，远端结果可能未知，将保留租约进行协调") from exc
@@ -361,7 +369,8 @@ class GoogleColabProvider:
             params["shape"] = "hm"
 
         self.store.update("leases", lease["id"], {"tunnel_nbh": nbh, "tunnel_assign_params": params}, self.owner_id)
-        first = self._tunnel_json(self._tunnel_request("GET", "/tun/m/assign", params=params))
+        assign_timeout = self._create_http_timeout()
+        first = self._tunnel_json(self._tunnel_request("GET", "/tun/m/assign", params=params, timeout=assign_timeout))
         if "endpoint" in first and isinstance(first.get("runtimeProxyInfo"), dict):
             assigned = first
         else:
@@ -374,6 +383,7 @@ class GoogleColabProvider:
                     "/tun/m/assign",
                     params=params,
                     headers={"X-Goog-Colab-Token": xsrf},
+                    timeout=assign_timeout,
                 )
             )
         endpoint = assigned.get("endpoint")
@@ -426,6 +436,7 @@ class GoogleColabProvider:
             "/v1beta/runtimes",
             params={"requestId": request_id, "runtimeId": runtime_id},
             json={"runtimeSpec": key},
+            timeout=self._create_http_timeout(),
         )
         operation = self._json(response)
         name = operation.get("name")

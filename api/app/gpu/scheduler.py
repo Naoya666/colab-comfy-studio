@@ -1318,7 +1318,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     self._event(job, "completed", msg)
                     return self._get("jobs", job["id"], job["owner_id"])
         final_state = job.get("cleanup_final_state") or job.get("requested_outcome") or "failed"
-        from .instances import POOL_CREATION, job_pool
+        from .instances import POOL_CREATION, job_pool, lease_allocation_unconfirmed
 
         if (
             final_state == "cancelled"
@@ -1360,7 +1360,8 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     error_code=job.get("error_code") or "gpu_instance_completion_pending",
                     error_message=job.get("error_message") or str(exc),
                 )
-            if isinstance(instance, dict) and instance.get("state") == "retained_idle":
+            can_retain_lease = not (lease and lease_allocation_unconfirmed(lease.get("state"), lease, job))
+            if can_retain_lease and isinstance(instance, dict) and instance.get("state") == "retained_idle":
                 with self.db_store.admission_lock() as acquired:
                     if not acquired:
                         return job
@@ -1374,7 +1375,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                         elif lease.get("generation_timeouts") and instance.get("idle_deadline_at") is not None:
                             lease_patch["deadline_epoch"] = instance["idle_deadline_at"]
                         self._update("leases", lease["id"], lease_patch, job.get("owner_id"))
-            if isinstance(instance, dict) and instance.get("state") == "retained_idle":
+            if can_retain_lease and isinstance(instance, dict) and instance.get("state") == "retained_idle":
                 if job.get("execution_id"):
                     self._update(
                         "executions",

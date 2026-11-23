@@ -74,6 +74,39 @@ def instance_pool_of(instance: Mapping | None) -> str:
     return POOL_CREATION
 
 
+def lease_allocation_unconfirmed(
+    lease_state: str | None, lease_data: Mapping | None, job: Mapping | None = None
+) -> bool:
+    """Return True when a lease never reached a confirmed, reusable remote allocation."""
+    data = lease_data if isinstance(lease_data, Mapping) else {}
+    state = str(lease_state or data.get("state") or "").lower()
+    if state in {"creating", "cleanup_pending", "releasing", "deleting", "quarantined", "deleted"}:
+        return True
+    has_tunnel = bool(data.get("tunnel_endpoint") and data.get("proxy_url"))
+    if data.get("tunnel_nbh") and not has_tunnel:
+        return True
+    if data.get("last_create_error") and not has_tunnel and not data.get("operation_done"):
+        return True
+    handle = data.get("handle")
+    if (
+        isinstance(handle, Mapping)
+        and handle.get("intent") == "gpu-studio"
+        and not has_tunnel
+        and not data.get("operation_name")
+        and not data.get("operation_done")
+    ):
+        return True
+    if isinstance(job, Mapping) and job.get("error_code") in {
+        "gpu_allocation_aborted",
+        "gpu_create_failed",
+        "gpu_provider_unavailable",
+        "gpu_spec_invalid",
+    }:
+        if not has_tunnel and not data.get("operation_done"):
+            return True
+    return False
+
+
 def evaluate_lifetime_shortening(
     instance_data: Mapping,
     *,
@@ -1556,8 +1589,10 @@ class InstanceService:
                 or job.get("error_code") == RUNTIME_MISSING
             )
             unstarted_vm = False
+            unconfirmed_allocation = False
             if lease is not None:
                 unstarted_vm = not lease_data.get("handle") and int(lease_data.get("create_attempts") or 0) == 0
+                unconfirmed_allocation = lease_allocation_unconfirmed(lease.state, lease_data, job)
             elif data.get("provider") == "colab" or (not success and instance.state == "allocating"):
                 unstarted_vm = True
             force_stopped = bool(data.get("force_stop") or lease_data.get("force_stop"))
@@ -1570,12 +1605,20 @@ class InstanceService:
             hard = data.get("hard_deadline_at")
             past_hard = hard is not None and self.clock() >= float(hard)
 
-            hard_terminate = remote_missing or unstarted_vm or force_stopped or soft_tripped or manual_stop or past_hard
+            hard_terminate = (
+                remote_missing
+                or unstarted_vm
+                or unconfirmed_allocation
+                or force_stopped
+                or soft_tripped
+                or manual_stop
+                or past_hard
+            )
 
             if pool == POOL_EPHEMERAL:
                 mode = "save"
             elif pool == POOL_NATIVE or data.get("native_comfy"):
-                mode = "save" if (manual_stop or force_stopped or remote_missing or unstarted_vm) else "retain"
+                mode = "save" if (manual_stop or force_stopped or remote_missing or unstarted_vm or unconfirmed_allocation) else "retain"
             elif hard_terminate:
                 mode = "save"
 
@@ -1601,7 +1644,7 @@ class InstanceService:
                 # Native VM is retained only once booted (success or already marked native_comfy) and no hard stop.
                 retain = (
                     (success or bool(data.get("native_comfy")))
-                    and not (manual_stop or force_stopped or remote_missing or unstarted_vm or past_hard)
+                    and not (manual_stop or force_stopped or remote_missing or unstarted_vm or unconfirmed_allocation or past_hard)
                 )
             else:
                 # Creation pool: last job's strategy decides; smart/retain survive failure & cancellation!
