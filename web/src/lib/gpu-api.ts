@@ -1,9 +1,13 @@
 import type { GpuSpecKey } from './gpu-spec-order';
 import type {
   AccountRuntime,
+  ColabCliAuthCompleteResponse,
+  ColabCliAuthStartResponse,
+  ColabCliImportRequest,
   GoogleAccount,
   GoogleAccountCreateRequest,
   GoogleAccountUpdateRequest,
+  GoogleAuthChannel,
   GoogleAuthPurpose,
   GpuExecutionPolicyV020,
   GpuInstance,
@@ -22,9 +26,13 @@ import type {
 export type { GpuSpecKey } from './gpu-spec-order';
 export type {
   AccountRuntime,
+  ColabCliAuthCompleteResponse,
+  ColabCliAuthStartResponse,
+  ColabCliImportRequest,
   GoogleAccount,
   GoogleAccountCreateRequest,
   GoogleAccountUpdateRequest,
+  GoogleAuthChannel,
   GoogleAuthPurpose,
   GpuInstance,
   GpuInstanceFilters,
@@ -393,17 +401,53 @@ export const createGoogleAccount = (body: GoogleAccountCreateRequest, idempotenc
   apiFetch<GoogleAccount>('/api/gpu/accounts', write('POST', body, idempotencyKey));
 export const updateGoogleAccount = (accountId: string, body: GoogleAccountUpdateRequest, idempotencyKey: string) =>
   apiFetch<GoogleAccount>(`/api/gpu/accounts/${encodeURIComponent(accountId)}`, write('PATCH', body, idempotencyKey));
-export const disconnectGoogleAccount = (accountId: string, idempotencyKey: string) =>
-  apiFetch<GoogleAccount>(`/api/gpu/accounts/${encodeURIComponent(accountId)}/disconnect`, write('POST', {}, idempotencyKey));
-export const deleteGoogleAccount = (accountId: string, idempotencyKey: string) =>
-  apiFetch<{ account_id: string; deleted: boolean; remote_confirmed?: boolean; cleared_defaults?: string[] }>(
-    `/api/gpu/accounts/${encodeURIComponent(accountId)}`,
+export const disconnectGoogleAccount = (
+  accountId: string,
+  idempotencyKey: string,
+  options?: { revoke_remote?: boolean },
+) =>
+  apiFetch<GoogleAccount>(
+    `/api/gpu/accounts/${encodeURIComponent(accountId)}/disconnect`,
+    write('POST', options && typeof options.revoke_remote === 'boolean' ? { revoke_remote: options.revoke_remote } : {}, idempotencyKey),
+  );
+export const deleteGoogleAccount = (
+  accountId: string,
+  idempotencyKey: string,
+  options?: { revoke_remote?: boolean },
+) => {
+  const suffix = options?.revoke_remote === false ? '?revoke_remote=false' : '';
+  return apiFetch<{ account_id: string; deleted: boolean; remote_confirmed?: boolean; cleared_defaults?: string[] }>(
+    `/api/gpu/accounts/${encodeURIComponent(accountId)}${suffix}`,
     { method: 'DELETE', headers: { 'Idempotency-Key': idempotencyKey } },
   );
+};
 export const startGoogleAccountAuth = (accountId: string, purpose: GoogleAuthPurpose, idempotencyKey: string) =>
   apiFetch<{ authorization_url: string; state?: string }>(
     `/api/gpu/accounts/${encodeURIComponent(accountId)}/auth/${purpose}/start`,
     write('POST', { purpose }, idempotencyKey),
+  );
+export const startColabCliAuth = (accountId: string, idempotencyKey: string) =>
+  apiFetch<ColabCliAuthStartResponse>(
+    `/api/gpu/accounts/${encodeURIComponent(accountId)}/auth/colab-cli/start`,
+    write('POST', {}, idempotencyKey),
+  );
+export const completeColabCliAuth = (
+  accountId: string,
+  body: { state: string; code: string },
+  idempotencyKey: string,
+) =>
+  apiFetch<ColabCliAuthCompleteResponse>(
+    `/api/gpu/accounts/${encodeURIComponent(accountId)}/auth/colab-cli/complete`,
+    write('POST', body, idempotencyKey),
+  );
+export const importColabCliCredentials = (
+  accountId: string,
+  body: ColabCliImportRequest,
+  idempotencyKey: string,
+) =>
+  apiFetch<ColabCliAuthCompleteResponse>(
+    `/api/gpu/accounts/${encodeURIComponent(accountId)}/auth/colab-cli/import`,
+    write('POST', body, idempotencyKey),
   );
 export const getAccountRuntimes = (accountId: string) =>
   apiFetch<AccountRuntime[]>(`/api/gpu/accounts/${encodeURIComponent(accountId)}/runtimes`);

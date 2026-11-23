@@ -88,23 +88,23 @@ export function GoogleOAuthSetup({ onConfigured }: { onConfigured: () => void })
     }
   }
 
-  return <section className={styles.card} aria-label="Google OAuth 应用配置"><h2>Google OAuth 应用配置</h2>
-    <p className="muted">{config?.configured ? '应用已配置。连接账户与启用 GPU 是另外两步。' : '尚未配置 Google 应用，因此现在不能直接跳转授权。你需要先创建自己的 OAuth 网页客户端。'}</p>
+  return <section className={styles.card} aria-label="Google OAuth 应用配置"><h2>Google Web OAuth 应用配置</h2>
+    <p className="muted">{config?.configured ? 'Web OAuth 应用已配置，可用于 Google Drive 授权及 Colab Web OAuth（实验性）。常规 Colab 算力推荐直接在上方账号卡片点击「Colab CLI 授权（推荐）」。' : 'Google Drive 模型库与持久化需要自建 Web OAuth 应用（仅需启用 Google Drive API）；常规 Colab 算力无需此配置，可直接在上方点击「Colab CLI 授权（推荐）」。'}</p>
     <label className="field">配置目标<select aria-label="OAuth 配置目标" value={accountId} disabled={busy} onChange={(event) => changeTarget(event.target.value)}>
       <option value="">共享默认应用</option>
       {accounts.map((account) => <option key={account.account_id} value={account.account_id}>{account.alias || account.account_id}</option>)}
     </select></label>
-    <p className="muted">账号专用应用只影响这个 Google 账号，不会影响其他账号；共享默认应用仅保护依赖共享配置的连接。</p>
+    <p className="muted">账号专用应用只影响这个 Google 账号，不会影响其他账号；共享默认应用仅保护依赖共享配置的连接（不影响 Colab CLI 算力凭据）。</p>
     <ol className={styles.oauthSteps}>
       <li>打开 <a href="https://console.cloud.google.com/" target="_blank" rel="noreferrer">Google Cloud 控制台</a>，创建或选择自己的项目。</li>
-      <li>在“API 和服务 → 库”启用 Google Drive API，并按 Colab 官方文档启用 Colab API。</li>
+      <li>在“API 和服务 → 库”启用 <strong>Google Drive API</strong>（仅使用「Web OAuth 授权（实验性）」连接 Colab 时才需额外启用 Colaboratory API）。</li>
       <li>配置 Google Auth Platform：应用名称、受众选“外部”；测试模式把自己的 Google 邮箱加入测试用户。</li>
       <li>在“客户端”创建 OAuth 客户端，类型选“Web 应用”，填入下方回调地址，下载客户端 JSON。</li>
-      <li>在这里导入 JSON 并保存，再点击下面两个 Google 连接按钮，使用有 Colab 权益的账户授权。</li>
+      <li>在这里导入 JSON 并保存，然后在上方账号卡片点击 <strong>Drive 授权</strong>；Colab 算力优先使用 <strong>Colab CLI 授权（推荐）</strong>。</li>
     </ol>
     <label className="field">授权回调地址<input aria-label="Google OAuth 回调地址" readOnly value={callback} onFocus={(event) => event.target.select()} /></label>
     <button className="button secondary" type="button" onClick={async () => { try { await navigator.clipboard.writeText(callback); setNotice('已复制回调地址'); } catch { setNotice('请点击回调地址输入框，全选后复制'); } }}>复制回调地址</button>
-    <details><summary>需要的 OAuth 权限</summary><p className="muted">在 Google Auth Platform 的“数据访问权限”中添加下列 scopes；正式连接时也会由本站申请。测试模式仅允许你加入的测试用户授权。</p><code className={styles.oauthScope}>https://www.googleapis.com/auth/colaboratory</code><code className={styles.oauthScope}>https://www.googleapis.com/auth/drive.file</code></details>
+    <details><summary>需要的 OAuth 权限</summary><p className="muted">Google Drive 必填 <code>drive.file</code>（仅访问本站创建的目录，且按客户端隔离）；<code>colaboratory</code> 仅在选用「Web OAuth 授权（实验性）」连接 Colab 时需要。</p><code className={styles.oauthScope}>https://www.googleapis.com/auth/drive.file</code><code className={styles.oauthScope}>https://www.googleapis.com/auth/colaboratory</code></details>
     <p className="muted">如填写“已获授权的 JavaScript 来源”，使用 {window.location.origin}。授权不会产生 GPU 费用；不要把客户端 JSON 或 Secret 发到群里。</p>
     <details><summary>导入 / 更换 OAuth 客户端</summary><div className={styles.stack}>
       <label className="button secondary">选择 Google 客户端 JSON<input data-testid="google-client-file" hidden type="file" accept="application/json,.json" onChange={async (event) => { const file = event.target.files?.[0]; event.target.value = ''; if (!file) return; try { if (file.size > 65536) throw new Error('客户端 JSON 文件过大'); const value: unknown = JSON.parse(await file.text()); if (!value || typeof value !== 'object' || !('web' in value)) throw new Error('请选择 Web 应用客户端 JSON，不是桌面客户端或服务账号密钥'); setWebClient(value as Record<string, unknown>); setClientId(''); setClientSecret(''); setNotice('已读取文件，尚未保存'); setError(''); } catch (cause) { setWebClient(null); setError(apiMessage(cause)); } }} /></label>

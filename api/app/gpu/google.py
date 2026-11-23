@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import secrets
 import threading
 import time
 from contextlib import contextmanager
+from importlib import resources
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
@@ -25,6 +27,15 @@ from app.security import decrypt_secret, encrypt_secret
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+COLAB_CLI_CLIENT_ID_PREFIX = "764086051850-"
+COLAB_CLI_REDIRECT_URI = "https://sdk.cloud.google.com/applicationdefaultauthcode.html"
+COLAB_CLI_SCOPES = (
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/colaboratory",
+)
+COLAB_CLI_STATE_TTL_SECONDS = 1800
 
 
 class GoogleError(RuntimeError):
@@ -54,6 +65,67 @@ def _safe_id(value: str) -> str:
 
 def _now() -> float:
     return time.time()
+
+
+def _is_cli_credential(credential: dict | None) -> bool:
+    if not isinstance(credential, dict):
+        return False
+    if credential.get("auth_channel") == "colab_cli":
+        return True
+    cid = str(credential.get("client_id") or "").strip()
+    return cid.startswith(COLAB_CLI_CLIENT_ID_PREFIX)
+
+
+def load_colab_cli_oauth_client() -> tuple[str, str, str]:
+    """Load the public Colab CLI OAuth client dynamically without hardcoding secrets."""
+    env_id = os.getenv("GPU_COLAB_CLI_CLIENT_ID", "").strip()
+    env_secret = os.getenv("GPU_COLAB_CLI_CLIENT_SECRET", "").strip()
+    env_redirect = os.getenv("GPU_COLAB_CLI_REDIRECT_URI", "").strip() or COLAB_CLI_REDIRECT_URI
+    if env_id or env_secret:
+        if not env_id or not env_secret:
+            raise GoogleConfigurationError("GPU_COLAB_CLI_CLIENT_ID 与 GPU_COLAB_CLI_CLIENT_SECRET 必须同时配置")
+        return env_id, env_secret, env_redirect
+    try:
+        config_text = resources.files("colab_cli").joinpath("oauth_config.json").read_text(encoding="utf-8")
+        raw = json.loads(config_text)
+        installed = raw.get("installed") if isinstance(raw, dict) else None
+        client_id = str(installed.get("client_id") or "").strip() if isinstance(installed, dict) else ""
+        client_secret = str(installed.get("client_secret") or "").strip() if isinstance(installed, dict) else ""
+    except Exception as exc:
+        raise GoogleConfigurationError(
+            "当前运行环境未安装 google-colab-cli（需 Python 3.12+ 或官方 Docker 镜像），无法生成 Colab CLI 授权链接"
+        ) from exc
+    if not client_id or not client_secret:
+        raise GoogleConfigurationError("google-colab-cli 内置 OAuth 配置无效")
+    return client_id, client_secret, COLAB_CLI_REDIRECT_URI
+
+
+def colab_cli_oauth_available() -> bool:
+    try:
+        load_colab_cli_oauth_client()
+        return True
+    except GoogleConfigurationError:
+        return False
+
+
+def _extract_authorization_code(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise GoogleOAuthError("Colab CLI 授权码格式无效，请粘贴完整的授权码")
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    if text.startswith(("http://", "https://")):
+        query = parse_qs(urlparse(text).query)
+        extracted = (query.get("code") or [""])[0].strip()
+        text = extracted
+    elif "code=" in text:
+        query = parse_qs(text.lstrip("?"))
+        extracted = (query.get("code") or [""])[0].strip()
+        if extracted:
+            text = extracted
+    if not text or len(text) > 8192 or any(ch.isspace() for ch in text):
+        raise GoogleOAuthError("Colab CLI 授权码格式无效，请粘贴完整的授权码")
+    return text
 
 
 class GoogleService:
@@ -214,6 +286,7 @@ class GoogleService:
 
     def status(self) -> dict:
         configured = all(self._config_value())
+        cli_available = colab_cli_oauth_available()
         result: dict[str, dict[str, Any]] = {}
         for purpose in _PURPOSES:
             credential = self._credential(purpose, account_id=self.account_id)
@@ -224,13 +297,22 @@ class GoogleService:
                 and str(credential.get("client_id", "")).strip()
                 and credential.get("encrypted_client_secret")
             )
-            result[purpose] = {
+            auth_channel = (
+                ("colab_cli" if _is_cli_credential(credential) else "web_oauth")
+                if connected
+                else None
+            )
+            entry: dict[str, Any] = {
                 "connected": connected,
                 "configured": configured or cred_configured,
                 "expires_at": credential.get("expires_at") if credential else None,
+                "auth_channel": auth_channel,
             }
+            if purpose == "colab":
+                entry["cli_available"] = cli_available
             if credential and not scope_ok:
-                result[purpose]["message"] = "Google权限不足，请重新授权"
+                entry["message"] = "Google权限不足，请重新授权"
+            result[purpose] = entry
         return result
 
     @staticmethod
@@ -376,11 +458,15 @@ class GoogleService:
         data = {
             "provider": "google",
             "purpose": row["oauth_purpose"],
+            "auth_channel": "web_oauth",
+            "client_id": None,
+            "encrypted_client_secret": None,
             "encrypted_access_token": encrypt_secret(access),
             "encrypted_refresh_token": encrypt_secret(refresh),
             "expires_at": self.clock() + max(0, expires_in - 60),
             "scope": payload.get("scope", _PURPOSES[row["oauth_purpose"]]),
             "token_type": payload.get("token_type", "Bearer"),
+            "revoked": False,
             **({"account_id": row.get("account_id")} if row.get("account_id") is not None else {}),
         }
         if old:
@@ -394,6 +480,279 @@ class GoogleService:
         if not connected:
             result["message"] = "Google权限不足，请重新授权"
         return result
+
+    def start_colab_cli(self) -> dict:
+        if not self.owner_id:
+            raise GoogleOAuthError("当前登录用户无效")
+        client_id, _secret, redirect = load_colab_cli_oauth_client()
+        state = secrets.token_urlsafe(32)
+        verifier = secrets.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        expires_at = self.clock() + COLAB_CLI_STATE_TTL_SECONDS
+        self._create(
+            "credentials",
+            self.owner_id,
+            {
+                "provider": "google",
+                "purpose": "_oauth_state",
+                "oauth_purpose": "colab",
+                "auth_channel": "colab_cli",
+                **({"account_id": self.account_id} if self.account_id is not None else {}),
+                "state_hash": _safe_id(state),
+                "encrypted_code_verifier": encrypt_secret(verifier),
+                "expires_at": expires_at,
+                "used_at": None,
+                "in_flight_until": None,
+            },
+        )
+        query = urlencode(
+            {
+                "client_id": client_id,
+                "redirect_uri": redirect,
+                "response_type": "code",
+                "scope": " ".join(COLAB_CLI_SCOPES),
+                "access_type": "offline",
+                "prompt": "consent",
+                "token_usage": "remote",
+                "state": state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            }
+        )
+        return {
+            "authorization_url": AUTH_URL + "?" + query,
+            "state": state,
+            "expires_at": expires_at,
+            "expires_in": COLAB_CLI_STATE_TTL_SECONDS,
+            "auth_channel": "colab_cli",
+            "scopes": list(COLAB_CLI_SCOPES),
+        }
+
+    def _begin_cli_state(self, state: str) -> dict:
+        if not isinstance(state, str) or not state or len(state) > 512:
+            raise GoogleOAuthError("Colab CLI 授权会话无效或已过期，请重新生成授权链接")
+        with self._state_consume_guard():
+            rows = [
+                r
+                for r in self._list("credentials", self.owner_id)
+                if r.get("purpose") == "_oauth_state"
+                and r.get("auth_channel") == "colab_cli"
+                and r.get("oauth_purpose") == "colab"
+                and r.get("state_hash") == _safe_id(state)
+            ]
+            if len(rows) != 1:
+                raise GoogleOAuthError("Colab CLI 授权会话无效或已过期，请重新生成授权链接")
+            row = rows[0]
+            if self.account_id is not None and row.get("account_id") != self.account_id:
+                raise GoogleOAuthError("Colab CLI 授权会话与当前账号不匹配，请重新生成授权链接")
+            now = self.clock()
+            if row.get("used_at") or row.get("used") or float(row.get("expires_at", 0)) <= now:
+                raise GoogleOAuthError("Colab CLI 授权会话无效或已过期，请重新生成授权链接")
+            if float(row.get("in_flight_until") or 0) > now:
+                raise GoogleOAuthError("授权码正在验证中，请稍候片刻")
+            self._update("credentials", row["id"], {"in_flight_until": now + 30}, self.owner_id)
+            return row
+
+    def _finish_cli_state(self, row: dict, *, consumed: bool) -> None:
+        patch: dict[str, Any] = {"in_flight_until": None}
+        if consumed:
+            patch["used_at"] = self.clock()
+        with self._state_consume_guard():
+            self._update("credentials", row["id"], patch, self.owner_id)
+
+    def _save_cli_credential(
+        self,
+        *,
+        client_id: str,
+        client_secret: str,
+        access: str,
+        refresh: str,
+        expires_in: int,
+        scope: str,
+        token_type: str = "Bearer",
+    ) -> dict:
+        old = self._credential("colab", self.owner_id, self.account_id)
+        data = {
+            "provider": "google",
+            "purpose": "colab",
+            "auth_channel": "colab_cli",
+            "client_id": client_id,
+            "encrypted_client_secret": encrypt_secret(client_secret),
+            "encrypted_access_token": encrypt_secret(access),
+            "encrypted_refresh_token": encrypt_secret(refresh),
+            "expires_at": self.clock() + max(0, expires_in - 60),
+            "scope": scope,
+            "token_type": token_type,
+            "revoked": False,
+            **({"account_id": self.account_id} if self.account_id is not None else {}),
+        }
+        if old:
+            self._update("credentials", old["id"], data, self.owner_id)
+        else:
+            self._create("credentials", self.owner_id, data)
+        result: dict[str, Any] = {
+            "purpose": "colab",
+            "auth_channel": "colab_cli",
+            "connected": True,
+            "owner_id": self.owner_id,
+        }
+        if self.account_id is not None:
+            result["account_id"] = self.account_id
+        return result
+
+    def complete_colab_cli(self, code: str, state: str) -> dict:
+        if not self.owner_id:
+            raise GoogleOAuthError("当前登录用户无效")
+        cleaned_code = _extract_authorization_code(code)
+        client_id, client_secret, redirect = load_colab_cli_oauth_client()
+        row = self._begin_cli_state(state)
+        consumed = False
+        try:
+            try:
+                verifier = decrypt_secret(row["encrypted_code_verifier"])
+                response = self.client.post(
+                    TOKEN_URL,
+                    data={
+                        "code": cleaned_code,
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "redirect_uri": redirect,
+                        "grant_type": "authorization_code",
+                        "code_verifier": verifier,
+                    },
+                )
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                raise GoogleOAuthError("Colab CLI 授权码交换失败，请检查网络连接后重试") from exc
+            if response.status_code < 200 or response.status_code >= 300:
+                err_code = None
+                try:
+                    err_body = response.json()
+                    if isinstance(err_body, dict):
+                        err_code = err_body.get("error")
+                except ValueError:
+                    err_code = None
+                if err_code == "invalid_grant":
+                    raise GoogleOAuthError(
+                        "授权码无效、已过期或与当前链接不匹配，请核对后重试或重新生成授权链接"
+                    )
+                if err_code == "invalid_client":
+                    raise GoogleConfigurationError("Colab CLI 客户端配置不可用")
+                raise GoogleOAuthError("Colab CLI 授权码交换失败，请核对授权码或重新生成链接")
+            consumed = True
+            try:
+                payload = response.json()
+                access = payload.get("access_token")
+                refresh = payload.get("refresh_token")
+                expires_in = int(payload.get("expires_in", 3600))
+                if not isinstance(access, str) or not access:
+                    raise ValueError
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise GoogleOAuthError("Google OAuth响应无效") from exc
+            granted_scope = str(payload.get("scope") or " ".join(COLAB_CLI_SCOPES)).strip()
+            if not self._scope_sufficient("colab", granted_scope):
+                raise GoogleOAuthError("授权缺少 Google Colab 权限，请重新生成链接并在授权页保留 Colab 权限")
+            old = self._credential("colab", self.owner_id, self.account_id)
+            if not refresh and old and _is_cli_credential(old):
+                try:
+                    refresh = decrypt_secret(old["encrypted_refresh_token"])
+                except (KeyError, TypeError, ValueError):
+                    refresh = None
+            if not refresh:
+                raise GoogleOAuthError("Google OAuth 未返回可持久化刷新凭证，请重新生成链接并确认授权")
+            return self._save_cli_credential(
+                client_id=client_id,
+                client_secret=client_secret,
+                access=access,
+                refresh=refresh,
+                expires_in=expires_in,
+                scope=granted_scope,
+                token_type=str(payload.get("token_type") or "Bearer"),
+            )
+        finally:
+            self._finish_cli_state(row, consumed=consumed)
+
+    def import_colab_cli(self, payload: dict) -> dict:
+        if not self.owner_id:
+            raise GoogleOAuthError("当前登录用户无效")
+        if not isinstance(payload, dict):
+            raise GoogleOAuthError("Colab CLI 凭据参数必须是对象")
+        source = payload.get("credentials_json")
+        if isinstance(source, str):
+            if len(source) > 65536:
+                raise GoogleOAuthError("Colab CLI 凭据 JSON 过大")
+            try:
+                source = json.loads(source)
+            except ValueError as exc:
+                raise GoogleOAuthError("Colab CLI 凭据 JSON 格式无效") from exc
+        if source is not None and not isinstance(source, dict):
+            raise GoogleOAuthError("Colab CLI 凭据 JSON 必须是对象")
+        raw = source if isinstance(source, dict) else payload
+        if "web" in raw and not raw.get("refresh_token"):
+            raise GoogleOAuthError(
+                "这是 Web OAuth 客户端配置文件，不是已授权的 Colab CLI 凭据；请改用上方两步授权或下方 Google 应用配置"
+            )
+        if "installed" in raw and not raw.get("refresh_token"):
+            raise GoogleOAuthError(
+                "这是 OAuth 客户端定义文件，缺少 refresh_token；请使用上方两步 Colab CLI 授权流程"
+            )
+        refresh = str(raw.get("refresh_token") or "").strip()
+        if not refresh or len(refresh) > 8192 or any(ch.isspace() for ch in refresh):
+            raise GoogleOAuthError("缺少有效的 refresh_token")
+        raw_cid = str(raw.get("client_id") or "").strip()
+        raw_secret = str(raw.get("client_secret") or "").strip()
+        if bool(raw_cid) != bool(raw_secret):
+            raise GoogleOAuthError("client_id 与 client_secret 必须同时提供，或全部留空使用内置 Colab CLI 客户端")
+        if raw_cid and raw_secret:
+            if not raw_cid.startswith(COLAB_CLI_CLIENT_ID_PREFIX):
+                raise GoogleOAuthError("仅支持 Colab CLI 公共客户端凭据（764086051850-...）")
+            client_id, client_secret = raw_cid, raw_secret
+        else:
+            client_id, client_secret, _redirect = load_colab_cli_oauth_client()
+        declared_scope = raw.get("scopes") if raw.get("scopes") is not None else raw.get("scope")
+        if declared_scope and not self._scope_sufficient("colab", declared_scope):
+            raise GoogleOAuthError("导入的凭据缺少 Google Colab 权限（colaboratory）")
+        try:
+            response = self.client.post(
+                TOKEN_URL,
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "refresh_token": refresh,
+                    "grant_type": "refresh_token",
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise GoogleOAuthError("验证 Colab CLI 凭据时网络异常，请稍后重试") from exc
+        if response.status_code < 200 or response.status_code >= 300:
+            raise GoogleOAuthError("Colab CLI 凭据校验失败（refresh_token 已失效或与客户端不匹配）")
+        try:
+            body = response.json()
+            access = body.get("access_token")
+            expires_in = int(body.get("expires_in", 3600))
+            if not isinstance(access, str) or not access:
+                raise ValueError
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise GoogleOAuthError("Google OAuth 刷新响应无效") from exc
+        returned_scope = body.get("scope")
+        if returned_scope and not self._scope_sufficient("colab", returned_scope):
+            raise GoogleOAuthError("导入的凭据缺少 Google Colab 权限（colaboratory）")
+        if isinstance(declared_scope, (list, tuple, set)):
+            fallback_scope = " ".join(str(item) for item in declared_scope)
+        elif isinstance(declared_scope, str) and declared_scope.strip():
+            fallback_scope = declared_scope.strip()
+        else:
+            fallback_scope = " ".join(COLAB_CLI_SCOPES)
+        effective_scope = str(returned_scope).strip() if isinstance(returned_scope, str) and returned_scope.strip() else fallback_scope
+        effective_refresh = str(body.get("refresh_token") or refresh).strip()
+        return self._save_cli_credential(
+            client_id=client_id,
+            client_secret=client_secret,
+            access=access,
+            refresh=effective_refresh,
+            expires_in=expires_in,
+            scope=effective_scope,
+            token_type=str(body.get("token_type") or "Bearer"),
+        )
 
     def access_token(self, purpose: str) -> str:
         if purpose not in _PURPOSES:
@@ -456,21 +815,25 @@ class GoogleService:
         )
         return new_access
 
-    def disconnect(self, purpose: str) -> bool:
+    def disconnect(self, purpose: str, *, revoke_remote: bool = True) -> bool:
         if purpose not in _PURPOSES:
             raise ValueError("Google OAuth purpose无效")
         credential = self._credential(purpose, account_id=self.account_id)
         if not credential:
             return False
         remote_confirmed = False
-        try:
-            refresh = decrypt_secret(credential.get("encrypted_refresh_token", ""))
-            token = refresh or decrypt_secret(credential.get("encrypted_access_token", ""))
-            response = self.client.post(REVOKE_URL, data={"token": token})
-            remote_confirmed = 200 <= response.status_code < 300
-        except (httpx.HTTPError, KeyError, TypeError, ValueError):
-            # Do not include the token or upstream response body in any error.
-            remote_confirmed = False
+        if revoke_remote:
+            try:
+                refresh = decrypt_secret(credential.get("encrypted_refresh_token", ""))
+                token = refresh or decrypt_secret(credential.get("encrypted_access_token", ""))
+                response = self.client.post(REVOKE_URL, data={"token": token})
+                remote_confirmed = 200 <= response.status_code < 300
+            except (httpx.HTTPError, KeyError, TypeError, ValueError):
+                # Do not include the token or upstream response body in any error.
+                remote_confirmed = False
+            disconnect_status = "confirmed" if remote_confirmed else "remote_unconfirmed"
+        else:
+            disconnect_status = "local_only"
         # Remove local bearer material and keep a sanitized tombstone that records
         # whether Google confirmed the revoke.
         self._update(
@@ -480,9 +843,10 @@ class GoogleService:
                 "revoked": True,
                 "encrypted_access_token": None,
                 "encrypted_refresh_token": None,
+                "encrypted_client_secret": None,
                 "expires_at": 0,
                 "disconnect_remote_confirmed": remote_confirmed,
-                "disconnect_status": "confirmed" if remote_confirmed else "remote_unconfirmed",
+                "disconnect_status": disconnect_status,
             },
             self.owner_id,
         )
@@ -493,4 +857,14 @@ class GoogleService:
             self.client.close()
 
 
-__all__ = ["GoogleConfigurationError", "GoogleError", "GoogleOAuthError", "GoogleService"]
+__all__ = [
+    "COLAB_CLI_CLIENT_ID_PREFIX",
+    "COLAB_CLI_REDIRECT_URI",
+    "COLAB_CLI_SCOPES",
+    "GoogleConfigurationError",
+    "GoogleError",
+    "GoogleOAuthError",
+    "GoogleService",
+    "colab_cli_oauth_available",
+    "load_colab_cli_oauth_client",
+]

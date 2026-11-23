@@ -62,7 +62,8 @@ async function jsonBody(call) {
 test('exports the v0.2 account, instance, and workbench client functions', () => {
   for (const name of [
     'getGoogleAccounts', 'createGoogleAccount', 'updateGoogleAccount',
-    'disconnectGoogleAccount', 'deleteGoogleAccount', 'startGoogleAccountAuth', 'getAccountRuntimes',
+    'disconnectGoogleAccount', 'deleteGoogleAccount', 'startGoogleAccountAuth',
+    'startColabCliAuth', 'completeColabCliAuth', 'importColabCliCredentials', 'getAccountRuntimes',
     'listGpuInstances', 'getGpuInstance', 'getInstanceJobs', 'getInstanceEvents',
     'setInstanceRetention', 'stopInstance', 'getWorkbench', 'workbenchAction',
   ]) assert.equal(typeof api[name], 'function', `${name} should be exported`);
@@ -102,6 +103,40 @@ test('account auth and runtime reads preserve the typed route contract', async (
   assert.equal(request.url, '/api/gpu/accounts/account%2F1/auth/colab/start');
   assert.equal(header(request, 'Idempotency-Key'), 'oauth-1');
   assert.deepEqual(JSON.parse(request.init.body), { purpose: 'colab' });
+
+  requests = [];
+  await api.startColabCliAuth('account/1', 'cli-start-1');
+  request = lastRequest();
+  assert.equal(request.url, '/api/gpu/accounts/account%2F1/auth/colab-cli/start');
+  assert.equal(request.init.method, 'POST');
+  assert.equal(header(request, 'Idempotency-Key'), 'cli-start-1');
+  assert.deepEqual(JSON.parse(request.init.body), {});
+
+  requests = [];
+  await api.completeColabCliAuth('account/1', { state: 'st-1', code: '4/0A-code' }, 'cli-complete-1');
+  request = lastRequest();
+  assert.equal(request.url, '/api/gpu/accounts/account%2F1/auth/colab-cli/complete');
+  assert.equal(header(request, 'Idempotency-Key'), 'cli-complete-1');
+  assert.deepEqual(JSON.parse(request.init.body), { state: 'st-1', code: '4/0A-code' });
+
+  requests = [];
+  await api.importColabCliCredentials('account/1', { refresh_token: '1//abc' }, 'cli-import-1');
+  request = lastRequest();
+  assert.equal(request.url, '/api/gpu/accounts/account%2F1/auth/colab-cli/import');
+  assert.equal(header(request, 'Idempotency-Key'), 'cli-import-1');
+  assert.deepEqual(JSON.parse(request.init.body), { refresh_token: '1//abc' });
+
+  requests = [];
+  await api.disconnectGoogleAccount('account/1', 'disc-local', { revoke_remote: false });
+  request = lastRequest();
+  assert.equal(request.url, '/api/gpu/accounts/account%2F1/disconnect');
+  assert.deepEqual(JSON.parse(request.init.body), { revoke_remote: false });
+
+  requests = [];
+  await api.deleteGoogleAccount('account/1', 'del-local', { revoke_remote: false });
+  request = lastRequest();
+  assert.equal(request.url, '/api/gpu/accounts/account%2F1?revoke_remote=false');
+  assert.equal(request.init.method, 'DELETE');
 
   requests = [];
   await api.getAccountRuntimes('account/1');

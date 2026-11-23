@@ -1,7 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { RefreshCw, Trash2 } from 'lucide-react';
-import { apiMessage, createGoogleAccount, deleteGoogleAccount, disconnectGoogleAccount, getGoogleAccounts, startGoogleAccountAuth, updateGoogleAccount, type CuAccount } from '../lib/gpu-api';
+import {
+  apiMessage,
+  completeColabCliAuth,
+  createGoogleAccount,
+  deleteGoogleAccount,
+  disconnectGoogleAccount,
+  getGoogleAccounts,
+  importColabCliCredentials,
+  startColabCliAuth,
+  startGoogleAccountAuth,
+  updateGoogleAccount,
+  type CuAccount,
+} from '../lib/gpu-api';
+import type {
+  ColabCliAuthCompleteResponse,
+  ColabCliAuthStartResponse,
+  ColabCliImportRequest,
+  GoogleAuthChannel,
+} from '../lib/v020-types';
 import { cuNumber } from '../lib/ui-helpers';
+import { ColabCliAuthDialog } from './ColabCliAuthDialog';
 import styles from './v020.module.css';
 
 export type AccountStatus = 'connected' | 'needs_reauth' | 'disabled' | 'error' | string;
@@ -11,14 +30,32 @@ export interface GpuAccount {
   account_id: string;
   alias: string;
   status: AccountStatus;
-  colab?: { status?: AuthorizationStatus; scopes?: string[]; checked_at?: string; expires_at?: string };
+  colab?: { status?: AuthorizationStatus; scopes?: string[]; checked_at?: string; expires_at?: string; auth_channel?: GoogleAuthChannel | null };
   drive?: { status?: AuthorizationStatus; scopes?: string[]; checked_at?: string; expires_at?: string };
   colab_status?: AuthorizationStatus;
   drive_status?: AuthorizationStatus;
   drive_account_id?: string | null;
   drive_account_alias?: string | null;
   drive_dependents?: string[];
-  authorization?: { colab?: { connected?: boolean; configured?: boolean; expires_at?: string | null; message?: string }; drive?: { connected?: boolean; configured?: boolean; expires_at?: string | null; message?: string; delegated_to?: string; delegated_alias?: string } };
+  authorization?: {
+    colab?: {
+      connected?: boolean;
+      configured?: boolean;
+      expires_at?: string | number | null;
+      message?: string;
+      auth_channel?: GoogleAuthChannel | null;
+      cli_available?: boolean;
+    };
+    drive?: {
+      connected?: boolean;
+      configured?: boolean;
+      expires_at?: string | number | null;
+      message?: string;
+      auth_channel?: GoogleAuthChannel | null;
+      delegated_to?: string;
+      delegated_alias?: string;
+    };
+  };
   allow_allocation?: boolean;
   enabled?: boolean;
   budget?: number | Record<string, unknown> | null;
@@ -94,9 +131,29 @@ export interface AccountDirectoryApi {
   getGpuAccounts: () => Promise<GpuAccount[]>;
   createGpuAccount: (body: { alias: string }, idempotencyKey: string) => Promise<GpuAccount>;
   updateGpuAccount: (accountId: string, patch: Record<string, unknown>, idempotencyKey: string) => Promise<GpuAccount>;
-  disconnectGpuAccount: (accountId: string, idempotencyKey: string, confirmActiveStop: boolean) => Promise<unknown>;
-  deleteGpuAccount: (accountId: string, idempotencyKey: string) => Promise<{ account_id?: string; deleted?: boolean; cleared_defaults?: string[] }>;
+  disconnectGpuAccount: (
+    accountId: string,
+    idempotencyKey: string,
+    confirmActiveStop: boolean,
+    revokeRemote?: boolean,
+  ) => Promise<unknown>;
+  deleteGpuAccount: (
+    accountId: string,
+    idempotencyKey: string,
+    revokeRemote?: boolean,
+  ) => Promise<{ account_id?: string; deleted?: boolean; cleared_defaults?: string[] }>;
   startGpuAccountAuth: (accountId: string, purpose: 'colab' | 'drive', idempotencyKey: string) => Promise<{ authorization_url?: string } | string>;
+  startColabCliAuth: (accountId: string, idempotencyKey: string) => Promise<ColabCliAuthStartResponse>;
+  completeColabCliAuth: (
+    accountId: string,
+    body: { state: string; code: string },
+    idempotencyKey: string,
+  ) => Promise<ColabCliAuthCompleteResponse>;
+  importColabCliCredentials: (
+    accountId: string,
+    body: ColabCliImportRequest,
+    idempotencyKey: string,
+  ) => Promise<ColabCliAuthCompleteResponse>;
 }
 
 export interface AccountDirectoryProps {
@@ -134,15 +191,30 @@ const defaultAccountApi: AccountDirectoryApi = {
   getGpuAccounts: async () => listPayload(await getGoogleAccounts()),
   createGpuAccount: async (body, key) => accountPayload(await createGoogleAccount(body, key)),
   updateGpuAccount: async (accountId, patch, key) => accountPayload(await updateGoogleAccount(accountId, patch as Parameters<typeof updateGoogleAccount>[1], key)),
-  disconnectGpuAccount: (accountId, key, _confirmActiveStop) => disconnectGoogleAccount(accountId, key),
-  deleteGpuAccount: (accountId, key) => deleteGoogleAccount(accountId, key),
+  disconnectGpuAccount: (accountId, key, _confirmActiveStop, revokeRemote) =>
+    disconnectGoogleAccount(accountId, key, typeof revokeRemote === 'boolean' ? { revoke_remote: revokeRemote } : undefined),
+  deleteGpuAccount: (accountId, key, revokeRemote) =>
+    deleteGoogleAccount(accountId, key, typeof revokeRemote === 'boolean' ? { revoke_remote: revokeRemote } : undefined),
   startGpuAccountAuth: (accountId, purpose, key) => startGoogleAccountAuth(accountId, purpose, key),
+  startColabCliAuth: (accountId, key) => startColabCliAuth(accountId, key),
+  completeColabCliAuth: (accountId, body, key) => completeColabCliAuth(accountId, body, key),
+  importColabCliCredentials: (accountId, body, key) => importColabCliCredentials(accountId, body, key),
 };
 
 function authStatus(account: GpuAccount, purpose: 'colab' | 'drive'): AuthorizationStatus {
   const authorization = account.authorization?.[purpose];
   if (authorization) return authorization.connected ? 'connected' : authorization.message ? 'needs_reauth' : 'not_connected';
   return account[purpose]?.status || account[`${purpose}_status`] || 'not_connected';
+}
+
+function colabChannel(account: GpuAccount): GoogleAuthChannel | null {
+  return account.authorization?.colab?.auth_channel || account.colab?.auth_channel || null;
+}
+
+function channelLabel(channel: GoogleAuthChannel | null): string | null {
+  if (channel === 'colab_cli') return 'Colab CLI';
+  if (channel === 'web_oauth') return 'Web OAuth';
+  return null;
 }
 
 function statusLabel(status: string): string {
@@ -178,8 +250,11 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
   const [alias, setAlias] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editAlias, setEditAlias] = useState('');
+  const [cliAuthAccount, setCliAuthAccount] = useState<GpuAccount | null>(null);
   const [disconnecting, setDisconnecting] = useState<GpuAccount | null>(null);
+  const [disconnectRevokeRemote, setDisconnectRevokeRemote] = useState(true);
   const [deleting, setDeleting] = useState<GpuAccount | null>(null);
+  const [deleteRevokeRemote, setDeleteRevokeRemote] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
@@ -223,7 +298,7 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
     try {
       const created = await accountApi.createGpuAccount({ alias: nextAlias }, keyFor(operation));
       replaceAccounts([...accounts, created]);
-      setAlias(''); finishKey(operation); setStatus(`已创建「${created.alias || nextAlias}」，请分别授权 Colab 与 Drive。`);
+      setAlias(''); finishKey(operation); setStatus(`已创建「${created.alias || nextAlias}」，推荐点击「Colab CLI 授权（推荐）」连接算力，并为至少一个账号授权 Drive。`);
     } catch (cause) {
       setError(apiMessage(cause)); setStatus('创建未确认；再次重试会复用同一幂等键。');
     } finally { setBusy(null); }
@@ -244,7 +319,7 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
   async function authorize(account: GpuAccount, purpose: 'colab' | 'drive') {
     const operation = `account-auth-${account.account_id}-${purpose}`;
     if (busy) return;
-    setBusy(operation); setError(''); setStatus(`正在准备 ${purpose === 'colab' ? 'Colab' : 'Drive'} 授权…`);
+    setBusy(operation); setError(''); setStatus(`正在准备 ${purpose === 'colab' ? 'Colab (Web OAuth 实验性)' : 'Drive'} 授权…`);
     try {
       const response = await accountApi.startGpuAccountAuth(account.account_id, purpose, keyFor(operation));
       const target = safeAuthRedirect(response);
@@ -274,16 +349,35 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
     return hasOwnColab || hasOwnDrive;
   }
 
+  function openDisconnect(account: GpuAccount) {
+    setDisconnectRevokeRemote(colabChannel(account) !== 'colab_cli');
+    setDisconnecting(account);
+  }
+
+  function openDelete(account: GpuAccount) {
+    setDeleteRevokeRemote(colabChannel(account) !== 'colab_cli');
+    setDeleting(account);
+  }
+
   async function disconnect() {
     const account = disconnecting;
     if (!account || busy) return;
-    const operation = `account-disconnect-${account.account_id}`;
+    const operation = `account-disconnect-${account.account_id}-${disconnectRevokeRemote ? 'revoke' : 'local'}`;
     setBusy(operation); setError(''); setStatus('正在请求解除授权…');
     try {
-      await accountApi.disconnectGpuAccount(account.account_id, keyFor(operation), activeCount(account) > 0);
+      await accountApi.disconnectGpuAccount(
+        account.account_id,
+        keyFor(operation),
+        activeCount(account) > 0,
+        disconnectRevokeRemote,
+      );
       finishKey(operation); setDisconnecting(null);
       await refresh();
-      setStatus(`已解除「${account.alias || '该账号'}」的 Google 授权；如需移除卡片可点击删除。`);
+      setStatus(
+        disconnectRevokeRemote
+          ? `已解除并吊销「${account.alias || '该账号'}」的 Google 授权；如需移除卡片可点击删除。`
+          : `已仅从本站移除「${account.alias || '该账号'}」的本地授权凭据（未吊销 Google 远端令牌）。`,
+      );
     } catch (cause) {
       setError(apiMessage(cause)); setStatus('解除授权未确认；再次重试会复用同一幂等键。');
     } finally { setBusy(null); }
@@ -292,16 +386,21 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
   async function removeAccount() {
     const account = deleting;
     if (!account || busy) return;
-    const operation = `account-delete-${account.account_id}`;
+    const operation = `account-delete-${account.account_id}-${deleteRevokeRemote ? 'revoke' : 'local'}`;
     setBusy(operation); setError(''); setStatus('正在删除账号…');
     try {
-      const result = await accountApi.deleteGpuAccount(account.account_id, keyFor(operation));
+      const result = await accountApi.deleteGpuAccount(
+        account.account_id,
+        keyFor(operation),
+        deleteRevokeRemote,
+      );
       replaceAccounts(accounts.filter((item) => item.account_id !== account.account_id));
       finishKey(operation); setDeleting(null);
       const cleared = result?.cleared_defaults?.length
         ? `（已自动清空 ${result.cleared_defaults.join('、')} 的默认账号）`
         : '';
-      setStatus(`已删除账号「${account.alias || '未命名账号'}」${cleared}，历史任务与账单不受影响。`);
+      const revokeNote = hasOwnAuthorization(account) && !deleteRevokeRemote ? '（仅本地移除，未吊销 Google 远端令牌）' : '';
+      setStatus(`已删除账号「${account.alias || '未命名账号'}」${cleared}${revokeNote}，历史任务与账单不受影响。`);
     } catch (cause) {
       setError(apiMessage(cause)); setStatus('删除未确认；再次重试会复用同一幂等键。');
     } finally { setBusy(null); }
@@ -311,7 +410,7 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
     <section className={styles.directory} aria-label="Google 账号目录">
       {hideTitle ? (
         <div className={styles.toolbar}>
-          <p className={styles.muted}>每个账号的 Colab 与 Drive 授权分开管理。只会使用当前 owner 已授权、允许分配且预算可用的账号。</p>
+          <p className={styles.muted}>Colab 算力推荐使用 <strong>Colab CLI 授权</strong>（免开 GCP Colaboratory API，支持自用与异地交付授权码）；Google Drive 需通过下方自建 Web OAuth 应用授权，多算力号可复用同一个 Drive 账号。</p>
           <button type="button" className={styles.iconButton} onClick={() => void refresh()} disabled={Boolean(busy)} aria-label="刷新账号" title="刷新账号"><RefreshCw size={16} aria-hidden /></button>
         </div>
       ) : (
@@ -320,7 +419,7 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
             <div><p className={styles.eyebrow}>设置 · 单一账号入口</p><h2>账号目录</h2></div>
             <button type="button" className={styles.iconButton} onClick={() => void refresh()} disabled={Boolean(busy)} aria-label="刷新账号"><RefreshCw size={16} aria-hidden /></button>
           </header>
-          <p className={styles.muted}>每个账号的 Colab 与 Drive 授权分开管理。只会使用当前 owner 已授权、允许分配且预算可用的账号。</p>
+          <p className={styles.muted}>Colab 算力推荐使用 <strong>Colab CLI 授权</strong>（免开 GCP Colaboratory API，支持自用与异地交付授权码）；Google Drive 需通过下方自建 Web OAuth 应用授权，多算力号可复用同一个 Drive 账号。</p>
         </>
       )}
       {status && <p className={styles.status} role="status">{status}</p>}
@@ -328,18 +427,21 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
 
       <form className={styles.createRow} onSubmit={createAccount}>
         <label className={styles.srOnly} htmlFor="new-gpu-account-alias">新账号别名</label>
-        <input id="new-gpu-account-alias" value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="例如：主账号" maxLength={80} />
+        <input id="new-gpu-account-alias" value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="例如：主账号 或 Colab算力号" maxLength={80} />
         <button type="submit" className={styles.button} disabled={!alias.trim() || Boolean(busy)}>新增账号</button>
       </form>
 
       {!accounts.length ? (
-        <div className={styles.empty}><strong>还没有账号目录</strong><span>先新增别名，再分别完成 Colab / Drive 授权。</span></div>
+        <div className={styles.empty}><strong>还没有账号目录</strong><span>先新增别名，再用「Colab CLI 授权（推荐）」连接算力，并为 Drive 账号授权。</span></div>
       ) : <div className={styles.accountGrid}>
         {accounts.map((account) => {
           const balance = balances.find(row => row.account_id === account.account_id);
           const active = activeCount(account);
           const colab = authStatus(account, 'colab');
           const drive = authStatus(account, 'drive');
+          const channel = colabChannel(account);
+          const channelText = channelLabel(channel);
+          const delegatedAlias = account.drive_account_alias || account.authorization?.drive?.delegated_alias;
           const isBusy = busy?.includes(account.account_id) || false;
           return (
             <article className={styles.accountCard} key={account.account_id}>
@@ -353,11 +455,51 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
               </div>
               {account.last_error && <p className={styles.warning}>{account.last_error}</p>}
               <div className={styles.authGrid}>
-                {(['colab', 'drive'] as const).map((purpose) => {
-                  const auth = purpose === 'colab' ? colab : drive;
-                  const delegatedAlias = purpose === 'drive' ? (account.drive_account_alias || account.authorization?.drive?.delegated_alias) : null;
-                  return <div className={styles.authCell} key={purpose}><span>{purpose === 'colab' ? 'Colab' : 'Drive'}</span><b>{delegatedAlias ? `复用「${delegatedAlias}」(${statusLabel(auth)})` : statusLabel(auth)}</b><button type="button" className={styles.buttonSecondary} disabled={Boolean(busy)} onClick={() => void authorize(account, purpose)}>{auth === 'connected' ? '重新授权' : '授权'}</button></div>;
-                })}
+                <div className={styles.authCell}>
+                  <div className={styles.authCellHead}>
+                    <span>Colab 算力</span>
+                    {channelText && <span className={styles.channelTag}>{channelText}</span>}
+                  </div>
+                  <b>{statusLabel(colab)}</b>
+                  <div className={styles.authButtons}>
+                    <button
+                      type="button"
+                      className={`${colab === 'connected' && channel === 'colab_cli' ? styles.buttonSecondary : styles.button} ${styles.authButtonRow}`}
+                      disabled={Boolean(busy)}
+                      onClick={() => setCliAuthAccount(account)}
+                    >
+                      <span>{colab === 'connected' && channel === 'colab_cli' ? '重新 CLI 授权' : 'Colab CLI 授权'}</span>
+                      <span className={`${styles.channelTag} ${styles.channelTagRecommended}`}>推荐</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`${styles.buttonSecondary} ${styles.authButtonRow}`}
+                      disabled={Boolean(busy)}
+                      title="使用下方自建 Web OAuth 应用授权 Colab（需 GCP 开通 Colaboratory API，长驻保活与实时速率待更多真机验证）"
+                      onClick={() => void authorize(account, 'colab')}
+                    >
+                      <span>{colab === 'connected' && channel === 'web_oauth' ? '重新 Web OAuth' : 'Web OAuth 授权'}</span>
+                      <span className={`${styles.channelTag} ${styles.channelTagExperimental}`}>实验性</span>
+                    </button>
+                  </div>
+                </div>
+                <div className={styles.authCell}>
+                  <div className={styles.authCellHead}>
+                    <span>Google Drive</span>
+                    <span className={styles.channelTag}>Web OAuth</span>
+                  </div>
+                  <b>{delegatedAlias ? `复用「${delegatedAlias}」(${statusLabel(drive)})` : statusLabel(drive)}</b>
+                  <div className={styles.authButtons}>
+                    <button
+                      type="button"
+                      className={`${styles.buttonSecondary} ${styles.authButtonRow}`}
+                      disabled={Boolean(busy)}
+                      onClick={() => void authorize(account, 'drive')}
+                    >
+                      <span>{drive === 'connected' && !delegatedAlias ? '重新授权 Drive' : '授权独立 Drive'}</span>
+                    </button>
+                  </div>
+                </div>
               </div>
               <div className={styles.accountControls}>
                 <div className={styles.togglePair}>
@@ -410,13 +552,13 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
               <div className={styles.cardActions}>
                 <button type="button" className={styles.buttonSecondary} disabled={Boolean(busy)} onClick={() => { setEditingId(account.account_id); setEditAlias(account.alias || ''); }}>改名</button>
                 {hasOwnAuthorization(account) && (
-                  <button type="button" className={styles.buttonSecondary} disabled={Boolean(busy)} onClick={() => setDisconnecting(account)}>解除授权</button>
+                  <button type="button" className={styles.buttonSecondary} disabled={Boolean(busy)} onClick={() => openDisconnect(account)}>解除授权</button>
                 )}
                 <button
                   type="button"
                   className={styles.buttonDanger}
                   disabled={Boolean(busy)}
-                  onClick={() => setDeleting(account)}
+                  onClick={() => openDelete(account)}
                 >
                   <Trash2 size={14} strokeWidth={1.8} aria-hidden />删除账号
                 </button>
@@ -428,6 +570,33 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
         })}
       </div>}
 
+      {cliAuthAccount && (
+        <ColabCliAuthDialog
+          account={accounts.find((item) => item.account_id === cliAuthAccount.account_id) || cliAuthAccount}
+          driveCandidates={accounts.filter(
+            (item) =>
+              item.account_id !== cliAuthAccount.account_id &&
+              !item.drive_account_id &&
+              authStatus(item, 'drive') === 'connected',
+          )}
+          cliAvailable={cliAuthAccount.authorization?.colab?.cli_available !== false}
+          onStart={accountApi.startColabCliAuth}
+          onComplete={accountApi.completeColabCliAuth}
+          onImport={accountApi.importColabCliCredentials}
+          onBindDrive={async (targetAccountId, driveAccountId) => {
+            const target = accounts.find((item) => item.account_id === targetAccountId) || cliAuthAccount;
+            await updateAccount(
+              target,
+              { drive_account_id: driveAccountId },
+              `account-drive-source-${targetAccountId}`,
+              '已绑定 Drive 存储来源。',
+            );
+          }}
+          onCompleted={refresh}
+          onClose={() => setCliAuthAccount(null)}
+        />
+      )}
+
       {disconnecting && (
         <div className={styles.sheetBackdrop} role="presentation" onClick={() => !busy && setDisconnecting(null)}>
           <section className={styles.sheet} role="dialog" aria-modal="true" aria-labelledby="disconnect-title" onClick={(event) => event.stopPropagation()}>
@@ -435,8 +604,24 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
             {activeCount(disconnecting) > 0 ? (
               <p className={styles.warning}>检测到 {activeCount(disconnecting)} 个活动实例/任务。解除前必须由服务端执行安全停机检查；若仍无法安全停机，操作会失败，历史记录不会丢失。</p>
             ) : (
-              <p className={styles.muted}>仅吊销本站的 Google OAuth 授权，账号卡片会保留为「未连接」状态，不会删除历史任务与作品。</p>
+              <p className={styles.muted}>解除后账号卡片会保留为「未连接」状态，不会删除历史任务与作品。</p>
             )}
+            <div className={styles.revokeChoice}>
+              <label className={styles.toggleRow}>
+                <input
+                  type="checkbox"
+                  checked={disconnectRevokeRemote}
+                  disabled={Boolean(busy)}
+                  onChange={(event) => setDisconnectRevokeRemote(event.target.checked)}
+                />
+                <span>同时向 Google 远端吊销令牌</span>
+              </label>
+              <p className={styles.muted}>
+                {colabChannel(disconnecting) === 'colab_cli'
+                  ? '检测到此账号使用 Colab CLI 凭据：默认不勾选（仅从本站移除），避免误将第三方交付或本机复用的 CLI 令牌在 Google 侧作废。'
+                  : '勾选后将请求 Google 吊销本站持有的刷新令牌；不勾选则仅清除本站加密凭据。'}
+              </p>
+            </div>
             <div className={styles.sheetActions}>
               <button type="button" className={styles.buttonSecondary} onClick={() => setDisconnecting(null)} disabled={Boolean(busy)}>取消</button>
               <button type="button" className={styles.buttonDanger} onClick={() => void disconnect()} disabled={Boolean(busy)}>{activeCount(disconnecting) ? '确认安全检查后解除' : '确认解除授权'}</button>
@@ -465,11 +650,31 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
                 </p>
               )}
               {!blocked && (
-                <p className={styles.muted}>
-                  {ownAuth
-                    ? '删除前会先吊销此账号在本站的 Google 授权，并从账号目录中移除。历史任务、作品和 CU 账单不会丢失。'
-                    : '将从账号目录中移除此账号，历史任务、作品和 CU 账单不会丢失。'}
-                </p>
+                <>
+                  <p className={styles.muted}>
+                    {ownAuth
+                      ? '将清除此账号在本站的 Google 授权并从账号目录中移除。历史任务、作品和 CU 账单不会丢失。'
+                      : '将从账号目录中移除此账号，历史任务、作品和 CU 账单不会丢失。'}
+                  </p>
+                  {ownAuth && (
+                    <div className={styles.revokeChoice}>
+                      <label className={styles.toggleRow}>
+                        <input
+                          type="checkbox"
+                          checked={deleteRevokeRemote}
+                          disabled={Boolean(busy)}
+                          onChange={(event) => setDeleteRevokeRemote(event.target.checked)}
+                        />
+                        <span>同时向 Google 远端吊销令牌</span>
+                      </label>
+                      <p className={styles.muted}>
+                        {colabChannel(deleting) === 'colab_cli'
+                          ? '检测到 Colab CLI 凭据：默认不勾选（仅从本站移除），不影响卖家或本机 colab-cli 继续使用。'
+                          : '勾选后会在删除前向 Google 请求吊销刷新令牌。'}
+                      </p>
+                    </div>
+                  )}
+                </>
               )}
               <div className={styles.sheetActions}>
                 <button type="button" className={styles.buttonSecondary} onClick={() => setDeleting(null)} disabled={Boolean(busy)}>取消</button>

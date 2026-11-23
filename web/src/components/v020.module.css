@@ -187,11 +187,20 @@
 .authCell {
   display: grid;
   gap: 6px;
+  align-content: start;
   border: 1px solid var(--v-border);
   border-radius: var(--r-md, 12px);
   background: var(--v-panel);
   padding: 10px;
   min-width: 0;
+}
+
+.authCellHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .authCell span, .budgetField span, .fieldLabel {
@@ -202,6 +211,171 @@
 .authCell b {
   font-size: 0.86rem;
   font-weight: 600;
+}
+
+.authButtons {
+  display: grid;
+  gap: 6px;
+}
+
+.authButtonRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  min-height: 36px;
+  padding: 4px 10px;
+  font-size: 0.8rem;
+  white-space: normal;
+  text-align: left;
+}
+
+.channelTag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  border: 1px solid var(--v-border-strong);
+  border-radius: var(--r-full, 999px);
+  padding: 1px 7px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  color: var(--v-text-2);
+  background: transparent;
+}
+
+.channelTagRecommended {
+  background: var(--v-text);
+  color: var(--v-bg);
+  border-color: var(--v-text);
+}
+
+.button .channelTagRecommended {
+  background: var(--v-bg);
+  color: var(--v-text);
+  border-color: var(--v-bg);
+}
+
+.channelTagExperimental {
+  color: var(--warning, #ffd27d);
+  background: var(--warning-bg, rgba(255, 210, 125, 0.1));
+  border-color: var(--warning-line, rgba(255, 210, 125, 0.4));
+}
+
+.cliWizardSheet {
+  max-width: 620px;
+  max-height: 88vh;
+  overflow-y: auto;
+}
+
+.cliWizardHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.cliStepCard {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--v-border);
+  border-radius: var(--r-md, 12px);
+  background: var(--v-bg);
+}
+
+.cliStepHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cliStepNum {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-full, 999px);
+  background: var(--v-text);
+  color: var(--v-bg);
+  font-size: 0.74rem;
+  font-weight: 700;
+  flex: none;
+}
+
+.cliActionRow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cliActionRow a {
+  text-decoration: none;
+}
+
+.cliImportFold {
+  border: 1px dashed var(--v-border-strong);
+  border-radius: var(--r-md, 12px);
+  padding: 10px 12px;
+  background: var(--v-bg);
+}
+
+.cliImportFold > summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--v-text-2);
+}
+
+.cliImportFold[open] > summary {
+  margin-bottom: 10px;
+}
+
+.cliImportFold textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.76rem;
+}
+
+.cliSuccessBox {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--v-border-strong);
+  border-radius: var(--r-md, 12px);
+  background: var(--v-bg);
+}
+
+.cliSuccessTitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.92rem;
+}
+
+.cliDriveGuide {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--warning-line, rgba(255, 210, 125, 0.38));
+  border-radius: var(--r-md, 12px);
+  background: var(--warning-bg, rgba(255, 210, 125, 0.08));
+}
+
+.revokeChoice {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--v-border);
+  border-radius: var(--r-md, 12px);
+  background: var(--v-bg);
 }
 
 .accountControls {
@@ -668,6 +842,12 @@
 .logList {
   max-height: 48vh;
   overflow-y: auto;
+}
+
+@media (max-width: 560px) {
+  .authGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (min-width: 700px) {

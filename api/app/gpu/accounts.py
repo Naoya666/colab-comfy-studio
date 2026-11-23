@@ -318,8 +318,14 @@ class AccountService:
 
     def disconnect(self, account_id: str, idempotency_key: str | None = None, body: dict | None = None) -> dict:
         self.require(account_id)
-        body = {"account_id": account_id, **(body or {})}
-        existing = self._operation(idempotency_key, body)
+        raw_body = body or {}
+        if not isinstance(raw_body, dict):
+            raise APIError("VALIDATION_ERROR", "解除授权参数必须是对象", 422)
+        revoke_remote = raw_body.get("revoke_remote", True)
+        if not isinstance(revoke_remote, bool):
+            raise APIError("VALIDATION_ERROR", "revoke_remote必须为布尔值", 422)
+        op_body = {"account_id": account_id, **raw_body}
+        existing = self._operation(idempotency_key, op_body)
         if existing is not None:
             return existing
         active = [
@@ -337,23 +343,59 @@ class AccountService:
         credential_rows = [row for row in self._rows("credentials") if row.get("account_id") == account_id]
         if os.getenv("STUDIO_OFFLINE_TEST") == "1":
             for credential in credential_rows:
-                self.repo.update("credentials", credential["id"], {"revoked": True, "encrypted_access_token": None, "encrypted_refresh_token": None, "disconnect_status": "offline_unconfirmed"}, self.owner_id)
-            result = {"account_id": account_id, "disconnected": False, "remote_confirmed": False, "status": "remote_unconfirmed"}
-            return self._save_operation(idempotency_key, body, result, operation="disconnect")
+                if credential.get("purpose") in {"colab", "drive"}:
+                    self.repo.update(
+                        "credentials",
+                        credential["id"],
+                        {
+                            "revoked": True,
+                            "encrypted_access_token": None,
+                            "encrypted_refresh_token": None,
+                            "disconnect_status": "local_only" if not revoke_remote else "offline_unconfirmed",
+                        },
+                        self.owner_id,
+                    )
+            result = {
+                "account_id": account_id,
+                "disconnected": not revoke_remote,
+                "remote_confirmed": False,
+                "revoke_remote": revoke_remote,
+                "status": "local_only" if not revoke_remote else "remote_unconfirmed",
+            }
+            return self._save_operation(idempotency_key, op_body, result, operation="disconnect")
         from .google import GoogleService
 
         service = GoogleService(self.repo, self.owner_id, account_id=account_id)
-        remote_confirmed = True
+        remote_confirmed = revoke_remote
         for purpose in ("colab", "drive"):
             had_credential = any(item.get("purpose") == purpose and not item.get("revoked") for item in credential_rows)
-            outcome = service.disconnect(purpose)
+            outcome = service.disconnect(purpose, revoke_remote=revoke_remote)
             if had_credential and not outcome:
                 remote_confirmed = False
-        result = {"account_id": account_id, "disconnected": remote_confirmed, "remote_confirmed": remote_confirmed, "status": "confirmed" if remote_confirmed else "remote_unconfirmed"}
-        return self._save_operation(idempotency_key, body, result, operation="disconnect")
+        if not revoke_remote:
+            result = {
+                "account_id": account_id,
+                "disconnected": True,
+                "remote_confirmed": False,
+                "revoke_remote": False,
+                "status": "local_only",
+            }
+        else:
+            result = {
+                "account_id": account_id,
+                "disconnected": remote_confirmed,
+                "remote_confirmed": remote_confirmed,
+                "revoke_remote": True,
+                "status": "confirmed" if remote_confirmed else "remote_unconfirmed",
+            }
+        return self._save_operation(idempotency_key, op_body, result, operation="disconnect")
 
-    def delete(self, account_id: str, idempotency_key: str | None = None) -> dict:
-        body = {"account_id": account_id, "action": "delete"}
+    def delete(self, account_id: str, idempotency_key: str | None = None, *, revoke_remote: bool = True) -> dict:
+        if not isinstance(revoke_remote, bool):
+            raise APIError("VALIDATION_ERROR", "revoke_remote必须为布尔值", 422)
+        body: dict[str, Any] = {"account_id": account_id, "action": "delete"}
+        if not revoke_remote:
+            body["revoke_remote"] = False
         existing = self._operation(idempotency_key, body)
         if existing is not None:
             return existing
@@ -393,7 +435,7 @@ class AccountService:
                 ):
                     self.repo.update("credentials", cred["id"], {"account_id": None}, self.owner_id)
 
-        remote_confirmed = True
+        remote_confirmed = revoke_remote
         if os.getenv("STUDIO_OFFLINE_TEST") == "1":
             for cred in credential_rows:
                 if cred.get("purpose") in {"colab", "drive"}:
@@ -404,7 +446,7 @@ class AccountService:
                             "revoked": True,
                             "encrypted_access_token": None,
                             "encrypted_refresh_token": None,
-                            "disconnect_status": "offline_unconfirmed",
+                            "disconnect_status": "local_only" if not revoke_remote else "offline_unconfirmed",
                         },
                         self.owner_id,
                     )
@@ -415,13 +457,13 @@ class AccountService:
             service = GoogleService(self.repo, self.owner_id, account_id=account_id)
             for purpose in ("colab", "drive"):
                 had_credential = any(item.get("purpose") == purpose and not item.get("revoked") for item in credential_rows)
-                outcome = service.disconnect(purpose)
+                outcome = service.disconnect(purpose, revoke_remote=revoke_remote)
                 if had_credential and not outcome:
                     remote_confirmed = False
 
         # Remove token/state credentials tied strictly to this account (never touch detached shared oauth_client_config).
         for cred in credential_rows:
-            if cred.get("purpose") in {"colab", "drive", "oauth_state"}:
+            if cred.get("purpose") in {"colab", "drive", "oauth_state", "_oauth_state"}:
                 try:
                     self.repo.delete("credentials", cred["id"], self.owner_id)
                 except KeyError:

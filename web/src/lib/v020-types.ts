@@ -35,15 +35,48 @@ export interface GpuJobRequestV020 {
 }
 
 export type GoogleAuthPurpose = 'colab' | 'drive';
+export type GoogleAuthChannel = 'colab_cli' | 'web_oauth';
 export type GoogleAccountState = 'connected' | 'needs_reauth' | 'disabled' | 'error' | string;
 
 export interface GoogleAuthorization {
   connected: boolean;
+  configured?: boolean;
   state?: GoogleAccountState;
   scopes?: string[];
-  expires_at?: string | null;
+  expires_at?: string | number | null;
   last_checked_at?: string | null;
   error_code?: string | null;
+  auth_channel?: GoogleAuthChannel | null;
+  cli_available?: boolean;
+  message?: string;
+  delegated_to?: string;
+  delegated_alias?: string;
+}
+
+export interface ColabCliAuthStartResponse {
+  authorization_url: string;
+  state: string;
+  expires_at: number;
+  expires_in: number;
+  auth_channel: 'colab_cli';
+  scopes?: string[];
+}
+
+export interface ColabCliAuthCompleteResponse {
+  account_id: string;
+  purpose: 'colab';
+  auth_channel: 'colab_cli';
+  connected: boolean;
+  balance?: number | null;
+  eligible_gpus?: string[];
+  probe_error?: string | null;
+}
+
+export interface ColabCliImportRequest {
+  credentials_json?: Record<string, unknown> | string;
+  refresh_token?: string;
+  client_id?: string;
+  client_secret?: string;
 }
 
 export interface GoogleAccount {

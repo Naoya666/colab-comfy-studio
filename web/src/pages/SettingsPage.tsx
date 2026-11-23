@@ -107,7 +107,7 @@ export function SettingsPanel({
         <AccountDirectory hideTitle balances={usage?.accounts} accounts={accounts} onAccountsChange={onAccountsChange} />
         {!settings?.offline_mode && (
           <details className="foldable">
-            <summary>Google 应用配置（首次使用）</summary>
+            <summary>Google Web OAuth 应用配置（Drive 必填 / Colab 实验性）</summary>
             <div className="foldContent"><GoogleOAuthSetup onConfigured={() => setOauthConfigured(true)} /></div>
           </details>
         )}

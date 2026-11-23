@@ -103,6 +103,126 @@ def update_account(
     return _invoke(request, action)
 
 
+@router.post("/{account_id}/auth/colab-cli/start")
+def start_account_colab_cli_auth(
+    account_id: str,
+    body: dict | None = None,
+    request: Request = None,
+    user=Depends(get_current_user_for_tests),
+):
+    def action():
+        key = _idempotency(request)
+        if body is not None and not isinstance(body, dict):
+            raise APIError("VALIDATION_ERROR", "授权参数必须是对象", 422)
+        service = _service(request, user)
+        account = service.require(account_id)
+        if account.get("enabled", True) is False:
+            raise APIError("ACCOUNT_DISABLED", "该账号已停用，不能发起授权", 409)
+        operation_body = {"account_id": account_id, "purpose": "colab", "auth_channel": "colab_cli"}
+        previous = service._operation(key, operation_body)
+        if previous is not None:
+            return ok(previous, request)
+        google = service_google(request, user["id"], account_id)
+        try:
+            result = google.start_colab_cli()
+        finally:
+            google.close()
+        return ok(service._save_operation(key, operation_body, result, operation="colab_cli_start"), request)
+
+    return _invoke(request, action)
+
+
+@router.post("/{account_id}/auth/colab-cli/complete")
+def complete_account_colab_cli_auth(
+    account_id: str,
+    body: dict,
+    request: Request = None,
+    user=Depends(get_current_user_for_tests),
+):
+    def action():
+        key = _idempotency(request)
+        if not isinstance(body, dict):
+            raise APIError("VALIDATION_ERROR", "授权参数必须是对象", 422)
+        state = body.get("state")
+        code = body.get("code")
+        if not isinstance(state, str) or not state.strip():
+            raise APIError("VALIDATION_ERROR", "缺少授权会话标识 state", 422)
+        if not isinstance(code, str) or not code.strip():
+            raise APIError("VALIDATION_ERROR", "请粘贴 Google 页面显示的授权码", 422)
+        service = _service(request, user)
+        account = service.require(account_id)
+        if account.get("enabled", True) is False:
+            raise APIError("ACCOUNT_DISABLED", "该账号已停用，不能完成授权", 409)
+        operation_body = {
+            "account_id": account_id,
+            "purpose": "colab",
+            "auth_channel": "colab_cli",
+            "state": state.strip(),
+            "code_hash": service._hash(code.strip()),
+        }
+        previous = service._operation(key, operation_body)
+        if previous is not None:
+            return ok(previous, request)
+        google = service_google(request, user["id"], account_id)
+        try:
+            result = google.complete_colab_cli(code=code, state=state.strip())
+        finally:
+            google.close()
+        probe = probe_colab_cli_account(request, user["id"], account_id)
+        payload = {
+            "account_id": account_id,
+            "purpose": result["purpose"],
+            "auth_channel": result["auth_channel"],
+            "connected": result["connected"],
+            **probe,
+        }
+        return ok(service._save_operation(key, operation_body, payload, operation="colab_cli_complete"), request)
+
+    return _invoke(request, action)
+
+
+@router.post("/{account_id}/auth/colab-cli/import")
+def import_account_colab_cli_auth(
+    account_id: str,
+    body: dict,
+    request: Request = None,
+    user=Depends(get_current_user_for_tests),
+):
+    def action():
+        key = _idempotency(request)
+        if not isinstance(body, dict) or not body:
+            raise APIError("VALIDATION_ERROR", "导入参数必须是对象", 422)
+        service = _service(request, user)
+        account = service.require(account_id)
+        if account.get("enabled", True) is False:
+            raise APIError("ACCOUNT_DISABLED", "该账号已停用，不能导入授权", 409)
+        operation_body = {
+            "account_id": account_id,
+            "purpose": "colab",
+            "auth_channel": "colab_cli",
+            "import_hash": service._hash(body),
+        }
+        previous = service._operation(key, operation_body)
+        if previous is not None:
+            return ok(previous, request)
+        google = service_google(request, user["id"], account_id)
+        try:
+            result = google.import_colab_cli(body)
+        finally:
+            google.close()
+        probe = probe_colab_cli_account(request, user["id"], account_id)
+        payload = {
+            "account_id": account_id,
+            "purpose": result["purpose"],
+            "auth_channel": result["auth_channel"],
+            "connected": result["connected"],
+            **probe,
+        }
+        return ok(service._save_operation(key, operation_body, payload, operation="colab_cli_import"), request)
+
+    return _invoke(request, action)
+
+
 @router.post("/{account_id}/auth/{purpose}/start")
 def start_account_auth(
     account_id: str,
@@ -135,6 +255,51 @@ def start_account_auth(
     return _invoke(request, action)
 
 
+def probe_colab_cli_account(request: Request, owner_id: str, account_id: str) -> dict:
+    """Best-effort read-only CCU & eligible GPU probe after CLI authorization."""
+    from .gpu import ccu
+
+    if not ccu.sampling_enabled():
+        return {"balance": None, "eligible_gpus": [], "probe_error": None}
+    repo = _repo(request)
+    provider = None
+    try:
+        from .gpu.colab import GoogleColabProvider
+
+        provider = GoogleColabProvider(repo, owner_id, account_id=account_id, timeout=8.0)
+        info = provider.subscription()
+        normalized = ccu.normalize_subscription(info)
+        if normalized.get("balance") is not None and hasattr(repo, "store"):
+            try:
+                ccu.sample_and_record(
+                    repo,
+                    owner_id,
+                    account_id,
+                    "cli_auth",
+                    sampler=lambda *_: normalized,
+                )
+            except Exception:
+                pass
+        gpus = [str(g).upper() for g in (info.get("eligibleGpus") or []) if isinstance(g, str) and g]
+        return {
+            "balance": normalized.get("balance"),
+            "eligible_gpus": gpus,
+            "probe_error": None,
+        }
+    except Exception:
+        return {
+            "balance": None,
+            "eligible_gpus": [],
+            "probe_error": "凭据已保存，但实时余额探测暂未响应（可稍后在算力页检查）",
+        }
+    finally:
+        if provider is not None:
+            try:
+                provider.close()
+            except Exception:
+                pass
+
+
 def service_google(request: Request, owner_id: str, account_id: str):
     # Imported lazily to keep importing the route free of network/client setup.
     from .gpu.google import GoogleService
@@ -159,12 +324,13 @@ def disconnect_account(
 @router.delete("/{account_id}")
 def delete_account(
     account_id: str,
-    request: Request,
+    revoke_remote: bool = True,
+    request: Request = None,
     user=Depends(get_current_user_for_tests),
 ):
     def action():
         key = _idempotency(request)
-        return ok(_service(request, user).delete(account_id, key), request)
+        return ok(_service(request, user).delete(account_id, key, revoke_remote=revoke_remote), request)
 
     return _invoke(request, action)
 

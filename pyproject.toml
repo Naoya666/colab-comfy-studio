@@ -4,7 +4,7 @@ version = "0.3.1"
 description = "Independent mobile AI studio with on-demand compute"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-dependencies = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1", "sqlalchemy>=2,<3", "pydantic-settings>=2.6,<3", "cryptography>=43,<46", "httpx>=0.27,<1", "python-multipart>=0.0.9,<1", "pillow>=10,<12", "psycopg[binary]>=3.2,<4", "alembic>=1.14,<2", "websockets>=13,<16", "tzdata>=2024.1"]
+dependencies = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1", "sqlalchemy>=2,<3", "pydantic-settings>=2.6,<3", "cryptography>=43,<46", "httpx>=0.27,<1", "python-multipart>=0.0.9,<1", "pillow>=10,<12", "psycopg[binary]>=3.2,<4", "alembic>=1.14,<2", "websockets>=13,<16", "tzdata>=2024.1", "google-colab-cli>=0.8.0,<1; python_version >= '3.12'"]
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.9", "playwright>=1.50"]
 [tool.pytest.ini_options]

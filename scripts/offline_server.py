@@ -65,6 +65,7 @@ def main():
                 "/google/auth",
                 "/google/connect",
                 "/google/oauth",
+                "/auth/colab-cli/",
                 "/loras/upload",
                 "/admin/compute/smoke",
             )

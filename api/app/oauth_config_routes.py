@@ -138,6 +138,7 @@ def _connected(repo: Repository, owner_id: str) -> list[dict]:
         and row.get("purpose") in {"colab", "drive"}
         and not row.get("revoked")
         and row.get("encrypted_refresh_token")
+        and not (str(row.get("client_id", "")).strip() and row.get("encrypted_client_secret"))
     ]
 
 

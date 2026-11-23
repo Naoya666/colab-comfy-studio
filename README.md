@@ -152,12 +152,22 @@ uv run python scripts/offline_server.py --port 18788
 
 ## 接入真实 Colab GPU
 
-1. **配置 Google OAuth 与 Drive 授权**：在 Google Cloud 创建 Web 应用 OAuth 客户端并下载 JSON，登录 Studio 后进入「设置 → Google 账号」导入 JSON，分别授权 Google Colab 与 Google Drive（仅使用 `drive.file` 权限，不扫描网盘中其他文件）。详见 [Google OAuth 与 Drive 配置](docs/OAUTH_SETUP.md)。
-2. **启用真实 GPU**：编辑 `.env`，将 `GPU_REAL_ENABLED` 设为 `1`（需要 Drive 模型缓存与持久化时同步设 `GPU_STORAGE=drive`，并按需确认 `STUDIO_TIMEZONE=Asia/Shanghai`），再执行 `docker compose up -d` 使配置生效。完整变量说明见 [`.env.example`](.env.example)。
-3. **配置 CU 熔断保护与检查算力**：进入「算力」页设置**今日总上限（温和熔断）**与**余额底线（强制熔断）**，点击「检查可用 GPU」确认账号可分配的规格（如 T4 / L4 / A100）；如需调整选卡优先级或收纳上游新卡，可在「设置 → GPU 规格顺序」编辑。详见 [CU 统计与熔断说明](docs/cu-accounting-and-fuse-redesign.md)。
-4. **启用工作流草稿**：进入「资产 → 工作流」，点击内置模板右侧的**一键启用**，按五步向导完成校验、模型许可确认、依赖锁定、真实 GPU 冒烟测试与发布；也可自行导入 ComfyUI 工作流或从 PNG 图片提取。详见 [内置工作流说明](docs/BUILTIN_WORKFLOWS.md) · [工作流审核流程](docs/WORKFLOW_REVIEW.md) · [PNG 导入与 GPU 选择](docs/runtime-gpu-and-png-import.md)。
+系统将 **Google Colab 算力** 与 **Google Drive 存储** 解耦管理，同时支持「纯自用账号」与「第三方交付 CU（Colab CLI）+ 自有 Drive」两种常见场景：
 
-> GPU 实际可用规格受 Google Colab 当时容量影响，参考费率仅作界面提示，实际扣费以 Google Colab 账号余额流水与官方账单为准。
+1. **连接 Google Colab 算力（推荐网页内置 Colab CLI 授权）**：
+   - 登录 Studio 后进入 **「设置 → Google 账号」**，新增账号并点击 **「Colab CLI 授权（推荐）」**；
+   - **纯自用**：点击「新窗口打开」登录自己的 Google 账号，将页面返回的 `4/0A...` 授权码粘贴回网页即可；
+   - **异地 / 第三方交付 CU**：点击「复制授权链接」发给交付方，收到对方返回的授权码后粘贴回网页即可完成授权（会话持久化 30 分钟，刷新不丢失）。
+   - 该向导**无需**在宿主机手动安装 `google-colab-cli`、配置 keyring 或设置 `OAUTHLIB_RELAX_TOKEN_SCOPE`，仅请求 Colab 最小必要权限（不访问对方 Drive / GCP），提交后自动加密入库并探测余额与可用 GPU；如已有现成 CLI 凭据 JSON 也可在向导底部折叠区直接导入。
+   - **备用方式**：如需使用自建 GCP Web OAuth 应用授权 Colab，可点击账号卡片上的 **「Web OAuth 授权（实验性）」**（需在 GCP 开通 Colaboratory API；当前长驻保活与实时 CU 速率在 Colab CLI 通道上实测覆盖更充分）。
+2. **配置 Google Drive 授权（模型库、缓存与原生 ComfyUI 必需）**：
+   - 在 Google Cloud 创建一个 **Web 应用** OAuth 客户端（只需启用 **Google Drive API**，仅申请 `drive.file` 权限，不扫描网盘中其他文件），进入「设置 → Google 账号 → Google Web OAuth 应用配置」导入 JSON 并为一个主账号完成 **Drive 授权**；
+   - 若算力号与 Drive 主账号分开（如购买的第三方 CU 算力号），在算力号卡片的 **「Drive 存储来源」** 选择复用主账号的 Drive 即可，后续更换算力号不会丢失模型库与自定义节点缓存。详见 [Google Colab 与 Drive 授权配置](docs/OAUTH_SETUP.md)。
+3. **启用真实 GPU**：编辑 `.env`，将 `GPU_REAL_ENABLED` 设为 `1`（需要 Drive 模型缓存与持久化时同步设 `GPU_STORAGE=drive`，并按需确认 `STUDIO_TIMEZONE=Asia/Shanghai`），再执行 `docker compose up -d` 使配置生效。完整变量说明见 [`.env.example`](.env.example)。
+4. **配置 CU 熔断保护与检查算力**：进入「算力」页设置**今日总上限（温和熔断）**与**余额底线（强制熔断）**，点击「检查可用 GPU」确认账号可分配的规格（如 T4 / L4 / A100）；如需调整选卡优先级或收纳上游新卡，可在「设置 → GPU 规格顺序」编辑。详见 [CU 统计与熔断说明](docs/cu-accounting-and-fuse-redesign.md)。
+5. **启用工作流草稿**：进入「资产 → 工作流」，点击内置模板右侧的**一键启用**，按五步向导完成校验、模型许可确认、依赖锁定、真实 GPU 冒烟测试与发布；也可自行导入 ComfyUI 工作流或从 PNG 图片提取。详见 [内置工作流说明](docs/BUILTIN_WORKFLOWS.md) · [工作流审核流程](docs/WORKFLOW_REVIEW.md) · [PNG 导入与 GPU 选择](docs/runtime-gpu-and-png-import.md)。
+
+> GPU 实际可用规格受 Google Colab 当时容量影响，参考费率仅作界面提示，实际扣费以 Google Colab 账号余额流水与官方账单为准。解绑或删除 Colab CLI 账号时，默认**仅从本站移除本地凭据**而不向 Google 远端吊销令牌，避免影响其他复用端。
 
 ---
 
