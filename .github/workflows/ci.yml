@@ -137,11 +137,7 @@ jobs:
             TAGS+=("${IMAGE}:${SAFE_TAG}")
           fi
 
-          CREATE_ARGS=(
-            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
-            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}"
-            --annotation "index:org.opencontainers.image.licenses=AGPL-3.0-only"
-          )
+          CREATE_ARGS=()
           for tag in "${TAGS[@]}"; do
             CREATE_ARGS+=(--tag "${tag}")
           done
