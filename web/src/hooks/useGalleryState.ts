@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   apiMessage,
   BATCH_DELETE_ASSET_LIMIT,
@@ -127,20 +127,36 @@ export function useGalleryState({
     }
   }, [pendingRouteAssetId, gallery, projectGallery, galleryProjectFilter]);
 
+  const lastLoadedKey = useRef<string | null>(null);
+  const needsGallery = tab === '作品' || (tab === '创作' && desktop) || Boolean(pendingRouteAssetId);
+
   useEffect(() => {
-    if (!loggedIn) return;
+    if (!loggedIn) {
+      lastLoadedKey.current = null;
+      return;
+    }
+    if (!needsGallery) return;
+    const fetchKey = `${galleryOutputs}|${galleryRevision}`;
+    if (lastLoadedKey.current === fetchKey) return;
+    const controller = new AbortController();
     let alive = true;
     setGalleryError('');
     setRefreshingGallery(true);
-    getGpuGallery().then((next) => {
-      if (alive) setGallery(next);
+    getGpuGallery(undefined, controller.signal).then((next) => {
+      if (alive) {
+        setGallery(next);
+        lastLoadedKey.current = fetchKey;
+      }
     }).catch((cause) => {
-      if (alive) setGalleryError(apiMessage(cause));
+      if (alive && !controller.signal.aborted) setGalleryError(apiMessage(cause));
     }).finally(() => {
       if (alive) setRefreshingGallery(false);
     });
-    return () => { alive = false; };
-  }, [loggedIn, tab, galleryOutputs, galleryRevision]);
+    return () => {
+      alive = false;
+      controller.abort();
+    };
+  }, [loggedIn, needsGallery, galleryOutputs, galleryRevision]);
 
   const refreshGallery = useCallback(() => {
     setGalleryRevision((revision) => revision + 1);

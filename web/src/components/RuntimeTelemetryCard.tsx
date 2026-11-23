@@ -89,11 +89,15 @@ export function RuntimeTelemetryCard({
     () => instances.filter((i) => i.provider === 'colab' && !i.runtime_deleted && ACTIVE_STATES.has(String(i.state || '').toLowerCase())),
     [instances],
   );
+  const activeNativeInstances = useMemo(
+    () => activeColabInstances.filter((i) => i.native_comfy === true || i.instance_pool === 'native'),
+    [activeColabInstances],
+  );
   const activeNativeSession = useMemo(
     () => usage?.active_sessions?.find((s) => s.session_kind === 'native_comfy'),
     [usage],
   );
-  const shouldPollTelemetry = realEnabled && (activeCount > 0 || activeColabInstances.length > 0 || Boolean(activeNativeSession));
+  const shouldPollTelemetry = realEnabled && (activeNativeInstances.length > 0 || Boolean(activeNativeSession));
 
   const [snapshot, setSnapshot] = useState<NativeTelemetryResponse | null>(null);
   const [refreshing, setRefreshing] = useState(false);

@@ -8,7 +8,7 @@ import { formatGpuSpecName, gpuSpecId } from '../lib/gpu-spec-order';
 import { Card } from './ui';
 import styles from '../gpu.module.css';
 
-export function GpuOrderSettings({ canEdit }: { canEdit: boolean }) {
+export function GpuOrderSettings({ canEdit, onSaved }: { canEdit: boolean; onSaved?: (orderedSpecs: GpuSpecKey[]) => void }) {
   const [data, setData] = useState<GpuSpecOrderSettings | null>(null);
   const [draft, setDraft] = useState<GpuSpecKey[]>([]);
   const [discovered, setDiscovered] = useState<DiscoveredGpuSpec[]>([]);
@@ -16,11 +16,14 @@ export function GpuOrderSettings({ canEdit }: { canEdit: boolean }) {
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
 
-  const apply = useCallback((next: GpuSpecOrderSettings) => {
+  const apply = useCallback((next: GpuSpecOrderSettings, notify = false) => {
     setData(next);
     setDraft(next.ordered_specs || []);
     setDiscovered(next.discovered_specs || []);
-  }, []);
+    if (notify && Array.isArray(next.ordered_specs) && next.ordered_specs.length) {
+      onSaved?.(next.ordered_specs);
+    }
+  }, [onSaved]);
 
   const load = useCallback(async () => {
     setError('');
@@ -74,7 +77,7 @@ export function GpuOrderSettings({ canEdit }: { canEdit: boolean }) {
     setError('');
     setStatus('');
     try {
-      apply(await saveGpuSpecOrder(draft));
+      apply(await saveGpuSpecOrder(draft), true);
       setStatus('GPU 规格顺序已保存，并立即对所有复用与底线校验生效。');
     } catch (cause) {
       setError(apiMessage(cause));
@@ -89,7 +92,7 @@ export function GpuOrderSettings({ canEdit }: { canEdit: boolean }) {
     setError('');
     setStatus('');
     try {
-      apply(await resetGpuSpecOrder());
+      apply(await resetGpuSpecOrder(), true);
       setStatus('已恢复默认 GPU 规格顺序。');
     } catch (cause) {
       setError(apiMessage(cause));

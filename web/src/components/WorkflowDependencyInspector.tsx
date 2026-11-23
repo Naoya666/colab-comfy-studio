@@ -78,6 +78,16 @@ function BatchImportPreviewDialog({
   const [committing, setCommitting] = useState(false);
   const [globalError, setGlobalError] = useState('');
   const runToken = useRef(0);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const itemsSignature = useMemo(
+    () => items
+      .filter((item) => Boolean(item.sourceUrl))
+      .map((item) => `${item.sourceUrl}::${item.dep.reference.toLowerCase()}`)
+      .sort()
+      .join('|'),
+    [items],
+  );
 
   // Deduplicate by (sourceUrl, reference) and resolve concurrently when dialog opens.
   useEffect(() => {
@@ -87,7 +97,7 @@ function BatchImportPreviewDialog({
     setCommitting(false);
 
     const grouped = new Map<string, { dep: Dependency; sourceUrl: string; nodeCount: number; hasLocalCandidate: boolean; optional: boolean }>();
-    for (const item of items) {
+    for (const item of itemsRef.current) {
       if (!item.sourceUrl) continue;
       const key = `${item.sourceUrl}::${item.dep.reference.toLowerCase()}`;
       const existing = grouped.get(key);
@@ -168,7 +178,7 @@ function BatchImportPreviewDialog({
     for (let i = 0; i < concurrency; i++) {
       void worker();
     }
-  }, [open, items]);
+  }, [open, itemsSignature]);
 
   useEffect(() => {
     if (!open) return;

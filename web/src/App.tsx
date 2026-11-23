@@ -164,7 +164,7 @@ export default function App() {
   const usageSequence = useRef(0);
   const refreshUsage = useCallback(async (signal?: AbortSignal) => {
     const sequence = ++usageSequence.current;
-    const value = await getGpuUsage();
+    const value = await getGpuUsage(signal);
     if (!signal?.aborted && sequence === usageSequence.current) setUsage(value);
   }, []);
   const [specs, setSpecs] = useState<ComputeSpec[]>([]);
@@ -354,14 +354,14 @@ export default function App() {
     return () => { alive = false; };
   }, [loggedIn, loginRefresh]);
 
-  const refreshResources = useCallback(async () => {
+  const refreshResources = useCallback(async (signal?: AbortSignal) => {
     const seq = ++resourceSequenceRef.current;
     try {
       const [accountResult, instanceResult] = await Promise.all([
-        apiFetch<unknown>('/api/gpu/accounts'),
-        listGpuInstances(),
+        apiFetch<unknown>('/api/gpu/accounts', { signal }),
+        listGpuInstances({}, signal),
       ]);
-      if (seq < appliedResourceSequenceRef.current) return;
+      if (signal?.aborted || seq < appliedResourceSequenceRef.current) return;
       appliedResourceSequenceRef.current = seq;
       const nextAccounts = (Array.isArray(accountResult) ? accountResult : record(accountResult) && Array.isArray(accountResult.data) ? accountResult.data : []) as GpuAccount[];
       const nextInstances = instanceResult as unknown as GpuInstance[];
@@ -370,7 +370,7 @@ export default function App() {
       setInstances(uniqueBy(nextInstances, (instance) => instanceIdOf(instance)));
       setResourceError('');
     } catch (cause) {
-      if (seq === resourceSequenceRef.current) setResourceError(`账号/实例：${apiMessage(cause)}`);
+      if (!signal?.aborted && seq === resourceSequenceRef.current) setResourceError(`账号/实例：${apiMessage(cause)}`);
     }
   }, []);
 
@@ -464,19 +464,19 @@ export default function App() {
     writeWorkflowDraft(projectId, workflowId, params);
   }, [params, projectId, workflowId]);
 
-  const refreshJobs = useCallback(async () => {
+  const refreshJobs = useCallback(async (signal?: AbortSignal) => {
     const seq = ++jobSequence.current;
-    const current = () => seq === jobSequence.current;
+    const current = () => !signal?.aborted && seq === jobSequence.current;
     setRefreshingJobs(true);
     try {
-      const next = await getGpuJobs();
+      const next = await getGpuJobs(undefined, signal);
       if (!current()) return;
       setJobs(next);
       setJobError('');
     } catch (cause) {
       if (current()) setJobError(apiMessage(cause));
     } finally {
-      if (current()) setRefreshingJobs(false);
+      if (seq === jobSequence.current) setRefreshingJobs(false);
     }
   }, []);
 
@@ -486,10 +486,6 @@ export default function App() {
     activeMs: 4000,
     idleMs: 25000,
   });
-
-  useEffect(() => {
-    if (loggedIn) void refreshJobs();
-  }, [loggedIn, refreshJobs]);
 
   useEffect(() => {
     setPinnedReferenceAssets([]);
@@ -647,14 +643,18 @@ export default function App() {
 
   useEffect(() => {
     if (!loggedIn) return;
+    const controller = new AbortController();
     let alive = true;
-    void getGpuSpecOrder().then((res) => {
+    void getGpuSpecOrder(controller.signal).then((res) => {
       if (alive && Array.isArray(res.ordered_specs) && res.ordered_specs.length) {
         setGpuOrder(res.ordered_specs);
       }
     }).catch(() => {});
-    return () => { alive = false; };
-  }, [loggedIn, loginRefresh, tab]);
+    return () => {
+      alive = false;
+      controller.abort();
+    };
+  }, [loggedIn, loginRefresh]);
 
   const workflowDefaultSpec = (manifest?.compute_spec as Record<string, unknown> | undefined) || null;
   const specBelowDefaultError = runtime === 'colab' && selectedCompute && workflowDefaultSpec
@@ -1539,7 +1539,9 @@ export default function App() {
         {tab === '设置' && (
           <SettingsPanel
             accounts={accounts}
+            accountsLoaded={accountsLoaded}
             onAccountsChange={setAccounts}
+            onGpuOrderChange={setGpuOrder}
             settings={settings}
             usage={usage}
             canEditGuard={adminRole}

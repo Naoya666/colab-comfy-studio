@@ -1,7 +1,7 @@
 import { ModelSourceSettings, ModelStorageSettings } from './ModelLibraryPage';
 import { useEffect, useState } from 'react';
 import { Settings, ChevronLeft, Monitor, Moon, Sun, Plug, LogOut } from 'lucide-react';
-import type { GpuSettings, GpuUsage } from '../lib/gpu-api';
+import type { GpuSettings, GpuSpecKey, GpuUsage } from '../lib/gpu-api';
 import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
 import { AccountDirectory, type GpuAccount } from '../components/AccountDirectory';
 import { GpuOrderSettings } from '../components/GpuOrderSettings';
@@ -35,7 +35,7 @@ export function ThemePicker() {
 }
 
 export function SettingsPanel({
-  settings, usage, canEditGuard, desktop = false, focusSection = null, onFocusHandled, error, accounts = [], onAccountsChange, onLogout, onBack,
+  settings, usage, canEditGuard, desktop = false, focusSection = null, onFocusHandled, error, accounts = [], accountsLoaded = false, onAccountsChange, onGpuOrderChange, onLogout, onBack,
 }: {
   settings: GpuSettings | null;
   usage?: GpuUsage | null;
@@ -47,9 +47,12 @@ export function SettingsPanel({
   onLogout: () => void;
   onBack?: () => void;
   accounts?: GpuAccount[];
+  accountsLoaded?: boolean;
   onAccountsChange?: (accounts: GpuAccount[]) => void;
+  onGpuOrderChange?: (orderedSpecs: GpuSpecKey[]) => void;
 }) {
   const [oauthConfigured, setOauthConfigured] = useState(false);
+  const [oauthOpen, setOauthOpen] = useState(false);
 
   useEffect(() => {
     if (focusSection !== 'model-storage') return;
@@ -92,10 +95,10 @@ export function SettingsPanel({
       </section>
 
       <div className={styles.workspaceWide}>
-        <GpuOrderSettings canEdit={canEditGuard} />
+        <GpuOrderSettings canEdit={canEditGuard} onSaved={onGpuOrderChange} />
       </div>
 
-      <ModelStorageSettings id="settings-model-storage" defaultOpen={focusSection === 'model-storage'} />
+      <ModelStorageSettings id="settings-model-storage" defaultOpen={focusSection === 'model-storage'} accounts={accountsLoaded ? accounts : undefined} />
       <ModelSourceSettings id="settings-model-source" defaultOpen={focusSection === 'model-storage'} />
 
       <Card
@@ -104,11 +107,11 @@ export function SettingsPanel({
         title="Google 账号"
         aside={settings?.offline_mode ? <span className="pill">离线模式</span> : oauthConfigured ? <span className="pill solid">应用已配置</span> : undefined}
       >
-        <AccountDirectory hideTitle balances={usage?.accounts} accounts={accounts} onAccountsChange={onAccountsChange} />
+        <AccountDirectory hideTitle balances={usage?.accounts} accounts={accounts} accountsLoaded={accountsLoaded} onAccountsChange={onAccountsChange} />
         {!settings?.offline_mode && (
-          <details className="foldable">
+          <details className="foldable" open={oauthOpen} onToggle={(e) => setOauthOpen(e.currentTarget.open)}>
             <summary>Google Web OAuth 应用配置（Drive 必填 / Colab 实验性）</summary>
-            <div className="foldContent"><GoogleOAuthSetup onConfigured={() => setOauthConfigured(true)} /></div>
+            <div className="foldContent">{oauthOpen && <GoogleOAuthSetup accounts={accountsLoaded ? accounts : undefined} onConfigured={() => setOauthConfigured(true)} />}</div>
           </details>
         )}
       </Card>

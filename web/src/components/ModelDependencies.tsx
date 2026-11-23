@@ -10,12 +10,14 @@ import {
   type LibraryModel,
   type ModelTask,
 } from '../lib/model-library';
+import { useSmartPoll } from '../lib/smart-poll';
 import { DependencyCard } from './ModelDependencyItem';
 import styles from '../gpu.module.css';
 
 type WorkflowDepFilter = 'all' | 'unbound' | 'ready';
 
 export function ModelDependencies({ workflowId, onDraft }: { workflowId: string; onDraft?: () => void }) {
+  const [open, setOpen] = useState(false);
   const [record, setRecord] = useState<DependencyRecord | null>(null);
   const [models, setModels] = useState<LibraryModel[]>([]);
   const [tasks, setTasks] = useState<ModelTask[]>([]);
@@ -25,38 +27,22 @@ export function ModelDependencies({ workflowId, onDraft }: { workflowId: string;
   const [busyAction, setBusyAction] = useState('');
   const [filter, setFilter] = useState<WorkflowDepFilter>('all');
 
-  const refresh = useCallback(async () => {
-    const [r, c, t] = await Promise.all([
-      dependencyApi<DependencyRecord>(workflowId),
-      libraryApi<Catalog>(),
-      libraryApi<ModelTask[]>('/tasks').catch(() => [] as ModelTask[]),
-    ]);
-    setRecord(r);
-    setModels(c.items);
-    setTypes(Object.keys(c.types || {}));
-    setTasks(t);
-  }, [workflowId]);
-
-  useEffect(() => {
-    void refresh().catch((e) => setError(apiMessage(e)));
-    const id = setInterval(() => {
-      void refresh().catch(() => {});
-    }, 4000);
-    return () => clearInterval(id);
-  }, [refresh]);
-
-  async function action(key: string, fn: () => Promise<unknown>) {
-    setError('');
-    setBusyAction(key);
+  const refresh = useCallback(async (signal?: AbortSignal) => {
     try {
-      await fn();
-      await refresh();
+      const [r, c, t] = await Promise.all([
+        dependencyApi<DependencyRecord>(workflowId),
+        libraryApi<Catalog>(),
+        libraryApi<ModelTask[]>('/tasks').catch(() => [] as ModelTask[]),
+      ]);
+      if (signal?.aborted) return;
+      setRecord(r);
+      setModels(c.items);
+      setTypes(Object.keys(c.types || {}));
+      setTasks(t);
     } catch (e) {
-      setError(apiMessage(e));
-    } finally {
-      setBusyAction('');
+      if (!signal?.aborted) setError(apiMessage(e));
     }
-  }
+  }, [workflowId]);
 
   const stats = useMemo(() => {
     const list = record?.dependencies || [];
@@ -71,6 +57,27 @@ export function ModelDependencies({ workflowId, onDraft }: { workflowId: string;
     return { total: list.length, ready, unbound, inProgress };
   }, [record]);
 
+  const hasActiveModels = stats.inProgress > 0 || tasks.some((t) => ACTIVE_MODEL_STATES.has(t.state));
+  useSmartPoll(refresh, {
+    enabled: open,
+    active: hasActiveModels,
+    activeMs: 4000,
+    idleMs: 30000,
+  });
+
+  async function action(key: string, fn: () => Promise<unknown>) {
+    setError('');
+    setBusyAction(key);
+    try {
+      await fn();
+      await refresh();
+    } catch (e) {
+      setError(apiMessage(e));
+    } finally {
+      setBusyAction('');
+    }
+  }
+
   const dependencies = useMemo(() => {
     const list = record?.dependencies || [];
     if (filter === 'unbound') return list.filter((dep) => !dep.model_id);
@@ -79,7 +86,11 @@ export function ModelDependencies({ workflowId, onDraft }: { workflowId: string;
   }, [record, filter]);
 
   return (
-    <details className={`foldable ${styles.depFoldable}`}>
+    <details
+      className={`foldable ${styles.depFoldable}`}
+      open={open}
+      onToggle={(e) => setOpen(e.currentTarget.open)}
+    >
       <summary>
         <span className={styles.depFoldSummary}>
           <span>模型依赖</span>
@@ -255,25 +266,36 @@ export function ModelRunOverrides({
   value: ModelOverride[];
   onChange: (v: ModelOverride[]) => void;
 }) {
+  const [open, setOpen] = useState(false);
   const [record, setRecord] = useState<DependencyRecord | null>(null);
   const [models, setModels] = useState<LibraryModel[]>([]);
   const [error, setError] = useState('');
 
   useEffect(() => {
-    setError('');
     setRecord(null);
+    setError('');
+  }, [workflowId]);
+
+  useEffect(() => {
+    if (!open && !value.length) return;
+    let alive = true;
+    setError('');
     void Promise.all([dependencyApi<DependencyRecord>(workflowId), libraryApi<Catalog>()])
       .then(([r, c]) => {
+        if (!alive) return;
         setRecord(r);
         setModels(c.items);
       })
-      .catch((e) => setError(apiMessage(e)));
-  }, [workflowId]);
+      .catch((e) => {
+        if (alive) setError(apiMessage(e));
+      });
+    return () => { alive = false; };
+  }, [workflowId, open, value.length > 0]);
 
   const overridable = record?.dependencies.filter((d) => ['checkpoints', 'loras'].includes(d.model_type)) || [];
 
   return (
-    <details className="foldable">
+    <details className="foldable" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>
       <summary>本次底模 / LoRA 覆盖（{value.length} 项）</summary>
       <div className="foldContent">
         <p className="muted small">

@@ -4,13 +4,18 @@ import {
   getGoogleAccounts,
   getGoogleClientConfig,
   saveGoogleClientConfig,
-  type GoogleAccount,
   type GoogleClientConfig,
 } from '../lib/gpu-api';
 import styles from '../gpu.module.css';
 
-export function GoogleOAuthSetup({ onConfigured }: { onConfigured: () => void }) {
-  const [accounts, setAccounts] = useState<GoogleAccount[]>([]);
+export function GoogleOAuthSetup({
+  accounts: suppliedAccounts,
+  onConfigured,
+}: {
+  accounts?: Array<{ account_id: string; alias?: string | null }>;
+  onConfigured: () => void;
+}) {
+  const [accounts, setAccounts] = useState<Array<{ account_id: string; alias?: string | null }>>(suppliedAccounts || []);
   const [accountId, setAccountId] = useState('');
   const [config, setConfig] = useState<GoogleClientConfig | null>(null);
   const [clientId, setClientId] = useState('');
@@ -26,13 +31,17 @@ export function GoogleOAuthSetup({ onConfigured }: { onConfigured: () => void })
   const callback = config?.redirect_uri || `${window.location.origin}/api/gpu/auth/google/callback`;
 
   useEffect(() => {
+    if (suppliedAccounts) {
+      setAccounts(suppliedAccounts);
+      return;
+    }
     const generation = targetGeneration.current;
     let alive = true;
     getGoogleAccounts()
       .then((next) => { if (alive && generation === targetGeneration.current) setAccounts(next); })
       .catch((cause) => { if (alive && generation === targetGeneration.current) setError(apiMessage(cause)); });
     return () => { alive = false; };
-  }, []);
+  }, [suppliedAccounts]);
 
   useEffect(() => {
     const requestId = ++configRequest.current;

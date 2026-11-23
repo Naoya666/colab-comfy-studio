@@ -223,10 +223,17 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     } catch (cause) { if (!signal.aborted) setError(apiMessage(cause)); }
   }, [autoOpen, desktop]);
 
-  const nativeActive = Boolean(
-    pendingStart || pendingRestart || (status && status.state !== 'stopped' && !terminalStates.has(status.state)) || status?.ready,
+  const nativeTransitioning = Boolean(
+    pendingStart || pendingRestart || (status && status.state !== 'stopped' && !terminalStates.has(status.state))
+    || status?.restart?.phase === 'checking' || status?.restart?.phase === 'syncing'
+    || status?.restart?.phase === 'rebooting' || status?.restart?.phase === 'recovering',
   );
-  useSmartPoll(pollStatus, { enabled: true, active: nativeActive, activeMs: 3000, idleMs: 20000 });
+  useSmartPoll(pollStatus, {
+    enabled: true,
+    active: nativeTransitioning,
+    activeMs: 3000,
+    idleMs: status?.ready ? 15000 : 20000,
+  });
   const startupPending = Boolean(pendingStart || (status?.job_id && !status.ready && status.state !== 'stopped' && !terminalStates.has(status.state)));
   const validTimeouts = [idleMinutes, runtimeMinutes].every(value => Number.isInteger(Number(value)) && Number(value) >= 1);
   const validStorage = storage && Number.isInteger(storage.cache_gb) && storage.cache_gb >= 1

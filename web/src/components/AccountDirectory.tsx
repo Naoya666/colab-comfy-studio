@@ -159,6 +159,8 @@ export interface AccountDirectoryApi {
 export interface AccountDirectoryProps {
   /** Optional externally loaded list. When supplied it is kept in sync with the view. */
   accounts?: GpuAccount[];
+  /** When true, parent already fetched accounts; skip redundant initial GET /api/gpu/accounts on mount. */
+  accountsLoaded?: boolean;
   balances?: CuAccount[];
   api?: Partial<AccountDirectoryApi>;
   onAccountsChange?: (accounts: GpuAccount[]) => void;
@@ -244,7 +246,7 @@ function safeAuthRedirect(value: { authorization_url?: string } | string): strin
   }
 }
 
-export function AccountDirectory({ accounts: suppliedAccounts, balances = [], api, onAccountsChange, hideTitle = false }: AccountDirectoryProps) {
+export function AccountDirectory({ accounts: suppliedAccounts, accountsLoaded = false, balances = [], api, onAccountsChange, hideTitle = false }: AccountDirectoryProps) {
   const accountApi = useMemo(() => ({ ...defaultAccountApi, ...api }), [api]);
   const [accounts, setAccounts] = useState<GpuAccount[]>(suppliedAccounts || []);
   const [alias, setAlias] = useState('');
@@ -279,10 +281,17 @@ export function AccountDirectory({ accounts: suppliedAccounts, balances = [], ap
     }
   }, [accountApi, replaceAccounts]);
 
+  const skipInitialRefresh = useRef(accountsLoaded);
   useEffect(() => {
     if (suppliedAccounts) setAccounts(suppliedAccounts);
   }, [suppliedAccounts]);
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    if (skipInitialRefresh.current) {
+      skipInitialRefresh.current = false;
+      return;
+    }
+    void refresh();
+  }, [refresh]);
 
   function keyFor(operation: string): string {
     return keyRef.current[operation] ||= newIdempotencyKey(operation);

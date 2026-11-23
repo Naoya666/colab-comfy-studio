@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import gzip
+import io
 import json
 import os
 import secrets
@@ -16,6 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers, MutableHeaders
 
 from . import __version__
 from .account_routes import router as account_router
@@ -123,9 +126,105 @@ async def security_context(request, call_next):
         else "same-origin"
     )
     response.headers["X-Frame-Options"] = "DENY"
-    if request.url.path.startswith("/api/"):
+    if request.url.path.startswith("/api/") and "cache-control" not in response.headers:
         response.headers["Cache-Control"] = "private, no-store"
     return response
+
+
+_NON_COMPRESSIBLE_PREFIXES = ("image/", "video/", "audio/")
+_NON_COMPRESSIBLE_TYPES = frozenset({"application/octet-stream", "text/event-stream"})
+
+
+class SelectiveGZipMiddleware:
+    """Compress JSON/text/JS/CSS responses >= minimum_size while leaving media/range streams untouched."""
+
+    def __init__(self, app, *, minimum_size: int = 1024, compresslevel: int = 5):
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        accept = Headers(scope=scope).get("accept-encoding", "")
+        if "gzip" not in accept.lower():
+            await self.app(scope, receive, send)
+            return
+
+        initial_message = None
+        passthrough = False
+        gzip_buffer: io.BytesIO | None = None
+        gzip_file: gzip.GzipFile | None = None
+
+        async def send_wrapper(message):
+            nonlocal initial_message, passthrough, gzip_buffer, gzip_file
+            msg_type = message["type"]
+            if msg_type == "http.response.start":
+                status = message.get("status", 200)
+                headers = Headers(raw=message.get("headers", []))
+                ctype = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                if (
+                    status in {204, 206, 304}
+                    or "content-encoding" in headers
+                    or ctype.startswith(_NON_COMPRESSIBLE_PREFIXES)
+                    or ctype in _NON_COMPRESSIBLE_TYPES
+                ):
+                    passthrough = True
+                    await send(message)
+                    return
+                initial_message = message
+                return
+            if msg_type == "http.response.body":
+                if passthrough or initial_message is None:
+                    await send(message)
+                    return
+                body = message.get("body", b"")
+                more_body = message.get("more_body", False)
+                if gzip_file is None and not more_body:
+                    # Single-chunk response (JSONResponse, small text, FileResponse single body):
+                    if len(body) < self.minimum_size:
+                        passthrough = True
+                        await send(initial_message)
+                        await send(message)
+                        return
+                    compressed = gzip.compress(body, compresslevel=self.compresslevel)
+                    headers = MutableHeaders(raw=initial_message["headers"])
+                    headers["Content-Encoding"] = "gzip"
+                    headers["Content-Length"] = str(len(compressed))
+                    headers.add_vary_header("Accept-Encoding")
+                    await send(initial_message)
+                    await send({"type": "http.response.body", "body": compressed, "more_body": False})
+                    return
+                if gzip_file is None:
+                    gzip_buffer = io.BytesIO()
+                    gzip_file = gzip.GzipFile(mode="wb", fileobj=gzip_buffer, compresslevel=self.compresslevel)
+                    headers = MutableHeaders(raw=initial_message["headers"])
+                    headers["Content-Encoding"] = "gzip"
+                    if "content-length" in headers:
+                        del headers["content-length"]
+                    headers.add_vary_header("Accept-Encoding")
+                    await send(initial_message)
+                if body:
+                    gzip_file.write(body)
+                if not more_body:
+                    gzip_file.close()
+                chunk = gzip_buffer.getvalue()
+                gzip_buffer.seek(0)
+                gzip_buffer.truncate()
+                await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+                return
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+class ImmutableStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code in {200, 304}:
+            response.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+        return response
 
 
 def error_response(request, exc):
@@ -833,6 +932,7 @@ app.include_router(instance_router)
 app.include_router(native_outputs_router)
 app.include_router(native_router)
 app.include_router(creation_api_router)
+app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
 app.add_middleware(CreationHostMiddleware, studio_app=app)
 app.add_middleware(NativeHostMiddleware, studio_app=app)
 app.include_router(history_router)
@@ -863,7 +963,7 @@ if not _static_root.exists():
     _static_root = Path(__file__).resolve().parents[3] / "web" / "dist"
 if _static_root.exists():
     if (_static_root / "assets").exists():
-        app.mount("/assets", StaticFiles(directory=_static_root / "assets"), name="web-assets")
+        app.mount("/assets", ImmutableStaticFiles(directory=_static_root / "assets"), name="web-assets")
 
     @app.get("/{path:path}", include_in_schema=False)
     def spa(path: str):
@@ -874,6 +974,6 @@ if _static_root.exists():
             if target.suffix == ".webmanifest":
                 return FileResponse(target, media_type="application/manifest+json")
             return FileResponse(target)
-        return FileResponse(_static_root / "index.html")
+        return FileResponse(_static_root / "index.html", headers={"Cache-Control": "no-cache"})
 
 __all__ = ["AGENT_TOOLS", "app", "security_context"]

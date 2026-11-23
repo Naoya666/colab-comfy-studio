@@ -1581,18 +1581,41 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             return self._cleanup(job)
         return self._begin_failure(job, "gpu_invalid_state", f"unknown GPU state: {state}")
 
+    def _rr_state(self) -> dict[str, Any]:
+        rr = getattr(self.db_store, "_scheduler_rr", None)
+        if rr is None:
+            rr = {"seq": 0, "stalled": {}}
+            self.db_store._scheduler_rr = rr
+        return rr
+
     def _claim_next_job(self) -> tuple[dict | None, str | None]:
         now = self.clock()
+        rr = self._rr_state()
+        stalled: dict[str, int] = rr["stalled"]
         jobs = self._list("jobs")
+        active_ids = {job["id"] for job in jobs if job.get("state") in ACTIVE_STATES}
+        for stale_id in [jid for jid in stalled if jid not in active_ids]:
+            stalled.pop(stale_id, None)
         jobs.sort(
             key=lambda x: (
-                # A job parked on its cache prep goes last, so it cannot starve the prep job it waits on.
+                # Cleanup goes first; a job parked on its cache prep goes last so it cannot starve its prep job.
                 0 if x.get("state") in {"cleanup_pending", "cleaning_up"} else 2 if x.get("awaiting_prep") else 1,
+                # Jobs that polled without changing state yield to newly queued/advancing jobs in FIFO round-robin.
+                stalled.get(x["id"], 0),
                 x.get("created_epoch", x.get("created_at", "")),
             )
         )
         for job in jobs:
-            if job.get("state") not in ACTIVE_STATES:
+            state = job.get("state")
+            if state not in ACTIVE_STATES:
+                continue
+            # Do not repeatedly claim/unclaim a running job sitting in poll backoff unless cancelled or expired.
+            if (
+                state == "running"
+                and float(job.get("poll_retry_at") or 0) > now
+                and not job.get("cancel_requested")
+                and not self._expired(job)
+            ):
                 continue
             until = float(job.get("claim_until") or 0)
             if job.get("claim_token") and until > now:
@@ -1630,13 +1653,21 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         if job is None:
             return {"acquired": True, "advanced": False}
         before = job.get("state")
+        after = job
         try:
             after = self._advance(job)
         finally:
             self._release_claim(job["id"], claim, job.get("owner_id"))
+        advanced = before != after.get("state")
+        rr = self._rr_state()
+        if after.get("state") in TERMINAL_STATES or advanced:
+            rr["stalled"].pop(job["id"], None)
+        else:
+            rr["seq"] += 1
+            rr["stalled"][job["id"]] = rr["seq"]
         return {
             "acquired": True,
-            "advanced": before != after.get("state"),
+            "advanced": advanced,
             "job_id": job["id"],
             "state": after.get("state"),
         }

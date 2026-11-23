@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import io
+import re
+import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, Response
@@ -16,6 +19,48 @@ from .storage import asset_path, delete_asset_file, save_asset
 
 gallery_router = APIRouter()
 assets_router = APIRouter()
+
+_SAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    if not header:
+        return False
+    target = etag.removeprefix("W/").strip()
+    for part in header.split(","):
+        token = part.strip()
+        if token == "*" or token == etag or token.removeprefix("W/").strip() == target:
+            return True
+    return False
+
+
+def _asset_thumb_dir() -> Path:
+    root = (settings.data_dir / "asset-thumb-cache").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _asset_thumb_path(asset: dict) -> tuple[Path, str]:
+    safe_id = _SAFE_TOKEN_RE.sub("", str(asset.get("id") or ""))[:64] or "asset"
+    raw_rev = str(asset.get("sha256") or asset.get("updated_at") or "v0")
+    safe_rev = _SAFE_TOKEN_RE.sub("", raw_rev)[:16] or "v0"
+    root = _asset_thumb_dir()
+    target = (root / f"{safe_id}-{safe_rev}.webp").resolve()
+    if not target.is_relative_to(root):
+        raise ValueError("非法缩略图路径")
+    etag = f'W/"asset-thumb-{safe_id}-{safe_rev}"'
+    return target, etag
+
+
+def _delete_asset_thumbs(asset: dict) -> None:
+    safe_id = _SAFE_TOKEN_RE.sub("", str(asset.get("id") or ""))[:64]
+    if not safe_id:
+        return
+    root = (settings.data_dir / "asset-thumb-cache").resolve()
+    if not root.is_dir():
+        return
+    for item in root.glob(f"{safe_id}-*.webp"):
+        item.unlink(missing_ok=True)
 
 
 @gallery_router.get("/gallery")
@@ -83,21 +128,56 @@ async def upload_asset(
 
 @assets_router.get("/api/assets/{asset_id}/download")
 @assets_router.get("/api/assets/{asset_id}/preview")
-def download_asset(asset_id: str, user=Depends(current_user), st=Depends(get_store)):
+def download_asset(asset_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
     asset = own(st, "assets", asset_id, user)
-    return FileResponse(asset_path(asset), media_type=asset["mime"], filename=asset["filename"])
+    is_preview = request.url.path.endswith("/preview")
+    headers = {
+        "Cache-Control": "private, max-age=86400",
+        "Vary": "Cookie, Authorization",
+    }
+    sha = asset.get("sha256")
+    if isinstance(sha, str) and sha:
+        etag = f'"{sha[:32]}"'
+        headers["ETag"] = etag
+        if _etag_matches(request.headers.get("if-none-match"), etag):
+            return Response(status_code=304, headers=headers)
+    return FileResponse(
+        asset_path(asset),
+        media_type=asset["mime"],
+        filename=asset["filename"],
+        content_disposition_type="inline" if is_preview else "attachment",
+        headers=headers,
+    )
 
 
 @assets_router.get("/api/assets/{asset_id}/thumbnail")
-def thumbnail(asset_id: str, user=Depends(current_user), st=Depends(get_store)):
+def thumbnail(asset_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
     asset = own(st, "assets", asset_id, user)
     if not asset["mime"].startswith("image/"):
         raise APIError("THUMBNAIL_UNAVAILABLE", "非图片素材不提供图片缩略图", 404)
+    cache_path, etag = _asset_thumb_path(asset)
+    headers = {
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "ETag": etag,
+        "Vary": "Cookie, Authorization",
+    }
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    if cache_path.is_file():
+        return Response(cache_path.read_bytes(), media_type="image/webp", headers=headers)
     with Image.open(asset_path(asset)) as image:
         image.thumbnail((480, 480))
         target = io.BytesIO()
-        image.convert("RGB").save(target, "WEBP", quality=80)
-    return Response(target.getvalue(), media_type="image/webp")
+        mode = "RGBA" if image.mode in {"RGBA", "LA"} else "RGB"
+        image.convert(mode).save(target, "WEBP", quality=80)
+        webp = target.getvalue()
+    tmp = cache_path.with_name(f"{cache_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_bytes(webp)
+        tmp.replace(cache_path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+    return Response(webp, media_type="image/webp", headers=headers)
 
 
 def _require_target_project(st, project_id: str, user: dict) -> dict:
@@ -157,6 +237,7 @@ def batch_move_assets(body: dict, request: Request, user=Depends(current_user), 
 def delete_asset(asset_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
     asset = own(st, "assets", asset_id, user)
     delete_asset_file(asset)
+    _delete_asset_thumbs(asset)
     st.delete("assets", asset_id, user["id"])
     return ok({"deleted": True}, request)
 
@@ -171,6 +252,7 @@ def batch_delete_assets(body: dict, request: Request, user=Depends(current_user)
     deleted_ids = []
     for asset in assets:
         delete_asset_file(asset)
+        _delete_asset_thumbs(asset)
         st.delete("assets", asset["id"], user["id"])
         deleted_ids.append(asset["id"])
     return ok({"deleted": len(deleted_ids), "ids": deleted_ids}, request)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from urllib.parse import quote
 
 import httpx
@@ -13,6 +14,17 @@ from .common import APIError, current_user, ok
 from .gpu import native_outputs
 
 router = APIRouter(prefix="/api/gpu/native/outputs")
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    if not header:
+        return False
+    target = etag.removeprefix("W/").strip()
+    for part in header.split(","):
+        token = part.strip()
+        if token == "*" or token == etag or token.removeprefix("W/").strip() == target:
+            return True
+    return False
 
 
 def _content_disposition(filename: str) -> str:
@@ -83,10 +95,19 @@ async def output_thumbnail(
         user["id"],
         file_id,
     )
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    etag = f'W/"native-thumb-{file_id[:32]}-{digest}"'
+    headers = {
+        "Cache-Control": "private, max-age=86400",
+        "ETag": etag,
+        "Vary": "Cookie, Authorization",
+    }
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
     return Response(
         data,
         media_type=media_type,
-        headers={"Cache-Control": "private, max-age=86400"},
+        headers=headers,
     )
 
 
@@ -112,6 +133,9 @@ async def output_content(
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match and not range_header:
+        headers["If-None-Match"] = if_none_match
     url = f"{base_url}/files/{quote(file_id, safe='')}?alt=media"
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=15.0))
@@ -122,6 +146,18 @@ async def output_content(
         await client.aclose()
         raise APIError("DRIVE_STREAM_FAILED", "连接 Google Drive 流式读取失败", 502, True) from exc
 
+    if upstream.status_code == 304:
+        not_modified_headers: dict[str, str] = {
+            "Cache-Control": "private, max-age=3600",
+            "Vary": "Cookie, Authorization",
+        }
+        etag_val = upstream.headers.get("etag")
+        if etag_val:
+            not_modified_headers["ETag"] = etag_val
+        await upstream.aclose()
+        await client.aclose()
+        return Response(status_code=304, headers=not_modified_headers)
+
     if upstream.status_code not in {200, 206}:
         status = upstream.status_code
         await upstream.aclose()
@@ -131,6 +167,7 @@ async def output_content(
     resp_headers: dict[str, str] = {
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=3600",
+        "Vary": "Cookie, Authorization",
         "Content-Disposition": (
             _content_disposition(item["filename"]).replace("inline;", "attachment;", 1)
             if download

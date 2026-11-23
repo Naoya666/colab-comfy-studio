@@ -331,7 +331,8 @@ export const deleteGpuPreset = (id: string) =>
 export async function createGpuJob(body: GpuJobRequest, idempotencyKey: string): Promise<GpuJob> {
   return apiFetch<GpuJob>('/api/gpu/jobs', { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(body) });
 }
-export const getGpuJobs = (projectId?: string) => apiFetch<GpuJob[]>(projectId ? `/api/gpu/jobs?project_id=${encodeURIComponent(projectId)}` : '/api/gpu/jobs');
+export const getGpuJobs = (projectId?: string, signal?: AbortSignal) =>
+  apiFetch<GpuJob[]>(projectId ? `/api/gpu/jobs?project_id=${encodeURIComponent(projectId)}` : '/api/gpu/jobs', { signal });
 export const getGpuJob = (id: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}`);
 export const cancelGpuJob = (id: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/cancel`, post({}));
 export const retryGpuJob = (id: string, idempotencyKey: string) => apiFetch<GpuJob>(`/api/gpu/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify({}) });
@@ -339,8 +340,9 @@ export const clearGpuJobHistory = (body: { project_id?: string; scope?: 'all_ter
   apiFetch<{ cleared: number }>('/api/gpu/jobs/history/clear', post(body));
 export const clearCreationWarmups = () =>
   apiFetch<{ cleared: number }>('/api/gpu/creation-api/warmups/clear', post({}));
-export const getGpuGallery = (projectId?: string) => apiFetch<GalleryAsset[]>(projectId ? `/api/gpu/gallery?project_id=${encodeURIComponent(projectId)}` : '/api/gpu/gallery');
-export const getGpuUsage = () => apiFetch<GpuUsage>('/api/gpu/usage', { cache: 'no-store' });
+export const getGpuGallery = (projectId?: string, signal?: AbortSignal) =>
+  apiFetch<GalleryAsset[]>(projectId ? `/api/gpu/gallery?project_id=${encodeURIComponent(projectId)}` : '/api/gpu/gallery', { signal });
+export const getGpuUsage = (signal?: AbortSignal) => apiFetch<GpuUsage>('/api/gpu/usage', { cache: 'no-store', signal });
 export const saveCuGuard = (limits: Pick<CuGuard, 'daily_limit_cu' | 'min_balance_cu'>) =>
   apiFetch<CuGuard>('/api/gpu/cu/guard', { method: 'PUT', body: JSON.stringify(limits) });
 export function getCuSessions({
@@ -396,7 +398,7 @@ export const disconnectGoogle = (purpose: 'drive' | 'colab') => apiFetch<Record<
 
 // v0.2.0 account/instance/workbench contract. All mutating calls receive the
 // stable idempotency key from the caller; the client never generates one.
-export const getGoogleAccounts = () => apiFetch<GoogleAccount[]>('/api/gpu/accounts');
+export const getGoogleAccounts = (signal?: AbortSignal) => apiFetch<GoogleAccount[]>('/api/gpu/accounts', { signal });
 export const createGoogleAccount = (body: GoogleAccountCreateRequest, idempotencyKey: string) =>
   apiFetch<GoogleAccount>('/api/gpu/accounts', write('POST', body, idempotencyKey));
 export const updateGoogleAccount = (accountId: string, body: GoogleAccountUpdateRequest, idempotencyKey: string) =>
@@ -452,13 +454,13 @@ export const importColabCliCredentials = (
 export const getAccountRuntimes = (accountId: string) =>
   apiFetch<AccountRuntime[]>(`/api/gpu/accounts/${encodeURIComponent(accountId)}/runtimes`);
 
-export const listGpuInstances = (filters: GpuInstanceFilters = {}) => {
+export const listGpuInstances = (filters: GpuInstanceFilters = {}, signal?: AbortSignal) => {
   const query = new URLSearchParams();
   if (filters.state) query.set('state', filters.state);
   if (filters.account_id) query.set('account_id', filters.account_id);
   if (filters.provider) query.set('provider', filters.provider);
   const suffix = query.toString() ? `?${query.toString()}` : '';
-  return apiFetch<GpuInstance[]>(`/api/gpu/instances${suffix}`);
+  return apiFetch<GpuInstance[]>(`/api/gpu/instances${suffix}`, { signal });
 };
 export const getGpuInstance = (instanceId: string) =>
   apiFetch<GpuInstance>(`/api/gpu/instances/${encodeURIComponent(instanceId)}`);
@@ -673,7 +675,7 @@ export interface GpuSpecDiscoverResult extends GpuSpecOrderSettings {
   errors: Array<{ account_id: string | null; error: string }>;
 }
 
-export const getGpuSpecOrder = () => apiFetch<GpuSpecOrderSettings>('/api/gpu/settings/gpu-order', { cache: 'no-store' });
+export const getGpuSpecOrder = (signal?: AbortSignal) => apiFetch<GpuSpecOrderSettings>('/api/gpu/settings/gpu-order', { cache: 'no-store', signal });
 export const saveGpuSpecOrder = (orderedSpecs: GpuSpecKey[]) =>
   apiFetch<GpuSpecOrderSettings>('/api/gpu/settings/gpu-order', {
     method: 'PUT',

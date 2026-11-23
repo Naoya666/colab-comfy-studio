@@ -5,6 +5,7 @@ import {
   getCuDaily,
   getCuSessions,
   type CuDailyEntry,
+  type CuDailyPage,
   type CuSession,
   type CuSessionKind,
   type GpuUsage,
@@ -460,16 +461,16 @@ export function CuSessionDetails({ usage }: { usage: GpuUsage | null }) {
   const useDefaultDaily = !dailyStartDate && !dailyEndDate && dailyOffset === 0;
   const hasDailyDateFilter = Boolean(dailyStartDate) || Boolean(dailyEndDate);
   const dailyModified = dailyStartDate !== default7d.start || dailyEndDate !== default7d.end;
-  const { page: dailyPage, loading: dailyLoading, error: dailyRequestError } = useCuPage(
-    getCuDaily, { kind: 'all', startDate: dailyStartDate, endDate: dailyEndDate, offset: dailyOffset },
-    tab === 'daily' && !useDefaultDaily && !dailyRangeInvalid, usageRefreshKey, setDailyOffset,
-  );
-  const dailyError = dailyRangeInvalid ? '起始日期不能晚于终止日期' : dailyRequestError;
 
-  // Separate unpaginated daily fetch for the SVG trend chart when filtered.
-  const [chartState, setChartState] = useState<{ key: string; days: CuDailyEntry[]; loading: boolean }>({
+  // Single daily fetch (up to 90 days) drives both the SVG trend chart and the first 90 items of the list,
+  // avoiding firing two identical /api/gpu/cu/daily requests for the same date range.
+  const [chartState, setChartState] = useState<{
+    key: string;
+    page?: CuDailyPage;
+    loading: boolean;
+    error?: string;
+  }>({
     key: '',
-    days: [],
     loading: false,
   });
   const chartQueryKey = `${dailyStartDate}:${dailyEndDate}:${usageRefreshKey}`;
@@ -477,25 +478,44 @@ export function CuSessionDetails({ usage }: { usage: GpuUsage | null }) {
   useEffect(() => {
     if (!chartNeedsFetch) return;
     const controller = new AbortController();
-    setChartState((prev) => ({ key: chartQueryKey, days: prev.key === chartQueryKey ? prev.days : [], loading: true }));
+    setChartState((prev) => ({
+      key: chartQueryKey,
+      page: prev.key === chartQueryKey ? prev.page : undefined,
+      loading: true,
+    }));
     void getCuDaily({ startDate: dailyStartDate, endDate: dailyEndDate, limit: 90, offset: 0 }, controller.signal).then(
       (page) => {
         if (!controller.signal.aborted) {
-          setChartState({ key: chartQueryKey, days: page.days, loading: false });
+          setChartState({ key: chartQueryKey, page, loading: false });
         }
       },
-      () => {
+      (cause) => {
         if (!controller.signal.aborted) {
-          setChartState((prev) => ({ ...prev, loading: false }));
+          setChartState((prev) => ({ ...prev, loading: false, error: apiMessage(cause) }));
         }
       },
     );
     return () => controller.abort();
   }, [chartNeedsFetch, chartQueryKey, dailyStartDate, dailyEndDate]);
 
+  const chartSliceCoversPage = chartNeedsFetch && dailyOffset + PAGE_SIZE <= 90;
+  const { page: pagedDaily, loading: pagedDailyLoading, error: pagedDailyError } = useCuPage(
+    getCuDaily, { kind: 'all', startDate: dailyStartDate, endDate: dailyEndDate, offset: dailyOffset },
+    tab === 'daily' && !useDefaultDaily && !dailyRangeInvalid && !chartSliceCoversPage, usageRefreshKey, setDailyOffset,
+  );
+  const chartPageForKey = chartState.key === chartQueryKey ? chartState.page : undefined;
+  const dailyPage: CuDailyPage | undefined = chartSliceCoversPage
+    ? (chartPageForKey
+      ? { ...chartPageForKey, days: chartPageForKey.days.slice(dailyOffset, dailyOffset + PAGE_SIZE), limit: PAGE_SIZE, offset: dailyOffset }
+      : undefined)
+    : pagedDaily;
+  const dailyLoading = chartSliceCoversPage ? (chartNeedsFetch && chartState.loading) : pagedDailyLoading;
+  const dailyRequestError = chartSliceCoversPage ? (chartState.key === chartQueryKey ? chartState.error : undefined) : pagedDailyError;
+  const dailyError = dailyRangeInvalid ? '起始日期不能晚于终止日期' : dailyRequestError;
+
   const chartDays: CuDailyEntry[] = !hasDailyDateFilter
     ? (usage?.daily_history || [])
-    : (chartState.key === chartQueryKey && chartState.days.length ? chartState.days : (dailyPage?.days || []));
+    : (chartPageForKey?.days || dailyPage?.days || []);
   const chartLoading = chartNeedsFetch && chartState.loading;
 
   const defaultDailySummary = useMemo(() => {

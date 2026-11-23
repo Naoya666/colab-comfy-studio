@@ -4,6 +4,7 @@ import { getInstanceHistory, type InstanceHistory, type InstanceHistoryJob } fro
 import { formatDuration, formatTiming, timingRows, type TimingDetail } from '../lib/job-history';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
 import { gpuLabel } from '../lib/gpu-label';
+import { useSmartPoll } from '../lib/smart-poll';
 import type { GpuInstance } from './AccountDirectory';
 import { WorkflowGraphPreview, type WorkflowGraphPreviewData } from './WorkflowGraphPreview';
 import styles from './v020.module.css';
@@ -103,46 +104,56 @@ export function InstanceWorkbench({ instance, api, onBack, onQueued }: InstanceW
   const requestGeneration = useRef(0);
   const id = instanceId(instance);
 
-  useEffect(() => {
-    const generation = ++requestGeneration.current;
-    let active = true;
-    setData(null); setHistory(null); setWorkflow(''); setValues({}); setPreviewWorkflow(null); setBusy(null);
-    setStatus(''); setError(''); setHistoryError(''); setHistoryLoading(Boolean(id));
-    if (!id) { setHistoryLoading(false); return () => { active = false; }; }
-
-    const current = () => active && generation === requestGeneration.current;
-    const loadLive = async (silent = false) => {
-      try {
-        const next = recordPayload(await workbenchApi.getInstanceWorkbench(id));
+  const loadWorkbenchData = useCallback(async (targetId: string, generation: number, silent: boolean) => {
+    const current = () => generation === requestGeneration.current;
+    await Promise.all([
+      workbenchApi.getInstanceWorkbench(targetId).then((raw) => {
+        const next = recordPayload(raw);
         if (!current()) return;
         setData(next);
         setWorkflow((old) => old || (next.allowed_workflows?.[0] ? workflowIdentity(next.allowed_workflows[0]) : ''));
         setValues((old) => Object.keys(old).length ? old : { ...(next.values || {}) });
         if (!silent) setStatus('工作台状态已刷新。');
-      } catch (cause) {
+      }).catch((cause) => {
         if (current() && !silent) setError(apiMessage(cause));
-      }
-    };
-    const loadHistory = async () => {
-      try {
-        const next = historyPayload(await workbenchApi.getInstanceHistory(id));
+      }),
+      workbenchApi.getInstanceHistory(targetId).then((raw) => {
+        const next = historyPayload(raw);
         if (current()) setHistory(next);
-      } catch (cause) {
+      }).catch((cause) => {
         if (current()) setHistoryError(apiMessage(cause));
-      } finally {
+      }).finally(() => {
         if (current()) setHistoryLoading(false);
-      }
-    };
-    void loadLive();
-    void loadHistory();
-    const timer = window.setInterval(() => { void loadLive(true); void loadHistory(); }, 8000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [id, workbenchApi]);
+      }),
+    ]);
+  }, [workbenchApi]);
+
+  useEffect(() => {
+    const generation = ++requestGeneration.current;
+    setData(null); setHistory(null); setWorkflow(''); setValues({}); setPreviewWorkflow(null); setBusy(null);
+    setStatus(''); setError(''); setHistoryError(''); setHistoryLoading(Boolean(id));
+    if (!id) { setHistoryLoading(false); return; }
+    void loadWorkbenchData(id, generation, false);
+  }, [id, loadWorkbenchData]);
 
   const workflows = data?.allowed_workflows || [];
   const selected = workflows.find((item) => workflowIdentity(item) === workflow);
   const parameters = selected?.parameters || data?.parameters || [];
   const readOnly = historyOnly(instance, data || undefined);
+
+  useSmartPoll(
+    useCallback(async () => {
+      if (!id) return;
+      await loadWorkbenchData(id, requestGeneration.current, true);
+    }, [id, loadWorkbenchData]),
+    {
+      enabled: Boolean(id) && !readOnly,
+      active: true,
+      activeMs: 8000,
+      idleMs: 20000,
+      immediate: false,
+    },
+  );
   const canQueue = !readOnly && data?.capabilities?.includes('queue_reviewed_workflow') === true && Boolean(selected);
   const canSetParams = !readOnly && data?.capabilities?.includes('set_reviewed_params') === true && Boolean(selected);
 

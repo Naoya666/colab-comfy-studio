@@ -172,21 +172,16 @@ export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: 
   }, [applyLoadedStatus]);
 
   const hasPollableWarmups = warmups.some(job => !finished.has(job.state) || job.ready) || poolInstances.length > 0;
-  const pollWarmups = useCallback(async () => {
-    const pending = warmups.filter(job => !finished.has(job.state) || job.ready);
+  const pollWarmups = useCallback(async (signal?: AbortSignal) => {
     try {
-      const [rows, refreshed] = await Promise.all([
-        pending.length ? Promise.all(pending.map(job => apiFetch<Warmup>(`${prefix}/warmups/${job.id}`))) : Promise.resolve([]),
-        apiFetch<Status>(prefix),
-      ]);
-      if (rows.length) {
-        setWarmups(current => current.map(job => rows.find(row => row.id === job.id) || job));
-      }
+      const refreshed = await apiFetch<Status>(prefix, { signal });
+      if (signal?.aborted) return;
+      setWarmups(refreshed.warmups || []);
       setPoolInstances(refreshed.pool_instances || []);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (!signal?.aborted) setError(e instanceof Error ? e.message : String(e));
     }
-  }, [warmups]);
+  }, []);
 
   useSmartPoll(pollWarmups, {
     enabled: hasPollableWarmups,
