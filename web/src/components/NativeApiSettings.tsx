@@ -1,5 +1,6 @@
 import { useRef, useState, type FormEvent } from 'react';
 import { apiFetch, apiMessage } from '../lib/gpu-api';
+import { countDistinctDriveAccounts } from '../lib/allocation-retry-copy';
 import type { GpuAccount } from './AccountDirectory';
 import { NativeModelSettings, type ModelStorage } from './NativeModelSettings';
 import { WorkflowGpuSelection } from './WorkflowGpuSelection';
@@ -381,13 +382,18 @@ export function NativeApiSettings({ accounts }: { accounts: GpuAccount[] }) {
           </label>
           {policy.auto_start && <>
             <label className="field">默认 Google 账号
-              <select value={policy.account_id || ''} required onChange={event => changePolicy({ account_id: event.target.value || null, gpu: null })}>
-                <option value="">选择账号</option>
+              <select value={policy.account_id || ''} onChange={event => changePolicy({ account_id: event.target.value || null })}>
+                <option value="">自动选择账号（多账号轮换）</option>
                 {configuredAccounts.map(account => <option key={account.account_id} value={account.account_id}>{account.alias || account.account_id}</option>)}
               </select>
             </label>
-            {policy.account_id && <WorkflowGpuSelection manifest={null} accountId={policy.account_id} value={policy.gpu}
-              label="API 默认 GPU" onChange={gpu => changePolicy({ gpu })} />}
+            {!policy.account_id && countDistinctDriveAccounts(configuredAccounts) > 1 && (
+              <p className="status" role="status">
+                提示：自动选择账号会在所有可用账号间轮换；建议在「设置 → Google 账号」将小号存储盘绑定到主号，以确保 API 自动开机挂载一致的工作区与插件。
+              </p>
+            )}
+            <WorkflowGpuSelection manifest={null} accountId={policy.account_id} value={policy.gpu}
+              label="API 默认 GPU" onChange={gpu => changePolicy({ gpu })} />
           </>}
           <NativeModelSettings value={policy} onChange={changePolicy} />
           <label className="field">空闲回收时间（分钟）
@@ -399,7 +405,7 @@ export function NativeApiSettings({ accounts }: { accounts: GpuAccount[] }) {
               onChange={event => changePolicy({ max_runtime_minutes: Number(event.target.value) })} />
           </label>
           <p className="muted small">这些设置用于 API 新启动的会话。生成和同步完成后开始计算空闲时间。到期后停止接收新任务。</p>
-          <button className="button" disabled={pending || (policy.auto_start && (!policy.account_id || !policy.gpu))}>保存接入与启动设置</button>
+          <button className="button" disabled={pending || (policy.auto_start && (!policy.gpu || (!policy.account_id && configuredAccounts.length === 0)))}>保存接入与启动设置</button>
         </form>
 
         {isStrictMode ? (

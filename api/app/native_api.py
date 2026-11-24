@@ -82,12 +82,27 @@ def validate_policy(repo, owner, body):
             raise APIError("NATIVE_API_INPUT", f"{field} 必须为正整数（分钟）")
         timeouts[field] = value
     account, gpu = merged.get("account_id"), merged.get("gpu")
+    if isinstance(account, str):
+        account = account.strip() or None
+    elif account is not None:
+        raise APIError("NATIVE_API_INPUT", "Google 账号参数无效")
     if merged["auto_start"]:
         from .compute_routes import _require_account
 
-        if not account:
-            raise APIError("NATIVE_API_INPUT", "请选择自动启动使用的 Google 账号")
-        _require_account(repo, owner, account)
+        if account:
+            _require_account(repo, owner, account)
+        else:
+            from .admission import _account_is_usable, _google_status
+
+            all_accounts = repo.list("accounts", owner)
+            usable = [row.get("account_id") or row["id"] for row in all_accounts if _account_is_usable(row)]
+            if not usable:
+                raise APIError("NATIVE_API_INPUT", "没有已授权且允许分配的 Google 账号，无法启用自动启动")
+            creds = repo.list("credentials", owner)
+            if any(c.get("purpose") == "colab" for c in creds):
+                connected = [aid for aid in usable if _google_status(repo, owner, aid)["colab"]["connected"]]
+                if not connected:
+                    raise APIError("NATIVE_API_INPUT", "请先授权至少一个 Google Colab 账号后再启用自动启动")
         try:
             gpu = spec_key(gpu)
             if gpu["variant"] != "VARIANT_GPU":

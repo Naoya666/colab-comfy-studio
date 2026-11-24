@@ -508,9 +508,15 @@ def _validate_admit_request(repo, owner, body, key):
     generation = body.get("plugin_generation")
     if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
         raise APIError("NATIVE_INPUT", "plugin_generation 必须为历史清单的 64 位 SHA256", 422)
-    account = body.get("account_id")
-    if not isinstance(account, str) or not account.strip() or not isinstance(body.get("spec"), dict):
-        raise APIError("NATIVE_INPUT", "请选择账号和 GPU 规格", 422)
+    raw_account = body.get("account_id")
+    if raw_account is None or raw_account == "":
+        account = None
+    elif isinstance(raw_account, str) and raw_account.strip():
+        account = raw_account.strip()
+    else:
+        raise APIError("NATIVE_INPUT", "请选择有效的账号或使用自动选择账号", 422)
+    if not isinstance(body.get("spec"), dict):
+        raise APIError("NATIVE_INPUT", "请选择 GPU 规格", 422)
     return cfg, timeouts, storage, commit, account
 
 
@@ -553,10 +559,14 @@ def _admit_locked(
             return source
         from .specs import spec_key
         try:
-            same_spec = source and spec_key(source.get("requested_spec")) == spec_key(body["spec"])
+            source_spec = source.get("initial_requested_spec") or source.get("requested_spec") if source else None
+            same_spec = bool(source and source_spec and spec_key(source_spec) == spec_key(body["spec"]))
         except ValueError:
             same_spec = False
-        if not source or source.get("account_id") != account or not same_spec:
+        same_account = (account is None) or bool(
+            source and (source.get("account_id") or source.get("requested_account_id")) == account
+        )
+        if not source or not same_account or not same_spec:
             raise APIError("NATIVE_ACTIVE", "已有原生会话；请等待任务和同步完成后停止旧实例，再切换 GPU", 409)
         policy = source.get("execution_policy") or {}
         if any(field in body and timeouts[field] != policy.get(field, default)
@@ -583,7 +593,20 @@ def _admit_locked(
     if inflight_plan and inflight_plan.get("state") in {"dispatching", "cancelling"}:
         raise APIError("NATIVE_ACTIVE", "原生 ComfyUI 自动恢复正在推进或取消中，请稍后重试", 409)
     from app.compute_routes import _require_account
-    _require_account(repo, owner, account)
+    if account is not None:
+        _require_account(repo, owner, account)
+    else:
+        from app.admission import _account_is_usable, _google_status
+
+        all_accounts = repo.list("accounts", owner)
+        usable = [row.get("account_id") or row["id"] for row in all_accounts if _account_is_usable(row)]
+        if not usable:
+            raise APIError("ACCOUNT_UNAVAILABLE", "没有已授权且允许分配的 Google 账号", 409)
+        creds = repo.list("credentials", owner)
+        if any(c.get("purpose") == "colab" for c in creds):
+            connected = [aid for aid in usable if _google_status(repo, owner, aid)["colab"]["connected"]]
+            if not connected:
+                raise APIError("GOOGLE_NOT_CONNECTED", "请先授权至少一个 Google Colab 账号", 409)
     if cancel_recovery_plan:
         with repo.store.db_lock(), repo.store.Session.begin() as session:
             repo.store.begin_immediate(session)
@@ -602,7 +625,9 @@ def _admit_locked(
         "instance_pool": "native",
         "native_request_hash": digest(body), "project_id": project, "provider": "colab",
         "account_id": account, "requested_account_id": account,
+        "auto_select_account": account is None,
         "requested_instance_id": None, "requested_spec": body["spec"],
+        "initial_requested_spec": body["spec"],
         "lifecycle": "retain", "execution_policy": policy,
         "model_id": "native-comfy", "workflow_key": "system/native-comfy", "workflow_version": 1,
         "max_runtime_minutes": timeouts["max_runtime_minutes"], "unit_rate": rate,

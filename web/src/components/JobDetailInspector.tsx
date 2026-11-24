@@ -4,6 +4,7 @@ import type { GpuJob, GpuWorkflow } from '../lib/gpu-api';
 import { formatInstanceTime } from '../lib/instance-time';
 import { jobDetailTimings, paramRows, stageSecondsTotal, taskStatusNote } from '../lib/job-detail-copy';
 import { jobErrorMessage, jobErrorRows } from '../lib/job-error-copy';
+import { formatAllocationRetryHeadline, formatRetrySpec } from '../lib/allocation-retry-copy';
 import { jobStateLabel } from '../lib/job-stage-rows';
 import { gpuLabel } from '../lib/gpu-label';
 import { shown } from '../lib/create-runtime-prefs';
@@ -65,6 +66,40 @@ export function JobDetailInspector({
             <dt>GPU</dt><dd>{gpuLabel(inspectedJob)}</dd>
             <dt>创建时间</dt><dd>{formatInstanceTime(inspectedJob.created_at)}</dd>
           </dl>
+          {inspectedJob.allocation_retry && (
+            <details className="foldable" open={Boolean(inspectedJob.allocation_retry.active || ['exhausted', 'aborted'].includes(inspectedJob.allocation_retry.phase || ''))}>
+              <summary>
+                自动排队抢卡（已尝试 {inspectedJob.allocation_retry.attempt ?? 1} 次 · 重试 {inspectedJob.allocation_retry.retries_used ?? 0}/{inspectedJob.allocation_retry.max_retries ?? 20}）
+              </summary>
+              <div className="foldContent">
+                <p className={inspectedJob.allocation_retry.active ? styles.retryInlineNote : 'muted small'}>
+                  {formatAllocationRetryHeadline(inspectedJob.allocation_retry)}
+                </p>
+                {inspectedJob.allocation_retry.candidate_specs && inspectedJob.allocation_retry.candidate_specs.length > 0 && (
+                  <p className="muted small">
+                    候选显卡顺序：{inspectedJob.allocation_retry.candidate_specs.map((s) => formatRetrySpec(s)).join(' → ')}
+                  </p>
+                )}
+                {inspectedJob.allocation_retry.excluded_accounts && Object.keys(inspectedJob.allocation_retry.excluded_accounts).length > 0 && (
+                  <p className="muted small">
+                    已移出账号：{Object.values(inspectedJob.allocation_retry.excluded_accounts).map((item) => `${item.alias || '账号'}（${item.code || '异常'}）`).join('、')}
+                  </p>
+                )}
+                {Array.isArray(inspectedJob.allocation_retry.history) && inspectedJob.allocation_retry.history.length > 0 && (
+                  <ul className={styles.activityLogList}>
+                    {inspectedJob.allocation_retry.history.map((entry, idx) => (
+                      <li key={`${entry.attempt}-${idx}`} className={styles.activityLogItem}>
+                        <span className={styles.activityLogText}>
+                          第 {entry.attempt} 次 · {entry.account_alias || entry.account_id || '账号'} · {formatRetrySpec(entry.spec)} · {entry.error_code || '失败'}
+                          {entry.error_message ? `：${entry.error_message}` : ''}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </details>
+          )}
           {(failureMessage || failureRows.length > 0) && (
             <details className="foldable" open>
               <summary>失败诊断</summary>

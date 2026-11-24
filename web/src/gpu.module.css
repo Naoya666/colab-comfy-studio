@@ -4237,6 +4237,76 @@
   border-radius: var(--r-md, 12px);
   background: var(--card);
 }
+
+/* Auto-Queue GPU Allocation Retry settings & status */
+.retryToggleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 0.92rem;
+}
+.retryPoolFieldset {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 12px);
+  padding: 12px 14px;
+  margin: 0;
+  display: grid;
+  gap: 10px;
+  background: var(--bg);
+}
+.retryPoolHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.retryPoolHead legend {
+  font-size: 0.86rem;
+  font-weight: 600;
+  padding: 0;
+  margin: 0;
+}
+.retryPoolQuickActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.retryPoolGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
+  gap: 8px;
+}
+.retryPoolChip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm, 8px);
+  background: var(--card);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.retryPoolChip[data-checked="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--card));
+}
+.retryFieldsRow {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.retryInlineNote {
+  font-size: 0.84rem;
+  color: var(--ink-2, var(--muted));
+  padding: 8px 10px;
+  border-radius: var(--r-sm, 8px);
+  border: 1px solid var(--warning-line, rgba(255, 210, 125, 0.45));
+  background: var(--warning-bg, rgba(255, 210, 125, 0.08));
+}
 .recoveryRestoreHead {
   display: flex;
   align-items: center;

@@ -45,6 +45,10 @@ MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 _MAX_STALLED_JOB_DEFERRALS = 8
 
 
+class SpecIneligibleError(ComputeError):
+    """Requested GPU spec is not in the current account's eligible runtime specs."""
+
+
 # Stage markers written by runtime_worker.py into status.json while a job is running.
 _STAGE_TEXT = {
     "native_environment": "初始化原生 ComfyUI 和节点依赖",
@@ -250,7 +254,19 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             runtime = self._effective_runtime(job)
             self._check_cu(job)
             provider = self._provider(job)
-            if self._provider_name(job) != "mock" and job.get("requested_spec") and not job.get("creation_fingerprint"):
+            from .allocation_retry import allocation_retry_settings
+
+            retry_enabled = bool(
+                job.get("owner_id")
+                and allocation_retry_settings(self.db_store, job["owner_id"]).get("enabled")
+            )
+            if (
+                self._provider_name(job) != "mock"
+                and job.get("requested_spec")
+                and not job.get("creation_fingerprint")
+                and not (job.get("auto_select_account") is True and not job.get("account_id"))
+                and not retry_enabled
+            ):
                 try:
                     self._select_spec(job, provider)
                 except ProviderUnavailable as exc:
@@ -499,6 +515,8 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
     def _select_spec(self, job: dict, provider: Any) -> dict:
         try:
             specs = provider.list_specs()
+        except ColabError:
+            raise
         except Exception as exc:
             raise ComputeError(self._safe_error(exc)) from exc
         requested = job.get("requested_spec") or (job.get("execution_policy") or {}).get("requested_spec")
@@ -524,7 +542,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 if not prep and not smoke:
                     check_requirements(snapshot.get("manifest") or {}, spec)
                 return spec
-        raise ComputeError("请求的 GPU 规格无申请资格或当前不可用；未切换其他 GPU：" + str(requested_key))
+        raise SpecIneligibleError("请求的 GPU 规格无申请资格或当前不可用；未切换其他 GPU：" + str(requested_key))
 
     def _recover_unknown_create(self, job: dict, lease: dict, provider: Any) -> str | bool:
         """Reconcile a create that may have succeeded before its response was lost."""
@@ -670,6 +688,9 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             job, lease = self._bind_instance_lease(job, lease)
         except SchedulerError as exc:
             return self._begin_failure(job, "gpu_instance_conflict", str(exc))
+        from . import allocation_retry
+
+        job = allocation_retry.sync_attempt_state(self.store, job, now=self.clock())
         if job.get("recovery_plan_id"):
             from . import recovery
 
@@ -697,6 +718,24 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             )
         except ProviderUnavailable as exc:
             return self._begin_failure(job, "gpu_provider_unavailable", self._safe_error(exc))
+        except ColabError as exc:
+            diag = self._error_diagnostics(
+                exc,
+                fallback_code="gpu_provider_unavailable",
+                fallback_phase=exc.phase or "list_specs",
+            )
+            return self._begin_failure(job, diag["error_code"], self._safe_error(exc), error_details=diag)
+        except SpecIneligibleError as exc:
+            return self._begin_failure(
+                job,
+                "gpu_spec_invalid",
+                self._safe_error(exc),
+                error_details={
+                    "error_code": "gpu_spec_invalid",
+                    "category": "spec_ineligible",
+                    "phase": "select_spec",
+                },
+            )
         except Exception as exc:
             return self._begin_failure(job, "gpu_spec_invalid", self._safe_error(exc))
         attempts = int(lease.get("create_attempts") or 0)
@@ -876,19 +915,39 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 diag["reconciling"] = False
                 return self._begin_failure(job, diag["error_code"], safe_msg, error_details=diag)
             return job
+        now_alloc = self.clock()
+        lease_ready_patch: dict[str, Any] = {
+            "state": "active",
+            "handle": handle,
+            "last_create_error": None,
+            "last_create_diagnostics": None,
+            "last_seen": now_alloc,
+        }
+        job_deadline_patch: dict[str, Any] = {}
+        if job.get("recovery_source") != "auto_recovery":
+            if (job.get("snapshot") or {}).get("native_comfy"):
+                fresh_deadline = now_alloc + self._effective_runtime(job) * 60
+                lease_ready_patch["deadline_epoch"] = fresh_deadline
+                lease_ready_patch["hard_deadline_at"] = fresh_deadline
+                job_deadline_patch["native_session_deadline_epoch"] = fresh_deadline
+                job_deadline_patch["hard_deadline_at"] = fresh_deadline
+                if job.get("instance_id"):
+                    self._update("instances", job["instance_id"], {"hard_deadline_at": fresh_deadline}, job.get("owner_id"))
+            elif job.get("generation_timeouts") or job.get("creation_fingerprint"):
+                fresh_task_deadline = now_alloc + self._effective_runtime(job) * 60
+                hard_cap = job.get("hard_deadline_at")
+                if hard_cap is not None:
+                    fresh_task_deadline = min(fresh_task_deadline, float(hard_cap))
+                job_deadline_patch["task_deadline_epoch"] = fresh_task_deadline
+                if lease.get("generation_timeouts") and lease.get("hard_deadline_at") is None:
+                    lease_ready_patch["deadline_epoch"] = fresh_task_deadline
         lease = self._update(
             "leases",
             lease["id"],
-            {
-                "state": "active",
-                "handle": handle,
-                "last_create_error": None,
-                "last_create_diagnostics": None,
-                "last_seen": self.clock(),
-            },
+            lease_ready_patch,
             job.get("owner_id"),
         )
-        ccu.open_instance_session(self.store, job, lease, self.clock())
+        ccu.open_instance_session(self.store, job, lease, now_alloc)
         return self._set_state(
             job,
             "preparing",
@@ -896,8 +955,9 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             request_id=lease["request_id"],
             runtime_id=lease["runtime_id"],
             deadline_epoch=lease["deadline_epoch"],
-            started_epoch=self.clock(),
-            started_at=self.clock(),
+            started_epoch=now_alloc,
+            started_at=now_alloc,
+            **job_deadline_patch,
         )
 
     def _begin_failure(
@@ -1014,6 +1074,54 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     requested_outcome="cancelled",
                 )
             job = self._mark_instance("mark_ready", job)
+            job = self._update("jobs", job["id"], {"allocation_confirmed_ready": True}, job.get("owner_id"))
+            if job.get("allocation_retry"):
+                from . import allocation_retry
+
+                job = allocation_retry.mark_succeeded(
+                    self.store, job, now=self.clock(), actual_spec=reported or job.get("requested_spec")
+                )
+                # If a batch leader fell back to a different GPU spec, align waiting sibling jobs
+                # in the same batch so they seamlessly reuse the leader's warm VM.
+                if job.get("batch_id") and job.get("requested_spec") and job.get("requested_spec") != job.get("initial_requested_spec"):
+                    resolved_spec = job["requested_spec"]
+                    resolved_key = resolved_spec.get("key", resolved_spec) if isinstance(resolved_spec, dict) else None
+                    if isinstance(resolved_key, dict):
+                        from .specs import (
+                            check_requirements,
+                            gpu_spec_order_settings,
+                            is_below_workflow_default,
+                        )
+
+                        order = gpu_spec_order_settings(self.db_store, job["owner_id"])["ordered_specs"]
+                        for sibling in self._list("jobs", job["owner_id"]):
+                            if (
+                                sibling["id"] == job["id"]
+                                or sibling.get("batch_id") != job["batch_id"]
+                                or sibling.get("state") not in {"queued", "validating", "waiting_for_capacity"}
+                                or sibling.get("instance_id")
+                            ):
+                                continue
+                            sib_snap = dict(sibling.get("snapshot") or {})
+                            sib_manifest = sib_snap.get("manifest") or {}
+                            try:
+                                if sib_manifest:
+                                    check_requirements(dict(sib_manifest), {"key": resolved_key})
+                                    if is_below_workflow_default(sib_manifest, resolved_key, order):
+                                        continue
+                            except ValueError:
+                                continue
+                            sib_snap["runtime_compute_spec"] = dict(resolved_key)
+                            self._update(
+                                "jobs",
+                                sibling["id"],
+                                {
+                                    "requested_spec": {"key": dict(resolved_key)},
+                                    "snapshot": sib_snap,
+                                    "unit_rate": job.get("unit_rate"),
+                                },
+                                job["owner_id"],
+                            )
             if job.get("recovery_plan_id") and job.get("instance_id"):
                 from . import recovery
 
@@ -1887,6 +1995,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 deferred = recovery.maybe_defer_retry_job_after_cleanup(self.store, job, None, self.clock())
                 if deferred is not None:
                     return deferred
+            if final_state == "failed" and not job.get("recovery_plan_id"):
+                from . import allocation_retry
+
+                deferred_alloc = allocation_retry.maybe_defer_allocation_retry(self.store, job, None, self.clock())
+                if deferred_alloc is not None:
+                    return deferred_alloc
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         if lease.get("state") == "creating" and not lease.get("handle") and not lease.get("create_attempts"):
             lease = self._update("leases", lease["id"], {"state": "deleted", "last_seen": self.clock()}, job["owner_id"])
@@ -1899,6 +2013,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 deferred = recovery.maybe_defer_retry_job_after_cleanup(self.store, job, lease, self.clock())
                 if deferred is not None:
                     return deferred
+            if final_state == "failed" and not job.get("recovery_plan_id"):
+                from . import allocation_retry
+
+                deferred_alloc = allocation_retry.maybe_defer_allocation_retry(self.store, job, lease, self.clock())
+                if deferred_alloc is not None:
+                    return deferred_alloc
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         next_epoch = float(lease.get("cleanup_next_epoch") or 0)
         if self.clock() < next_epoch or (observation == "unknown" and not lease.get("force_stop")):
@@ -1976,6 +2096,16 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 if waiting_window
                 else "GPU cleanup is pending"
             )
+            if job.get("allocation_retry"):
+                from . import allocation_retry
+
+                job = allocation_retry.mark_reconciling(
+                    self.store,
+                    job,
+                    now=self.clock(),
+                    error_code=job.get("error_code"),
+                    error_message=job.get("error_message"),
+                )
             return self._set_state(
                 job,
                 "cleanup_pending",
@@ -2000,6 +2130,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             deferred = recovery.maybe_defer_retry_job_after_cleanup(self.store, job, fresh_lease, self.clock())
             if deferred is not None:
                 return deferred
+        if final_state == "failed" and not job.get("recovery_plan_id"):
+            from . import allocation_retry
+
+            deferred_alloc = allocation_retry.maybe_defer_allocation_retry(self.store, job, fresh_lease, self.clock())
+            if deferred_alloc is not None:
+                return deferred_alloc
         finish_patch: dict[str, Any] = {}
         finish_msg = "GPU cleanup completed"
         if isinstance(job.get("error_details"), dict):
@@ -2286,11 +2422,15 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             from . import recovery
 
             recovery.cancel_plans_for_job(self.store, owner_id, job_id, self.clock())
+        if job.get("allocation_retry"):
+            from . import allocation_retry
+
+            job = allocation_retry.mark_cancelled(self.store, job, now=self.clock())
         if (
             job.get("state") == "queued"
             or (
                 job.get("state") == "waiting_for_capacity"
-                and job.get("recovery_hold") is True
+                and (job.get("recovery_hold") is True or float(job.get("retry_not_before_epoch") or 0) > 0)
                 and not job.get("instance_id")
             )
         ) and not self._lease(job):

@@ -5,7 +5,8 @@ import { RuntimeSelection, type RuntimeLifecycle } from '../components/RuntimeSe
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import { ConfirmDialog } from '../components/Feedback';
 import { Card } from '../components/ui';
-import { apiFetch, clearCreationWarmups, type Project } from '../lib/gpu-api';
+import { apiFetch, cancelGpuJob, clearCreationWarmups, type AllocationRetryState, type Project } from '../lib/gpu-api';
+import { formatAllocationRetryHeadline } from '../lib/allocation-retry-copy';
 import { projectOptionLabel } from '../lib/project-label';
 import { useSmartPoll } from '../lib/smart-poll';
 import styles from '../gpu.module.css';
@@ -61,6 +62,8 @@ type Warmup = {
   error_message?: string;
   compute_warnings?: string[];
   gpu_reported?: string;
+  allocation_retry?: AllocationRetryState | null;
+  auto_select_account?: boolean;
   creation_runtime?: { instance_id: string; process: string; devices?: { name: string }[] };
 };
 type PoolInstance = {
@@ -671,7 +674,28 @@ export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: 
           onClick={() => void run(() => start(workflowId))}>启动工作流</button>
         {visibleWarmups.map(job => <div key={job.id} className="status">
           <strong>{title(job)} · {job.ready ? '就绪' : job.state === 'completed' ? '预热完成，当前未报告可用实例'
-            : job.state === 'failed' ? '启动失败' : job.state === 'cancelled' ? '已取消' : stages[job.stage || ''] || '准备实例'}</strong>
+            : job.state === 'failed' ? '启动失败' : job.state === 'cancelled' ? '已取消'
+            : job.allocation_retry?.active ? '自动排队抢卡中' : stages[job.stage || ''] || '准备实例'}</strong>
+          {job.allocation_retry && (
+            <p className="muted small">{formatAllocationRetryHeadline(job.allocation_retry)}</p>
+          )}
+          {job.allocation_retry?.active && !finished.has(job.state) && (
+            <div className="actions">
+              <button
+                type="button"
+                className="button secondary small"
+                disabled={busy}
+                onClick={() => void run(async () => {
+                  await cancelGpuJob(job.id);
+                  const refreshed = await apiFetch<Status>(prefix);
+                  setWarmups(refreshed.warmups || []);
+                  setPoolInstances(refreshed.pool_instances || []);
+                })}
+              >
+                停止排队
+              </button>
+            </div>
+          )}
           {job.expires_at && <p>可用至 {new Date(job.expires_at * 1000).toLocaleString()}</p>}
           {job.error_message && <p>{job.error_message}</p>}
           {job.compute_warnings?.map(warning => <p key={warning}>{warning}</p>)}

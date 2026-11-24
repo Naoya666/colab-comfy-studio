@@ -7,6 +7,7 @@ import { type GpuJob, type GpuWorkflow, type Project } from '../lib/gpu-api';
 import styles from '../gpu.module.css';
 import { formatDateTime, jobSize, progressPercent, readableState, terminalStates } from '../lib/ui-helpers';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
+import { formatAllocationRetryHeadline } from '../lib/allocation-retry-copy';
 import { canRetainJobInstance, gpuLabel } from '../lib/gpu-label';
 import { groupJobsByBatch, partitionJobEntries, type DateBucketKey, type JobBatchEntry, type JobDisplayEntry } from '../lib/history-grouping';
 import { isSystemJob, projectOptionLabel, projectTitleById } from '../lib/project-label';
@@ -251,7 +252,11 @@ export function TasksPanel({
         {(running || waiting) && (
           <div className={styles.progressBlock}>
             <div className={styles.progressText}>
-              <span>{running ? (job.stage ? jobStageLabel(job.stage) : pct !== null ? `生成中 ${pct}%` : '生成中…') : '排队等待中'}</span>
+              <span>
+                {job.allocation_retry?.active
+                  ? formatAllocationRetryHeadline(job.allocation_retry)
+                  : running ? (job.stage ? jobStageLabel(job.stage) : pct !== null ? `生成中 ${pct}%` : '生成中…') : '排队等待中'}
+              </span>
             </div>
             <div className={styles.progress} data-indeterminate={pct === null}><span style={pct !== null ? { width: `${pct}%` } : undefined} /></div>
           </div>

@@ -1,6 +1,19 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUpRight, FolderKanban, Loader2 } from 'lucide-react';
-import { apiFetch, apiMessage, cancelRecoveryPlan, type GpuUsage, type RecoveryPlan } from '../lib/gpu-api';
+import {
+  apiFetch,
+  apiMessage,
+  cancelGpuJob,
+  cancelRecoveryPlan,
+  type AllocationRetryState,
+  type GpuUsage,
+  type RecoveryPlan,
+} from '../lib/gpu-api';
+import {
+  countDistinctDriveAccounts,
+  formatAllocationRetryHeadline,
+  formatRetrySpec,
+} from '../lib/allocation-retry-copy';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import { NativeModelSettings, type ModelStorage } from '../components/NativeModelSettings';
 import { NativeModelPreparation } from '../components/NativeModelPreparation';
@@ -23,6 +36,7 @@ import { useSmartPoll } from '../lib/smart-poll';
 import styles from '../gpu.module.css';
 
 const NATIVE_PREFS_KEY = 'studio-native-comfy-prefs';
+const AUTO_ACCOUNT_PREF = '__auto__';
 
 type Timeouts = { retain_idle_minutes: number; max_runtime_minutes: number };
 type NativePrefs = {
@@ -103,6 +117,8 @@ type NativeStatus = {
   model_storage_known?: boolean;
   disk?: { disk_free_bytes?: number; vfs_cache_bytes?: number };
   recovery?: RecoveryPlan | null;
+  allocation_retry?: AllocationRetryState | null;
+  auto_select_account?: boolean;
   self_heal?: Record<string, unknown> | null;
   events: NativeEvent[];
 };
@@ -224,6 +240,7 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     [accounts],
   );
   const [account, setAccount] = useState(() => {
+    if (initialPrefs.account === AUTO_ACCOUNT_PREF) return '';
     if (initialPrefs.account) {
       if (!accountsLoaded || eligibleAccounts.some(a => a.account_id === initialPrefs.account)) return initialPrefs.account;
     }
@@ -239,6 +256,7 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const [submittingRestart, setSubmittingRestart] = useState(false);
   const [pendingRestart, setPendingRestart] = useState<{ id: string; previous?: string }>();
   const [cancellingRecovery, setCancellingRecovery] = useState(false);
+  const [cancellingRetry, setCancellingRetry] = useState(false);
   const [recoveryClockSec, setRecoveryClockSec] = useState(() => Math.floor(Date.now() / 1000));
   const [autoOpen, setAutoOpen] = useState(false);
   const [statusFetchedAtMs, setStatusFetchedAtMs] = useState(() => Date.now());
@@ -247,17 +265,21 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const [runtimeMinutes, setRuntimeMinutes] = useState(() => initialPrefs.runtimeMinutes ?? '');
   const [wizardRequest, setWizardRequest] = useState<{ seq: number; step?: 1 | 2 | 3 | 4 | 5 } | null>(null);
   const timeoutsInitialized = useRef(Boolean(initialPrefs.storage && initialPrefs.idleMinutes && initialPrefs.runtimeMinutes));
-  const accountEligible = eligibleAccounts.some(a => a.account_id === account);
+  const isAutoAccount = account === '';
+  const accountEligible = isAutoAccount
+    ? eligibleAccounts.length > 0
+    : eligibleAccounts.some(a => a.account_id === account);
+  const autoAccountMixedDrives = isAutoAccount && countDistinctDriveAccounts(eligibleAccounts) > 1;
 
   useEffect(() => {
-    if (!accountsLoaded || accountEligible) return;
+    if (!accountsLoaded || isAutoAccount || accountEligible) return;
     const fallback = eligibleAccounts[0]?.account_id || '';
     if (fallback !== account) setAccount(fallback);
-  }, [accountsLoaded, accountEligible, eligibleAccounts, account]);
+  }, [accountsLoaded, isAutoAccount, accountEligible, eligibleAccounts, account]);
 
   useEffect(() => {
     const next: NativePrefs = {};
-    if (account) next.account = account;
+    next.account = account || AUTO_ACCOUNT_PREF;
     if (spec) next.spec = spec;
     if (isValidStorage(storage)) next.storage = storage;
     if (isPositiveIntText(idleMinutes)) next.idleMinutes = idleMinutes;
@@ -270,9 +292,12 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const sendingRestart = useRef(false);
   const sendingStart = useRef(false);
   const scheduledSession = usage?.active_sessions?.find(session => session.instance_id === status?.instance_id);
-  const selectedBalance = usage?.accounts?.find(row => row.account_id === account);
+  const selectedBalance = isAutoAccount ? undefined : usage?.accounts?.find(row => row.account_id === account);
+  const allEligibleBelowFloor = isAutoAccount && eligibleAccounts.length > 0 && eligibleAccounts.every(
+    a => Boolean(usage?.accounts?.find(row => row.account_id === a.account_id)?.below_floor),
+  );
   const currentGuard = usage?.guard;
-  const blocked = currentGuard?.soft_tripped || selectedBalance?.below_floor;
+  const blocked = currentGuard?.soft_tripped || (isAutoAccount ? allEligibleBelowFloor : selectedBalance?.below_floor);
 
   async function enter(newTab: boolean, signal?: AbortSignal) {
     if (opening.current || signal?.aborted) return;
@@ -335,16 +360,21 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const recoveryCountdownSec = recoveryPlan?.next_retry_at
     ? Math.max(0, Math.ceil(recoveryPlan.next_retry_at - recoveryClockSec))
     : 0;
+  const allocationRetry = status?.allocation_retry ?? null;
+  const allocationRetryActive = Boolean(
+    allocationRetry?.active && status && !status.ready && !terminalStates.has(status.state),
+  );
+  const allocationRetryWaiting = Boolean(allocationRetryActive && allocationRetry?.phase === 'waiting' && allocationRetry?.next_retry_at);
 
   useEffect(() => {
-    if (!recoveryInProgress || !recoveryPlan?.next_retry_at) return;
+    if ((!recoveryInProgress || !recoveryPlan?.next_retry_at) && !allocationRetryWaiting) return;
     setRecoveryClockSec(Math.floor(Date.now() / 1000));
     const timer = window.setInterval(() => setRecoveryClockSec(Math.floor(Date.now() / 1000)), 1000);
     return () => window.clearInterval(timer);
-  }, [recoveryInProgress, recoveryPlan?.next_retry_at]);
+  }, [recoveryInProgress, recoveryPlan?.next_retry_at, allocationRetryWaiting]);
 
   const nativeTransitioning = Boolean(
-    pendingStart || pendingRestart || recoveryInProgress || recoveryRestoringModels
+    pendingStart || pendingRestart || recoveryInProgress || recoveryRestoringModels || allocationRetryActive
     || (status && status.state !== 'stopped' && !terminalStates.has(status.state))
     || status?.restart?.phase === 'checking' || status?.restart?.phase === 'syncing'
     || status?.restart?.phase === 'rebooting' || status?.restart?.phase === 'recovering',
@@ -400,6 +430,21 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     }
   }
 
+  async function handleCancelRetry() {
+    if (!status?.job_id || cancellingRetry) return;
+    setCancellingRetry(true);
+    setError('');
+    try {
+      await cancelGpuJob(status.job_id);
+      setAutoOpen(false);
+      refreshStatusNow();
+    } catch (cause) {
+      setError(apiMessage(cause));
+    } finally {
+      setCancellingRetry(false);
+    }
+  }
+
   async function restartNative() {
     const instance = status?.instance_id;
     if (!instance || !status?.can_restart || sendingRestart.current) return;
@@ -424,7 +469,7 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     sendingStart.current = true;
     setStarting(true); setError('');
     try {
-      await apiFetch('/api/gpu/native/start', { method: 'POST', headers: { 'Idempotency-Key': key.current }, body: JSON.stringify({ account_id: account, spec: { key: spec }, retain_idle_minutes: Number(idleMinutes), max_runtime_minutes: Number(runtimeMinutes), ...storage }) });
+      await apiFetch('/api/gpu/native/start', { method: 'POST', headers: { 'Idempotency-Key': key.current }, body: JSON.stringify({ account_id: account || null, spec: { key: spec }, retain_idle_minutes: Number(idleMinutes), max_runtime_minutes: Number(runtimeMinutes), ...storage }) });
       key.current = crypto.randomUUID();
       setPendingStart(true);
       setAutoOpen(!desktop);
@@ -490,6 +535,44 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
       已运行 {scheduledSession.elapsed_minutes.toFixed(1)} 分钟 · 实扣 {cuNumber(scheduledSession.actual_cu)} CU
       {scheduledSession.draining && <p className={styles.cuWarning}>正在排空会话，队列与 Drive 同步空闲后释放。</p>}
     </div>}
+    {allocationRetryActive && allocationRetry && (
+      <div className={styles.recoveryBanner} role="status" aria-label="自动排队抢卡状态">
+        <div className={styles.recoveryBannerBody}>
+          <div className={styles.recoveryBannerTitle}>
+            <Loader2 size={15} className={styles.spin} aria-hidden />
+            <strong>{formatAllocationRetryHeadline(allocationRetry, recoveryClockSec)}</strong>
+          </div>
+          <p className="muted small">
+            已尝试 {allocationRetry.attempt ?? 1} 次（重试 {allocationRetry.retries_used ?? 0}/{allocationRetry.max_retries ?? 20}）
+            {allocationRetry.candidate_specs && allocationRetry.candidate_specs.length > 0 && (
+              <> · 候选显卡：{allocationRetry.candidate_specs.map(s => formatRetrySpec(s)).join(' → ')}</>
+            )}
+            {allocationRetry.last_error_message && ` · 上次：${allocationRetry.last_error_message}`}
+          </p>
+          {allocationRetry.excluded_accounts && Object.keys(allocationRetry.excluded_accounts).length > 0 && (
+            <p className="muted small">
+              已移出异常账号：{Object.values(allocationRetry.excluded_accounts).map(a => `${a.alias || '账号'}（${a.code || '异常'}）`).join('、')}
+            </p>
+          )}
+        </div>
+        {status?.job_id && (
+          <button
+            type="button"
+            className="button secondary"
+            disabled={cancellingRetry}
+            onClick={() => void handleCancelRetry()}
+          >
+            {cancellingRetry ? '正在停止…' : '停止排队'}
+          </button>
+        )}
+      </div>
+    )}
+    {allocationRetry && !status?.ready && !allocationRetryActive && !startupPending && ['exhausted', 'aborted'].includes(allocationRetry.phase || '') && (
+      <div className={styles.recoveryBannerMuted} role="status">
+        <strong>{allocationRetry.phase === 'exhausted' ? '自动排队抢卡已达重试上限' : '自动排队抢卡已停止'}</strong>
+        {allocationRetry.stop_reason && <p className="muted small">{allocationRetry.stop_reason}</p>}
+      </div>
+    )}
     {recoveryPlan && recoveryInProgress && (
       <div className={styles.recoveryBanner} role="status" aria-label="自动恢复状态">
         <div className={styles.recoveryBannerBody}>
@@ -614,15 +697,20 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
           )}
         </> : <>
           <label className="field">Google 账号<select value={account} onChange={e => { setAccount(e.target.value); key.current = crypto.randomUUID(); }}>
-            <option value="">选择账号</option>
+            <option value="">自动选择账号（多账号轮换）</option>
             {eligibleAccounts.map(a => <option key={a.account_id} value={a.account_id}>{a.alias || a.account_id}</option>)}
           </select></label>
-          <WorkflowGpuSelection manifest={null} accountId={account} value={spec} onChange={value => { setSpec(value); key.current = crypto.randomUUID(); }}
+          {autoAccountMixedDrives && (
+            <p className="status" role="status">
+              提示：当前多个可用账号的 Google Drive 存储盘未统一。轮换到不同账号时将挂载该账号各自的 Drive 工作区；建议在「设置 → Google 账号」将小号存储盘绑定到主号，实现工作流与插件完全互通。
+            </p>
+          )}
+          <WorkflowGpuSelection manifest={null} accountId={account || null} value={spec} onChange={value => { setSpec(value); key.current = crypto.randomUUID(); }}
             rateHint={rate => <p className="muted small">{rate == null || rate <= 0 ? '估算费率未知' : <>
               {String(spec?.accelerator || 'GPU')} 约 {cuNumber(rate)} CU/小时
               {selectedBalance?.balance != null && !selectedBalance.error && ` · 当前余额约可运行 ${(selectedBalance.balance / rate).toFixed(1)} 小时`}
             </>}</p>} />
-          {blocked && <p className="status error" role="alert">{selectedBalance?.below_floor ? currentGuard?.message : currentGuard?.daily_message}</p>}
+          {blocked && <p className="status error" role="alert">{(isAutoAccount ? allEligibleBelowFloor : selectedBalance?.below_floor) ? currentGuard?.message : currentGuard?.daily_message}</p>}
           {storage && <NativeModelSettings value={storage} onChange={value => { setStorage(value); key.current = crypto.randomUUID(); }} />}
           <div className={styles.nativeFieldPair}>
             <label className="field">空闲回收时间（分钟）

@@ -14,7 +14,7 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 from . import native_api, native_model_api
 from .api_access import build_access_urls, get_or_create_path_code, peek_path_code, reset_path_code
 from .common import APIError, admin, current_user, ok
-from .gpu import native, native_config, native_restart, native_workspace, recovery
+from .gpu import allocation_retry, native, native_config, native_restart, native_workspace, recovery
 from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
 from .job_history import job_timing_details
 from .native_proxy import get_native_gateway
@@ -467,6 +467,8 @@ async def status(request: Request, user=Depends(current_user)):
                "restart": restart, "can_restart": can_restart,
                "has_pending_offline_plugins": has_pending_offline_plugins,
                "recovery": rec_plan,
+               "allocation_retry": allocation_retry.public_allocation_retry((job or {}).get("allocation_retry")),
+               "auto_select_account": bool((job or {}).get("auto_select_account")),
                "self_heal": (lease or {}).get("native_self_heal"),
                "reason": RUNTIME_MISSING if reclaimed else None,
                "error": RUNTIME_MISSING_MESSAGE if reclaimed else (job or {}).get("error_message"),

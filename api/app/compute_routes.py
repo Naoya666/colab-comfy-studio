@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from .common import APIError, admin, current_user, get_store, ok
 from .gpu import ccu
+from .gpu.allocation_retry import allocation_retry_settings, save_allocation_retry_settings
 from .gpu.colab import GoogleColabProvider
 from .gpu.compute import GpuConfig
 from .gpu.cu_guard import CuGuardService
@@ -247,6 +248,25 @@ def cuda_smoke(body: dict, request: Request, user=Depends(current_user), st=Depe
 @router.get("/settings/gpu-order")
 def get_gpu_order(request: Request, user=Depends(current_user), st=Depends(get_store)):
     return ok(gpu_spec_order_settings(st, user["id"]), request)
+
+
+@router.get("/settings/allocation-retry")
+def get_allocation_retry(request: Request, user=Depends(current_user), st=Depends(get_store)):
+    return ok(allocation_retry_settings(st, user["id"]), request)
+
+
+@router.put("/settings/allocation-retry")
+def put_allocation_retry(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    admin(user)
+    if not isinstance(body, dict):
+        raise APIError("ALLOCATION_RETRY_INVALID", "请提供有效的自动排队抢卡策略对象", 422)
+    try:
+        saved = save_allocation_retry_settings(st, user["id"], body)
+    except ValueError as exc:
+        raise APIError("ALLOCATION_RETRY_INVALID", str(exc), 422) from exc
+    except RuntimeError as exc:
+        raise APIError("SCHEDULER_BUSY", str(exc), 503, True) from exc
+    return ok(saved, request)
 
 
 @router.put("/settings/gpu-order")

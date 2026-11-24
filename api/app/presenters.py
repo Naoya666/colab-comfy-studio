@@ -85,8 +85,16 @@ def public_job(job):
         "selection_reason",
         "instance_pool",
         "creation_runtime",
+        "auto_select_account",
+        "retry_not_before_epoch",
     }
     result = {k: v for k, v in job.items() if k in keys}
+    if job.get("allocation_retry") is not None:
+        from .gpu.allocation_retry import public_allocation_retry
+
+        retry_info = public_allocation_retry(job.get("allocation_retry"))
+        if retry_info is not None:
+            result["allocation_retry"] = retry_info
     error_details = _public_error_details(job.get("error_details"))
     if error_details is not None:
         result["error_details"] = error_details

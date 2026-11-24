@@ -5,6 +5,7 @@ import type { GpuSettings, GpuSpecKey, GpuUsage } from '../lib/gpu-api';
 import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
 import { AccountDirectory, type GpuAccount } from '../components/AccountDirectory';
 import { GpuOrderSettings } from '../components/GpuOrderSettings';
+import { AllocationRetrySettings } from '../components/AllocationRetrySettings';
 import { Card, Segmented } from '../components/ui';
 import { applyTheme, readStoredTheme, type ThemeMode } from '../lib/theme';
 import styles from '../gpu.module.css';
@@ -48,6 +49,7 @@ export function SettingsPanel({
 }) {
   const [oauthConfigured, setOauthConfigured] = useState(false);
   const [oauthOpen, setOauthOpen] = useState(false);
+  const [orderedSpecs, setOrderedSpecs] = useState<GpuSpecKey[] | undefined>(undefined);
 
   useEffect(() => {
     if (focusSection !== 'model-storage') return;
@@ -90,7 +92,17 @@ export function SettingsPanel({
       </section>
 
       <div className={styles.workspaceWide}>
-        <GpuOrderSettings canEdit={canEditGuard} onSaved={onGpuOrderChange} />
+        <GpuOrderSettings
+          canEdit={canEditGuard}
+          onSaved={(specs) => {
+            setOrderedSpecs(specs);
+            onGpuOrderChange?.(specs);
+          }}
+        />
+      </div>
+
+      <div className={styles.workspaceWide}>
+        <AllocationRetrySettings canEdit={canEditGuard} orderedSpecs={orderedSpecs} />
       </div>
 
       <ModelStorageSettings id="settings-model-storage" defaultOpen={focusSection === 'model-storage'} accounts={accountsLoaded ? accounts : undefined} />

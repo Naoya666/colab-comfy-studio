@@ -1,6 +1,7 @@
 import { memo, useState } from 'react';
 import { ArrowUpRight, Download, Film, Image as ImageIcon, ImagePlus, Maximize2, Star, Trash2 } from 'lucide-react';
 import { assetUrl, type GalleryAsset, type GpuJob } from '../lib/gpu-api';
+import { formatAllocationRetryHeadline } from '../lib/allocation-retry-copy';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
 import { progressPercent, terminalStates } from '../lib/ui-helpers';
 import { ConfirmDialog } from './Feedback';
@@ -35,7 +36,9 @@ export const CreateResults = memo(function CreateResults({ jobs, count, gallery,
   const finished = jobs.filter(job => terminalStates.has(String(job.state).toLowerCase())).length;
   const progress = progressPercent(running?.progress);
   const status = running
-    ? `${running.stage ? jobStageLabel(running.stage) : jobStateLabel(running.state)}${progress === null ? '' : ` · ${progress}%`}`
+    ? running.allocation_retry?.active
+      ? formatAllocationRetryHeadline(running.allocation_retry)
+      : `${running.stage ? jobStageLabel(running.stage) : jobStateLabel(running.state)}${progress === null ? '' : ` · ${progress}%`}`
     : finished === count
       ? count === 1 ? jobStateLabel(jobs[0]?.state) : `${finished}/${count} 个任务已结束`
       : '等待任务状态更新';

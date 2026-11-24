@@ -71,6 +71,42 @@ export interface GpuErrorDetails {
   reconciliation_result?: string | null;
   retry_attempt?: number | null;
 }
+export interface AllocationRetryHistoryItem {
+  attempt: number;
+  account_id?: string | null;
+  account_alias?: string | null;
+  spec?: GpuSpecKey | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  kind?: string | null;
+  at?: number | null;
+}
+export interface AllocationRetryState {
+  enabled?: boolean;
+  active?: boolean;
+  phase?: 'waiting' | 'allocating' | 'reconciling' | 'succeeded' | 'exhausted' | 'aborted' | 'cancelled' | string;
+  attempt?: number;
+  retries_used?: number;
+  max_retries?: number;
+  interval_seconds?: number;
+  next_retry_at?: number | null;
+  candidate_specs?: GpuSpecKey[];
+  current_spec?: GpuSpecKey | null;
+  current_account_id?: string | null;
+  current_account_alias?: string | null;
+  next_spec?: GpuSpecKey | null;
+  next_account_id?: string | null;
+  next_account_alias?: string | null;
+  excluded_accounts?: Record<string, { alias?: string; code?: string; reason?: string }>;
+  last_error_code?: string | null;
+  last_error_message?: string | null;
+  last_failed_spec?: GpuSpecKey | null;
+  last_failed_account_id?: string | null;
+  last_failed_account_alias?: string | null;
+  stop_reason?: string | null;
+  updated_at?: number | null;
+  history?: AllocationRetryHistoryItem[];
+}
 export interface GpuJob {
   id: string;
   job_id?: string;
@@ -89,6 +125,9 @@ export interface GpuJob {
   error_code?: string | null;
   error_message?: string;
   error_details?: GpuErrorDetails | null;
+  allocation_retry?: AllocationRetryState | null;
+  auto_select_account?: boolean;
+  retry_not_before_epoch?: number | null;
   message?: string;
   progress?: number;
   idempotency_key?: string;
@@ -699,6 +738,22 @@ export const resetGpuSpecOrder = () =>
   apiFetch<GpuSpecOrderSettings>('/api/gpu/settings/gpu-order/reset', post({}));
 export const discoverGpuSpecs = () =>
   apiFetch<GpuSpecDiscoverResult>('/api/gpu/settings/gpu-order/discover', post({}), 30000);
+
+export interface AllocationRetrySettings {
+  enabled: boolean;
+  gpu_pool: GpuSpecKey[];
+  retry_interval_seconds: number;
+  max_retries: number;
+  updated_at: number | null;
+}
+
+export const getAllocationRetrySettings = (signal?: AbortSignal) =>
+  apiFetch<AllocationRetrySettings>('/api/gpu/settings/allocation-retry', { cache: 'no-store', signal });
+export const saveAllocationRetrySettings = (body: Omit<AllocationRetrySettings, 'updated_at'>) =>
+  apiFetch<AllocationRetrySettings>('/api/gpu/settings/allocation-retry', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
 
 export type ReusePreviewDecision =
   | 'unsupported_spec'

@@ -176,7 +176,9 @@ def admit_job(
         return existing
     project = own(st, "projects", body["project_id"], user)
     cfg = GpuConfig.from_env()
-    policy = _validate_allocation(repo, user, normalize_policy(body["execution_policy"]))
+    normalized_policy = normalize_policy(body["execution_policy"])
+    user_auto_account = not bool(normalized_policy.get("account_id"))
+    policy = _validate_allocation(repo, user, normalized_policy)
     if policy["provider"] not in {"mock", "colab"}:
         raise APIError("PROVIDER_INVALID", "仅允许已配置的 mock 或 colab Provider")
     if policy["provider"] == "colab" and not cfg.real_enabled:
@@ -229,6 +231,8 @@ def admit_job(
     compute_fields = {
         "instance_pool": POOL_CREATION,
         "requested_spec": requested_spec,
+        "initial_requested_spec": requested_spec,
+        "auto_select_account": user_auto_account,
         "compute_warnings": compute_warnings,
         "workflow_version_id": workflow["id"],
         "generation_timeouts": True,

@@ -448,6 +448,29 @@ class InstanceService:
         self._set(cursor, data, state="active", session=session)
         return selected
 
+    def _filter_colab_connected_accounts(self, session, owner_id, accounts):
+        """When live Colab credentials exist in DB, restrict auto-selection to Colab-connected accounts."""
+        cred_rows = self._rows(session, "credentials", owner_id)
+        colab_creds = [r for r in cred_rows if (self._data(r) or {}).get("purpose") == "colab"]
+        if not colab_creds:
+            return accounts
+        connected_ids = {
+            r.account_id or (self._data(r) or {}).get("account_id")
+            for r in colab_creds
+            if not (self._data(r) or {}).get("revoked") and (self._data(r) or {}).get("encrypted_refresh_token")
+        }
+        filtered = [a for a in accounts if self._account_id(a) in connected_ids]
+        return filtered or accounts
+
+    def _select_create_account(self, session, accounts, owner_id, project_id, requested_account, retry_target_account):
+        if requested_account:
+            return accounts[0]
+        if retry_target_account:
+            matched = next((a for a in accounts if self._account_id(a) == retry_target_account), None)
+            if matched is not None:
+                return matched
+        return self._choose_account(session, accounts, owner_id, project_id)
+
     def _instance_pool(self, session, instance) -> str:
         data = self._data(instance)
         if data.get("native_comfy") is True:
@@ -1262,7 +1285,7 @@ class InstanceService:
             )
             if job.get("creation_fingerprint") and self._provider(job) == "colab":
                 data.update(unit_rate=job.get("unit_rate"), estimated_units=job.get("estimated_units"))
-            if not data.get("drive_account_id") and drive_account_id:
+            if drive_account_id and (job_pool(job) == POOL_NATIVE or not data.get("drive_account_id")):
                 data["drive_account_id"] = drive_account_id
             if job.get("lease_id") is not None:
                 data["lease_id"] = job["lease_id"]
@@ -1472,7 +1495,7 @@ class InstanceService:
         key, stable_id = self._attempt_key(job)
         policy = self._job_policy(job)
         requested_instance = self._requested(job, "instance_id")
-        requested_account = self._requested(job, "account_id")
+        requested_account = None if job.get("auto_select_account") is True else self._requested(job, "account_id")
         reuse_action = str(policy.get("reuse_action") or job.get("reuse_action") or "auto")
         wait_delete_id = job.get("wait_for_deleted_instance_id")
         if reuse_action == "replace":
@@ -1487,7 +1510,10 @@ class InstanceService:
             if existing is not None and self._data(existing).get("allocation_key") == key:
                 return self._dict(existing)
             accounts = self._legal_accounts(session, owner_id, project_id, provider, requested_account)
+            retry_target_account = job.get("retry_target_account_id") if not requested_account else None
             if provider == "colab":
+                if not requested_account:
+                    accounts = self._filter_colab_connected_accounts(session, owner_id, accounts)
                 from .cu_guard import CuGuardService
 
                 guard = CuGuardService(self.repo, self.clock)
@@ -1527,10 +1553,11 @@ class InstanceService:
                     if account is None or not self._compatible(session, instance, job, self._account_id(account)):
                         raise InstanceConflict("指定原生实例不兼容或已被占用")
                     return self._claim_existing(session, instance, job, account, key, stable_id, "requested_instance")
-                account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
-                return self._create_instance(
-                    session, job, account, key, stable_id, "requested_account" if requested_account else "round_robin"
+                account = self._select_create_account(
+                    session, accounts, owner_id, project_id, requested_account, retry_target_account
                 )
+                reason = "requested_account" if requested_account else ("allocation_retry" if retry_target_account else "round_robin")
+                return self._create_instance(session, job, account, key, stable_id, reason)
 
             # 3) Creation pool (frontend Create + batches + workbench + Creation API)
             order_table = self._order_table(owner_id)
@@ -1538,7 +1565,9 @@ class InstanceService:
             # 3a) Gentle replace: wait for old instance to be deleted, then create new instance.
             if reuse_action == "replace" or wait_delete_id:
                 self._validate_new_creation_spec(job, order_table)
-                account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
+                account = self._select_create_account(
+                    session, accounts, owner_id, project_id, requested_account, retry_target_account
+                )
                 return self._create_instance(
                     session, job, account, key, stable_id, "requested_account" if requested_account else "replace_new"
                 )
@@ -1549,6 +1578,11 @@ class InstanceService:
                 if requested_account:
                     account = accounts[0]
                     reason = "requested_account"
+                elif retry_target_account:
+                    account = self._select_create_account(
+                        session, accounts, owner_id, project_id, None, retry_target_account
+                    )
+                    reason = "allocation_retry"
                 else:
                     active_accounts = {
                         self._data(r).get("account_id")
@@ -1693,10 +1727,11 @@ class InstanceService:
                 if job.get("creation_existing_only"):
                     raise AllocationError("没有可复用实例，请先在创作 → API 设置启动工作流")
                 self._validate_new_creation_spec(job, order_table)
-                account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
-                return self._create_instance(
-                    session, job, account, key, stable_id, "requested_account" if requested_account else "round_robin"
+                account = self._select_create_account(
+                    session, accounts, owner_id, project_id, requested_account, retry_target_account
                 )
+                reason = "requested_account" if requested_account else ("allocation_retry" if retry_target_account else "round_robin")
+                return self._create_instance(session, job, account, key, stable_id, reason)
 
             # Frontend creation (`reuse_action == "auto"`):
             # If this job is part of a batch, wait for any earlier active job in the same batch
@@ -1767,10 +1802,11 @@ class InstanceService:
                 )
 
             self._validate_new_creation_spec(job, order_table)
-            account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
-            return self._create_instance(
-                session, job, account, key, stable_id, "requested_account" if requested_account else "round_robin"
+            account = self._select_create_account(
+                session, accounts, owner_id, project_id, requested_account, retry_target_account
             )
+            reason = "requested_account" if requested_account else ("allocation_retry" if retry_target_account else "round_robin")
+            return self._create_instance(session, job, account, key, stable_id, reason)
 
     # ---- scheduler lifecycle -------------------------------------------------------
     def _instance_for_job(self, session, job, owner_id=None):

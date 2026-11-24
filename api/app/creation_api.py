@@ -335,10 +335,13 @@ def warm_status(repo, row):
         binding = next((item for item in repo.list("model_dependencies", row["owner_id"])
                         if item.get("workflow_id") == workflow_id), None)
         ready = valid and binding_digest == digest({"dependencies": binding["dependencies"] if binding else None})
+    from .gpu.allocation_retry import public_allocation_retry
+
     return {**{field: row.get(field) for field in (
         "id", "state", "stage", "error_code", "error_message", "worker_timings", "instance_id", "workflow_key",
         "workflow_version", "creation_runtime", "compute_warnings", "gpu_reported",
-    )}, "ready": ready, "expires_at": expires if ready else None}
+        "auto_select_account", "retry_not_before_epoch",
+    )}, "allocation_retry": public_allocation_retry(row.get("allocation_retry")), "ready": ready, "expires_at": expires if ready else None}
 
 
 def default_project_id(owner: str) -> str:
@@ -405,12 +408,18 @@ def submit(store, owner, workflow, params, *, key=None, idem=None, graph_hash=No
         if workflow["id"] not in versions:
             raise APIError("WORKFLOW_UNPUBLISHED", "发布版本已撤销或不可执行", 409)
         if warmup:
+            target_acct = job["execution_policy"].get("account_id")
             for row in rows:
+                same_acct = (
+                    (not target_acct and bool(row.get("auto_select_account")))
+                    or row.get("requested_account_id") == target_acct
+                )
+                row_initial_spec = row.get("initial_requested_spec") or row.get("requested_spec")
                 if (row.get("warmup") and row.get("creation_fingerprint") == job["creation_fingerprint"]
-                        and row.get("requested_account_id") == job["execution_policy"].get("account_id")
+                        and same_acct
                         and all(row.get("execution_policy", {}).get(field) == job["execution_policy"].get(field)
                                 for field in ("lifecycle", "retain_idle_minutes", "max_runtime_minutes"))
-                        and row.get("requested_spec") == job.get("requested_spec")
+                        and row_initial_spec == job.get("requested_spec")
                         and (is_active(row) or warm_status(repo, row)["ready"])):
                     return row
             try:
