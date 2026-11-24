@@ -1,15 +1,16 @@
 import { ModelDependencies } from '../components/ModelDependencies';
-import { WorkflowImportWorkspace } from '../components/WorkflowImportWorkspace';
+import { WorkflowImportWorkspace, type WorkflowImportResult } from '../components/WorkflowImportWorkspace';
 import { ImageDraftConfiguration } from '../components/ImageDraftConfiguration';
 import { Fragment, Suspense, lazy, useCallback, useMemo, useState } from 'react';
-import { ChevronDown, Search, Trash2, Upload } from 'lucide-react';
-import type { GpuWorkflow } from '../lib/gpu-api';
+import { ChevronDown, Download, Search, Trash2, Upload, X } from 'lucide-react';
+import type { GpuWorkflow, WorkflowExportResponse } from '../lib/gpu-api';
 import { Pager } from '../components/ui';
 import { WorkflowActivationPanel } from '../components/WorkflowActivation';
 import type { WorkflowGraphPreviewData } from '../components/WorkflowGraphPreview';
 const WorkflowGraphPreview = lazy(() => import('../components/WorkflowGraphPreview').then((m) => ({ default: m.WorkflowGraphPreview })));
 import { ConfirmDialog } from '../components/Feedback';
 import { readActivationWatch, writeActivationWatch, type ActivationWatch } from '../lib/activation-resume';
+import { shortHash } from '../lib/model-library';
 import { workflowSearchText, workflowTitle, workflowUsage } from '../lib/workflow-copy';
 import styles from '../gpu.module.css';
 import { workflowState } from '../lib/ui-helpers';
@@ -33,12 +34,13 @@ async function fetchWorkflowGraphPreview(workflow: Pick<GpuWorkflow, 'workflow_k
 }
 
 export function WorkflowsPanel({
-  workflows, projectId = '', projectTitle = '', onImport, onValidate, onPublish, onRollback, onDeactivate, onDelete, deleting = false, onActivated, onOpenJob, onUseProject, onOpenModelLibrary,
+  workflows, projectId = '', projectTitle = '', onImport, onExport, onValidate, onPublish, onRollback, onDeactivate, onDelete, deleting = false, onActivated, onOpenJob, onUseProject, onOpenModelLibrary,
 }: {
   workflows: GpuWorkflow[];
   projectId?: string;
   projectTitle?: string;
-  onImport: (bundle: string) => Promise<boolean> | void;
+  onImport: (bundle: string) => Promise<boolean | WorkflowImportResult> | void;
+  onExport?: (workflow: GpuWorkflow) => Promise<WorkflowExportResponse | null | void>;
   onValidate: (workflow: GpuWorkflow) => void;
   onPublish: (workflow: GpuWorkflow) => void;
   onRollback: (workflow: GpuWorkflow) => void;
@@ -54,11 +56,28 @@ export function WorkflowsPanel({
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(0);
   const [activating, setActivating] = useState<string | null>(null);
+  const [exportingId, setExportingId] = useState<string | null>(null);
+  const [exportReport, setExportReport] = useState<WorkflowExportResponse | null>(null);
   const [previewing, setPreviewing] = useState<GpuWorkflow | null>(null);
   const [deletingTarget, setDeletingTarget] = useState<GpuWorkflow | null>(null);
   const [openKeys, setOpenKeys] = useState<Set<string>>(new Set());
   const [showAll, setShowAll] = useState<Set<string>>(new Set());
   const [watch, setWatch] = useState<Record<string, ActivationWatch>>(() => readActivationWatch());
+
+  async function handleExport(wf: GpuWorkflow) {
+    if (!onExport || exportingId) return;
+    setExportingId(wf.id);
+    try {
+      const res = await onExport(wf);
+      if (res && (res.summary.warnings.length > 0 || res.summary.rebind_models.length > 0)) {
+        setExportReport(res);
+      } else if (res) {
+        setExportReport(null);
+      }
+    } finally {
+      setExportingId(null);
+    }
+  }
   const rememberWatch = useCallback((workflowId: string, next: ActivationWatch | null) => {
     setWatch((current) => {
       const copy = { ...current };
@@ -122,6 +141,39 @@ export function WorkflowsPanel({
         onOpenModelLibrary={onOpenModelLibrary}
       />
 
+      {exportReport && (
+        <div className={`${styles.depNoticeStrip} ${styles.wfExportSummary}`} role="status">
+          <div className={styles.wfExportSummaryHead}>
+            <strong>已导出分享包：{exportReport.filename}</strong>
+            <button
+              type="button"
+              className={styles.iconGhost}
+              aria-label="关闭导出提示"
+              onClick={() => setExportReport(null)}
+            >
+              <X size={15} aria-hidden />
+            </button>
+          </div>
+          {exportReport.summary.warnings.map((note) => (
+            <p key={note} className="small">{note}</p>
+          ))}
+          {exportReport.summary.rebind_models.length > 0 && (
+            <ul className={styles.wfRebindList}>
+              {exportReport.summary.rebind_models.map((item) => (
+                <li key={`${item.source}:${item.target}:${item.sha256 || item.filename}`} className="small">
+                  <span className={styles.depTag}>{item.source === 'civitai' ? 'Civitai' : '需重绑'}</span>
+                  <strong>{item.display_name || item.filename}</strong>
+                  {item.filename && item.display_name && item.filename !== item.display_name ? (
+                    <span className="muted">（{item.filename}）</span>
+                  ) : null}
+                  {item.sha256 ? <span className="muted"> · SHA {shortHash(item.sha256)}</span> : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       <label className={styles.searchBox}>
         <Search size={17} strokeWidth={1.6} aria-hidden />
         <input aria-label="搜索工作流" placeholder="搜索工作流名称" value={query} onChange={(e) => { setQuery(e.target.value); setPage(0); }} />
@@ -166,6 +218,18 @@ export function WorkflowsPanel({
                           </span>
                           <span className={styles.versionActions}>
                             <button className="button secondary small" type="button" onClick={() => setPreviewing(wf)}>离线预览</button>
+                            {published && onExport && (
+                              <button
+                                className="button secondary small"
+                                type="button"
+                                disabled={exportingId === wf.id}
+                                title="导出不含个人 Drive ID 的 Studio 工作流分享包"
+                                onClick={() => void handleExport(wf)}
+                              >
+                                <Download size={14} aria-hidden />
+                                {exportingId === wf.id ? '导出中…' : '导出'}
+                              </button>
+                            )}
                             {!published && (
                               <button className="button small" type="button" disabled={Array.isArray(wf.pending_configuration) && wf.pending_configuration.length > 0} title={Array.isArray(wf.pending_configuration) && wf.pending_configuration.length ? '请先补充图片草稿配置' : undefined} onClick={() => setActivating(activating === wf.id ? null : wf.id)}>
                                 {activating === wf.id ? '收起启用向导' : watch[wf.id] && ['queued', 'running', 'pending'].includes(watch[wf.id].state.toLowerCase()) ? '查看启用进度' : '一键启用'}

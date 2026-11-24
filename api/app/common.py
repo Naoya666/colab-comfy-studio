@@ -11,8 +11,14 @@ from .security import read_session
 
 
 class APIError(Exception):
-    def __init__(self, code, message, status=422, retryable=False):
-        self.code, self.message, self.status, self.retryable = code, message, status, retryable
+    def __init__(self, code, message, status=422, retryable=False, detail=None):
+        self.code, self.message, self.status, self.retryable, self.detail = (
+            code,
+            message,
+            status,
+            retryable,
+            detail,
+        )
 
 
 def envelope(data=None, error=None, request_id=None):

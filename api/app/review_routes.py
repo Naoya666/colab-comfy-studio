@@ -151,6 +151,14 @@ def _review_manifest(row: dict) -> tuple[dict, list[str], str, list[dict]]:
     except Exception as exc:
         raise APIError("REVIEW_INVALID", "custom_nodes 只允许已审核并锁定提交的仓库") from exc
     weights = dependencies.get("weight_files")
+    if isinstance(weights, list) and any(
+        isinstance(item, Mapping) and item.get("source") in {"civitai", "manual"}
+        for item in weights
+    ):
+        raise APIError(
+            "REVIEW_INVALID",
+            "工作流包含 Civitai 或待重绑的模型权重，请先在「模型依赖」中准备并绑定模型，再点击「将当前绑定生成新草稿」后启用",
+        )
     try:
         checked = _validate_weights({"weight_files": weights})
     except Exception as exc:
@@ -538,6 +546,7 @@ def review_model(
         raise APIError("LICENSE_CONFIRMATION_REQUIRED", "必须明确接受模型许可", 403)
     repo = Repository(st)
     model = _model(repo, user["id"], model_id)
+    model_patch: dict = {}
     if model.get("library_model_id"):
         from .gpu.model_library import ModelLibrary
         from .gpu.model_sources import ModelError
@@ -546,6 +555,38 @@ def review_model(
             entry = lib.check_remote(model["library_model_id"])
             if entry.get("state") != "ready" or entry.get("sha256") != model.get("model_sha256"):
                 raise ModelError("模型库文件身份已变化或未就绪，请重新注册工作流模型")
+        except ModelError as exc:
+            raise APIError("MODEL_REVIEW_INVALID", str(exc)) from exc
+        finally:
+            lib.close()
+    elif model.get("model_sha256") and not (
+        isinstance(model.get("revision"), str)
+        and _COMMIT.fullmatch(model["revision"])
+        and isinstance(model.get("source"), str)
+        and (urlsplit(model["source"]).hostname or "").lower() in _SOURCE_HOSTS
+    ):
+        from .gpu.model_library import ModelLibrary
+        from .gpu.model_sources import ModelError
+        lib = ModelLibrary(repo, user["id"])
+        try:
+            expected_sha = str(model["model_sha256"]).lower()
+            matched = next(
+                (
+                    item for item in lib.models()
+                    if item.get("state") == "ready"
+                    and isinstance(item.get("sha256"), str)
+                    and item["sha256"].lower() == expected_sha
+                ),
+                None,
+            )
+            if not matched:
+                raise ModelError("请先在工作流的「模型依赖」中下载并准备对应的模型库文件（SHA-256 匹配），再完成模型审查")
+            entry = lib.check_remote(matched["id"])
+            if entry.get("state") != "ready" or (entry.get("sha256") or "").lower() != expected_sha:
+                raise ModelError("模型库文件身份已变化或未就绪，请重新准备对应模型")
+            model_patch["library_model_id"] = matched["id"]
+            if entry.get("drive_file_id"):
+                model_patch["drive_file_id"] = entry["drive_file_id"]
         except ModelError as exc:
             raise APIError("MODEL_REVIEW_INVALID", str(exc)) from exc
         finally:
@@ -561,6 +602,7 @@ def review_model(
         "models",
         model["id"],
         {
+            **model_patch,
             "review_approved": True,
             "license_accepted": True,
             "license_review_approved": True,
@@ -1088,8 +1130,24 @@ def workflow_activation(
     blockers = []
     if model is None:
         blockers.append("找不到该工作流绑定的模型记录")
-    elif not (isinstance(model.get("source"), str) and model.get("license")):
-        blockers.append("模型缺少来源或许可字段，无法完成审查")
+    else:
+        has_source_or_identity = bool(
+            (isinstance(model.get("source"), str) and model.get("source").strip())
+            or model.get("library_model_id")
+            or model.get("model_sha256")
+        )
+        if not (has_source_or_identity and model.get("license")):
+            blockers.append("模型缺少来源或许可字段，无法完成审查")
+    raw_weights = (
+        ((row.get("manifest") or {}).get("dependencies") or {}).get("weight_files")
+        or (row.get("manifest") or {}).get("weight_files")
+        or []
+    )
+    if isinstance(raw_weights, list) and any(
+        isinstance(item, Mapping) and item.get("source") in {"civitai", "manual"}
+        for item in raw_weights
+    ):
+        blockers.append("工作流包含 Civitai 或待重绑的模型权重，请先展开「模型依赖」准备并绑定模型，再点击「将当前绑定生成新草稿」后启用")
     if not cfg.real_enabled:
         blockers.append("服务端未开启真实 GPU（GPU_REAL_ENABLED）")
     if runtime_error:

@@ -45,6 +45,8 @@ export interface DependencyWeight {
   repo_type?: string;
   revision?: string;
   filename?: string;
+  display_name?: string;
+  version_name?: string;
   target?: string;
   sha256?: string;
   size?: number;
@@ -53,6 +55,7 @@ export interface DependencyWeight {
   source_url?: string;
   download_url?: string;
   url?: string;
+  source_identity?: Record<string, unknown>;
 }
 
 export interface Dependency {
@@ -61,6 +64,7 @@ export interface Dependency {
   node_type: string;
   field: string;
   reference: string;
+  display_name?: string;
   model_type: string;
   architecture: string;
   model_id?: string | null;
@@ -623,6 +627,17 @@ export function dependencySourceUrl(dep: Dependency): string | null {
     const direct = weight.source_url || weight.download_url || weight.url;
     if (typeof direct === 'string' && direct.startsWith('https://')) {
       return direct;
+    }
+    if (weight.source === 'civitai' && weight.source_identity && typeof weight.source_identity === 'object') {
+      const modelId = weight.source_identity.model_id;
+      const versionId = weight.source_identity.version_id;
+      if (modelId !== undefined && /^\d+$/.test(String(modelId))) {
+        const base = `https://civitai.com/models/${modelId}`;
+        if (versionId !== undefined && /^\d+$/.test(String(versionId))) {
+          return `${base}?modelVersionId=${versionId}`;
+        }
+        return base;
+      }
     }
   }
   return null;

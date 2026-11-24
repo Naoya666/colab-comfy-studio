@@ -1,10 +1,22 @@
 import { useEffect, useRef, useState } from 'react';
-import { Copy, Download, Globe, Image as ImageIcon, RefreshCw, Upload, X } from 'lucide-react';
-import { ApiError, apiMessage, fetchWorkflowFromUrl } from '../lib/gpu-api';
+import { AlertTriangle, Copy, Download, Globe, Image as ImageIcon, RefreshCw, Upload, X } from 'lucide-react';
+import { ApiError, apiMessage, fetchWorkflowFromUrl, type WorkflowVersionConflictDetail } from '../lib/gpu-api';
 import { extractPng, MAX_IMAGE, type ExtractedWorkflow } from '../lib/png-workflow';
-import { classifyWorkflowJson, validateWorkflowUrlInput } from '../lib/workflow-import';
+import {
+  applyBundleIdentityOverride,
+  classifyWorkflowJson,
+  isValidSemver,
+  isValidWorkflowKey,
+  parseWorkflowVersionConflict,
+  validateWorkflowUrlInput,
+} from '../lib/workflow-import';
 import { WorkflowSourceDropzone } from './WorkflowSourceDropzone';
 import styles from '../gpu.module.css';
+
+export type WorkflowImportResult =
+  | { ok: true }
+  | { ok: false; conflict: WorkflowVersionConflictDetail }
+  | { ok: false; error?: string };
 
 interface PendingPngPreview {
   sourceKind: 'local' | 'remote';
@@ -15,6 +27,13 @@ interface PendingPngPreview {
   result: ExtractedWorkflow;
 }
 
+interface PendingVersionConflict {
+  bundle: Record<string, unknown>;
+  detail: WorkflowVersionConflictDetail;
+  workflowKey: string;
+  version: string;
+}
+
 export function WorkflowImportWorkspace({
   open,
   onClose,
@@ -23,11 +42,12 @@ export function WorkflowImportWorkspace({
 }: {
   open: boolean;
   onClose: () => void;
-  onImport: (bundle: string) => Promise<boolean> | void;
+  onImport: (bundle: string) => Promise<boolean | WorkflowImportResult> | void;
   onOpenModelLibrary?: () => void;
 }) {
   const revision = useRef(0);
   const [pending, setPending] = useState<PendingPngPreview | null>(null);
+  const [conflict, setConflict] = useState<PendingVersionConflict | null>(null);
   const [thumbUrl, setThumbUrl] = useState('');
   const [selected, setSelected] = useState<'workflow' | 'prompt'>('workflow');
   const [busy, setBusy] = useState(false);
@@ -52,6 +72,7 @@ export function WorkflowImportWorkspace({
   function resetPreview() {
     revision.current += 1;
     setPending(null);
+    setConflict(null);
     setError('');
     setPlainComfyNotice('');
     setCopyFeedback('');
@@ -59,17 +80,61 @@ export function WorkflowImportWorkspace({
 
   async function importBundlePayload(bundle: Record<string, unknown>): Promise<boolean> {
     setImporting(true);
+    setError('');
     try {
-      const ok = await onImport(JSON.stringify(bundle));
-      if (ok !== false) {
-        resetPreview();
-        onClose();
-        return true;
+      const outcome = await onImport(JSON.stringify(bundle));
+      if (outcome && typeof outcome === 'object' && 'conflict' in outcome && outcome.conflict) {
+        setConflict({
+          bundle,
+          detail: outcome.conflict,
+          workflowKey: outcome.conflict.workflow_key,
+          version: outcome.conflict.suggested_version,
+        });
+        setError('');
+        return false;
       }
+      if (outcome === false || (outcome && typeof outcome === 'object' && outcome.ok === false)) {
+        if (outcome && typeof outcome === 'object' && 'error' in outcome && outcome.error) {
+          setError(outcome.error);
+        }
+        return false;
+      }
+      resetPreview();
+      onClose();
+      return true;
+    } catch (cause) {
+      const parsedConflict = parseWorkflowVersionConflict(cause);
+      if (parsedConflict) {
+        setConflict({
+          bundle,
+          detail: parsedConflict,
+          workflowKey: parsedConflict.workflow_key,
+          version: parsedConflict.suggested_version,
+        });
+        setError('');
+        return false;
+      }
+      setError(apiMessage(cause));
       return false;
     } finally {
       setImporting(false);
     }
+  }
+
+  async function submitConflictResolution() {
+    if (!conflict || importing) return;
+    const nextKey = conflict.workflowKey.trim();
+    const nextVersion = conflict.version.trim();
+    if (!isValidWorkflowKey(nextKey)) {
+      setError('工作流标识格式无效：仅支持字母、数字、点、下划线和短横线，且需以字母或数字开头（最多 120 字符）');
+      return;
+    }
+    if (!isValidSemver(nextVersion)) {
+      setError('版本号必须符合 SemVer 格式，例如 1.0.1 或 1.2.0-custom.1');
+      return;
+    }
+    const updated = applyBundleIdentityOverride(conflict.bundle, nextKey, nextVersion);
+    await importBundlePayload(updated);
   }
 
   async function handleJsonObject(parsed: unknown): Promise<boolean> {
@@ -226,7 +291,7 @@ export function WorkflowImportWorkspace({
           </span>
         </div>
         <div className={styles.titleActions}>
-          {pending && (
+          {(pending || conflict) && (
             <button
               type="button"
               className="button ghost small"
@@ -249,7 +314,7 @@ export function WorkflowImportWorkspace({
         </div>
       </div>
 
-      {!pending && (
+      {!pending && !conflict && (
         <WorkflowSourceDropzone
           title="拖入或选择工作流文件（.json / .png 原图）"
           description="支持 Studio 工作流包 JSON 及 PNG 原图（本地解包或服务端安全拉取远程链接）；普通 ComfyUI 工作流 JSON 请到「模型库」检测模型依赖。"
@@ -282,6 +347,104 @@ export function WorkflowImportWorkspace({
               </button>
             </div>
           )}
+        </div>
+      )}
+
+      {conflict && (
+        <div className={`${styles.depNoticeStrip} ${styles.wfConflictPanel}`} role="region" aria-label="解决工作流版本冲突">
+          <div className={styles.depSummaryMeta}>
+            <AlertTriangle size={15} aria-hidden />
+            <strong>
+              版本冲突：「{conflict.detail.workflow_key}」v{conflict.detail.workflow_version} 已存在
+            </strong>
+            {conflict.detail.existing_state === 'deleted' && (
+              <span className={styles.depTag}>历史已删除版本仍占号</span>
+            )}
+          </div>
+          <p className="small muted">
+            可直接使用建议的新版本号，或修改工作流标识 / 版本号后重新导入为草稿。
+            {conflict.detail.existing_versions.length > 0 && (
+              <> 已有版本：{conflict.detail.existing_versions.map((v) => `v${v}`).join('、')}。</>
+            )}
+          </p>
+          <div className={styles.wfConflictFields}>
+            <label className={styles.wfConflictField}>
+              <span className="small">工作流标识（workflow_key）</span>
+              <input
+                type="text"
+                aria-label="工作流标识"
+                value={conflict.workflowKey}
+                disabled={anyBusy}
+                onChange={(e) => {
+                  setConflict((curr) => (curr ? { ...curr, workflowKey: e.target.value } : null));
+                  setError('');
+                }}
+              />
+            </label>
+            <label className={styles.wfConflictField}>
+              <span className="small">版本号（SemVer，例如 1.0.1）</span>
+              <input
+                type="text"
+                aria-label="新版本号"
+                value={conflict.version}
+                disabled={anyBusy}
+                onChange={(e) => {
+                  setConflict((curr) => (curr ? { ...curr, version: e.target.value } : null));
+                  setError('');
+                }}
+              />
+            </label>
+          </div>
+          <div className="actions">
+            {conflict.workflowKey.trim() !== conflict.detail.suggested_workflow_key && (
+              <button
+                type="button"
+                className="button ghost small"
+                disabled={anyBusy}
+                onClick={() => {
+                  setConflict((curr) => (
+                    curr ? { ...curr, workflowKey: curr.detail.suggested_workflow_key } : null
+                  ));
+                  setError('');
+                }}
+              >
+                改用新标识：{conflict.detail.suggested_workflow_key}
+              </button>
+            )}
+            {conflict.version.trim() !== conflict.detail.suggested_version && (
+              <button
+                type="button"
+                className="button ghost small"
+                disabled={anyBusy}
+                onClick={() => {
+                  setConflict((curr) => (
+                    curr ? { ...curr, version: curr.detail.suggested_version } : null
+                  ));
+                  setError('');
+                }}
+              >
+                恢复建议版本：v{conflict.detail.suggested_version}
+              </button>
+            )}
+          </div>
+          <div className="actions">
+            <button
+              type="button"
+              className="button small"
+              disabled={anyBusy}
+              onClick={() => void submitConflictResolution()}
+            >
+              {importing ? '导入中…' : '按新版本导入为草稿'}
+            </button>
+            <button
+              type="button"
+              className="button ghost small"
+              disabled={anyBusy}
+              onClick={resetPreview}
+            >
+              取消
+            </button>
+          </div>
         </div>
       )}
 

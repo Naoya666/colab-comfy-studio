@@ -2573,6 +2573,42 @@
 .wfImportNoticeRow {
   gap: 8px;
 }
+.wfConflictPanel {
+  gap: 10px;
+  padding: 12px 14px;
+}
+.wfConflictFields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+.wfConflictField {
+  display: grid;
+  gap: 4px;
+}
+.wfExportSummary {
+  gap: 8px;
+  padding: 10px 12px;
+}
+.wfExportSummaryHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.wfRebindList {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.wfRebindList li {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .depFilterBar {
   display: flex;
   align-items: center;

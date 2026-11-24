@@ -407,7 +407,7 @@ class ModelLibrary:
         self.repo.update("model_dependencies", record["id"], {"dependencies": record["dependencies"]}, self.owner)
         return self.dependency_record(workflow_id)
 
-    def prepare_dependencies(self, workflow_id):
+    def prepare_dependencies(self, workflow_id, *, auto_import: bool = False):
         record = self.dependency_record(workflow_id)
         tasks, unresolved = [], []
         for dep in record["dependencies"]:
@@ -417,23 +417,99 @@ class ModelLibrary:
             if not model_id and dep.get("weight"):
                 weight = dep["weight"]
                 target = weight.get("target") or weight.get("filename") or ""
-                if weight.get("source") == "drive":
+                weight_source = weight.get("source")
+                if weight_source == "drive":
                     data = {"source": "drive", "drive_file_id": weight.get("drive_file_id")}
-                elif all(weight.get(k) for k in ("repo_id", "revision", "filename")):
+                    model = self.add({**data, "filename": Path(target).name, "model_type": dep["model_type"],
+                                      "expected_sha256": weight.get("sha256"), "expected_size": weight.get("size"), "legacy_target": target})
+                    model_id = model["id"]
+                    dep.update(model_id=model_id, confirmed=True)
+                elif weight_source in {None, "huggingface"} and all(weight.get(k) for k in ("repo_id", "revision", "filename")):
                     repo_type = normalize_hf_repo_type(weight.get("repo_type"))
                     url = hf_download_url(weight["repo_id"], weight["revision"], weight["filename"], repo_type)
                     identity = {"repo_id": weight["repo_id"], "revision": weight["revision"], "filename": weight["filename"]}
                     if repo_type != "models":
                         identity["repo_type"] = repo_type
                     data = {"source": "huggingface", "download_url": url, "source_url": url, "source_identity": identity}
+                    model = self.add({**data, "filename": Path(target).name, "model_type": dep["model_type"],
+                                      "expected_sha256": weight.get("sha256"), "expected_size": weight.get("size"), "legacy_target": target})
+                    model_id = model["id"]
+                    dep.update(model_id=model_id, confirmed=True)
+                elif auto_import:
+                    unresolved.append(dep["id"])
+                    continue
+                elif weight_source == "civitai":
+                    civitai_url = deps.source_url_of(dep)
+                    expected_sha = (dep.get("expected_sha256") or weight.get("sha256") or "").lower() or None
+                    expected_fid = (weight.get("source_identity") or {}).get("file_id")
+                    if civitai_url or expected_sha:
+                        try:
+                            candidates = self.resolve({"url": civitai_url} if civitai_url else {"sha256": expected_sha})
+                            exact = [
+                                f for f in candidates
+                                if (expected_sha and (f.get("expected_sha256") or "").lower() == expected_sha)
+                                or (not expected_sha and expected_fid is not None and (f.get("source_identity") or {}).get("file_id") == expected_fid)
+                            ]
+                            if not exact and not expected_sha and len(candidates) == 1:
+                                exact = candidates
+                            if len(exact) == 1:
+                                selected = exact[0]
+                                rel = target.split("/", 1)[-1] if "/" in target else None
+                                if rel and PurePosixPath(rel).name != selected["filename"]:
+                                    rel = None
+                                model = self.add({
+                                    **selected,
+                                    "model_type": dep["model_type"],
+                                    **({"relative_path": rel} if rel else {}),
+                                    "expected_sha256": expected_sha or selected.get("expected_sha256"),
+                                })
+                                model_id = model["id"]
+                                dep.update(model_id=model_id, confirmed=True)
+                            else:
+                                dep["source_error"] = "Civitai 来源包含多个或不匹配的文件，请点击「解析并绑定准备」手动选择具体文件"
+                        except ModelError as exc:
+                            dep["source_error"] = str(exc)
+                    else:
+                        dep["source_error"] = "缺少 Civitai 链接或 SHA-256，请手动搜索并绑定模型"
+                    if not model_id:
+                        unresolved.append(dep["id"])
+                        continue
+                elif weight_source == "manual":
+                    hint_url = deps.source_url_of(dep)
+                    expected_sha = (dep.get("expected_sha256") or weight.get("sha256") or "").lower() or None
+                    if hint_url:
+                        try:
+                            candidates = self.resolve({"url": hint_url})
+                            exact = [
+                                f for f in candidates
+                                if not expected_sha or (f.get("expected_sha256") or "").lower() == expected_sha
+                            ]
+                            if len(exact) == 1:
+                                selected = exact[0]
+                                rel = target.split("/", 1)[-1] if "/" in target else None
+                                if rel and PurePosixPath(rel).name != selected["filename"]:
+                                    rel = None
+                                model = self.add({
+                                    **selected,
+                                    "model_type": dep["model_type"],
+                                    **({"relative_path": rel} if rel else {}),
+                                    "expected_sha256": expected_sha or selected.get("expected_sha256"),
+                                })
+                                model_id = model["id"]
+                                dep.update(model_id=model_id, confirmed=True)
+                            else:
+                                dep["source_error"] = "参考来源包含多个或不匹配的文件，请手动解析并核对 SHA-256 后绑定"
+                        except ModelError as exc:
+                            dep["source_error"] = str(exc)
+                    else:
+                        dep["source_error"] = "该模型来自原导出者的私有存储，请根据模型名称与 SHA-256 自行查找或上传后绑定"
+                    if not model_id:
+                        unresolved.append(dep["id"])
+                        continue
                 else:
                     unresolved.append(dep["id"])
                     continue
-                model = self.add({**data, "filename": Path(target).name, "model_type": dep["model_type"],
-                                  "expected_sha256": weight.get("sha256"), "expected_size": weight.get("size"), "legacy_target": target})
-                model_id = model["id"]
-                dep.update(model_id=model_id, confirmed=True)
-            if not model_id and (dep.get("source_hint") or dep.get("expected_sha256")):
+            if not model_id and not auto_import and (dep.get("source_hint") or dep.get("expected_sha256")):
                 try:
                     candidates = self.resolve({"url": dep["source_hint"]} if dep.get("source_hint") else {"sha256": dep["expected_sha256"]})
                     exact = [f for f in candidates if not dep.get("expected_sha256") or f.get("expected_sha256") == dep["expected_sha256"]]
@@ -529,18 +605,31 @@ class ModelLibrary:
         bundle["manifest"].pop("version", None)
         weights = deps.weights_of(original)
         weights = copy.deepcopy(weights)
+        optional_targets: set[str] = set()
+        bound_targets: set[str] = set()
         for d in self.dependency_record(workflow_id)["dependencies"]:
             if not d.get("model_id"):
+                if (not d.get("required", True) or d.get("disabled")) and d.get("model_type") in deps.directories():
+                    optional_targets.add(deps.target_for(d))
                 continue
             m = self.get(d["model_id"])
             if m["state"] != "ready":
                 raise ModelError("请先准备全部绑定模型")
             target = deps.target_for(d, m)
+            bound_targets.add(target)
             weights = [w for w in weights if w.get("target") != target]
             weights.append({"source": "drive", "drive_file_id": m["drive_file_id"], "sha256": m["sha256"], "size": m["size"], "target": target})
             if d.get("strengths"):
                 for field, value in d["strengths"].items():
                     deps.set_input(bundle["api_graph"][d["node_id"]]["inputs"], field, 0 if d.get("disabled") else value)
+        weights = [
+            w for w in weights
+            if not (w.get("source") in {"civitai", "manual"} and w.get("target") in optional_targets - bound_targets)
+        ]
+        pending_rebind = [w for w in weights if w.get("source") in {"civitai", "manual"}]
+        if pending_rebind:
+            names = [str(w.get("display_name") or w.get("filename") or w.get("target") or "未命名模型") for w in pending_rebind]
+            raise ModelError(f"仍有未绑定的 Civitai / 待重绑模型（{'、'.join(names[:4])}），请先在「模型依赖」中准备并绑定后再生成草稿")
         bundle["manifest"].setdefault("dependencies", {})["weight_files"] = weights
         bundle["manifest"].pop("weight_files", None)
         return Registry(self.repo).import_workflow(self.owner, bundle)

@@ -247,4 +247,9 @@ test('project default, batch asset move, and optional project_id queries match b
   requests = [];
   await api.getReferenceAssets();
   assert.equal(lastRequest().url, '/api/assets');
+
+  requests = [];
+  await api.exportGpuWorkflow('wf/1');
+  assert.equal(lastRequest().url, '/api/gpu/workflows/wf%2F1/export');
+  assert.equal(lastRequest().init.method, undefined);
 });

@@ -114,7 +114,11 @@ export function DependencyCard({
   const [disabled, setDisabled] = useState(dep.disabled || false);
   const [targetType, setTargetType] = useState(dep.model_type !== 'unknown' ? dep.model_type : '');
   const [url, setUrl] = useState(sourceUrl || '');
-  const [searchQuery, setSearchQuery] = useState(() => defaultSearchQuery(dep.reference));
+  const hintDisplayName = (dep.display_name || dep.weight?.display_name || '').trim();
+  const preferredSearchSeed = hintDisplayName && hintDisplayName !== dep.reference
+    ? hintDisplayName
+    : dep.reference;
+  const [searchQuery, setSearchQuery] = useState(() => defaultSearchQuery(preferredSearchSeed));
   const [platformFilter, setPlatformFilter] = useState<SourcePlatformFilter>('all');
   const [lookup, setLookup] = useState<SourceLookup | null>(null);
   const [showManualUrl, setShowManualUrl] = useState(false);
@@ -140,8 +144,8 @@ export function DependencyCard({
 
   useEffect(() => {
     setUrl(sourceUrl || '');
-    setSearchQuery(defaultSearchQuery(dep.reference));
-  }, [dep.id, dep.reference, sourceUrl]);
+    setSearchQuery(defaultSearchQuery(preferredSearchSeed));
+  }, [dep.id, preferredSearchSeed, sourceUrl]);
 
   const compatibleModels = useMemo(
     () => models.filter((m) => dep.model_type === 'unknown' || m.model_type === dep.model_type),
@@ -293,6 +297,8 @@ export function DependencyCard({
           </div>
           <div className={styles.depMetaRow}>
             <span className={styles.depTag}>{dep.model_type}</span>
+            {dep.weight?.source === 'civitai' && <span className={styles.depTag}>Civitai 来源</span>}
+            {dep.weight?.source === 'manual' && <span className={styles.depTag}>需重新绑定</span>}
             {dep.architecture && dep.architecture !== 'unknown' && (
               <span className={styles.depTag}>{dep.architecture}</span>
             )}
@@ -313,6 +319,20 @@ export function DependencyCard({
               </button>
             ) : null}
           </div>
+          {hintDisplayName && hintDisplayName !== dep.reference && hintDisplayName !== expectedBasename && (
+            <div className={styles.depMetaRow}>
+              <span className="small">模型名称：<strong>{hintDisplayName}</strong></span>
+              <button
+                type="button"
+                className={styles.depCopyBtn}
+                title="复制模型名称"
+                aria-label={`复制模型名称 ${hintDisplayName}`}
+                onClick={() => copyText('displayName', hintDisplayName)}
+              >
+                {copiedKey === 'displayName' ? <Check size={12} aria-hidden /> : <Copy size={12} aria-hidden />}
+              </button>
+            </div>
+          )}
         </div>
 
         <span className={styles.depStatusBadge} data-tone={tone}>
@@ -392,6 +412,24 @@ export function DependencyCard({
               直接绑定此文件
             </button>
           )}
+        </div>
+      )}
+
+      {dep.weight?.source === 'manual' && !bound && (
+        <div className={styles.depNoticeStrip}>
+          <p className="small">
+            原导出工作流使用了私有存储模型「{hintDisplayName || expectedBasename}」
+            {effectiveSha ? `（SHA-256：${shortHash(effectiveSha)}）` : ''}。
+            请根据模型名称自行搜索或上传到模型库并绑定，全部绑定就绪后点击上方「将当前绑定生成新草稿」。
+          </p>
+        </div>
+      )}
+
+      {dep.weight?.source === 'civitai' && !bound && mode === 'workflow' && (
+        <div className={styles.depInfoStrip}>
+          <p className="muted small">
+            此权重来自 Civitai：可点击上方「准备全部缺失模型」或下方「解析并绑定准备」自动下载到你的模型库，准备完成后点击「将当前绑定生成新草稿」即可启用。
+          </p>
         </div>
       )}
 

@@ -223,6 +223,15 @@ def source_url_of(dep):
                     return https_url(val)
                 except ModelError:
                     return None
+        if weight.get("source") == "civitai" and isinstance(weight.get("source_identity"), dict):
+            ident = weight["source_identity"]
+            model_id = ident.get("model_id")
+            version_id = ident.get("version_id")
+            if model_id is not None and str(model_id).isdigit():
+                base = f"https://civitai.com/models/{model_id}"
+                if version_id is not None and str(version_id).isdigit():
+                    return f"{base}?modelVersionId={version_id}"
+                return base
     return None
 
 
@@ -669,9 +678,18 @@ def scan(workflow, *, node_types=None, include_hints=False):
         matches = [w for w in weights_of(workflow)
                    if w.get("target") == f"{directory_map.get(dep['model_type'], dep['model_type'])}/{dep['reference']}"]
         if len(matches) == 1:
-            dep["weight"] = copy.deepcopy(matches[0])
-            dep["expected_sha256"] = matches[0].get("sha256")
-            dep["architecture"] = matches[0].get("architecture") or dep["architecture"]
+            weight = matches[0]
+            dep["weight"] = copy.deepcopy(weight)
+            dep["expected_sha256"] = weight.get("sha256") or dep.get("expected_sha256")
+            if type(weight.get("size")) is int and weight["size"] > 0 and not dep.get("expected_size"):
+                dep["expected_size"] = weight["size"]
+            if isinstance(weight.get("display_name"), str) and weight["display_name"].strip():
+                dep["display_name"] = weight["display_name"].strip()
+            dep["architecture"] = weight.get("architecture") or dep["architecture"]
+            if not dep.get("source_hint"):
+                derived = source_url_of(dep)
+                if derived:
+                    dep["source_hint"] = derived
     return dependencies
 
 
@@ -683,6 +701,13 @@ def identity_matches(dep, model):
     identity = model.get("source_identity") or {}
     if weight.get("source") == "drive":
         return weight.get("drive_file_id") == model.get("drive_file_id")
+    if weight.get("source") == "civitai" and model.get("source") == "civitai":
+        w_ident = weight.get("source_identity") or {}
+        if w_ident.get("version_id") is not None and w_ident.get("file_id") is not None:
+            return (
+                identity.get("version_id") == w_ident.get("version_id")
+                and identity.get("file_id") == w_ident.get("file_id")
+            )
     return bool(weight.get("repo_id") and all(weight.get(k) == identity.get(k) for k in ("repo_id", "revision", "filename")))
 
 

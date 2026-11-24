@@ -279,6 +279,8 @@ class ImmutableStaticFiles(StaticFiles):
 
 def error_response(request, exc):
     error = {"code": exc.code, "message": exc.message, "retryable": exc.retryable}
+    if getattr(exc, "detail", None) is not None:
+        error["detail"] = exc.detail
     result = envelope(error=error, request_id=getattr(request.state, "request_id", None))
     result.update(code=exc.code, message=exc.message)
     return JSONResponse(result, status_code=exc.status)
@@ -544,34 +546,100 @@ def fetch_workflow_from_url(body: dict, request: Request, user=Depends(current_u
     raise APIError("INVALID_WORKFLOW_BUNDLE", "JSON 必须包含 manifest、api_graph、object_info", 422)
 
 
+@router.get("/workflows/{workflow_id}/export")
+def export_workflow(workflow_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    admin(user)
+    repo, _ = repo_registry(st, user)
+    row = own(repo, "workflows", workflow_id, user)
+    if row.get("state") != "published":
+        raise APIError("WORKFLOW_NOT_PUBLISHED", "仅支持导出已发布的工作流版本", 409)
+    from .gpu.workflow_export import build_workflow_export
+
+    return ok(build_workflow_export(repo, user["id"], row), request)
+
+
 @router.post("/workflows/import")
 def import_workflow(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
     admin(user)
     if len(json.dumps(body)) > 5 * 1024 * 1024:
         raise APIError("WORKFLOW_TOO_LARGE", "工作流 JSON 过大", 413)
     repo, registry = repo_registry(st, user)
-    manifest = body.get("manifest") or {}
-    body = {
-        **body,
-        "workflow_key": body.get("workflow_key", manifest.get("workflow_key")),
-        "model_id": body.get("model_id", manifest.get("model_id")),
-    }
-    row = registry.import_workflow(user["id"], body)
+    from .gpu.workflow_export import (
+        find_workflow_version_conflict,
+        sanitize_import_model,
+        summarize_portable_weights,
+    )
+
+    body_copy = copy.deepcopy(body)
+    is_wrapped = isinstance(body_copy.get("workflow"), dict)
+    source = body_copy["workflow"] if is_wrapped else body_copy
+    manifest = source.get("manifest") if isinstance(source.get("manifest"), dict) else {}
+    resolved_key = source.get("workflow_key") or source.get("key") or manifest.get("workflow_key")
+    resolved_model_id = source.get("model_id") or manifest.get("model_id")
+    if resolved_key is not None and not source.get("workflow_key"):
+        source["workflow_key"] = resolved_key
+    if resolved_model_id is not None and not source.get("model_id"):
+        source["model_id"] = resolved_model_id
+
+    manifest_version = manifest.get("version")
+    if isinstance(resolved_key, str) and resolved_key and manifest_version is not None:
+        conflict = find_workflow_version_conflict(repo, user["id"], resolved_key, manifest_version)
+        if conflict is not None:
+            raise APIError(
+                "WORKFLOW_VERSION_CONFLICT",
+                f"工作流「{resolved_key}」版本 v{manifest_version} 已存在，请修改版本号或工作流标识后导入",
+                status=409,
+                detail=conflict,
+            )
+
+    row = registry.import_workflow(user["id"], body_copy)
+
+    model_auto_registered = False
+    raw_model = source.get("model") if isinstance(source.get("model"), dict) else body_copy.get("model")
+    target_model_id = row.get("model_id")
+    if isinstance(raw_model, dict) and isinstance(target_model_id, str) and target_model_id and target_model_id != "unconfigured":
+        existing_models = repo.list("models", user["id"])
+        if not any(m.get("model_id") == target_model_id for m in existing_models):
+            sanitized_model = sanitize_import_model(raw_model, target_model_id)
+            if sanitized_model is not None:
+                repo.create("models", user["id"], sanitized_model)
+                model_auto_registered = True
+
     from .gpu.model_library import ModelLibrary
     lib = ModelLibrary(repo, user["id"])
     try:
         lib.dependency_record(row["id"], rescan=True)
-        # Exact manifest sources can enter the durable queue without allocating GPU.
-        if any(d.get("weight") for d in row.get("model_dependency_scan") or []):
+        # Only exact pinned HF / local Drive weights enter the background queue immediately on import.
+        # Civitai / manual portable weights stay visible in Model Dependencies for explicit user preparation.
+        has_auto_queue_weight = any(
+            isinstance(d.get("weight"), dict)
+            and (
+                (d["weight"].get("source") == "drive" and d["weight"].get("drive_file_id"))
+                or (
+                    d["weight"].get("source") in {None, "huggingface"}
+                    and all(d["weight"].get(k) for k in ("repo_id", "revision", "filename"))
+                )
+            )
+            for d in (row.get("model_dependency_scan") or [])
+        )
+        if has_auto_queue_weight:
             from .gpu.model_sources import ModelError
             try:
-                lib.prepare_dependencies(row["id"])
+                lib.prepare_dependencies(row["id"], auto_import=True)
             except ModelError as exc:
                 row = repo.update("workflows", row["id"], {"model_preparation_error": str(exc)}, user["id"])
     finally:
         lib.close()
     row = cloud_sync_workflow(st, user["id"], row)
-    return ok(row, request, 201)
+    row_manifest = row.get("manifest") or {}
+    raw_weights = (row_manifest.get("dependencies") or {}).get("weight_files") or row_manifest.get("weight_files") or []
+    weight_summary = summarize_portable_weights(raw_weights)
+    response_payload = {
+        **row,
+        "model_auto_registered": model_auto_registered,
+        "import_weight_summary": weight_summary,
+    }
+    return ok(response_payload, request, 201)
 
 
 @router.put("/workflows/{workflow_id}/configuration")

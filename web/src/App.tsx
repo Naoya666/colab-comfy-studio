@@ -26,7 +26,7 @@ import {
 import {
   apiMessage, cancelGpuJob, clearGpuJobHistory, createGpuJob, createGpuBatch,
   createProject, deleteGpuPreset, deleteGpuWorkflow, deleteProject,
-  apiFetch,
+  apiFetch, exportGpuWorkflow,
   getGpuComputeSpecs, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
   getGpuPresets, getReferenceAssets, getGpuSettings, getGpuSpecOrder, getGpuUsage, getGpuWorkflowSchema, getGpuWorkflows, getProjects,
   importGpuWorkflow,
@@ -35,7 +35,10 @@ import {
   validateGpuWorkflow, rollbackGpuWorkflow, deactivateGpuWorkflow, saveGpuPreset, ApiError,
   type ComputeSpec, type GalleryAsset, type GpuJob, type GpuPreset,
   type GpuManifest, type GpuModel, type GpuSettings, type GpuSpecKey, type GpuUsage, type GpuWorkflow, type Project, type Provider, type ReusePreviewResponse,
+  type WorkflowExportResponse,
 } from './lib/gpu-api';
+import type { WorkflowImportResult } from './components/WorkflowImportWorkspace';
+import { formatExportSummaryMessage, parseWorkflowVersionConflict } from './lib/workflow-import';
 import type { GpuAccount, GpuInstance } from './components/AccountDirectory';
 import { isAccountSelectable } from './components/RuntimeSelection';
 import type { RuntimeChoice } from './pages/CreatePage';
@@ -855,29 +858,73 @@ export default function App() {
     }
   }
 
-  async function importWorkflow(raw: string): Promise<boolean> {
+  async function importWorkflow(raw: string): Promise<WorkflowImportResult> {
     try {
       const value = JSON.parse(raw) as unknown;
       const source = record(value) && record(value.workflow) ? value.workflow : value;
       if (!record(source) || (!record(source.image_extraction) && (!record(source.manifest) || !record(source.api_graph) || !record(source.object_info)))) {
         throw new Error('JSON 必须包含 manifest、api_graph、object_info');
       }
-      let imported = false;
-      await action('import', async () => {
+      setLoading('import');
+      setError('');
+      try {
         const workflow = await importGpuWorkflow(value as never);
         setWorkflows((curr) => [workflow, ...curr.filter((item) => item.id !== workflow.id)]);
-        pushToast(
-          workflow.pending_configuration
-            ? '图片工作流已保存为待配置草稿，请到「资产 › 工作流」展开草稿补充运行配置。'
-            : '工作流已作为草稿导入，请校验后发布。',
-          'success',
-        );
-        imported = true;
-      });
-      return imported;
+        if (workflow.model_auto_registered) {
+          void getGpuModels().then(setModels).catch(() => undefined);
+        }
+        const weightSummary = workflow.import_weight_summary;
+        let toastMsg = workflow.pending_configuration
+          ? '图片工作流已保存为待配置草稿，请到「资产 › 工作流」展开草稿补充运行配置。'
+          : '工作流已作为草稿导入，请校验后发布。';
+        if (!workflow.pending_configuration && weightSummary?.requires_rebind) {
+          const parts: string[] = [];
+          if (weightSummary.civitai > 0) parts.push(`${weightSummary.civitai} 个 Civitai 来源`);
+          if (weightSummary.manual > 0) parts.push(`${weightSummary.manual} 个待重绑模型`);
+          toastMsg = `工作流已作为草稿导入（含 ${parts.join('、')}），请展开草稿中的「模型依赖」准备或重新绑定模型后生成新草稿再启用。`;
+        } else if (!workflow.pending_configuration && workflow.model_auto_registered) {
+          toastMsg = '工作流已作为草稿导入，并已自动登记待审查的模型记录，请校验并完成启用。';
+        }
+        pushToast(toastMsg, 'success');
+        return { ok: true };
+      } catch (cause) {
+        const conflict = parseWorkflowVersionConflict(cause);
+        if (conflict) {
+          return { ok: false, conflict };
+        }
+        const msg = apiMessage(cause);
+        setError(msg);
+        pushToast(msg, 'error');
+        return { ok: false, error: msg };
+      } finally {
+        setLoading('');
+      }
     } catch (cause) {
-      setError(`导入失败：${apiMessage(cause)}`);
-      return false;
+      const msg = apiMessage(cause);
+      setError(`导入失败：${msg}`);
+      return { ok: false, error: msg };
+    }
+  }
+
+  async function exportWorkflow(wf: GpuWorkflow): Promise<WorkflowExportResponse | null> {
+    setError('');
+    try {
+      const exported = await exportGpuWorkflow(wf.id);
+      const blobUrl = URL.createObjectURL(
+        new Blob([JSON.stringify(exported.bundle, null, 2)], { type: 'application/json' }),
+      );
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = exported.filename || `${wf.workflow_key}-v${wf.workflow_version}.json`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+      pushToast(formatExportSummaryMessage(exported.summary), 'success');
+      return exported;
+    } catch (cause) {
+      const msg = apiMessage(cause);
+      setError(msg);
+      pushToast(`导出失败：${msg}`, 'error');
+      return null;
     }
   }
 
@@ -1525,6 +1572,7 @@ export default function App() {
                 <WorkflowsPanel
                   workflows={workflows}
                   onImport={(bundle) => importWorkflow(bundle)}
+                  onExport={(wf) => exportWorkflow(wf)}
                   onOpenModelLibrary={() => {
                     writeStoredWorkflowInspect({ ...readStoredWorkflowInspect(), open: true });
                     setAssetsSubTab('models');

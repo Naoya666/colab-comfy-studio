@@ -55,7 +55,64 @@ export interface GpuModel { model_id: string; display_name: string; enabled: boo
 export interface GpuOption { value: string | number | boolean; label?: string; }
 export interface GpuParameter { id?: string; key?: string; name?: string; label?: string; type: ParamType; widget?: string; options?: Array<GpuOption | string | number | boolean>; default?: unknown; min?: number; max?: number; step?: number; group?: string; advanced?: boolean; required?: boolean; description?: string; [key: string]: unknown; }
 export interface GpuManifest { model_id?: string; title?: string; description?: string; parameters?: GpuParameter[] | Record<string, Omit<GpuParameter, 'id'>>; [key: string]: unknown; }
-export interface GpuWorkflow { id: string; workflow_key: string; workflow_version: string | number; model_id: string; state: string; active?: boolean; manifest?: GpuManifest; title?: string; description?: string; [key: string]: unknown; }
+export interface WorkflowImportWeightSummary {
+  total: number;
+  huggingface: number;
+  civitai: number;
+  manual: number;
+  drive: number;
+  requires_rebind: boolean;
+  rebind_models: WorkflowExportRebindModel[];
+}
+export interface WorkflowExportRebindModel {
+  target: string;
+  display_name: string;
+  filename: string;
+  source: 'civitai' | 'manual' | string;
+  source_url?: string;
+  sha256?: string;
+}
+export interface WorkflowExportSummary {
+  workflow_key: string;
+  workflow_version: string;
+  model_id: string;
+  has_model_metadata: boolean;
+  total_weights: number;
+  huggingface_weights: number;
+  restored_huggingface_weights: number;
+  civitai_weights: number;
+  manual_rebind_weights: number;
+  stripped_drive_ids: number;
+  warnings: string[];
+  rebind_models: WorkflowExportRebindModel[];
+}
+export interface WorkflowExportResponse {
+  filename: string;
+  bundle: Record<string, unknown>;
+  summary: WorkflowExportSummary;
+}
+export interface WorkflowVersionConflictDetail {
+  workflow_key: string;
+  workflow_version: string;
+  existing_state?: string;
+  existing_versions: string[];
+  suggested_version: string;
+  suggested_workflow_key: string;
+}
+export interface GpuWorkflow {
+  id: string;
+  workflow_key: string;
+  workflow_version: string | number;
+  model_id: string;
+  state: string;
+  active?: boolean;
+  manifest?: GpuManifest;
+  title?: string;
+  description?: string;
+  model_auto_registered?: boolean;
+  import_weight_summary?: WorkflowImportWeightSummary;
+  [key: string]: unknown;
+}
 export interface GpuPreset { id: string; name: string; workflow_version_id: string; overrides: Record<string, unknown>; [key: string]: unknown; }
 export type GpuExecutionPolicy = GpuExecutionPolicyV020;
 export interface GpuJobRequest extends GpuJobRequestV020 { }
@@ -334,6 +391,7 @@ export const getGpuWorkflowSchema = (id: string, spec?: Record<string, unknown>)
   return apiFetch<GpuManifest>(`/api/gpu/workflows/${encodeURIComponent(id)}/schema${query}`);
 };
 export const importGpuWorkflow = (bundle: WorkflowBundle) => apiFetch<GpuWorkflow>('/api/gpu/workflows/import', post(bundle));
+export const exportGpuWorkflow = (id: string) => apiFetch<WorkflowExportResponse>(`/api/gpu/workflows/${encodeURIComponent(id)}/export`);
 export const validateGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/validate`, post({}));
 export const publishGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/publish`, post({ confirmed: true }));
 export const rollbackGpuWorkflow = (workflow_key: string, version: string | number) => apiFetch<GpuWorkflow>('/api/gpu/workflows/rollback', post({ workflow_key, version }));
