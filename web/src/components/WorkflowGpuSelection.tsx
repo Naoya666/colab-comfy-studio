@@ -88,7 +88,7 @@ export function WorkflowGpuSelection({
         const belowDefault = Boolean(workflowDefault && isBelowWorkflowDefault(key, workflowDefault, effectiveOrder));
         return (
           <option key={token(key)} value={token(key)} disabled={belowDefault}>
-            {computeLabel(key)} · {s.vram_gb ? `${s.vram_gb} GB 显存` : '显存以实际设备为准'} · {s.reference_rate_hourly != null ? `${s.reference_rate_hourly} CU/h` : '估算费率未知'}{belowDefault ? '（低于工作流默认规格，不支持）' : ''}
+            {computeLabel(key)}{s.vram_gb ? ` · ${s.vram_gb} GB 显存` : ''} · {s.reference_rate_hourly != null ? `${s.reference_rate_hourly} CU/h` : '估算费率未知'}{belowDefault ? '（低于工作流默认规格，不支持）' : ''}
           </option>
         );
       })}
