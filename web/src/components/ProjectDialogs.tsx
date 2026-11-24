@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Check, FolderInput, Pencil, Search, Star, Trash2, X } from 'lucide-react';
 import type { Project } from '../lib/gpu-api';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import { projectOptionLabel } from '../lib/project-label';
 import { ConfirmDialog } from './Feedback';
 import styles from '../gpu.module.css';
@@ -29,6 +30,8 @@ export function ProjectSheet({
   const [editingTitle, setEditingTitle] = useState('');
   const [busyId, setBusyId] = useState('');
   const [confirmDelete, setConfirmDelete] = useState<Project | null>(null);
+
+  useBodyScrollLock(open);
 
   if (!open) return null;
 
@@ -59,8 +62,9 @@ export function ProjectSheet({
   }
 
   return (
-    <div className={styles.dialogBackdrop} role="presentation" onClick={onClose}>
-      <section className={styles.dialog} role="dialog" aria-modal="true" aria-label="切换与管理项目" onClick={(e) => e.stopPropagation()}>
+    <>
+      <div className={styles.dialogBackdrop} role="presentation" onClick={onClose}>
+        <section className={styles.dialog} role="dialog" aria-modal="true" aria-label="切换与管理项目" onClick={(e) => e.stopPropagation()}>
         <div className={styles.cardHead}>
           <h2>切换与管理项目</h2>
           <button className={styles.iconGhost} type="button" aria-label="关闭" onClick={onClose}><X size={18} strokeWidth={1.6} aria-hidden /></button>
@@ -148,6 +152,7 @@ export function ProjectSheet({
           })}
         </ul>
       </section>
+      </div>
 
       <ConfirmDialog
         open={Boolean(confirmDelete)}
@@ -167,7 +172,7 @@ export function ProjectSheet({
           }
         }}
       />
-    </div>
+    </>
   );
 }
 
@@ -189,6 +194,8 @@ export function MoveProjectDialog({
   const [targetId, setTargetId] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+
+  useBodyScrollLock(open && assetIds.length > 0);
 
   useEffect(() => {
     if (!open) return;
@@ -271,6 +278,7 @@ export function NewProjectDialog({
 }) {
   const [title, setTitle] = useState('');
   const [creating, setCreating] = useState(false);
+  useBodyScrollLock(open);
   if (!open) return null;
 
   async function handleCreate(e: FormEvent) {

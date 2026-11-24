@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { timingRows, type TimingDetail } from '../lib/job-history';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
+import styles from '../gpu.module.css';
 
 const LOG_PREVIEW_COUNT = 6;
 
@@ -30,7 +31,7 @@ export function JobHistoryDetails({ job }: { job: JobHistoryDetailRecord }) {
         <details className="foldable" open>
           <summary>各阶段耗时</summary>
           <div className="foldContent">
-            <dl className="kv">
+            <dl className={styles.kv}>
               {rows.map((row) => (
                 <div key={row.key} style={{ display: 'contents' }}>
                   <dt>{row.label}</dt>

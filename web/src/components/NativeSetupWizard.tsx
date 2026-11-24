@@ -568,7 +568,7 @@ export function NativeSetupWizard({
             <section className={styles.stack} aria-label={STEPS[3].title}>
               <h3>第四步：选择访问入口与 ComfyUI 版本</h3>
 
-              <div className={styles.segmented} role="tablist" aria-label="原生访问模式">
+              <div className={`${styles.segmented} ${styles.segmentedStackMobile}`} role="tablist" aria-label="原生访问模式">
                 <button
                   type="button"
                   role="tab"

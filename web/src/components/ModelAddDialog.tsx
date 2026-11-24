@@ -10,6 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiMessage } from '../lib/gpu-api';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import {
   bytesLabel,
   displayModelTitles,
@@ -108,6 +109,8 @@ export function ModelAddDialog({
   const [error, setError] = useState('');
   const [statusMsg, setStatusMsg] = useState('');
   const [uploadPct, setUploadPct] = useState<number | null>(null);
+
+  useBodyScrollLock(open);
 
   useEffect(() => {
     if (!open) return;

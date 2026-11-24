@@ -9,6 +9,7 @@ import {
 import { extractPromptText } from '../lib/create-runtime-prefs';
 import { formatInstanceTime } from '../lib/instance-time';
 import { paramRows } from '../lib/job-detail-copy';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import { bytesLabel } from '../lib/model-library';
 import { extractPng, MAX_IMAGE, type ExtractedWorkflow } from '../lib/png-workflow';
 import {
@@ -87,6 +88,7 @@ export function GalleryViewer({
   const [selectedJson, setSelectedJson] = useState<'workflow' | 'prompt'>('workflow');
   const [importingDraft, setImportingDraft] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [lightbox, setLightbox] = useState(false);
   const [view, setView] = useState<ViewTransform>(IDENTITY_TRANSFORM);
   const [dragging, setDragging] = useState(false);
   const [smoothTransform, setSmoothTransform] = useState(false);
@@ -97,6 +99,8 @@ export function GalleryViewer({
   const imgRef = useRef<HTMLImageElement>(null);
   const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const pinchRef = useRef<{ dist: number; scale: number; midX: number; midY: number } | null>(null);
+  const pointerStartRef = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
+  const lastTapRef = useRef<{ time: number; x: number; y: number } | null>(null);
   const moveRafRef = useRef<number | null>(null);
   const pendingPanRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
   const pendingPinchRef = useRef<{ dx: number; dy: number; targetScale: number; anchorX: number; anchorY: number } | null>(null);
@@ -111,7 +115,23 @@ export function GalleryViewer({
   const assetId = item.asset.id;
   const mime = item.asset.mime || '';
   const isImage = mime.startsWith('image/');
-  const canZoom = isFullscreen && isImage;
+  const isExpanded = isFullscreen || lightbox;
+  const canZoom = isExpanded && isImage;
+
+  useBodyScrollLock(lightbox);
+
+  useEffect(() => {
+    const panel = headRef.current?.closest('section') ?? null;
+    if (!panel) return;
+    if (lightbox) {
+      panel.dataset.lightbox = 'true';
+    } else {
+      delete panel.dataset.lightbox;
+    }
+    return () => {
+      delete panel.dataset.lightbox;
+    };
+  }, [lightbox]);
 
   useEffect(() => {
     function syncFullscreen() {
@@ -124,12 +144,38 @@ export function GalleryViewer({
         setSmoothTransform(false);
         pointersRef.current.clear();
         pinchRef.current = null;
+        pointerStartRef.current = null;
+        lastTapRef.current = null;
       }
     }
     syncFullscreen();
     document.addEventListener('fullscreenchange', syncFullscreen);
     return () => document.removeEventListener('fullscreenchange', syncFullscreen);
   }, []);
+
+  useEffect(() => {
+    if (isExpanded) return;
+    setView(IDENTITY_TRANSFORM);
+    setDragging(false);
+    setSmoothTransform(false);
+    pointersRef.current.clear();
+    pinchRef.current = null;
+    pointerStartRef.current = null;
+    lastTapRef.current = null;
+  }, [isExpanded]);
+
+  useEffect(() => {
+    if (!lightbox) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        setLightbox(false);
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [lightbox]);
 
   useEffect(() => {
     setExtracted(null);
@@ -140,6 +186,8 @@ export function GalleryViewer({
     setSmoothTransform(false);
     pointersRef.current.clear();
     pinchRef.current = null;
+    pointerStartRef.current = null;
+    lastTapRef.current = null;
     if (imgRef.current?.complete && imgRef.current.naturalWidth > 0) {
       setNaturalSize({ width: imgRef.current.naturalWidth, height: imgRef.current.naturalHeight });
     } else {
@@ -149,7 +197,7 @@ export function GalleryViewer({
 
   useEffect(() => {
     const el = stageRef.current;
-    if (!el || !isFullscreen) return;
+    if (!el || !isExpanded) return;
     if (imgRef.current?.complete && imgRef.current.naturalWidth > 0) {
       setNaturalSize({ width: imgRef.current.naturalWidth, height: imgRef.current.naturalHeight });
     }
@@ -164,7 +212,7 @@ export function GalleryViewer({
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [isFullscreen]);
+  }, [isExpanded]);
 
   const baseImageSize = useMemo<Size2D>(() => {
     if (naturalSize.width > 0 && naturalSize.height > 0 && stageSize.width > 0 && stageSize.height > 0) {
@@ -252,6 +300,8 @@ export function GalleryViewer({
     pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
     setSmoothTransform(false);
     if (pointersRef.current.size === 2) {
+      pointerStartRef.current = null;
+      lastTapRef.current = null;
       const [a, b] = [...pointersRef.current.values()];
       pinchRef.current = {
         dist: Math.hypot(b.x - a.x, b.y - a.y) || 1,
@@ -260,8 +310,15 @@ export function GalleryViewer({
         midY: (a.y + b.y) / 2,
       };
       setDragging(true);
-    } else if (pointersRef.current.size === 1 && view.scale > MIN_ZOOM + 0.01) {
-      setDragging(true);
+    } else if (pointersRef.current.size === 1) {
+      if (event.pointerType === 'touch') {
+        pointerStartRef.current = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+      } else {
+        pointerStartRef.current = null;
+      }
+      if (view.scale > MIN_ZOOM + 0.01) {
+        setDragging(true);
+      }
     }
   }
 
@@ -320,6 +377,13 @@ export function GalleryViewer({
     }
 
     if (pointersRef.current.size === 1) {
+      if (
+        pointerStartRef.current
+        && pointerStartRef.current.id === event.pointerId
+        && Math.hypot(currPt.x - pointerStartRef.current.x, currPt.y - pointerStartRef.current.y) > 10
+      ) {
+        pointerStartRef.current.moved = true;
+      }
       const dx = currPt.x - prev.x;
       const dy = currPt.y - prev.y;
       if (dx !== 0 || dy !== 0) {
@@ -331,6 +395,7 @@ export function GalleryViewer({
   }
 
   function handleStagePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    const tapStart = pointerStartRef.current;
     pointersRef.current.delete(event.pointerId);
     if (pointersRef.current.size < 2) {
       pinchRef.current = null;
@@ -343,6 +408,29 @@ export function GalleryViewer({
         moveRafRef.current = null;
       }
       setDragging(false);
+      pointerStartRef.current = null;
+      if (
+        event.type === 'pointerup'
+        && event.pointerType === 'touch'
+        && canZoom
+        && stageRef.current
+        && tapStart
+        && tapStart.id === event.pointerId
+        && !tapStart.moved
+      ) {
+        const now = Date.now();
+        const prevTap = lastTapRef.current;
+        if (prevTap && now - prevTap.time < 300 && Math.hypot(event.clientX - prevTap.x, event.clientY - prevTap.y) < 28) {
+          lastTapRef.current = null;
+          const rect = stageRef.current.getBoundingClientRect();
+          const tapX = event.clientX - (rect.left + rect.width / 2);
+          const tapY = event.clientY - (rect.top + rect.height / 2);
+          setSmoothTransform(true);
+          setView((curr) => toggleDoubleClickZoom(curr, tapX, tapY, getBaseImageSize()));
+        } else {
+          lastTapRef.current = { time: now, x: event.clientX, y: event.clientY };
+        }
+      }
     }
   }
 
@@ -494,7 +582,7 @@ export function GalleryViewer({
               )}
             </div>
           )}
-          {isFullscreen && (
+          {isExpanded && (
             <>
               {item.kind === 'studio' ? (
                 <button className="button secondary small" type="button" onClick={() => onFavoriteStudio(item.asset)}>
@@ -517,16 +605,30 @@ export function GalleryViewer({
             type="button"
             onClick={async (event) => {
               const panel = event.currentTarget.closest('section');
-              try {
-                if (document.fullscreenElement) await document.exitFullscreen();
-                else if (panel?.requestFullscreen) await panel.requestFullscreen();
-                else throw new Error('当前浏览器不支持全屏');
-              } catch (cause) {
-                onError(apiMessage(cause));
+              if (document.fullscreenElement) {
+                try {
+                  await document.exitFullscreen();
+                } catch (cause) {
+                  onError(apiMessage(cause));
+                }
+                return;
               }
+              if (lightbox) {
+                setLightbox(false);
+                return;
+              }
+              if (panel?.requestFullscreen) {
+                try {
+                  await panel.requestFullscreen();
+                  return;
+                } catch {
+                  // Fall back to CSS lightbox when Fullscreen API is unavailable or rejected (e.g. iOS Safari).
+                }
+              }
+              setLightbox(true);
             }}
           >
-            {isFullscreen ? (
+            {isExpanded ? (
               <><Minimize2 size={14} strokeWidth={1.6} aria-hidden />退出全屏</>
             ) : (
               <><Maximize2 size={14} strokeWidth={1.6} aria-hidden />全屏查看</>
@@ -537,6 +639,7 @@ export function GalleryViewer({
             type="button"
             onClick={() => {
               if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+              setLightbox(false);
               onClose();
             }}
           >
@@ -580,7 +683,7 @@ export function GalleryViewer({
         </div>
       </div>
 
-      {!isFullscreen && item.kind === 'studio' && hasStudioInfo && (
+      {!isExpanded && item.kind === 'studio' && hasStudioInfo && (
         <details className="foldable" open={inlineViewer}>
           <summary>作品信息</summary>
           <div className="foldContent">
@@ -624,7 +727,7 @@ export function GalleryViewer({
         </details>
       )}
 
-      {!isFullscreen && item.kind === 'studio' && viewerJobId && (
+      {!isExpanded && item.kind === 'studio' && viewerJobId && (
         matchedViewerJob ? (
           <details className="foldable" open={inlineViewer}>
             <summary>生成参数</summary>
@@ -657,7 +760,7 @@ export function GalleryViewer({
         )
       )}
 
-      {!isFullscreen && item.kind === 'native' && (
+      {!isExpanded && item.kind === 'native' && (
         <details className="foldable" open={inlineViewer}>
           <summary>原生作品信息（Drive）</summary>
           <div className="foldContent">
@@ -672,7 +775,7 @@ export function GalleryViewer({
         </details>
       )}
 
-      {!isFullscreen && <div className={styles.viewerActions}>
+      {!isExpanded && <div className={styles.viewerActions}>
         {item.kind === 'studio' ? (
           <>
             <button className="button secondary small" type="button" onClick={() => onFavoriteStudio(item.asset)}>
@@ -741,9 +844,9 @@ export function GalleryViewer({
         )}
       </div>}
 
-      {!isFullscreen && extractError && <p className="status error" role="alert">{extractError}</p>}
+      {!isExpanded && extractError && <p className="status error" role="alert">{extractError}</p>}
 
-      {!isFullscreen && extracted && (
+      {!isExpanded && extracted && (
         <div className={styles.inlinePanel} aria-label="PNG 工作流提取结果">
           <div className={styles.cardHead}>
             <strong>已提取 ComfyUI 工作流</strong>

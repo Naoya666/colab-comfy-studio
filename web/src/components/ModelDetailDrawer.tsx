@@ -11,6 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiMessage } from '../lib/gpu-api';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import {
   ACTIVE_MODEL_STATES,
   bytesLabel,
@@ -66,6 +67,8 @@ export function ModelDetailDrawer({
   const [regError, setRegError] = useState('');
 
   const modelId = model?.id || null;
+
+  useBodyScrollLock(Boolean(modelId));
 
   useEffect(() => {
     if (!modelId) {

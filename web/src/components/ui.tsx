@@ -22,21 +22,67 @@ export function Card({ icon, title, aside, children, className }: {
 /** ⓘ 说明按钮：点一下展开一小段解释，再点或点别处收起。 */
 export function InfoTip({ text, label = '查看说明' }: { text: ReactNode; label?: string }) {
   const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ left: number; top: number; placeAbove: boolean } | null>(null);
   const ref = useRef<HTMLSpanElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+
   useEffect(() => {
     if (!open) return;
-    const close = (event: Event) => {
+    const updatePosition = () => {
+      const rect = btnRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const vw = window.innerWidth;
+      const bubbleW = Math.min(300, vw - 24);
+      const left = Math.max(12, Math.min(vw - bubbleW - 12, rect.right - bubbleW));
+      const placeAbove = rect.bottom + 140 > window.innerHeight && rect.top > 140;
+      const top = placeAbove ? rect.top - 8 : rect.bottom + 8;
+      setPos({ left, top, placeAbove });
+    };
+    updatePosition();
+    const closeOutside = (event: Event) => {
       if (ref.current && !ref.current.contains(event.target as Node)) setOpen(false);
     };
-    document.addEventListener('pointerdown', close);
-    return () => document.removeEventListener('pointerdown', close);
+    const closeOnKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    const closeOnViewport = () => setOpen(false);
+    document.addEventListener('pointerdown', closeOutside);
+    window.addEventListener('keydown', closeOnKey);
+    window.addEventListener('scroll', closeOnViewport, true);
+    window.addEventListener('resize', closeOnViewport);
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside);
+      window.removeEventListener('keydown', closeOnKey);
+      window.removeEventListener('scroll', closeOnViewport, true);
+      window.removeEventListener('resize', closeOnViewport);
+    };
   }, [open]);
+
   return (
     <span className={styles.tipWrap} ref={ref}>
-      <button type="button" className={styles.tipButton} aria-label={label} aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+      <button
+        ref={btnRef}
+        type="button"
+        className={styles.tipButton}
+        aria-label={label}
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
         <Info size={15} strokeWidth={1.6} aria-hidden />
       </button>
-      {open && <span className={styles.tipBubble} role="note">{text}</span>}
+      {open && (
+        <span
+          className={styles.tipBubble}
+          role="note"
+          style={pos ? {
+            left: `${pos.left}px`,
+            top: `${pos.top}px`,
+            transform: pos.placeAbove ? 'translateY(-100%)' : undefined,
+          } : undefined}
+        >
+          {text}
+        </span>
+      )}
     </span>
   );
 }

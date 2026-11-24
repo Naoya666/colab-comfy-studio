@@ -243,7 +243,7 @@ export function TasksPanel({
               ].filter(Boolean).join(' · ')}
             </p>
             <p className="muted small">创建于 {formatDateTime(job.created_at)}</p>
-            {instanceId ? <button type="button" className={styles.linkButton} onClick={() => onInstance?.(job)}>{machineInfo}</button>
+            {instanceId ? <button type="button" className={styles.jobMachineBtn} onClick={() => onInstance?.(job)}>{machineInfo}</button>
               : <p className="muted small">{machineInfo}</p>}
           </div>
         </div>

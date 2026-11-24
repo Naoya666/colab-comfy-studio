@@ -6,6 +6,7 @@ import { InstanceWorkbench } from './InstanceWorkbench';
 import { formatInstanceTime as formatTime } from '../lib/instance-time';
 import { gpuLabel } from '../lib/gpu-label';
 import { isCreationPoolInstance } from '../lib/instance-submission';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import { ConfirmDialog } from './Feedback';
 import styles from './v020.module.css';
 
@@ -93,6 +94,7 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
   const currentWorkbench = workbench ? instances.find((item) => instanceId(item) === instanceId(workbench)) || workbench : null;
   const [confirm, setConfirm] = useState<{ action: Action; instance: GpuInstance } | null>(null);
   const [retainMinutes, setRetainMinutes] = useState(15);
+  useBodyScrollLock(Boolean(confirm));
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');

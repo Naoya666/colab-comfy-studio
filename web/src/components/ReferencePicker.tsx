@@ -50,7 +50,7 @@ export function ReferencePicker({ manifest, assets, selected, currentProjectId, 
       }}
     >
       <div className={styles.refHead}>
-        <span className="muted small">点选、拖拽或 Ctrl+V 粘贴参考图</span>
+        <span className="muted small">点选<span className="desktopOnly">、拖拽或 Ctrl+V 粘贴</span>参考图</span>
         <label className="button secondary small">
           <Upload size={14} strokeWidth={1.6} aria-hidden />上传
           <input hidden type="file" multiple accept="image/*,video/*,audio/*" onChange={async (event) => {
@@ -78,7 +78,7 @@ export function ReferencePicker({ manifest, assets, selected, currentProjectId, 
             );
           })}
         </div>
-      ) : <p className="muted small">还没有素材，拖入文件、Ctrl+V 粘贴，或点右上角「上传」添加。</p>}
+      ) : <p className="muted small">还没有素材，<span className="desktopOnly">拖入文件、Ctrl+V 粘贴，或</span>点右上角「上传」添加。</p>}
     </div>
   );
 }

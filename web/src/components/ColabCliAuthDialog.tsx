@@ -7,6 +7,7 @@ import type {
   ColabCliImportRequest,
 } from '../lib/v020-types';
 import { cuNumber } from '../lib/ui-helpers';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import type { GpuAccount } from './AccountDirectory';
 import styles from './v020.module.css';
 
@@ -115,6 +116,8 @@ export function ColabCliAuthDialog({
   const completeKeyRef = useRef<string>('');
   const importKeyRef = useRef<string>('');
   const initiatedRef = useRef(false);
+
+  useBodyScrollLock(true);
 
   const hasOwnOrDelegatedDrive = useMemo(() => {
     if (account.drive_account_id || account.authorization?.drive?.delegated_to) return true;

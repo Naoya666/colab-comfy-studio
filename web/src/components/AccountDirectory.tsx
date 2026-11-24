@@ -20,6 +20,7 @@ import type {
   GoogleAuthChannel,
 } from '../lib/v020-types';
 import { cuNumber } from '../lib/ui-helpers';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import { ColabCliAuthDialog } from './ColabCliAuthDialog';
 import styles from './v020.module.css';
 
@@ -257,6 +258,7 @@ export function AccountDirectory({ accounts: suppliedAccounts, accountsLoaded = 
   const [disconnectRevokeRemote, setDisconnectRevokeRemote] = useState(true);
   const [deleting, setDeleting] = useState<GpuAccount | null>(null);
   const [deleteRevokeRemote, setDeleteRevokeRemote] = useState(true);
+  useBodyScrollLock(Boolean(disconnecting || deleting));
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');

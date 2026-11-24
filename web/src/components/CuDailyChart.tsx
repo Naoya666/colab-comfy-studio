@@ -72,6 +72,18 @@ export function CuDailyChart({
     setTouchPinnedIdx(null);
   }, [startDate, endDate, points.length]);
 
+  // Dismiss pinned touch tooltip when tapping outside the chart stage.
+  useEffect(() => {
+    if (touchPinnedIdx === null) return;
+    const onOutside = (event: PointerEvent) => {
+      if (stageRef.current && !stageRef.current.contains(event.target as Node)) {
+        setTouchPinnedIdx(null);
+      }
+    };
+    document.addEventListener('pointerdown', onOutside);
+    return () => document.removeEventListener('pointerdown', onOutside);
+  }, [touchPinnedIdx]);
+
   const summary = useMemo(() => {
     let totalCu = 0;
     let peakPoint = points[0] ?? null;
@@ -188,12 +200,12 @@ export function CuDailyChart({
   }
 
   // Position tooltip neatly left or right of active point without overflowing narrow viewports.
-  const tooltipPlaceLeft = activeCoord ? chartW - activeCoord.x < 172 : false;
-  const tooltipLeftPx = activeCoord
-    ? (tooltipPlaceLeft
-      ? Math.max(150, activeCoord.x - 12)
-      : Math.min(chartW - 150, activeCoord.x + 12))
-    : 0;
+  const tooltipEstW = Math.min(184, Math.max(120, chartW - 8));
+  const tooltipPlaceLeft = activeCoord ? chartW - activeCoord.x < tooltipEstW + 16 : false;
+  const rawTooltipLeft = activeCoord
+    ? (tooltipPlaceLeft ? activeCoord.x - 12 - tooltipEstW : activeCoord.x + 12)
+    : 4;
+  const tooltipLeftPx = Math.max(4, Math.min(Math.max(4, chartW - tooltipEstW - 4), rawTooltipLeft));
   const tooltipTopPx = activeCoord
     ? Math.max(4, Math.min(baselineY - 76, activeCoord.y - 32))
     : 8;
@@ -415,9 +427,8 @@ export function CuDailyChart({
             data-side={tooltipPlaceLeft ? 'left' : 'right'}
             data-interactive={touchPinnedIdx !== null}
             style={{
-              transform: tooltipPlaceLeft
-                ? `translate3d(${tooltipLeftPx}px, ${tooltipTopPx}px, 0) translateX(-100%)`
-                : `translate3d(${tooltipLeftPx}px, ${tooltipTopPx}px, 0)`,
+              maxWidth: `${Math.max(120, chartW - 8)}px`,
+              transform: `translate3d(${tooltipLeftPx}px, ${tooltipTopPx}px, 0)`,
             }}
             role="status"
             aria-live="polite"

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { GpuWorkflow } from '../lib/gpu-api';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import { normalisePreviewGraph, previewFileName, type JsonRecord, type PreviewGraph } from './workflow-graph-preview-data';
 import styles from './WorkflowGraphPreview.module.css';
 
@@ -72,16 +73,60 @@ function GraphCanvas({ graph, selected, onSelect, pan, setPan }: {
   pan: Pan;
   setPan: (next: Pan) => void;
 }) {
+  const panRef = useRef(pan);
+  panRef.current = pan;
+  const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const drag = useRef<{ pointerId: number; x: number; y: number; pan: Pan } | null>(null);
+  const pinchRef = useRef<{ dist: number; midX: number; midY: number; pan: Pan } | null>(null);
   const onPointerDown = (event: React.PointerEvent<SVGSVGElement>) => {
-    drag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, pan };
     event.currentTarget.setPointerCapture(event.pointerId);
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (pointersRef.current.size === 2) {
+      const [a, b] = [...pointersRef.current.values()];
+      drag.current = null;
+      pinchRef.current = {
+        dist: Math.hypot(b.x - a.x, b.y - a.y) || 1,
+        midX: (a.x + b.x) / 2,
+        midY: (a.y + b.y) / 2,
+        pan: panRef.current,
+      };
+    } else if (pointersRef.current.size === 1) {
+      pinchRef.current = null;
+      drag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, pan: panRef.current };
+    }
   };
   const onPointerMove = (event: React.PointerEvent<SVGSVGElement>) => {
+    if (!pointersRef.current.has(event.pointerId)) return;
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (pointersRef.current.size === 2 && pinchRef.current) {
+      const [a, b] = [...pointersRef.current.values()];
+      const dist = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      const midX = (a.x + b.x) / 2;
+      const midY = (a.y + b.y) / 2;
+      const base = pinchRef.current;
+      const scale = Math.min(2.4, Math.max(0.45, base.pan.scale * (dist / base.dist)));
+      setPan({
+        x: base.pan.x + (midX - base.midX),
+        y: base.pan.y + (midY - base.midY),
+        scale,
+      });
+      return;
+    }
     if (!drag.current || drag.current.pointerId !== event.pointerId) return;
-    setPan({ ...pan, x: drag.current.pan.x + event.clientX - drag.current.x, y: drag.current.pan.y + event.clientY - drag.current.y });
+    setPan({ ...drag.current.pan, x: drag.current.pan.x + event.clientX - drag.current.x, y: drag.current.pan.y + event.clientY - drag.current.y });
   };
-  const stopPointer = () => { drag.current = null; };
+  const stopPointer = (event: React.PointerEvent<SVGSVGElement>) => {
+    pointersRef.current.delete(event.pointerId);
+    if (pointersRef.current.size < 2) {
+      pinchRef.current = null;
+    }
+    if (pointersRef.current.size === 1) {
+      const [[remainingId, pt]] = [...pointersRef.current.entries()];
+      drag.current = { pointerId: remainingId, x: pt.x, y: pt.y, pan: panRef.current };
+    } else {
+      drag.current = null;
+    }
+  };
   const onWheel = (event: React.WheelEvent<SVGSVGElement>) => {
     event.preventDefault();
     const scale = Math.min(2.4, Math.max(0.45, pan.scale * (event.deltaY > 0 ? 0.9 : 1.1)));
@@ -142,6 +187,8 @@ export function WorkflowGraphPreview({ workflow, loadPreview, onClose }: Workflo
   const [pan, setPan] = useState<Pan>({ x: 0, y: 0, scale: 1 });
   const [selected, setSelected] = useState('');
   const [error, setError] = useState('');
+
+  useBodyScrollLock(true);
 
   // 父组件每次刷新都会传一个新的 loadPreview；只在换工作流时重新读取，
   // 否则会在「读取中」和结果之间来回闪（#31）。

@@ -12,6 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiMessage } from '../lib/gpu-api';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import {
   ACTIVE_MODEL_STATES,
   buildCatalogIndex,
@@ -79,6 +80,7 @@ function BatchImportPreviewDialog({
   const [committing, setCommitting] = useState(false);
   const [globalError, setGlobalError] = useState('');
   const runToken = useRef(0);
+  useBodyScrollLock(open);
   const itemsRef = useRef(items);
   itemsRef.current = items;
   const itemsSignature = useMemo(

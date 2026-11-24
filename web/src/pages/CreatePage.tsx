@@ -16,6 +16,7 @@ import type { GpuAccount, GpuInstance } from '../components/AccountDirectory';
 import { Card, InfoTip, Segmented } from '../components/ui';
 import { ConfirmDialog } from '../components/Feedback';
 import { RUNTIME_HELP } from '../lib/labels';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import { workflowTitle, workflowUsage } from '../lib/workflow-copy';
 import { parameterList, parameterKey, cuNumber, shown } from '../lib/ui-helpers';
 import styles from '../gpu.module.css';
@@ -121,6 +122,8 @@ export function CreatePanel({
   const [selectedPresetId, setSelectedPresetId] = useState('');
   const [deletingPreset, setDeletingPreset] = useState<GpuPreset | null>(null);
   const [runtimeExpanded, setRuntimeExpanded] = useState(false);
+
+  useBodyScrollLock(pickerOpen);
 
   const [estimatedSchema, setEstimatedSchema] = useState<GpuManifest | null>(null);
   useEffect(() => {
@@ -411,7 +414,7 @@ export function CreatePanel({
         <Card
           icon={<Pencil size={17} strokeWidth={1.6} aria-hidden />}
           title="提示词"
-          aside={<span className="muted small">Ctrl+Enter 生成</span>}
+          aside={desktop ? <span className="muted small">Ctrl+Enter 生成</span> : undefined}
         >
           <textarea
             aria-label="提示词"

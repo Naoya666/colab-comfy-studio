@@ -103,19 +103,40 @@ html, body, #root {
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
-body { overflow-x: hidden; overflow-wrap: anywhere; }
+html, body {
+  overflow-x: clip;
+}
+body {
+  overflow-wrap: break-word;
+}
+body[data-modal-open="true"] {
+  overflow: hidden;
+}
 
 button, input, textarea, select { font: inherit; color: inherit; }
 button, a, summary { touch-action: manipulation; cursor: pointer; }
 button { -webkit-appearance: none; appearance: none; }
 a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
 h1, h2, h3, p { margin: 0; }
+fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+legend {
+  padding: 0 6px;
+  font-size: 0.82rem;
+  color: var(--text-2);
+}
 :focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 svg { flex: none; }
 
 /* ───────── 外壳 ───────── */
 .app {
   width: 100%;
+  min-width: 0;
   max-width: var(--col);
   margin: 0 auto;
   min-height: 100dvh;
@@ -128,6 +149,7 @@ svg { flex: none; }
   position: sticky;
   top: 0;
   z-index: 30;
+  width: 100%;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -142,24 +164,28 @@ svg { flex: none; }
 .brandText strong { font-size: 0.88rem; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .brandText small { color: var(--muted); font-size: 0.7rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 420px) {
+  .topbar { gap: 6px; padding-inline: 12px; }
+  .brand { gap: 6px; }
+  .brandText strong { font-size: 0.82rem; }
   .brandText small { display: none; }
 }
 .topbarActions { display: flex; align-items: center; gap: 6px; flex: none; }
 
 .projectChip {
   display: inline-flex; align-items: center; gap: 5px;
-  max-width: 122px; height: 36px; padding: 0 9px;
+  max-width: min(140px, 36vw); height: 36px; padding: 0 9px;
   border: 1px solid var(--line-strong); border-radius: var(--r-md);
   background: transparent; font-size: 0.82rem;
 }
 .projectChip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.projectList { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 55vh; overflow-y: auto; }
+.projectList { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 55dvh; overflow-y: auto; }
 .projectRow {
   display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%;
   min-height: 46px; padding: 0 14px; text-align: left; font-size: 0.95rem;
   border: 1px solid var(--line); border-radius: var(--r-md); background: transparent;
 }
 .projectRow span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.projectRow .pill { flex: none; overflow: visible; }
 .projectRow:active { background: var(--card-2); }
 .projectRow[aria-current='true'] { border-color: var(--text); font-weight: 600; }
 .iconButton {
@@ -167,6 +193,7 @@ svg { flex: none; }
   border: 1px solid var(--line-strong); border-radius: var(--r-md); background: transparent;
 }
 .iconButton:active { background: var(--card-2); }
+.mobileSettings[aria-current="page"] { background: var(--card-2); border-color: var(--text); }
 
 .bottomNav {
   position: fixed; z-index: 30; left: 50%; bottom: 0; transform: translateX(-50%);
@@ -233,15 +260,18 @@ input[type="number"] { -moz-appearance: textfield; }
 .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .nativeRestartDialog {
   width: min(440px, calc(100% - 32px));
-  padding: 20px;
+  max-height: calc(100dvh - 32px - var(--safe-t) - var(--safe-b));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 20px 20px calc(20px + var(--safe-b));
   border: 1px solid var(--line-strong);
   border-radius: var(--r-lg);
   background: var(--card);
   color: var(--text);
 }
 .nativeRestartDialog::backdrop { background: var(--overlay); }
-.nativeApiDialog { width: min(660px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; }
-.nativeSetupDialog { width: min(740px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; }
+.nativeApiDialog { width: min(660px, calc(100% - 32px)); max-height: calc(100dvh - 32px - var(--safe-t) - var(--safe-b)); overflow-y: auto; }
+.nativeSetupDialog { width: min(740px, calc(100% - 32px)); max-height: calc(100dvh - 32px - var(--safe-t) - var(--safe-b)); overflow-y: auto; }
 .nativeSetupDialog > * + * { margin-top: 12px; }
 .nativeApiHeading { justify-content: space-between; }
 .nativeApiDialog form, .nativeApiDialog section { margin-block: 16px; }
@@ -275,7 +305,7 @@ p.error { color: var(--danger); }
 .empty span { font-size: 0.8rem; }
 
 /* 折叠面板 */
-details.foldable { border: 1px solid var(--line); border-radius: var(--r-md); background: var(--card); overflow: hidden; }
+details.foldable { border: 1px solid var(--line); border-radius: var(--r-md); background: var(--card); overflow: visible; }
 details.foldable > summary {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 12px 14px; font-size: 0.88rem; list-style: none; user-select: none;
@@ -287,16 +317,25 @@ details.foldable > summary::after {
   transform: rotate(45deg) translateY(-2px); transition: transform 0.15s;
 }
 details.foldable[open] > summary::after { transform: rotate(-135deg) translateY(-2px); }
-.foldContent { display: grid; gap: 12px; padding: 12px 14px 14px; border-top: 1px solid var(--line); }
+.foldContent { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 12px 14px 14px; border-top: 1px solid var(--line); min-width: 0; }
 
 /* 登录 */
-.login { min-height: 100dvh; display: grid; place-items: center; padding: 24px 16px; }
+.login { min-height: 100dvh; display: grid; place-items: center; padding: calc(24px + var(--safe-t)) 16px calc(24px + var(--safe-b)); }
 .loginCard {
   width: 100%; max-width: 360px; display: grid; gap: 16px; padding: 28px 22px;
   border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--card);
 }
 .loginCard h1 { font-size: 1.3rem; font-weight: 650; }
 .loginCard label { display: grid; gap: 6px; font-size: 0.8rem; color: var(--text-2); }
+
+@media (max-width: 799px) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+  select,
+  textarea {
+    font-size: 16px;
+  }
+  .desktopOnly { display: none !important; }
+}
 
 @media (min-width: 700px) {
   .app { border-left: 1px solid var(--line); border-right: 1px solid var(--line); }

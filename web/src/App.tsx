@@ -51,6 +51,7 @@ import {
 import { isSystemJob, pickInitialProjectId, projectOptionLabel, projectTitleById } from './lib/project-label';
 import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
 import { useDesktopLayout } from './lib/desktop-layout';
+import { useBodyScrollLock } from './lib/modal-scroll-lock';
 import { parameterKey, parameterList, readableState } from './lib/ui-helpers';
 import { useSmartPoll } from './lib/smart-poll';
 import { formatHashRoute, parseHashRoute, type AssetsSubTab, type MainTab } from './lib/route-state';
@@ -1032,6 +1033,7 @@ export default function App() {
       const typing = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable);
       if (e.key === 'Escape') {
         if (document.fullscreenElement) return;
+        if (document.querySelector('[data-lightbox="true"]')) return;
         if (state.gs.confirmDeleteViewer) state.gs.setConfirmDeleteViewer(null);
         else if (state.gs.confirmDeleteNative) state.gs.setConfirmDeleteNative(null);
         else if (state.moveDialog) setMoveDialog(null);
@@ -1048,6 +1050,14 @@ export default function App() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
+
+  useBodyScrollLock(Boolean(
+    loggedIn && (
+      confirm
+      || (detailId && tab === '任务' && !desktop)
+      || (gs.activeViewerItem && !gs.inlineViewer)
+    ),
+  ));
 
   if (!loggedIn) {
     return <LoginScreen onLoggedIn={() => { setLoggedIn(true); setLoginRefresh((c) => c + 1); }} />;
@@ -1161,7 +1171,13 @@ export default function App() {
           <button className="iconButton" type="button" aria-label="新建项目" title="新建项目" onClick={() => setShowNewProject(true)}>
             <Plus size={18} strokeWidth={1.6} aria-hidden />
           </button>
-          <button className="iconButton mobileSettings" aria-label="打开设置" onClick={() => navigate('设置')}>
+          <button
+            className="iconButton mobileSettings"
+            type="button"
+            aria-label="打开设置"
+            aria-current={tab === '设置' ? 'page' : undefined}
+            onClick={() => navigate('设置')}
+          >
             <SettingsIcon size={18} strokeWidth={1.6} aria-hidden />
           </button>
           <button

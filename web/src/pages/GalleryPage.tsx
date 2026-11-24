@@ -239,7 +239,6 @@ export function GalleryPanel({
                 toggleChecked(idsForCheck);
                 return;
               }
-              if (inspectedId === undefined) setSelectedId(asset.id);
               onOpen(asset, stackInfo && stackInfo.count > 1 ? stackInfo.items : filtered);
             }}
           >

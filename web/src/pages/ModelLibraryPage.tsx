@@ -76,6 +76,7 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
   const [detailId, setDetailId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [openMenuUp, setOpenMenuUp] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchDeleteMode, setBatchDeleteMode] = useState<'remove_index' | 'delete_file' | null>(null);
   const [singleDeleteTarget, setSingleDeleteTarget] = useState<{ model: LibraryModel; deleteFile: boolean } | null>(null);
@@ -121,10 +122,10 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
     });
   }, [catalog]);
 
-  // Close row overflow menu on outside click or Escape.
+  // Close row overflow menu on outside tap/click or Escape.
   useEffect(() => {
     if (!openMenuId) return;
-    const onPointerDown = (e: MouseEvent) => {
+    const onPointerDown = (e: Event) => {
       const target = e.target as HTMLElement | null;
       if (target?.closest('[data-row-menu="true"]')) return;
       setOpenMenuId(null);
@@ -132,10 +133,10 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setOpenMenuId(null);
     };
-    window.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('keydown', onKeyDown);
     return () => {
-      window.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('keydown', onKeyDown);
     };
   }, [openMenuId]);
@@ -673,7 +674,7 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
                 const isSelected = selectedIds.has(m.id);
                 const isInspected = detailId === m.id;
                 const menuOpen = openMenuId === m.id;
-                const flipUp = idx >= Math.max(2, visibleItems.length - 2);
+                const flipUp = openMenuUp || idx >= Math.max(2, visibleItems.length - 2);
                 const refCount = m.reference_count || 0;
                 const sizeRatio = m.size && maxVisibleSize > 0 ? Math.max(3, Math.round((m.size / maxVisibleSize) * 100)) : 0;
                 const effectiveState = isActive && task ? task.state : m.state;
@@ -866,7 +867,15 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
                           aria-label={`${titles.primary} 更多操作`}
                           aria-expanded={menuOpen}
                           aria-haspopup="menu"
-                          onClick={() => setOpenMenuId((curr) => (curr === m.id ? null : m.id))}
+                          onClick={(e) => {
+                            if (openMenuId === m.id) {
+                              setOpenMenuId(null);
+                              return;
+                            }
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            setOpenMenuUp(rect.bottom + 240 > window.innerHeight - 72);
+                            setOpenMenuId(m.id);
+                          }}
                         >
                           <MoreHorizontal size={16} aria-hidden />
                         </button>

@@ -644,7 +644,7 @@ export function CreationApiPage({ accounts, projects = [], onProjectsRefresh }: 
           <p>{match.status === 'matched' ? '唯一匹配' : match.status === 'ambiguous' ? '匹配到多个版本，请调整开放版本范围' : '没有匹配的版本'}</p>
           {match.matches.map(({ workflow, params }) => <div key={workflow.id}>
             <strong>{title(workflow)}</strong>
-            <pre>{JSON.stringify(params, null, 2)}</pre>
+            <pre className={styles.diagnostics}>{JSON.stringify(params, null, 2)}</pre>
             {match.status === 'matched' && <button className="button ghost" disabled={busy || Boolean(dirty)}
               onClick={() => void run(() => start(workflow.id))}>启动此工作流</button>}
           </div>)}

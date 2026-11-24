@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { CheckCircle2, AlertCircle, Info, X } from 'lucide-react';
+import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import styles from '../gpu.module.css';
 
 export interface ToastItem {
@@ -55,6 +56,8 @@ export function ConfirmDialog({
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
+  useBodyScrollLock(open);
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -70,7 +73,7 @@ export function ConfirmDialog({
   if (!open) return null;
 
   return (
-    <div className={styles.dialogBackdrop} role="presentation" onClick={() => { if (!busy) onCancel(); }}>
+    <div className={styles.dialogBackdrop} role="presentation" onClick={(e) => { e.stopPropagation(); if (!busy) onCancel(); }}>
       <section
         className={styles.dialog}
         role="dialog"

@@ -6,19 +6,14 @@ import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
 import { AccountDirectory, type GpuAccount } from '../components/AccountDirectory';
 import { GpuOrderSettings } from '../components/GpuOrderSettings';
 import { Card, Segmented } from '../components/ui';
+import { applyTheme, readStoredTheme, type ThemeMode } from '../lib/theme';
 import styles from '../gpu.module.css';
 
-type ThemeMode = 'dark' | 'light' | 'system';
-
 export function ThemePicker() {
-  const [theme, setTheme] = useState<ThemeMode>(() => {
-    const saved = localStorage.getItem('studio-theme');
-    return saved === 'light' || saved === 'system' ? saved : 'dark';
-  });
+  const [theme, setTheme] = useState<ThemeMode>(() => readStoredTheme());
   function change(value: ThemeMode) {
     setTheme(value);
-    localStorage.setItem('studio-theme', value);
-    document.documentElement.dataset.theme = value;
+    applyTheme(value);
   }
   return (
     <Segmented<ThemeMode>
