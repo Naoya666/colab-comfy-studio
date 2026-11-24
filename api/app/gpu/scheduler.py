@@ -979,19 +979,30 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 "leases", lease["id"], {"state": "deleted", "last_seen": self.clock()}, job.get("owner_id")
             )
         extra = {"error_details": error_details} if error_details is not None else {}
+        retry_cancelled = (
+            bool((current or job).get("cancel_requested"))
+            and ((current or job).get("allocation_retry") or {}).get("phase") == "cancelled"
+        )
+        outcome = "cancelled" if retry_cancelled else "failed"
         if lease or job.get("instance_id"):
             return self._set_state(
                 job,
                 "cleaning_up",
                 message,
-                requested_outcome="failed",
+                requested_outcome=outcome,
                 error_code=code,
                 error_message=message,
-                cleanup_final_state="failed",
+                cleanup_final_state=outcome,
                 **extra,
             )
         return self._set_state(
-            job, "failed", message, requested_outcome="failed", error_code=code, error_message=message, **extra
+            job,
+            outcome,
+            "GPU job cancelled" if retry_cancelled else message,
+            requested_outcome=outcome,
+            error_code=None if retry_cancelled else code,
+            error_message=None if retry_cancelled else message,
+            **extra,
         )
 
     def _allocation_failed(self, job: dict, exc: ColabAllocationError) -> dict:
@@ -1736,9 +1747,10 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         }, job["owner_id"])
 
     def _finish_cleanup(self, job: dict, state: str, message: str, **patch) -> dict:
-        if state in {"completed", "cancelled"} and job.get("error_code") in {
-            "gpu_cleanup_pending", "gpu_instance_completion_pending",
-        }:
+        if state in {"completed", "cancelled"} and (
+            job.get("error_code") in {"gpu_cleanup_pending", "gpu_instance_completion_pending"}
+            or (state == "cancelled" and (job.get("allocation_retry") or {}).get("phase") == "cancelled")
+        ):
             patch.update(error_code=None, error_message=None)
         return self._set_state(job, state, message, cleanup_next_epoch=0, **patch)
 
@@ -2422,6 +2434,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             from . import recovery
 
             recovery.cancel_plans_for_job(self.store, owner_id, job_id, self.clock())
+        was_retry_active = bool((job.get("allocation_retry") or {}).get("active"))
         if job.get("allocation_retry"):
             from . import allocation_retry
 
@@ -2443,9 +2456,14 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 recovery_hold=False,
                 retry_not_before_epoch=0,
             )
-        return self._update(
-            "jobs", job_id, {"cancel_requested": True, "requested_outcome": "cancelled"}, owner_id
-        )
+        cancel_patch: dict[str, Any] = {"cancel_requested": True, "requested_outcome": "cancelled"}
+        if (
+            was_retry_active
+            and job.get("state") in {"cleaning_up", "cleanup_pending"}
+            and job.get("cleanup_final_state") == "failed"
+        ):
+            cancel_patch["cleanup_final_state"] = "cancelled"
+        return self._update("jobs", job_id, cancel_patch, owner_id)
 
     def stop(self, owner_id: str) -> dict:
         count = 0

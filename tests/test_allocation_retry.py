@@ -781,3 +781,64 @@ def test_excluded_jobs_never_retry_and_native_auto_account_apis(monkeypatch):
         assert ws["allocation_retry"]["retries_used"] == 2
     finally:
         store.engine.dispose()
+
+
+def test_cancel_during_reconciling_finishes_as_cancelled_without_stale_error(monkeypatch):
+    store, repo = _make_store()
+    clock = FakeClock()
+    monkeypatch.setattr(allocation_retry.random, "uniform", lambda a, b: 0.0)
+    try:
+        _add_account(repo, "acc-a", "主号A")
+        allocation_retry.save_allocation_retry_settings(
+            store,
+            "owner",
+            {"enabled": True, "gpu_pool": [T4_STD], "retry_interval_seconds": 25, "max_retries": 5},
+        )
+        events: list[tuple[str, str]] = []
+        outcomes = [
+            {
+                "error": ColabError(
+                    "HTTP 503 upstream",
+                    error_code="colab_upstream_unavailable",
+                    category="upstream",
+                    phase="assign_post",
+                    http_status=503,
+                    remote_state_unknown=True,
+                ),
+            },
+        ]
+        provider = ScriptedColabProvider(
+            "acc-a",
+            eligible_by_account={"acc-a": [T4_STD, L4_STD]},
+            outcomes=outcomes,
+            events=events,
+            deleted_handles=[],
+            clock=clock,
+            repo=repo,
+        )
+        scheduler = Scheduler(
+            repo,
+            provider_factory=lambda job: provider,
+            executor_factory=lambda job: MockGPUExecutor(),
+            config=GpuConfig(enabled=True, real_enabled=True),
+            clock=clock,
+        )
+        job = _make_native_job(repo, spec=L4_STD, account_id="acc-a")
+        reconciling = _drive_scheduler(
+            scheduler, repo, job["id"], clock, stop_states={"cleanup_pending"}, max_ticks=20
+        )
+        assert reconciling["state"] == "cleanup_pending"
+        assert reconciling["allocation_retry"]["phase"] == "reconciling"
+        # User clicks "停止排队" while 503 reconciliation fence is still active!
+        cancelled = scheduler.cancel("owner", job["id"])
+        assert cancelled["allocation_retry"]["phase"] == "cancelled"
+        assert cancelled["cleanup_final_state"] == "cancelled"
+        # Advance past 60s reconciliation fence -> must finish as cancelled (not failed) with cleared error.
+        final = _drive_scheduler(scheduler, repo, job["id"], clock, stop_states={"cancelled", "failed"})
+        assert final["state"] == "cancelled"
+        assert final["allocation_retry"]["phase"] == "cancelled"
+        assert final["error_code"] is None
+        assert final["error_message"] is None
+        assert len(events) == 1
+    finally:
+        store.engine.dispose()
