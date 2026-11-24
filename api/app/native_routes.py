@@ -650,6 +650,8 @@ async def workspace_overview(
     user=Depends(current_user),
 ):
     admin(user)
+    if account_id is not None and (not account_id.strip() or len(account_id) > 128):
+        raise APIError("WORKSPACE_INVALID_INPUT", "account_id 格式无效", 422)
     data = await asyncio.to_thread(
         native_workspace.get_workspace_overview,
         request.app.state.repo,
@@ -739,6 +741,8 @@ async def workspace_delete_env_cache(
     keys = list(keys_query or [])
     delete_all = bool(all_caches)
     acct = account_id
+    if acct is not None and (not acct.strip() or len(acct) > 128):
+        raise APIError("WORKSPACE_INVALID_INPUT", "account_id 格式无效", 422)
     if body is not None:
         if not isinstance(body, dict):
             raise APIError("WORKSPACE_INVALID_INPUT", "请求体格式无效", 422)

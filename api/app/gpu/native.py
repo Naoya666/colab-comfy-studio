@@ -245,7 +245,7 @@ def renew_workspace_write_lock(
     ttl_seconds: float = WORKSPACE_WRITE_LOCK_TTL_SECONDS,
     now: float | None = None,
 ) -> bool:
-    """Extend an active workspace write lock TTL while owned by lock_id."""
+    """Extend an active, unexpired workspace write lock TTL while still offline and owned by lock_id."""
     if not lock_id or not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
         return False
     deadline = time.monotonic() + 0.5
@@ -254,8 +254,15 @@ def renew_workspace_write_lock(
             if acquired:
                 key = _workspace_lock_key(owner)
                 row = repo.store.get("settings", key, owner)
-                if isinstance(row, dict) and row.get("lock_id") == lock_id:
-                    current = time.time() if now is None else float(now)
+                current = time.time() if now is None else float(now)
+                if (
+                    isinstance(row, dict)
+                    and row.get("lock_id") == lock_id
+                    and float(row.get("expires_at") or 0.0) > current
+                ):
+                    writable, _ = workspace_offline_status(repo, owner, now=current)
+                    if not writable:
+                        return False
                     repo.store.update("settings", key, {"expires_at": current + float(ttl_seconds)}, owner)
                     return True
                 return False

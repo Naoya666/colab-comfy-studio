@@ -639,3 +639,303 @@ def test_p1_15_p1_16_git_bundle_validation_and_malformed_pyproject(tmp_path):
     assert item["path"] == "broken_node"
     assert item["version"] is None
     assert item["commit"] is None
+
+
+# ---------------------------------------------------------------------------
+# Follow-up Audit Fixes (1-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_audit_fix1_concurrent_prepare_studio_and_prepare_do_not_deadlock(tmp_path, monkeypatch):
+    import asyncio
+    import hashlib
+    import threading
+
+    model_dir = tmp_path / "models"
+    (model_dir / "checkpoints").mkdir(parents=True)
+    payload = b"safetensors-header-stub-data"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    active_sections = 0
+    max_overlap = 0
+    overlap_lock = threading.Lock()
+
+    # Direction A: prepare_studio holds exclusive lock first, then prepare() overlaps.
+    studio_entered = threading.Event()
+    studio_release = threading.Event()
+    order_a: list[str] = []
+
+    def fake_restore_weights(*args, **kwargs):
+        nonlocal active_sections, max_overlap
+        with overlap_lock:
+            active_sections += 1
+            max_overlap = max(max_overlap, active_sections)
+        order_a.append("studio_start")
+        studio_entered.set()
+        assert studio_release.wait(5), "event loop deadlocked waiting for studio_release"
+        order_a.append("studio_end")
+        with overlap_lock:
+            active_sections -= 1
+        return []
+
+    def fake_restore_loras(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(native_models.studio_worker, "_drive_cache", lambda p: None)
+    monkeypatch.setattr(native_models.studio_worker, "_lora_drive_cache", lambda p: None)
+    monkeypatch.setattr(native_models.studio_worker, "_restore_weights", fake_restore_weights)
+    monkeypatch.setattr(native_models.studio_worker, "_restore_user_loras", fake_restore_loras)
+
+    # Local hit file so prepare() runs cleanly after studio finishes.
+    ckpt = model_dir / "checkpoints" / "a.safetensors"
+    ckpt.write_bytes(payload)
+    catalog = [{"model_type": "checkpoints", "filename": "a.safetensors", "sha256": digest, "size": len(payload)}]
+    local = native_models.LocalModels(tmp_path, model_dir, {"channel": "ch", "catalog": catalog})
+
+    orig_prepare_one = local.prepare_one
+
+    def traced_prepare_one(target, plan, status):
+        nonlocal active_sections, max_overlap
+        with overlap_lock:
+            active_sections += 1
+            max_overlap = max(max_overlap, active_sections)
+        order_a.append("native_start")
+        try:
+            return orig_prepare_one(target, plan, status)
+        finally:
+            order_a.append("native_end")
+            with overlap_lock:
+                active_sections -= 1
+
+    monkeypatch.setattr(local, "prepare_one", traced_prepare_one)
+
+    t_studio = asyncio.create_task(
+        local.prepare_studio([], [], {"use_drive_cache": False}, lambda rows, require_files=False: {}, {}, 30)
+    )
+    assert await asyncio.to_thread(studio_entered.wait, 2)
+
+    prompt = {"prompt": {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "a.safetensors"}}}}
+    t_native = asyncio.create_task(local.prepare(prompt, [], catalog))
+    # Event loop MUST remain responsive while t_native waits for t_studio!
+    await asyncio.wait_for(asyncio.sleep(0.05), timeout=2.0)
+    assert not t_native.done()
+
+    studio_release.set()
+    res_studio, res_native = await asyncio.wait_for(asyncio.gather(t_studio, t_native), timeout=5.0)
+    assert res_studio == []
+    assert res_native[0]["state"] == "ready"
+    assert order_a == ["studio_start", "studio_end", "native_start", "native_end"]
+    assert max_overlap == 1
+
+    # Direction B: prepare() holds shared lock first, then prepare_studio() overlaps.
+    native_entered = threading.Event()
+    native_release = threading.Event()
+    order_b: list[str] = []
+
+    def blocking_prepare_one(target, plan, status):
+        order_b.append("native_start")
+        native_entered.set()
+        assert native_release.wait(5), "event loop deadlocked waiting for native_release"
+        res = orig_prepare_one(target, plan, status)
+        order_b.append("native_end")
+        return res
+
+    def fast_restore_weights(*args, **kwargs):
+        order_b.append("studio_run")
+        return []
+
+    monkeypatch.setattr(local, "prepare_one", blocking_prepare_one)
+    monkeypatch.setattr(native_models.studio_worker, "_restore_weights", fast_restore_weights)
+
+    t_native2 = asyncio.create_task(local.prepare(prompt, [], catalog))
+    assert await asyncio.to_thread(native_entered.wait, 2)
+
+    t_studio2 = asyncio.create_task(
+        local.prepare_studio([], [], {"use_drive_cache": False}, lambda rows, require_files=False: {}, {}, 30)
+    )
+    await asyncio.wait_for(asyncio.sleep(0.05), timeout=2.0)
+    assert not t_studio2.done()
+
+    native_release.set()
+    res_native2, res_studio2 = await asyncio.wait_for(asyncio.gather(t_native2, t_studio2), timeout=5.0)
+    assert res_native2[0]["state"] == "ready"
+    assert res_studio2 == []
+    assert order_b == ["native_start", "native_end", "studio_run"]
+
+
+def test_audit_fix2_cancel_during_ready_probe_transitions_to_cleaning_up(tmp_path):
+    from app.gpu.compute import GpuConfig
+    from app.gpu.scheduler import Scheduler
+
+    store = Store(f"sqlite:///{tmp_path / 'fix2.db'}")
+    repo = Repository(store)
+    store.create("projects", "owner", {"title": "P"}, record_id="proj-1")
+    now = 1_700_000_000.0
+    inst = repo.create(
+        "instances",
+        "owner",
+        {
+            "state": "allocating",
+            "provider": "colab",
+            "account_id": "acc-1",
+            "instance_pool": instances.POOL_CREATION,
+        },
+        project_id="proj-1",
+    )
+    job = repo.create(
+        "jobs",
+        "owner",
+        {
+            "state": "preparing",
+            "provider": "colab",
+            "account_id": "acc-1",
+            "instance_id": inst["id"],
+            "deadline_epoch": now + 3600,
+            "requested_spec": {"variant": "VARIANT_GPU", "accelerator": "T4", "shape": "SHAPE_STANDARD"},
+            "snapshot": {"manifest": {"compute_spec": {"variant": "VARIANT_GPU", "accelerator": "T4", "shape": "SHAPE_STANDARD"}}},
+        },
+        project_id="proj-1",
+    )
+    lease = repo.create(
+        "leases",
+        "owner",
+        {
+            "state": "active",
+            "provider": "colab",
+            "account_id": "acc-1",
+            "instance_id": inst["id"],
+            "owner_job_id": job["id"],
+            "handle": {"runtime_name": "runtimes/rt-1", "endpoint": "ep-1"},
+            "deadline_epoch": now + 3600,
+        },
+    )
+    repo.update("jobs", job["id"], {"lease_id": lease["id"]}, "owner")
+
+    class CancelDuringPollProvider:
+        def inspect(self, handle):
+            # Simulate concurrent user cancel arriving while provider.inspect() is in flight.
+            repo.update("jobs", job["id"], {"cancel_requested": True}, "owner")
+            return {"ready": True, "state": "RUNNING"}
+
+    sched = Scheduler(
+        repo,
+        provider_factory=lambda _j: CancelDuringPollProvider(),
+        config=GpuConfig(enabled=True, real_enabled=True),
+        clock=lambda: now,
+    )
+    after = sched._prepare(repo.get("jobs", job["id"], "owner"))
+    assert after["state"] == "cleaning_up"
+    assert after["cleanup_final_state"] == "cancelled"
+    assert after["requested_outcome"] == "cancelled"
+
+
+def test_audit_fix3_explicit_unavailable_account_never_falls_back_to_other_drive_account(tmp_path):
+    from app.gpu import native_workspace
+
+    store = Store(f"sqlite:///{tmp_path / 'fix3.db'}")
+    repo = Repository(store)
+    repo.create(
+        "accounts",
+        "owner",
+        {"account_id": "acc-a", "alias": "Account A (No Drive)", "enabled": True, "connected": False},
+        record_id="acc-a",
+    )
+    repo.create(
+        "accounts",
+        "owner",
+        {"account_id": "acc-b", "alias": "Account B (Has Drive)", "enabled": True, "connected": True},
+        record_id="acc-b",
+    )
+    # Only Account B has an active Drive credential.
+    repo.create(
+        "credentials",
+        "owner",
+        {
+            "provider": "google",
+            "purpose": "drive",
+            "account_id": "acc-b",
+            "revoked": False,
+            "encrypted_refresh_token": "enc-tok-b",
+        },
+    )
+
+    with pytest.raises(common.APIError) as exc_unavail:
+        native_workspace.delete_env_caches(repo, "owner", delete_all=True, account_id="acc-a")
+    assert exc_unavail.value.code == "ACCOUNT_DRIVE_UNAVAILABLE"
+    assert exc_unavail.value.status == 409
+
+    with pytest.raises(common.APIError) as exc_missing:
+        native_workspace.delete_env_caches(repo, "owner", delete_all=True, account_id="acc-does-not-exist")
+    assert exc_missing.value.code == "ACCOUNT_NOT_FOUND"
+    assert exc_missing.value.status == 404
+
+    with pytest.raises(common.APIError) as exc_overview:
+        native_workspace.get_workspace_overview(repo, "owner", refresh=True, account_id="acc-a")
+    assert exc_overview.value.code == "ACCOUNT_DRIVE_UNAVAILABLE"
+
+
+def test_audit_fix4_workspace_write_lock_expiry_cannot_resurrect_and_aborts_writes(tmp_path):
+    from app.gpu import native_workspace
+    from app.gpu.drive import DriveStorage
+
+    store = Store(f"sqlite:///{tmp_path / 'fix4.db'}")
+    repo = Repository(store)
+    base_now = 1_700_000_000.0
+
+    # Part A: Expired lock cannot be resurrected; active native lease also fails renewal.
+    lock_id = native.acquire_workspace_write_lock(repo, "owner", reason="test", ttl_seconds=90.0, now=base_now)
+    assert native.renew_workspace_write_lock(repo, "owner", lock_id, ttl_seconds=90.0, now=base_now + 30.0) is True
+    assert native.renew_workspace_write_lock(repo, "owner", lock_id, ttl_seconds=90.0, now=base_now + 200.0) is False
+    native.release_workspace_write_lock(repo, "owner", lock_id)
+
+    lock_id2 = native.acquire_workspace_write_lock(repo, "owner", reason="test2", ttl_seconds=90.0, now=base_now)
+    lease = repo.create("leases", "owner", {"state": "active", "native_comfy": True})
+    assert native.renew_workspace_write_lock(repo, "owner", lock_id2, ttl_seconds=90.0, now=base_now + 10.0) is False
+    repo.update("leases", lease["id"], {"state": "deleted"}, "owner")
+    native.release_workspace_write_lock(repo, "owner", lock_id2)
+
+    # Part B: Losing the lock mid-operation aborts subsequent Drive permanent deletions!
+    deleted_ids: list[str] = []
+
+    def drive_handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path.endswith("/files"):
+            q = req.url.params.get("q", "")
+            if "AI-Studio" in q:
+                return httpx.Response(200, json={"files": [{"id": "root-1", "name": "AI-Studio", "mimeType": "application/vnd.google-apps.folder"}]})
+            if "'root-1' in parents" in q:
+                return httpx.Response(200, json={"files": [{"id": "owner-1", "name": "owner", "mimeType": "application/vnd.google-apps.folder"}]})
+            if "'owner-1' in parents" in q:
+                return httpx.Response(200, json={"files": [{"id": "nc-1", "name": "native-comfy", "mimeType": "application/vnd.google-apps.folder"}]})
+            if "'nc-1' in parents" in q:
+                return httpx.Response(200, json={"files": [{"id": "ec-1", "name": "env-cache", "mimeType": "application/vnd.google-apps.folder"}]})
+            if "'ec-1' in parents" in q:
+                return httpx.Response(
+                    200,
+                    json={
+                        "files": [
+                            {"id": "f-1", "name": "k1.tar.gz", "size": "100"},
+                            {"id": "f-2", "name": "k2.tar.gz", "size": "100"},
+                            {"id": "f-3", "name": "k3.tar.gz", "size": "100"},
+                        ]
+                    },
+                )
+        if req.method == "DELETE":
+            fid = req.url.path.rsplit("/", 1)[-1]
+            deleted_ids.append(fid)
+            if fid == "f-1":
+                # Simulate lock expiry / loss before f-2 is deleted.
+                key = native._workspace_lock_key("owner")
+                repo.store.update("settings", key, {"expires_at": 1.0}, "owner")
+            return httpx.Response(204)
+        raise AssertionError(f"Unexpected Drive request: {req.method} {req.url}")
+
+    fake_google = SimpleNamespace(access_token=lambda _purpose: "fake-drive-token")
+    with httpx.Client(transport=httpx.MockTransport(drive_handler)) as client:
+        drive = DriveStorage({"id": "ws-test", "owner_id": "owner"}, repo, client=client, google=fake_google)
+        with pytest.raises(common.APIError) as exc_lost:
+            native_workspace.delete_env_caches(repo, "owner", delete_all=True, drive=drive)
+    assert exc_lost.value.code == "NATIVE_WORKSPACE_LOCK_LOST"
+    assert exc_lost.value.status == 409
+    assert deleted_ids == ["f-1"]
+

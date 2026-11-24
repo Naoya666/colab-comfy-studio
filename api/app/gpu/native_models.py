@@ -16,6 +16,7 @@ import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
@@ -238,7 +239,66 @@ class LocalModels:
         self.current_rows = {}
         self.inflight = {}
         self._reserved_bytes: dict[Path, int] = {}
+        self._rw_loop = None
+        self._rw_state = None
         self.handoffs = 0
+
+    def _rw_lock_state(self):
+        loop = asyncio.get_running_loop()
+        if self._rw_loop is not loop or self._rw_state is None:
+            self._rw_loop = loop
+            self._rw_state = {
+                "cond": asyncio.Condition(),
+                "readers": 0,
+                "writer": False,
+                "writers_waiting": 0,
+            }
+        return self._rw_state
+
+    @asynccontextmanager
+    async def _activity_lock(self, *, exclusive: bool = False):
+        """Serialize studio vs native prepares asynchronously without blocking the event loop,
+        while holding models-active.lock for cross-process probe visibility."""
+        state = self._rw_lock_state()
+        cond = state["cond"]
+        if exclusive:
+            async with cond:
+                state["writers_waiting"] += 1
+                try:
+                    await cond.wait_for(lambda: not state["writer"] and state["readers"] == 0)
+                    state["writer"] = True
+                except BaseException:
+                    state["writers_waiting"] -= 1
+                    cond.notify_all()
+                    raise
+                else:
+                    state["writers_waiting"] -= 1
+        else:
+            async with cond:
+                await cond.wait_for(lambda: not state["writer"] and state["writers_waiting"] == 0)
+                state["readers"] += 1
+
+        lock_file = None
+        try:
+            lock_file = (self.root / "models-active.lock").open("a")
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            try:
+                fcntl.flock(lock_file, mode | fcntl.LOCK_NB)
+            except BlockingIOError:
+                await asyncio.to_thread(fcntl.flock, lock_file, mode)
+            yield
+        finally:
+            if lock_file is not None:
+                try:
+                    lock_file.close()
+                except OSError:
+                    pass
+            async with cond:
+                if exclusive:
+                    state["writer"] = False
+                else:
+                    state["readers"] -= 1
+                cond.notify_all()
 
     _SENSITIVE_QUERY_KEYS = frozenset({
         "token", "access_token", "auth", "key", "api_key", "apikey",
@@ -991,8 +1051,7 @@ class LocalModels:
 
     async def prepare(self, body, explicit, catalog, *, visual=False, trusted=False):
         # A separate process can test the lock even when the gateway is disconnected.
-        with (self.root / "models-active.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_SH)
+        async with self._activity_lock(exclusive=False):
             rows = {}
             tasks = []
             grouped = defaultdict(list)
@@ -1048,9 +1107,8 @@ class LocalModels:
         return [copied.get(id(status), dict(status)) for status in rows.values()]
 
     async def prepare_studio(self, weights, loras, cache_payload, verify_paths, paths, timeout):
-        # Keep the existing native activity fence and serialize with native prepares.
-        with (self.root / "models-active.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        # Keep the existing native activity fence and serialize with native prepares off the event loop.
+        async with self._activity_lock(exclusive=True):
             rows = {}
             for target in [*(item["target"] for item in weights), *("loras/" + item["target"] for item in loras)]:
                 category, _, name = target.partition("/")
@@ -1103,8 +1161,7 @@ class LocalModels:
                 str(item.get("name") or ""),
             ),
         )
-        with (self.root / "models-active.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_SH)
+        async with self._activity_lock(exclusive=False):
             rows = {}
             tasks = []
             items: list[tuple[str, str, dict, dict]] = []

@@ -1010,7 +1010,8 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     latest_job,
                     "cleaning_up",
                     "任务已取消或触发熔断，停止推进至就绪",
-                    {"cleanup_final_state": "cancelled", "requested_outcome": "cancelled"},
+                    cleanup_final_state="cancelled",
+                    requested_outcome="cancelled",
                 )
             job = self._mark_instance("mark_ready", job)
             if job.get("recovery_plan_id") and job.get("instance_id"):
