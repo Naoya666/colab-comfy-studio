@@ -52,23 +52,11 @@ Colab GPU Studio 是一个自托管的 ComfyUI 与 Google Colab 算力创作工�
 
 ## 系统架构
 
-```mermaid
-flowchart LR
-    Client["浏览器 / PWA / SillyTavern"] -->|"HTTPS / WebSocket"| API["Studio API (FastAPI + React)"]
-
-    subgraph Host["本机 / VPS (Docker Compose)"]
-        API --- DB[("SQLite / PostgreSQL + 本地产物")]
-        Worker["任务 Worker"] --- DB
-        ModelWorker["模型下载 Worker (CPU-only)"] --- DB
-        Watchdog["回收与保活 Watchdog"] --- DB
-    end
-
-    ModelWorker -->|"免 GPU 流式上传权重"| Drive["Google Drive (drive.file)"]
-    Worker -->|"Colab MCP 控制通道"| Colab["Google Colab GPU 运行时"]
-    Watchdog -->|"心跳保活 / 空闲与熔断回收"| Colab
-    API -->|"Cloudflare Named Tunnel + Access"| Colab
-    Colab <-->|"rclone VFS / 节点与环境缓存 / 输出同步"| Drive
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/architecture-light.png">
+  <img alt="Colab GPU Studio 系统架构图" src="docs/images/architecture-light.png">
+</picture>
 
 Docker Compose 默认由 4 个职责分离的容器协作（共享 `studio-data` 数据卷与同一份 `.env`）：
 
