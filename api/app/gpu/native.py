@@ -1316,10 +1316,19 @@ def sync_plugins(repo, lease, client=None, *, return_state=False):
     fetched_telemetry_digest = None
     fetched_inventory = None
     fetched_inventory_digest = None
+    expected_lease_id = lease.get("id")
     with httpx.Client(timeout=15) if client is None else _borrow(client) as c:
         response = c.get(url + "/studio_native/state", headers=headers)
         response.raise_for_status()
         state_payload = response.json()
+        if not isinstance(state_payload, dict):
+            raise ValueError("Invalid runtime state payload")
+        if isinstance(expected_lease_id, str) and expected_lease_id and "lease_id" in state_payload:
+            remote_lease_id = state_payload.get("lease_id")
+            if not isinstance(remote_lease_id, str) or remote_lease_id.strip() != expected_lease_id:
+                raise ValueError(
+                    f"Runtime state lease_id mismatch: expected {expected_lease_id}, got {remote_lease_id!r}"
+                )
         status = state_payload.get("plugins") or {}
         remote_tel_digest = status.get("telemetry_digest")
         if (

@@ -2134,6 +2134,82 @@ def test_audit5_fix4_late_sync_plugins_response_from_exited_lease_cannot_clear_o
         drive.close()
 
 
+# ---------------------------------------------------------------------------
+# Sixth-Round Audit Fix (1)
+# ---------------------------------------------------------------------------
+
+
+def test_audit6_fix1_sync_plugins_rejects_mismatched_remote_lease_id(tmp_path, monkeypatch):
+    store = Store(f"sqlite:///{tmp_path / 'audit6_fix1.db'}")
+    repo = Repository(store)
+    lease_b = repo.create(
+        "leases",
+        "owner",
+        {
+            "state": "active",
+            "native_comfy": True,
+            "native_ready": True,
+            "account_id": "acc-b",
+            "native_drive_account_id": "acc-b",
+            "runtime_id": "rt-b",
+            "request_id": "req-b",
+        },
+        record_id="lease-b",
+    )
+
+    plugins_a = [
+        {"path": "PluginFromOldLeaseA", "checksum": "1" * 64, "enabled": True, "repo": None, "commit": None, "version": "1.0", "archive": "a" * 64, "kind": "directory"}
+    ]
+    manifest_a = {"schema": 1, "plugins": plugins_a, "generation": node_persistence.digest(plugins_a)}
+    plugins_b = [
+        {"path": "PluginFromCurrentLeaseB", "checksum": "2" * 64, "enabled": True, "repo": None, "commit": None, "version": "1.0", "archive": "b" * 64, "kind": "directory"}
+    ]
+    manifest_b = {"schema": 1, "plugins": plugins_b, "generation": node_persistence.digest(plugins_b)}
+
+    monkeypatch.setattr(native, "backend", lambda: ("https://internal.example.test", {}))
+
+    # 1. Tunnel returns a state payload explicitly tagged with old lease-a -> MUST raise ValueError
+    #    and MUST NOT write lease-a's manifest or telemetry into Drive B's cache!
+    tel_requested = []
+
+    def stale_tunnel_handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/studio_native/plugin-telemetry":
+            tel_requested.append(req.url.path)
+            return httpx.Response(200, json={"schema": 1, "import_times": {"PluginFromOldLeaseA": 1.0}})
+        return httpx.Response(
+            200,
+            json={
+                "busy": False,
+                "lease_id": "lease-old-a",
+                "plugins": {"manifest": manifest_a, "telemetry_digest": "t" * 64, "durable": True},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(stale_tunnel_handler)) as client:
+        with pytest.raises(ValueError, match="lease_id mismatch"):
+            native.sync_plugins(repo, lease_b, client=client)
+
+    assert tel_requested == []
+    assert repo.store.get("settings", native.plugin_settings_key("owner", "acc-b"), "owner") is None
+
+    # 2. Tunnel returns state matching lease-b -> succeeds and writes Drive B's cache cleanly.
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _req: httpx.Response(
+                200,
+                json={"busy": False, "lease_id": "lease-b", "plugins": {"manifest": manifest_b, "durable": True}},
+            )
+        )
+    ) as client:
+        native.sync_plugins(repo, lease_b, client=client)
+
+    saved_b = repo.store.get("settings", native.plugin_settings_key("owner", "acc-b"), "owner")
+    assert saved_b is not None
+    assert saved_b["manifest"]["generation"] == manifest_b["generation"]
+    assert saved_b["drive_account_id"] == "acc-b"
+
+
+
 
 
 
