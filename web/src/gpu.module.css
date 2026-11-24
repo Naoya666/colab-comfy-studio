@@ -2543,6 +2543,36 @@
   border-radius: var(--r-sm);
   background: var(--warning-bg);
 }
+.depInfoStrip {
+  display: grid;
+  gap: 4px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+}
+.wfImportUrlRow {
+  flex-wrap: wrap;
+}
+.wfImportUrlRow input {
+  flex: 1 1 220px;
+}
+.wfImportPreview {
+  display: grid;
+  gap: 10px;
+  overflow-wrap: anywhere;
+}
+.wfImportThumb {
+  max-width: 100%;
+  max-height: 180px;
+  object-fit: contain;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--bg);
+}
+.wfImportNoticeRow {
+  gap: 8px;
+}
 .depFilterBar {
   display: flex;
   align-items: center;

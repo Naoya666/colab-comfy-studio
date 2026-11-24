@@ -352,6 +352,31 @@ class ModelLibrary:
         return {"upload_url": location, "chunk_size": 8 * 1024 * 1024}
 
     def inspect_workflow(self, payload):
+        if isinstance(payload, dict) and set(payload.keys()) == {"url"}:
+            from .workflow_sources import fetch_workflow_source
+
+            fetched = fetch_workflow_source(self.http, payload["url"])
+            extra_warnings: list[str] = []
+            if fetched["kind"] == "png":
+                extracted = fetched["image_extraction"]
+                extra_warnings = [
+                    w for w in (extracted.get("warnings") or [])
+                    if "无法可靠自动转换为 API prompt" not in w
+                ]
+                inspect_payload = {
+                    "workflow": extracted.get("workflow"),
+                    "prompt": extracted.get("prompt"),
+                }
+            else:
+                inspect_payload = fetched["payload"]
+            result = deps.inspect_workflow(inspect_payload, self.models())
+            if extra_warnings:
+                result["warnings"] = [*extra_warnings, *(result.get("warnings") or [])]
+            result["source_name"] = fetched["source_name"]
+            result["source_host"] = fetched["source_host"]
+            if fetched.get("note"):
+                result["source_note"] = fetched["note"]
+            return result
         return deps.inspect_workflow(payload, self.models())
 
     def dependency_record(self, workflow_id, *, rescan=False):

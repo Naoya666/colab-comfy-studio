@@ -131,7 +131,10 @@ export async function extractPng(bytes: Uint8Array): Promise<ExtractedWorkflow> 
   const files = new Set<string>();
   const walk = (value: unknown, depth = 0) => {
     if (depth > 64) throw new Error('元数据嵌套过深');
-    if (typeof value === 'string' && /\.(safetensors|ckpt|pt|pth|bin|gguf|onnx)$/i.test(value)) files.add(value);
+    if (typeof value === 'string') {
+      const cleaned = value.trim();
+      if (!/^https?:\/\//i.test(cleaned) && /\.(safetensors|ckpt|pt|pth|bin|gguf|onnx)$/i.test(cleaned)) files.add(cleaned);
+    }
     else if (Array.isArray(value)) value.forEach(v => walk(v, depth + 1));
     else if (object(value)) Object.values(value).forEach(v => walk(v, depth + 1));
   };

@@ -134,6 +134,9 @@ export interface WorkflowInspectResult {
   models_ready: boolean;
   warnings: string[];
   summary: WorkflowInspectSummary;
+  source_name?: string;
+  source_host?: string;
+  source_note?: string;
 }
 
 export interface StoredInspectorState {
@@ -220,8 +223,17 @@ export interface DriveUsageReport {
 
 export const ACTIVE_MODEL_STATES = new Set(['pending', 'resolving', 'downloading', 'verifying', 'uploading']);
 
-export const libraryApi = <T,>(path = '', body?: unknown, method = body === undefined ? 'GET' : 'POST') =>
-  apiFetch<T>(`/api/gpu/model-library${path}`, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+export const libraryApi = <T,>(
+  path = '',
+  body?: unknown,
+  method = body === undefined ? 'GET' : 'POST',
+  timeoutMs?: number,
+) =>
+  apiFetch<T>(
+    `/api/gpu/model-library${path}`,
+    { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) },
+    timeoutMs,
+  );
 
 export const getDriveUsage = (refresh = false, signal?: AbortSignal) =>
   apiFetch<DriveUsageReport>(`/api/gpu/model-library/drive-usage${refresh ? '?refresh=true' : ''}`, { cache: 'no-store', signal }, 45000);
@@ -233,7 +245,7 @@ export const dependencyApi = <T,>(workflow: string, action = '', body?: unknown)
   );
 
 export const inspectWorkflowDependencies = (payload: Record<string, unknown>) =>
-  libraryApi<WorkflowInspectResult>('/inspect-workflow', payload, 'POST');
+  libraryApi<WorkflowInspectResult>('/inspect-workflow', payload, 'POST', 45000);
 
 export const bytesLabel = (value?: number | null) => {
   if (!value || !Number.isFinite(value) || value <= 0) return '大小待确认';

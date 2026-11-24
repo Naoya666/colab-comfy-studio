@@ -50,6 +50,7 @@ import {
 } from './lib/instance-submission';
 import { isSystemJob, pickInitialProjectId, projectOptionLabel, projectTitleById } from './lib/project-label';
 import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
+import { readStoredWorkflowInspect, writeStoredWorkflowInspect } from './lib/model-library';
 import { useDesktopLayout } from './lib/desktop-layout';
 import { useBodyScrollLock } from './lib/modal-scroll-lock';
 import { parameterKey, parameterList, readableState } from './lib/ui-helpers';
@@ -854,13 +855,14 @@ export default function App() {
     }
   }
 
-  async function importWorkflow(raw: string) {
+  async function importWorkflow(raw: string): Promise<boolean> {
     try {
       const value = JSON.parse(raw) as unknown;
       const source = record(value) && record(value.workflow) ? value.workflow : value;
       if (!record(source) || (!record(source.image_extraction) && (!record(source.manifest) || !record(source.api_graph) || !record(source.object_info)))) {
         throw new Error('JSON 必须包含 manifest、api_graph、object_info');
       }
+      let imported = false;
       await action('import', async () => {
         const workflow = await importGpuWorkflow(value as never);
         setWorkflows((curr) => [workflow, ...curr.filter((item) => item.id !== workflow.id)]);
@@ -870,9 +872,12 @@ export default function App() {
             : '工作流已作为草稿导入，请校验后发布。',
           'success',
         );
+        imported = true;
       });
+      return imported;
     } catch (cause) {
       setError(`导入失败：${apiMessage(cause)}`);
+      return false;
     }
   }
 
@@ -1140,7 +1145,7 @@ export default function App() {
         onDeleteStudio={gs.setConfirmDeleteViewer}
         onFavoriteNative={(asset) => void gs.favoriteNative(asset)}
         onImportNativeReference={gs.importNativeRef}
-        onImportWorkflowBundle={importWorkflow}
+        onImportWorkflowBundle={async (bundle) => { await importWorkflow(bundle); }}
         onDeleteNative={gs.setConfirmDeleteNative}
       />
     </Suspense>
@@ -1519,7 +1524,11 @@ export default function App() {
                 {error && <p className="status error" role="alert">{error}</p>}
                 <WorkflowsPanel
                   workflows={workflows}
-                  onImport={(bundle) => void importWorkflow(bundle)}
+                  onImport={(bundle) => importWorkflow(bundle)}
+                  onOpenModelLibrary={() => {
+                    writeStoredWorkflowInspect({ ...readStoredWorkflowInspect(), open: true });
+                    setAssetsSubTab('models');
+                  }}
                   onValidate={(wf) => void action('validate', async () => {
                     await validateGpuWorkflow(wf.id);
                     setWorkflows(await getGpuWorkflows());

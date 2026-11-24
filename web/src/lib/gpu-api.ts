@@ -851,6 +851,37 @@ export interface RecoveryStatusResponse {
 export const getRecoveryStatus = (signal?: AbortSignal) =>
   apiFetch<RecoveryStatusResponse>('/api/gpu/recovery/status', { cache: 'no-store', signal });
 
+export type FetchedWorkflowUrlResult =
+  | {
+      kind: 'png';
+      source_name: string;
+      source_host: string;
+      note?: string;
+      extraction: {
+        workflow?: Record<string, unknown>;
+        prompt?: Record<string, unknown>;
+        metadata?: Array<{ keyword: string; text: string }>;
+        warnings: string[];
+        node_count: number;
+        node_types: string[];
+        model_files: string[];
+      };
+    }
+  | {
+      kind: 'bundle';
+      source_name: string;
+      source_host: string;
+      note?: string;
+      bundle: Record<string, unknown>;
+    };
+
+export const fetchWorkflowFromUrl = (url: string) =>
+  apiFetch<FetchedWorkflowUrlResult>(
+    '/api/gpu/workflows/fetch-url',
+    { method: 'POST', body: JSON.stringify({ url }) },
+    45000,
+  );
+
 export const cancelRecoveryPlan = (planId: string, idempotencyKey?: string) =>
   apiFetch<RecoveryPlan>(`/api/gpu/recovery/${encodeURIComponent(planId)}/cancel`, {
     method: 'POST',

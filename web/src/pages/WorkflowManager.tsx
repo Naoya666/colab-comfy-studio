@@ -1,8 +1,8 @@
 import { ModelDependencies } from '../components/ModelDependencies';
-import { ImageWorkflowImport } from '../components/ImageWorkflowImport';
+import { WorkflowImportWorkspace } from '../components/WorkflowImportWorkspace';
 import { ImageDraftConfiguration } from '../components/ImageDraftConfiguration';
-import { Fragment, Suspense, lazy, useCallback, useMemo, useRef, useState } from 'react';
-import { ChevronDown, Search, Trash2 } from 'lucide-react';
+import { Fragment, Suspense, lazy, useCallback, useMemo, useState } from 'react';
+import { ChevronDown, Search, Trash2, Upload } from 'lucide-react';
 import type { GpuWorkflow } from '../lib/gpu-api';
 import { Pager } from '../components/ui';
 import { WorkflowActivationPanel } from '../components/WorkflowActivation';
@@ -33,12 +33,12 @@ async function fetchWorkflowGraphPreview(workflow: Pick<GpuWorkflow, 'workflow_k
 }
 
 export function WorkflowsPanel({
-  workflows, projectId = '', projectTitle = '', onImport, onValidate, onPublish, onRollback, onDeactivate, onDelete, deleting = false, onActivated, onOpenJob, onUseProject,
+  workflows, projectId = '', projectTitle = '', onImport, onValidate, onPublish, onRollback, onDeactivate, onDelete, deleting = false, onActivated, onOpenJob, onUseProject, onOpenModelLibrary,
 }: {
   workflows: GpuWorkflow[];
   projectId?: string;
   projectTitle?: string;
-  onImport: (bundle: string) => void;
+  onImport: (bundle: string) => Promise<boolean> | void;
   onValidate: (workflow: GpuWorkflow) => void;
   onPublish: (workflow: GpuWorkflow) => void;
   onRollback: (workflow: GpuWorkflow) => void;
@@ -48,8 +48,9 @@ export function WorkflowsPanel({
   onActivated: () => void;
   onOpenJob?: (jobId: string, projectId?: string) => void;
   onUseProject?: (projectId: string) => void;
+  onOpenModelLibrary?: () => void;
 }) {
-  const [text, setText] = useState('');
+  const [importOpen, setImportOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(0);
   const [activating, setActivating] = useState<string | null>(null);
@@ -58,7 +59,6 @@ export function WorkflowsPanel({
   const [openKeys, setOpenKeys] = useState<Set<string>>(new Set());
   const [showAll, setShowAll] = useState<Set<string>>(new Set());
   const [watch, setWatch] = useState<Record<string, ActivationWatch>>(() => readActivationWatch());
-  const fileRef = useRef<HTMLInputElement>(null);
   const rememberWatch = useCallback((workflowId: string, next: ActivationWatch | null) => {
     setWatch((current) => {
       const copy = { ...current };
@@ -96,27 +96,31 @@ export function WorkflowsPanel({
 
   return (
     <div className={styles.stack}>
-      <ImageWorkflowImport onImport={onImport} />
-      <details className="foldable">
-        <summary>导入新工作流（高级）</summary>
-        <div className="foldContent">
-          <p className="muted small">粘贴或选择工作流 JSON（含 manifest、api_graph、object_info）。导入后只是草稿，需要校验、发布后才能使用。</p>
-          <textarea className={styles.code} placeholder="在这里粘贴工作流 JSON" value={text} onChange={(e) => setText(e.target.value)} />
-          <div className="actions">
-            <button className="button secondary small" type="button" onClick={() => fileRef.current?.click()}>选择 JSON 文件</button>
-            <input ref={fileRef} hidden type="file" accept="application/json,.json" onChange={async (e) => {
-              const file = e.target.files?.[0];
-              if (file) setText(await file.text());
-              e.target.value = '';
-            }} />
-            <button className="button small" type="button" disabled={!text.trim()} onClick={() => onImport(text)}>导入为草稿</button>
-          </div>
+      <div className={styles.pageTitle}>
+        <h2>工作流管理</h2>
+        <div className={styles.titleActions}>
+          <button
+            className={`button ${importOpen ? '' : 'secondary'} small`}
+            type="button"
+            aria-expanded={importOpen}
+            onClick={() => setImportOpen((v) => !v)}
+          >
+            <Upload size={14} strokeWidth={1.8} aria-hidden />
+            导入工作流
+          </button>
         </div>
-      </details>
-
-      <div className={styles.pageHead}>
-        <p className="muted small">共 {groups.length} 个工作流、{workflows.length} 个版本。同一个工作流的版本收在一起，点开可查看全部。</p>
       </div>
+
+      <p className="muted small">
+        共 {groups.length} 个工作流、{workflows.length} 个版本。同一个工作流的版本收在一起，点开可查看全部。
+      </p>
+
+      <WorkflowImportWorkspace
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onImport={onImport}
+        onOpenModelLibrary={onOpenModelLibrary}
+      />
 
       <label className={styles.searchBox}>
         <Search size={17} strokeWidth={1.6} aria-hidden />

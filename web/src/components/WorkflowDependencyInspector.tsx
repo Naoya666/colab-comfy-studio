@@ -3,12 +3,10 @@ import {
   AlertTriangle,
   CheckCircle2,
   Download,
-  FileCode2,
   FileSearch,
   Loader2,
   RefreshCw,
   Trash2,
-  Upload,
   X,
 } from 'lucide-react';
 import { apiMessage } from '../lib/gpu-api';
@@ -34,7 +32,9 @@ import {
   type WorkflowInspectResult,
 } from '../lib/model-library';
 import { extractPng, MAX_IMAGE } from '../lib/png-workflow';
+import { validateWorkflowUrlInput } from '../lib/workflow-import';
 import { DependencyCard } from './ModelDependencyItem';
+import { WorkflowSourceDropzone } from './WorkflowSourceDropzone';
 import styles from '../gpu.module.css';
 
 type InspectFilter = 'all' | 'missing' | 'with_link' | 'ready' | 'candidates';
@@ -445,11 +445,7 @@ export function WorkflowDependencyInspector({
   onRefreshLibrary: () => Promise<void>;
   onLocateModel: (model: LibraryModel) => void;
 }) {
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const [pasteText, setPasteText] = useState('');
-  const [showPaste, setShowPaste] = useState(false);
   const [showDropzone, setShowDropzone] = useState(!result);
-  const [dragActive, setDragActive] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [filter, setFilter] = useState<InspectFilter>('all');
@@ -501,31 +497,31 @@ export function WorkflowDependencyInspector({
 
   if (!open) return null;
 
-  async function runInspect(payload: Record<string, unknown>, label: string, extraWarnings: string[] = []) {
+  async function runInspect(payload: Record<string, unknown>, label: string, extraWarnings: string[] = []): Promise<boolean> {
     setBusy(true);
     setError('');
     try {
       const inspected = await inspectWorkflowDependencies(payload);
       const mergedWarnings = [...extraWarnings, ...(inspected.warnings || [])];
+      const resolvedLabel = label || inspected.source_name || inspected.source_host || '远程工作流';
       onStateChange({
         open: true,
-        fileName: label,
+        fileName: resolvedLabel,
         result: { ...inspected, warnings: mergedWarnings },
         importedMap: {},
       });
       setShowDropzone(false);
-      setShowPaste(false);
-      setPasteText('');
       setFilter('all');
+      return true;
     } catch (cause) {
       setError(apiMessage(cause));
+      return false;
     } finally {
       setBusy(false);
     }
   }
 
-  async function handleFile(file?: File) {
-    if (!file) return;
+  async function handleFile(file: File) {
     setError('');
     const lower = file.name.toLowerCase();
     try {
@@ -550,23 +546,33 @@ export function WorkflowDependencyInspector({
     }
   }
 
-  async function handlePasteSubmit() {
-    if (!pasteText.trim()) return;
+  async function handlePasteSubmit(text: string): Promise<boolean> {
+    if (!text.trim()) return false;
     setError('');
     try {
-      const parsed: unknown = JSON.parse(pasteText);
+      const parsed: unknown = JSON.parse(text);
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error('JSON 根节点必须是对象');
       }
-      await runInspect(parsed as Record<string, unknown>, '粘贴的工作流 JSON');
+      return await runInspect(parsed as Record<string, unknown>, '粘贴的工作流 JSON');
     } catch (cause) {
       setError(cause instanceof SyntaxError ? 'JSON 格式错误，请检查粘贴内容' : apiMessage(cause));
+      return false;
     }
+  }
+
+  async function handleUrlSubmit(rawUrl: string): Promise<boolean> {
+    setError('');
+    const checked = validateWorkflowUrlInput(rawUrl);
+    if (!checked.ok) {
+      setError(checked.error);
+      return false;
+    }
+    return runInspect({ url: checked.url }, '');
   }
 
   function clearResult() {
     setError('');
-    setPasteText('');
     setShowDropzone(true);
     setFilter('all');
     onStateChange({ fileName: '', result: null, importedMap: {} });
@@ -609,76 +615,24 @@ export function WorkflowDependencyInspector({
         </div>
       </div>
 
-      {/* Import dropzone + paste JSON */}
+      {/* Import dropzone + URL + paste JSON */}
       {showDropzone && (
-        <div className={styles.stack}>
-          <div
-            className={`${styles.depDropzone} ${dragActive ? styles.dropActive : ''}`}
-            onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
-            onDragLeave={() => setDragActive(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragActive(false);
-              void handleFile(e.dataTransfer.files?.[0]);
-            }}
-          >
-            <input
-              ref={fileInputRef}
-              type="file"
-              hidden
-              accept=".json,application/json,.png,image/png"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                e.target.value = '';
-                void handleFile(file);
-              }}
-            />
-            <Upload size={20} strokeWidth={1.6} aria-hidden />
-            <strong>拖入或选择 ComfyUI 工作流文件（.json / .png 原图）</strong>
-            <span className="muted small">支持可视化工作流 JSON（可自动提取节点内嵌下载链接）、API Prompt JSON 及 PNG 原图（本地解包不上传原图）</span>
-            <div className="actions">
-              <button
-                type="button"
-                className="button small"
-                disabled={busy}
-                onClick={() => fileInputRef.current?.click()}
-              >
-                {busy ? <><Loader2 size={13} className={styles.spin} aria-hidden /> 解析检测中…</> : '选择 JSON / PNG 文件'}
-              </button>
-              <button
-                type="button"
-                className="button secondary small"
-                disabled={busy}
-                onClick={() => setShowPaste((v) => !v)}
-              >
-                <FileCode2 size={13} aria-hidden />
-                {showPaste ? '收起粘贴框' : '粘贴 JSON 文本'}
-              </button>
-            </div>
-          </div>
-
-          {showPaste && (
-            <div className={styles.depSubPanel}>
-              <textarea
-                className={styles.code}
-                aria-label="粘贴 ComfyUI 工作流 JSON"
-                placeholder="粘贴 ComfyUI 工作流 JSON 或 API Prompt JSON"
-                value={pasteText}
-                onChange={(e) => setPasteText(e.target.value)}
-              />
-              <div className="actions">
-                <button
-                  type="button"
-                  className="button small"
-                  disabled={busy || !pasteText.trim()}
-                  onClick={() => void handlePasteSubmit()}
-                >
-                  {busy ? '检测中…' : '检测模型依赖'}
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
+        <WorkflowSourceDropzone
+          title="拖入或选择 ComfyUI 工作流文件（.json / .png 原图）"
+          description="支持可视化工作流 JSON（可自动提取节点内嵌下载链接）、API Prompt JSON、PNG 原图（本地解包或服务端安全拉取远程链接）"
+          busy={busy}
+          busyLabel="解析检测中…"
+          urlPlaceholder="https://...（支持 .json 或含元数据的 PNG 原图直链，自动转换 GitHub / HF / Civitai 常见链接）"
+          urlSubmitLabel="检测链接模型"
+          urlBusyLabel="拉取检测中…"
+          pasteLabel="粘贴 JSON 文本"
+          pastePlaceholder="粘贴 ComfyUI 工作流 JSON 或 API Prompt JSON"
+          pasteSubmitLabel="检测模型依赖"
+          pasteBusyLabel="检测中…"
+          onSelectFile={handleFile}
+          onSubmitUrl={handleUrlSubmit}
+          onSubmitPaste={handlePasteSubmit}
+        />
       )}
 
       {error && <p role="alert" className="status error">{error}</p>}
@@ -689,6 +643,9 @@ export function WorkflowDependencyInspector({
           <div className={styles.depSummaryBar}>
             <div className={styles.depSummaryMeta}>
               <strong>{fileName || '已导入工作流'}</strong>
+              {result.source_host && (
+                <span className={styles.depTag}>来源：{result.source_host}</span>
+              )}
               <span className={styles.depTag}>{FORMAT_LABELS[result.format] || result.format}</span>
               <span className="muted small">{result.node_count} 个节点 · 检出 {stats.total} 项模型依赖</span>
             </div>
@@ -704,6 +661,12 @@ export function WorkflowDependencyInspector({
               </button>
             )}
           </div>
+
+          {result.source_note && (
+            <div className={styles.depInfoStrip}>
+              <p className="muted small">{result.source_note}</p>
+            </div>
+          )}
 
           {result.warnings.length > 0 && (
             <div className={styles.depNoticeStrip}>

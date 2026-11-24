@@ -499,6 +499,51 @@ def cloud_sync_workflow(st, owner, row):
     return Repository(st).update("workflows", row["id"], {"drive_files": records}, owner)
 
 
+@router.post("/workflows/fetch-url")
+def fetch_workflow_from_url(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    admin(user)
+    raw_url = body.get("url") if isinstance(body, dict) else None
+    from .gpu.model_library import ModelLibrary
+    from .gpu.model_sources import ModelError
+    from .gpu.workflow_sources import (
+        PLAIN_COMFYUI_WORKFLOW_ERROR,
+        fetch_workflow_source,
+        is_plain_comfyui_workflow,
+        is_studio_workflow_bundle,
+    )
+
+    repo = Repository(st)
+    lib = ModelLibrary(repo, user["id"])
+    try:
+        fetched = fetch_workflow_source(lib.http, raw_url)
+    except ModelError as exc:
+        raise APIError("WORKFLOW_URL_ERROR", str(exc), 422) from exc
+    finally:
+        lib.close()
+
+    if fetched["kind"] == "png":
+        return ok({
+            "kind": "png",
+            "source_name": fetched["source_name"],
+            "source_host": fetched["source_host"],
+            **({"note": fetched["note"]} if fetched.get("note") else {}),
+            "extraction": fetched["image_extraction"],
+        }, request)
+
+    payload = fetched["payload"]
+    if is_studio_workflow_bundle(payload):
+        return ok({
+            "kind": "bundle",
+            "source_name": fetched["source_name"],
+            "source_host": fetched["source_host"],
+            **({"note": fetched["note"]} if fetched.get("note") else {}),
+            "bundle": payload,
+        }, request)
+    if is_plain_comfyui_workflow(payload):
+        raise APIError("UNSUPPORTED_WORKFLOW_FORMAT", PLAIN_COMFYUI_WORKFLOW_ERROR, 422)
+    raise APIError("INVALID_WORKFLOW_BUNDLE", "JSON 必须包含 manifest、api_graph、object_info", 422)
+
+
 @router.post("/workflows/import")
 def import_workflow(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
     admin(user)
