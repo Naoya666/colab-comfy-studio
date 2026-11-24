@@ -26,6 +26,7 @@ from .compute import (
 )
 from .cu_guard import CuGuardService
 from .google import GoogleError
+from .instances import job_fifo_key
 from .manifest import digest
 from .mcp import MCPError
 from .newgpu.executor_plugins import TrustedExecutorAdapter
@@ -176,11 +177,15 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         return list(self.store.list(kind, owner_id=owner_id))
 
     def _list_by_states(
-        self, kind: str, states, owner_id: str | None = None, *, exclude: bool = False
+        self, kind: str, states, owner_id: str | None = None, *, exclude: bool = False, order_asc: bool = False
     ) -> list[dict]:
         if hasattr(self.store, "list_by_states"):
-            return list(self.store.list_by_states(kind, states, owner_id=owner_id, exclude=exclude))
+            return list(
+                self.store.list_by_states(kind, states, owner_id=owner_id, exclude=exclude, order_asc=order_asc)
+            )
         rows = self._list(kind, owner_id)
+        if order_asc:
+            rows = list(reversed(rows))
         wanted = set(states)
         if exclude:
             return [row for row in rows if row.get("state") not in wanted]
@@ -1330,6 +1335,8 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         retention_allowed = can_retain_lease and not (instance or {}).get("manual_stop_requested")
         if self._provider_name(job) == "colab":
             retention_allowed = retention_allowed and not CuGuardService(self.store, self.clock).state(job["owner_id"])["soft_tripped"]
+        # Deliberate FIFO exception: a running batch hands its active lease directly to the next
+        # item in the same batch so identical-model batch jobs finish consecutively on warm VRAM.
         if lease and retention_allowed and job.get("batch_id") and job.get("cleanup_final_state") == "completed":
             waiting = [j for j in self._list("jobs", job["owner_id"])
                        if j.get("batch_id") == job["batch_id"] and j["state"] not in TERMINAL_STATES
@@ -1563,6 +1570,8 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 return self._begin_failure(job, exc.code, exc.message)
             if self._await_prep(job):
                 return job if job.get("awaiting_prep") else self._update("jobs", job["id"], {"awaiting_prep": True}, job.get("owner_id"))
+            if job.get("awaiting_prep"):
+                job = self._update("jobs", job["id"], {"awaiting_prep": False}, job.get("owner_id"))
             if self._is_v020_job(job):
                 allocated = self._allocate_instance(job)
                 if allocated.get("state") in TERMINAL_STATES | {"cleaning_up", "cleanup_pending"}:
@@ -1613,47 +1622,69 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
     def _rr_state(self) -> dict[str, Any]:
         rr = getattr(self.db_store, "_scheduler_rr", None)
         if rr is None:
-            rr = {"seq": 0, "fresh_seq": 0, "stalled": {}}
+            rr = {"seq": 0, "fresh_seq": 0, "capacity_epoch": 0, "stalled": {}}
             self.db_store._scheduler_rr = rr
         else:
             rr.setdefault("fresh_seq", 0)
+            rr.setdefault("capacity_epoch", 0)
         return rr
 
     def _claim_next_job(self) -> tuple[dict | None, str | None]:
         now = self.clock()
         rr = self._rr_state()
-        stalled: dict[str, tuple[int, int] | int] = rr["stalled"]
-        jobs = self._list_by_states("jobs", ACTIVE_STATES)
+        stalled: dict[str, tuple[int, int, int] | tuple[int, int] | int] = rr["stalled"]
+        jobs = self._list_by_states("jobs", ACTIVE_STATES, order_asc=True)
         active_ids = {job["id"] for job in jobs}
         for stale_id in [jid for jid in stalled if jid not in active_ids]:
             stalled.pop(stale_id, None)
         if not jobs:
             return None, None
 
-        def _stalled_meta(job_id: str) -> tuple[int, int] | None:
-            entry = stalled.get(job_id)
+        cap_epoch = int(rr.get("capacity_epoch", 0))
+
+        def _is_prep_parked(job: dict) -> bool:
+            if not job.get("awaiting_prep"):
+                return False
+            prep_id = job.get("prep_job_id")
+            if prep_id:
+                return prep_id in active_ids
+            return True
+
+        def _stalled_meta(job: dict) -> tuple[int, int] | None:
+            entry = stalled.get(job["id"])
             if entry is None:
                 return None
             if isinstance(entry, tuple):
-                return entry
-            return int(entry), 0
+                if len(entry) >= 3:
+                    last_seq, last_fresh, entry_cap = int(entry[0]), int(entry[1]), int(entry[2])
+                else:
+                    last_seq, last_fresh, entry_cap = int(entry[0]), int(entry[1]), cap_epoch
+            else:
+                last_seq, last_fresh, entry_cap = int(entry), 0, cap_epoch
+            if job.get("state") == "waiting_for_capacity" and entry_cap < cap_epoch:
+                return None
+            return last_seq, last_fresh
 
         def priority(job):
             state = job.get("state")
-            created = job.get("created_epoch", job.get("created_at", ""))
+            fifo = job_fifo_key(job)
             if state in {"cleanup_pending", "cleaning_up"}:
-                return 0, 0, created
-            meta = _stalled_meta(job["id"])
-            if job.get("awaiting_prep"):
-                # A job parked on its cache prep always stays last so it can never starve its prep job.
-                return 3, meta[0] if meta is not None else 0, created
+                return 0, 0, fifo
+            if _is_prep_parked(job):
+                # A job parked on an active cache prep stays last so it can never starve its prep job.
+                entry = stalled.get(job["id"])
+                seq = int(entry[0]) if isinstance(entry, tuple) else int(entry or 0)
+                return 3, seq, fifo
+            meta = _stalled_meta(job)
+            if job.get("cancel_requested"):
+                return 1, meta[0] if meta is not None else 0, fifo
             if meta is not None:
                 last_seq, last_fresh = meta
-                if rr["fresh_seq"] - last_fresh >= _MAX_STALLED_JOB_DEFERRALS or job.get("cancel_requested"):
-                    # A stream of new/advancing jobs must not indefinitely delay a due poll or cancellation.
-                    return 1, last_seq, created
-                return 2, last_seq, created
-            return 2, 0, created
+                if rr["fresh_seq"] - last_fresh >= _MAX_STALLED_JOB_DEFERRALS:
+                    # A stream of new/advancing jobs must not indefinitely delay a due poll or retry.
+                    return 1, last_seq, fifo
+                return 2, last_seq, fifo
+            return 2, 0, fifo
 
         jobs.sort(key=priority)
         for job in jobs:
@@ -1678,12 +1709,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 {"claim_token": token, "claim_until": now + self.config.claim_ttl_seconds},
                 job.get("owner_id"),
             )
-            was_stalled = job["id"] in stalled
+            was_stalled = _stalled_meta(job) is not None
             rr["seq"] += 1
             if (
                 not was_stalled
                 and state not in {"cleanup_pending", "cleaning_up"}
-                and not job.get("awaiting_prep")
+                and not _is_prep_parked(job)
             ):
                 rr["fresh_seq"] += 1
             return claimed, token
@@ -1698,7 +1729,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
 
     def _next_job(self) -> dict | None:
         return next(
-            (x for x in self._list_by_states("jobs", ACTIVE_STATES) if not x.get("claim_token")),
+            (x for x in self._list_by_states("jobs", ACTIVE_STATES, order_asc=True) if not x.get("claim_token")),
             None,
         )
 
@@ -1713,16 +1744,24 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             return {"acquired": True, "advanced": False}
         before = job.get("state")
         after = job
+        self._last_fifo_blocked = False
+        self._last_fifo_blocker_id = None
         try:
             after = self._advance(job)
         finally:
             self._release_claim(job["id"], claim, job.get("owner_id"))
         advanced = before != after.get("state")
         rr = self._rr_state()
-        if after.get("state") in TERMINAL_STATES or advanced:
+        if after.get("state") in TERMINAL_STATES:
+            rr["stalled"].pop(job["id"], None)
+            # Releasing a runtime/instance or finishing prep wakes waiting_for_capacity jobs in FIFO order.
+            rr["capacity_epoch"] = int(rr.get("capacity_epoch", 0)) + 1
+        elif advanced:
             rr["stalled"].pop(job["id"], None)
         else:
-            rr["stalled"][job["id"]] = (rr["seq"], rr["fresh_seq"])
+            if self._last_fifo_blocked and self._last_fifo_blocker_id:
+                rr["stalled"].pop(self._last_fifo_blocker_id, None)
+            rr["stalled"][job["id"]] = (rr["seq"], rr["fresh_seq"], int(rr.get("capacity_epoch", 0)))
         return {
             "acquired": True,
             "advanced": advanced,

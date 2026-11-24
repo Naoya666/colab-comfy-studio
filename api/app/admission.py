@@ -137,6 +137,15 @@ def _resolve_drive_account_id(repo, owner_id, account_id):
     return AccountService(repo, owner_id).resolve_drive_account_id(account_id)
 
 
+def _account_alias_snapshot(repo, owner_id, account_id):
+    if not account_id:
+        return None
+    account = repo.get("accounts", account_id, owner_id)
+    if not isinstance(account, dict):
+        return None
+    return account.get("alias") or account.get("label") or None
+
+
 def admit_job(st, user, body, key, *, validate_only=False, creation=None, before_create=None):
     repo, registry = repo_registry(st, user)
     if not key or len(key) > 200:
@@ -315,8 +324,10 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
     if creation:
         compute_fields.update(creation, creation_binding_digest=digest(
             {"dependencies": binding["dependencies"] if binding else None}))
+    account_alias = _account_alias_snapshot(repo, user["id"], policy.get("account_id"))
     if validate_only:
         return {**body, **compute_fields, "execution_policy": policy,
+                **({"account_alias_snapshot": account_alias} if account_alias else {}),
                 "requested_account_id": policy.get("account_id"),
                 "requested_instance_id": policy.get("instance_id"),
                 **({"drive_account_id": model_drive_account or _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if model_drive_account or policy.get("account_id") else {}),
@@ -349,6 +360,7 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
             **compute_fields,
             "execution_policy": policy,
             **({"account_id": policy.get("account_id")} if policy.get("account_id") else {}),
+            **({"account_alias_snapshot": account_alias} if account_alias else {}),
             "requested_account_id": policy.get("account_id"),
             "requested_instance_id": policy.get("instance_id"),
             **({"drive_account_id": model_drive_account or _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if model_drive_account or policy.get("account_id") else {}),

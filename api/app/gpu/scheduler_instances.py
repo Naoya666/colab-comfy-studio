@@ -130,7 +130,10 @@ class SchedulerInstancesMixin:
             return job
         try:
             instance = self._instance_call("allocate", self._instance_job(job))
-        except CreationInstancePending:
+        except CreationInstancePending as exc:
+            if getattr(exc, "fifo_blocked", False):
+                self._last_fifo_blocked = True
+                self._last_fifo_blocker_id = getattr(exc, "blocker_job_id", None)
             return job
         except APIError as exc:
             return self._begin_failure(job, exc.code, exc.message)

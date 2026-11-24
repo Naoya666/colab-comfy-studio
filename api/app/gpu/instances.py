@@ -170,6 +170,39 @@ def evaluate_lifetime_shortening(
     return bool(reasons), reasons
 
 
+def _epoch_from_value(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) else None
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    if isinstance(value, str) and value:
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    return None
+
+
+def job_fifo_key(job: Mapping | None) -> tuple[float, int, str]:
+    """Deterministic FIFO ordering key shared by Scheduler and InstanceService."""
+    if not isinstance(job, Mapping):
+        return (0.0, 0, "")
+    ts = _epoch_from_value(job.get("created_epoch"))
+    if ts is None:
+        ts = _epoch_from_value(job.get("created_at"))
+    if ts is None:
+        ts = 0.0
+    raw_order = job.get("queue_order")
+    order = int(raw_order) if isinstance(raw_order, int) and not isinstance(raw_order, bool) else 0
+    return (ts, order, str(job.get("id") or ""))
+
+
 class InstanceServiceError(RuntimeError):
     """Base class for safe, domain-level allocation errors."""
 
@@ -184,6 +217,11 @@ class InstanceConflict(InstanceServiceError):
 
 class CreationInstancePending(InstanceConflict):
     """An eligible Studio VM is still starting or finishing an earlier job."""
+
+    def __init__(self, message: str = "", *, fifo_blocked: bool = False, blocker_job_id: str | None = None):
+        super().__init__(message)
+        self.fifo_blocked = fifo_blocked
+        self.blocker_job_id = blocker_job_id
 
 
 class InstanceService:
@@ -1292,6 +1330,97 @@ class InstanceService:
             with self._tx() as session:
                 yield session
 
+    def _earliest_earlier_waiter(
+        self,
+        session,
+        instance,
+        account,
+        job: Mapping,
+        *,
+        order_table,
+    ) -> str | None:
+        """Return the earliest eligible waiting_for_capacity job ahead of ``job`` for ``instance``."""
+        owner_id = job.get("owner_id") or getattr(instance, "owner_id", None)
+        if not owner_id:
+            return None
+        job_id = job.get("id")
+        provider = self._provider(job)
+        target_account_id = (
+            self._account_id(account) if account is not None else self._value(self._data(instance), "account_id")
+        )
+        if not target_account_id:
+            return None
+
+        current_row = self._find(session, "jobs", job_id, owner_id) if isinstance(job_id, str) and job_id else None
+        current_for_key = dict(job)
+        if current_row is not None:
+            row_dict = self._dict(current_row)
+            if current_for_key.get("created_epoch") is None and row_dict.get("created_epoch") is not None:
+                current_for_key["created_epoch"] = row_dict["created_epoch"]
+            if not current_for_key.get("created_at") and row_dict.get("created_at"):
+                current_for_key["created_at"] = row_dict["created_at"]
+            if current_for_key.get("queue_order") is None and row_dict.get("queue_order") is not None:
+                current_for_key["queue_order"] = row_dict["queue_order"]
+        job_key = job_fifo_key(current_for_key)
+
+        earliest_key: tuple[float, int, str] | None = None
+        earliest_id: str | None = None
+        for other in self._rows(session, "jobs", owner_id):
+            if other.id == job_id or other.state != "waiting_for_capacity":
+                continue
+            other_data = self._dict(other)
+            if other_data.get("instance_id"):
+                continue
+            if other_data.get("cancel_requested"):
+                continue
+            if other_data.get("awaiting_prep"):
+                prep_id = other_data.get("prep_job_id")
+                if not prep_id:
+                    continue
+                prep_row = self._find(session, "jobs", prep_id, owner_id)
+                if prep_row is not None and prep_row.state not in {"completed", "failed", "cancelled"}:
+                    continue
+            if job_pool(other_data) != POOL_CREATION or self._provider(other_data) != provider:
+                continue
+            other_policy = self._job_policy(other_data)
+            other_reuse_action = str(other_policy.get("reuse_action") or other_data.get("reuse_action") or "auto")
+            if other_reuse_action in {"new", "replace"} or other_data.get("wait_for_deleted_instance_id"):
+                continue
+            other_key = job_fifo_key(other_data)
+            if other_key >= job_key:
+                continue
+
+            other_req_inst = self._requested(other_data, "instance_id")
+            if other_req_inst and other_req_inst != instance.id:
+                continue
+            other_req_acct = self._requested(other_data, "account_id")
+            if other_req_acct and other_req_acct != target_account_id:
+                continue
+            if account is not None and not self._account_legal(account, owner_id, other.project_id, provider):
+                continue
+
+            other_is_creation_api = bool((other_data.get("snapshot") or {}).get("creation_api"))
+            other_wf_default = self._job_workflow_default_spec(other_data)
+            if other_req_inst or other_is_creation_api:
+                other_baseline = other_wf_default
+            else:
+                other_baseline = self._job_requested_spec(other_data) or other_wf_default
+
+            if not self._compatible(
+                session,
+                instance,
+                other_data,
+                target_account_id,
+                order_table=order_table,
+                target_baseline=other_baseline,
+                allow_busy=False,
+            ):
+                continue
+            if earliest_key is None or other_key < earliest_key:
+                earliest_key = other_key
+                earliest_id = other.id
+        return earliest_id
+
     def allocate(self, job) -> dict:
         if not isinstance(job, Mapping):
             raise AllocationError("job must be an object")
@@ -1429,6 +1558,15 @@ class InstanceService:
                         allow_busy=False,
                     ):
                         raise InstanceConflict("指定实例不兼容或已被占用")
+                blocker = self._earliest_earlier_waiter(
+                    session, instance, account, job, order_table=order_table
+                )
+                if blocker is not None:
+                    raise CreationInstancePending(
+                        "已有更早排队的任务等待该实例，按提交顺序依次执行",
+                        fifo_blocked=True,
+                        blocker_job_id=blocker,
+                    )
                 job = self._creation_reuse_cost(session, job, instance)
                 return self._claim_existing(session, instance, job, account, key, stable_id, "requested_instance")
 
@@ -1477,11 +1615,24 @@ class InstanceService:
                                 session, row, job, target_baseline=workflow_default, order_table=order_table
                             )
                         )
-                        best = idle_compatible[0]
-                        best_data = self._data(best)
-                        account = next(a for a in accounts if self._account_id(a) == best_data.get("account_id"))
-                        job = self._creation_reuse_cost(session, job, best)
-                        return self._claim_existing(session, best, job, account, key, stable_id, "reuse_idle")
+                        first_blocker: str | None = None
+                        for best in idle_compatible:
+                            best_data = self._data(best)
+                            account = next(a for a in accounts if self._account_id(a) == best_data.get("account_id"))
+                            blocker = self._earliest_earlier_waiter(
+                                session, best, account, job, order_table=order_table
+                            )
+                            if blocker is not None:
+                                if first_blocker is None:
+                                    first_blocker = blocker
+                                continue
+                            job = self._creation_reuse_cost(session, job, best)
+                            return self._claim_existing(session, best, job, account, key, stable_id, "reuse_idle")
+                        raise CreationInstancePending(
+                            "已有更早排队的任务等待当前空闲实例，按提交顺序依次执行",
+                            fifo_blocked=True,
+                            blocker_job_id=first_blocker,
+                        )
                     raise CreationInstancePending("等待当前创作实例完成启动或任务")
                 # No compatible creation instance: check releasing or lower-spec instances (NEVER auto multi-GPU!)
                 releasing = any(
@@ -1526,10 +1677,23 @@ class InstanceService:
                         session, row, job, target_baseline=target_baseline, order_table=order_table
                     )
                 )
-                instance = candidates[0]
-                account = next(a for a in accounts if self._account_id(a) == self._data(instance).get("account_id"))
-                job = self._creation_reuse_cost(session, job, instance)
-                return self._claim_existing(session, instance, job, account, key, stable_id, "reuse_idle")
+                first_blocker = None
+                for instance in candidates:
+                    account = next(a for a in accounts if self._account_id(a) == self._data(instance).get("account_id"))
+                    blocker = self._earliest_earlier_waiter(
+                        session, instance, account, job, order_table=order_table
+                    )
+                    if blocker is not None:
+                        if first_blocker is None:
+                            first_blocker = blocker
+                        continue
+                    job = self._creation_reuse_cost(session, job, instance)
+                    return self._claim_existing(session, instance, job, account, key, stable_id, "reuse_idle")
+                raise CreationInstancePending(
+                    "已有更早排队的任务等待当前空闲实例，按提交顺序依次执行",
+                    fifo_blocked=True,
+                    blocker_job_id=first_blocker,
+                )
 
             self._validate_new_creation_spec(job, order_table)
             account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
