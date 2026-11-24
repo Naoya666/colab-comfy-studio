@@ -1,5 +1,26 @@
 """Allowlisted public representations; never expose runtime connection handles."""
 
+_ERROR_DETAIL_KEYS = (
+    "error_code",
+    "category",
+    "phase",
+    "http_status",
+    "timeout_kind",
+    "elapsed_seconds",
+    "outcome",
+    "reconciling",
+    "reconciliation_result",
+    "retry_attempt",
+)
+
+
+def _public_error_details(raw):
+    if not isinstance(raw, dict):
+        return None
+    cleaned = {k: raw[k] for k in _ERROR_DETAIL_KEYS if k in raw and raw[k] is not None}
+    return cleaned or None
+
+
 def public_asset(asset):
     return {k: v for k, v in asset.items() if k not in {"storage_key", "owner_id"}}
 
@@ -66,6 +87,9 @@ def public_job(job):
         "creation_runtime",
     }
     result = {k: v for k, v in job.items() if k in keys}
+    error_details = _public_error_details(job.get("error_details"))
+    if error_details is not None:
+        result["error_details"] = error_details
     snapshot = job.get("snapshot") or {}
     workflow_key = str(job.get("workflow_key") or "")
     result["job_id"] = job["id"]

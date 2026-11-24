@@ -101,10 +101,9 @@ class SchedulerWatchdogMixin:
                     ))
                 self._update("leases", lease["id"], {"state": "deleted", "last_seen": self.clock()}, owner_id)
                 return True
-            delay = min(
-                self.config.cleanup_retry_max_seconds,
-                self.config.cleanup_retry_base_seconds * (2 ** max(0, attempts - 1)),
-            )
+            fresh_lease = self._get("leases", lease["id"], owner_id) or lease
+            next_retry, _ = self._cleanup_retry_next_epoch(fresh_lease, attempts)
+            delay = max(0.0, next_retry - self.clock())
             message = error or "delete not confirmed"
             finish_error = {"message": message, "retry_after": delay}
             if claimed:
@@ -114,7 +113,7 @@ class SchedulerWatchdogMixin:
                 ))
             self._update("leases", lease["id"], {
                 "state": "cleanup_pending", "delete_attempts": attempts,
-                "cleanup_next_epoch": self.clock() + delay, "last_error": message,
+                "cleanup_next_epoch": next_retry, "last_error": message,
                 "last_seen": self.clock(),
             }, owner_id)
             return False

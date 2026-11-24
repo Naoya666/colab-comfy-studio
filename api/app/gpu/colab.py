@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from urllib.parse import urlencode
 
 import httpx
@@ -14,11 +16,22 @@ from app.security import decrypt_secret, encrypt_secret
 
 from .google import GoogleError, GoogleService
 
+logger = logging.getLogger(__name__)
+
 RUNTIME_MISSING = "provider_runtime_missing"
 RUNTIME_MISSING_MESSAGE = "Colab 运行时已回收"
 KEEPALIVE_INTERVAL_SECONDS = 60.0
 KEEPALIVE_RETRY_SECONDS = 30.0
 KERNEL_EXEC_INTERVAL_SECONDS = 240.0
+TUNNEL_RECONCILE_WINDOW_SECONDS = 60.0
+
+_SAFE_OUTCOME = re.compile(r"^[A-Z0-9_]{1,64}$")
+_TUNNEL_OUTCOME_NUMERIC = {
+    1: "QUOTA_DENIED_REQUESTED_VARIANTS",
+    2: "QUOTA_EXCEEDED_USAGE_TIME",
+    4: "SUCCESS",
+    5: "DENYLISTED",
+}
 
 
 def runtime_status(result):
@@ -32,18 +45,276 @@ def runtime_status(result):
 
 
 class ColabError(GoogleError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str | None = None,
+        category: str | None = None,
+        phase: str | None = None,
+        http_status: int | None = None,
+        timeout_kind: str | None = None,
+        elapsed_seconds: float | None = None,
+        outcome: str | None = None,
+        remote_state_unknown: bool = False,
+        retryable_before_post: bool = False,
+    ):
+        super().__init__(message)
+        self.error_code = error_code
+        self.category = category
+        self.phase = phase
+        self.http_status = http_status
+        self.timeout_kind = timeout_kind
+        self.elapsed_seconds = round(float(elapsed_seconds), 1) if elapsed_seconds is not None else None
+        self.outcome = outcome
+        self.remote_state_unknown = bool(remote_state_unknown)
+        self.retryable_before_post = bool(retryable_before_post)
+
+    def to_diagnostics(self) -> dict:
+        data = {}
+        for key in (
+            "error_code",
+            "category",
+            "phase",
+            "http_status",
+            "timeout_kind",
+            "elapsed_seconds",
+            "outcome",
+        ):
+            value = getattr(self, key, None)
+            if value is not None:
+                data[key] = value
+        return data
 
 
 class ColabAllocationError(ColabError):
-    def __init__(self, code, reason):
+    def __init__(
+        self,
+        code,
+        reason,
+        *,
+        message: str | None = None,
+        error_code: str | None = None,
+        category: str | None = None,
+        phase: str | None = None,
+        http_status: int | None = None,
+        elapsed_seconds: float | None = None,
+        outcome: str | None = None,
+        remote_state_unknown: bool = False,
+    ):
         self.reason = reason
         # Only the numeric code is shown; Google's own text may carry private data.
-        if reason == "NO_RUNTIMES":
-            message = "Colab 暂时无法分配运行时（NO_RUNTIMES）；请稍后重试"
+        if message is None:
+            if reason == "NO_RUNTIMES":
+                message = "Colab 暂时无法分配运行时（NO_RUNTIMES）；请稍后重试"
+            else:
+                message = f"Colab 分配 Operation 失败（code {code}）"
+        resolved_code = error_code or ("gpu_capacity_unavailable" if reason == "NO_RUNTIMES" else "gpu_allocation_failed")
+        resolved_category = category or ("capacity" if reason == "NO_RUNTIMES" else "upstream")
+        resolved_outcome = outcome
+        if resolved_outcome is None and isinstance(reason, str):
+            norm = reason.strip().upper()
+            if _SAFE_OUTCOME.fullmatch(norm):
+                resolved_outcome = norm
+        super().__init__(
+            message,
+            error_code=resolved_code,
+            category=resolved_category,
+            phase=phase,
+            http_status=http_status,
+            elapsed_seconds=elapsed_seconds,
+            outcome=resolved_outcome,
+            remote_state_unknown=remote_state_unknown,
+            retryable_before_post=False,
+        )
+
+
+def _normalize_outcome(raw) -> str | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return _TUNNEL_OUTCOME_NUMERIC.get(raw)
+    if isinstance(raw, str):
+        norm = raw.strip().upper()
+        if norm.startswith("OUTCOME_"):
+            norm = norm[len("OUTCOME_"):]
+        if _SAFE_OUTCOME.fullmatch(norm):
+            return norm
+    return None
+
+
+def _classify_httpx_error(
+    exc: httpx.HTTPError,
+    *,
+    phase: str | None,
+    mutating: bool,
+    elapsed: float,
+    channel: str,
+) -> ColabError:
+    if isinstance(exc, httpx.ReadTimeout):
+        timeout_kind, label, category = "read", "响应超时", "timeout"
+        error_code = "colab_assign_timeout" if phase in {"assign_get", "assign_post", "v1beta_create"} else "colab_network_error"
+    elif isinstance(exc, httpx.ConnectTimeout):
+        timeout_kind, label, category, error_code = "connect", "连接超时", "network", "colab_network_error"
+    elif isinstance(exc, httpx.WriteTimeout):
+        timeout_kind, label, category, error_code = "write", "发送超时", "timeout", "colab_network_error"
+    elif isinstance(exc, httpx.PoolTimeout):
+        timeout_kind, label, category, error_code = "pool", "连接池等待超时", "timeout", "colab_network_error"
+    elif isinstance(exc, httpx.ProxyError):
+        timeout_kind, label, category, error_code = "proxy", "代理连接失败", "network", "colab_network_error"
+    elif isinstance(exc, httpx.ConnectError):
+        timeout_kind, label, category, error_code = "connect", "网络连接失败", "network", "colab_network_error"
+    else:
+        timeout_kind, label, category, error_code = "transport", "网络传输中断", "network", "colab_network_error"
+
+    if mutating:
+        if timeout_kind == "read":
+            message = (
+                f"等待 Colab 分配响应超时（{elapsed:.1f}s），可能是上游算力排队或网络波动；"
+                "远端结果待确认，正在安全释放租约，完成后可重试"
+            )
         else:
-            message = f"Colab 分配 Operation 失败（code {code}）"
-        super().__init__(message)
+            message = (
+                f"Colab {channel}网络异常（{label}，耗时 {elapsed:.1f}s）；"
+                "远端结果可能未知，正在确认释放租约，完成后可重试"
+            )
+    elif phase == "assign_get":
+        message = f"Colab 分配握手失败（{label}，耗时 {elapsed:.1f}s），未发送开机请求；请检查网络或稍后重试"
+    else:
+        message = f"Colab {channel}网络异常（{label}，耗时 {elapsed:.1f}s），远端结果可能未知，将保留租约进行协调"
+
+    return ColabError(
+        message,
+        error_code=error_code,
+        category=category,
+        phase=phase,
+        timeout_kind=timeout_kind,
+        elapsed_seconds=elapsed,
+        remote_state_unknown=bool(mutating),
+        retryable_before_post=(not mutating) and (phase == "assign_get"),
+    )
+
+
+def _classify_http_status(
+    status_code: int,
+    *,
+    phase: str | None,
+    mutating: bool,
+    elapsed: float,
+    channel: str,
+) -> ColabError:
+    if status_code in {401, 403}:
+        return ColabError(
+            f"Colab 账号授权无效或无访问权限（HTTP {status_code}，耗时 {elapsed:.1f}s）；请检查账号授权或重新连接",
+            error_code="colab_auth_failed",
+            category="auth",
+            phase=phase,
+            http_status=status_code,
+            elapsed_seconds=elapsed,
+            remote_state_unknown=False,
+            retryable_before_post=False,
+        )
+    if status_code == 412:
+        return ColabError(
+            f"Colab 拒绝分配运行时（HTTP 412，可能达到并发或配额上限，耗时 {elapsed:.1f}s）",
+            error_code="colab_quota_exceeded",
+            category="quota",
+            phase=phase,
+            http_status=status_code,
+            elapsed_seconds=elapsed,
+            remote_state_unknown=False,
+            retryable_before_post=False,
+        )
+    if status_code == 429:
+        return ColabError(
+            f"Colab 请求过于频繁或触发限流（HTTP 429，耗时 {elapsed:.1f}s）；请稍后重试",
+            error_code="colab_rate_limited",
+            category="quota",
+            phase=phase,
+            http_status=status_code,
+            elapsed_seconds=elapsed,
+            remote_state_unknown=False,
+            retryable_before_post=False,
+        )
+    if 400 <= status_code < 500:
+        return ColabError(
+            f"Colab 拒绝了{channel}请求（HTTP {status_code}，耗时 {elapsed:.1f}s）",
+            error_code="colab_request_rejected",
+            category="upstream",
+            phase=phase,
+            http_status=status_code,
+            elapsed_seconds=elapsed,
+            remote_state_unknown=False,
+            retryable_before_post=False,
+        )
+    if mutating:
+        return ColabError(
+            f"Colab 服务端暂时不可用（HTTP {status_code}，等待 {elapsed:.1f}s），可能是上游算力分配繁忙；"
+            "正在确认远端未创建实例后释放租约，完成后可重试",
+            error_code="colab_upstream_unavailable",
+            category="upstream",
+            phase=phase,
+            http_status=status_code,
+            elapsed_seconds=elapsed,
+            remote_state_unknown=True,
+            retryable_before_post=False,
+        )
+    return ColabError(
+        f"Colab 服务端暂时不可用（HTTP {status_code}，耗时 {elapsed:.1f}s）；请稍后重试",
+        error_code="colab_upstream_unavailable",
+        category="upstream",
+        phase=phase,
+        http_status=status_code,
+        elapsed_seconds=elapsed,
+        remote_state_unknown=False,
+        retryable_before_post=(phase == "assign_get"),
+    )
+
+
+def _classify_tunnel_outcome(payload: dict, *, elapsed: float) -> ColabError | None:
+    norm = _normalize_outcome(payload.get("outcome"))
+    if not norm or norm == "SUCCESS":
+        return None
+    if any(key in norm for key in ("QUOTA_DENIED", "NO_RUNTIME", "UNAVAILABLE")):
+        return ColabAllocationError(
+            "TUNNEL_DENIED",
+            "NO_RUNTIMES",
+            message=f"Colab 拒绝分配所请求的 GPU 规格（{norm}，耗时 {elapsed:.1f}s）；请切换 GPU 规格或稍后重试",
+            error_code="gpu_capacity_unavailable",
+            category="capacity",
+            phase="assign_post",
+            http_status=200,
+            elapsed_seconds=elapsed,
+            outcome=norm,
+            remote_state_unknown=False,
+        )
+    if any(key in norm for key in ("QUOTA_EXCEEDED", "TOO_MANY", "LIMIT")):
+        return ColabAllocationError(
+            "TUNNEL_QUOTA",
+            norm,
+            message=f"Colab 账号配额或并发已达上限（{norm}，耗时 {elapsed:.1f}s），拒绝分配新运行时",
+            error_code="colab_quota_exceeded",
+            category="quota",
+            phase="assign_post",
+            http_status=200,
+            elapsed_seconds=elapsed,
+            outcome=norm,
+            remote_state_unknown=False,
+        )
+    if any(key in norm for key in ("DENYLIST", "BANNED", "RESTRICTED")):
+        return ColabAllocationError(
+            "TUNNEL_DENYLISTED",
+            norm,
+            message=f"Colab 账号当前受限（{norm}，耗时 {elapsed:.1f}s），拒绝分配运行时",
+            error_code="colab_auth_failed",
+            category="auth",
+            phase="assign_post",
+            http_status=200,
+            elapsed_seconds=elapsed,
+            outcome=norm,
+            remote_state_unknown=False,
+        )
+    return None
 
 
 _CLI_PUBLIC_CLIENT_ID = "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com"
@@ -96,8 +367,47 @@ class GoogleColabProvider:
     def _create_http_timeout(self) -> httpx.Timeout:
         return httpx.Timeout(connect=10.0, read=self.create_timeout, write=15.0, pool=10.0)
 
+    @contextmanager
+    def _request_phase(self, phase: str, *, mutating: bool = False):
+        prev = getattr(self, "_active_request_meta", (None, False))
+        self._active_request_meta = (phase, bool(mutating))
+        try:
+            yield
+        finally:
+            self._active_request_meta = prev
+
+    def _access_token(self, phase: str | None) -> str:
+        t0 = time.monotonic()
+        try:
+            return self.google.access_token("colab")
+        except GoogleError as exc:
+            if phase not in {"assign_get", "assign_post", "v1beta_create"}:
+                raise
+            elapsed = time.monotonic() - t0
+            if isinstance(exc.__cause__, httpx.HTTPError):
+                raise ColabError(
+                    f"刷新 Google 授权凭据时网络异常（耗时 {elapsed:.1f}s）；请检查网络或稍后重试",
+                    error_code="colab_network_error",
+                    category="network",
+                    phase="auth",
+                    timeout_kind="transport",
+                    elapsed_seconds=elapsed,
+                    remote_state_unknown=False,
+                    retryable_before_post=True,
+                ) from exc
+            raise ColabError(
+                str(exc) or "Google 账号授权无效，请重新连接账号",
+                error_code="colab_auth_failed",
+                category="auth",
+                phase="auth",
+                elapsed_seconds=elapsed,
+                remote_state_unknown=False,
+                retryable_before_post=False,
+            ) from exc
+
     def _request(self, method, path, *, params=None, json=None, timeout=None):
-        token = self.google.access_token("colab")
+        phase, mutating = getattr(self, "_active_request_meta", (None, False))
+        token = self._access_token(phase)
         kwargs = {
             "params": params,
             "json": json,
@@ -105,12 +415,21 @@ class GoogleColabProvider:
         }
         if timeout is not None:
             kwargs["timeout"] = timeout
+        t0 = time.monotonic()
         try:
             response = self.client.request(method, self.base_url + path, **kwargs)
         except httpx.HTTPError as exc:
-            raise ColabError("Colab API 网络异常，远端结果可能未知，将保留租约进行协调") from exc
+            raise _classify_httpx_error(
+                exc, phase=phase, mutating=mutating, elapsed=time.monotonic() - t0, channel="API "
+            ) from exc
         if response.status_code >= 400 and response.status_code != 404:
-            raise ColabError(f"Colab API 请求失败（HTTP {response.status_code}）")
+            raise _classify_http_status(
+                response.status_code,
+                phase=phase,
+                mutating=mutating,
+                elapsed=time.monotonic() - t0,
+                channel="API ",
+            )
         return response
 
     @staticmethod
@@ -137,7 +456,8 @@ class GoogleColabProvider:
         return False
 
     def _tunnel_request(self, method: str, path: str, *, params: dict | None = None, headers: dict | None = None, timeout=None):
-        token = self.google.access_token("colab")
+        phase, mutating = getattr(self, "_active_request_meta", (None, False))
+        token = self._access_token(phase)
         req_params = {"authuser": "0"}
         if params:
             req_params.update(params)
@@ -151,6 +471,7 @@ class GoogleColabProvider:
         req_kwargs = {"params": req_params, "headers": req_headers}
         if timeout is not None:
             req_kwargs["timeout"] = timeout
+        t0 = time.monotonic()
         try:
             response = self.client.request(
                 method,
@@ -158,9 +479,17 @@ class GoogleColabProvider:
                 **req_kwargs,
             )
         except httpx.HTTPError as exc:
-            raise ColabError("Colab 隧道网络异常，远端结果可能未知，将保留租约进行协调") from exc
+            raise _classify_httpx_error(
+                exc, phase=phase, mutating=mutating, elapsed=time.monotonic() - t0, channel="隧道"
+            ) from exc
         if response.status_code >= 400 and response.status_code != 404:
-            raise ColabError(f"Colab 隧道请求失败（HTTP {response.status_code}）")
+            raise _classify_http_status(
+                response.status_code,
+                phase=phase,
+                mutating=mutating,
+                elapsed=time.monotonic() - t0,
+                channel="隧道",
+            )
         return response
 
     @staticmethod
@@ -346,10 +675,22 @@ class GoogleColabProvider:
                 "allocation_failure_reason": reason}
 
     @staticmethod
-    def _raise_operation_error(operation):
+    def _raise_operation_error(
+        operation,
+        *,
+        phase: str | None = None,
+        http_status: int | None = None,
+        elapsed_seconds: float | None = None,
+    ):
         failure = GoogleColabProvider._operation_failure(operation)
         if failure:
-            raise ColabAllocationError(failure["allocation_error_code"], failure["allocation_failure_reason"])
+            raise ColabAllocationError(
+                failure["allocation_error_code"],
+                failure["allocation_failure_reason"],
+                phase=phase,
+                http_status=http_status,
+                elapsed_seconds=elapsed_seconds,
+            )
 
     def _create_tunnel(self, lease: dict, key: dict, request_uuid: uuid.UUID, request_id: str, runtime_id: str) -> dict:
         nbh = _uuid_to_web_safe_base64(request_uuid)
@@ -368,30 +709,90 @@ class GoogleColabProvider:
         if shape == "SHAPE_HIGHMEM" and accelerator not in _HIGH_MEM_ONLY_ACCELERATORS:
             params["shape"] = "hm"
 
-        self.store.update("leases", lease["id"], {"tunnel_nbh": nbh, "tunnel_assign_params": params}, self.owner_id)
+        self.store.update(
+            "leases",
+            lease["id"],
+            {"tunnel_nbh": nbh, "tunnel_assign_params": params, "tunnel_post_sent": False},
+            self.owner_id,
+        )
         assign_timeout = self._create_http_timeout()
-        first = self._tunnel_json(self._tunnel_request("GET", "/tun/m/assign", params=params, timeout=assign_timeout))
+        t_get = time.monotonic()
+        with self._request_phase("assign_get", mutating=False):
+            first_resp = self._tunnel_request("GET", "/tun/m/assign", params=params, timeout=assign_timeout)
+            try:
+                first = self._tunnel_json(first_resp)
+            except ColabError as exc:
+                raise ColabError(
+                    str(exc),
+                    error_code="colab_invalid_response",
+                    category="protocol",
+                    phase="assign_get",
+                    http_status=getattr(first_resp, "status_code", 200),
+                    elapsed_seconds=time.monotonic() - t_get,
+                    remote_state_unknown=False,
+                    retryable_before_post=True,
+                ) from exc
         if "endpoint" in first and isinstance(first.get("runtimeProxyInfo"), dict):
             assigned = first
+            elapsed_post = time.monotonic() - t_get
         else:
             xsrf = first.get("token")
             if not isinstance(xsrf, str) or not xsrf:
-                raise ColabError("Colab 隧道分配未返回 XSRF 令牌")
-            assigned = self._tunnel_json(
-                self._tunnel_request(
+                raise ColabError(
+                    "Colab 隧道分配未返回 XSRF 令牌",
+                    error_code="colab_invalid_response",
+                    category="protocol",
+                    phase="assign_get",
+                    http_status=getattr(first_resp, "status_code", 200),
+                    elapsed_seconds=time.monotonic() - t_get,
+                    remote_state_unknown=False,
+                    retryable_before_post=True,
+                )
+            self.store.update("leases", lease["id"], {"tunnel_post_sent": True}, self.owner_id)
+            t_post = time.monotonic()
+            with self._request_phase("assign_post", mutating=True):
+                post_resp = self._tunnel_request(
                     "POST",
                     "/tun/m/assign",
                     params=params,
                     headers={"X-Goog-Colab-Token": xsrf},
                     timeout=assign_timeout,
                 )
-            )
+                elapsed_post = time.monotonic() - t_post
+                try:
+                    assigned = self._tunnel_json(post_resp)
+                except ColabError as exc:
+                    raise ColabError(
+                        f"{exc}（耗时 {elapsed_post:.1f}s）；远端结果待确认，正在安全释放租约，完成后可重试",
+                        error_code="colab_invalid_response",
+                        category="protocol",
+                        phase="assign_post",
+                        http_status=getattr(post_resp, "status_code", 200),
+                        elapsed_seconds=elapsed_post,
+                        remote_state_unknown=True,
+                        retryable_before_post=False,
+                    ) from exc
         endpoint = assigned.get("endpoint")
         proxy = assigned.get("runtimeProxyInfo") or {}
         proxy_url = proxy.get("url")
         proxy_token = proxy.get("token")
         if not (isinstance(endpoint, str) and endpoint and isinstance(proxy_url, str) and proxy_url and isinstance(proxy_token, str) and proxy_token):
-            raise ColabError("Colab 隧道分配响应缺少 endpoint 或代理连接信息")
+            denial = _classify_tunnel_outcome(assigned, elapsed=elapsed_post)
+            if denial is not None:
+                raise denial
+            norm = _normalize_outcome(assigned.get("outcome"))
+            raise ColabError(
+                f"Colab 隧道分配响应缺少 endpoint 或代理连接信息（耗时 {elapsed_post:.1f}s）；"
+                "远端结果待确认，正在安全释放租约，完成后可重试",
+                error_code="colab_invalid_response",
+                category="protocol",
+                phase="assign_post",
+                http_status=200,
+                elapsed_seconds=elapsed_post,
+                outcome=norm,
+                remote_state_unknown=True,
+                retryable_before_post=False,
+            )
         ttl = int(proxy.get("tokenExpiresInSeconds") or 3600)
         op_name = f"operations/tunnel-{runtime_id}"
         self.store.update(
@@ -430,39 +831,83 @@ class GoogleColabProvider:
             raise ColabError("Colab requestId 必须是 UUID4")
         lease = self._lease(runtime_id, request_id, job_id)
         key = self._spec(spec)
-        if self._is_cli_tunnel(lease):
-            return self._create_tunnel(lease, key, request_uuid, request_id, runtime_id)
-        response = self._request(
-            "POST",
-            "/v1beta/runtimes",
-            params={"requestId": request_id, "runtimeId": runtime_id},
-            json={"runtimeSpec": key},
-            timeout=self._create_http_timeout(),
-        )
-        operation = self._json(response)
-        name = operation.get("name")
-        if not isinstance(name, str) or not _OPERATION.fullmatch(name):
-            raise ColabError("创建响应缺少合法 Operation，保留既定 runtimeId 待协调")
-        self.store.update(
-            "leases",
-            lease["id"],
-            {
+        try:
+            if self._is_cli_tunnel(lease):
+                return self._create_tunnel(lease, key, request_uuid, request_id, runtime_id)
+            t_post = time.monotonic()
+            with self._request_phase("v1beta_create", mutating=True):
+                response = self._request(
+                    "POST",
+                    "/v1beta/runtimes",
+                    params={"requestId": request_id, "runtimeId": runtime_id},
+                    json={"runtimeSpec": key},
+                    timeout=self._create_http_timeout(),
+                )
+                elapsed_post = time.monotonic() - t_post
+                try:
+                    operation = self._json(response)
+                except ColabError as exc:
+                    raise ColabError(
+                        f"{exc}（耗时 {elapsed_post:.1f}s）；远端结果待确认，正在安全释放租约，完成后可重试",
+                        error_code="colab_invalid_response",
+                        category="protocol",
+                        phase="v1beta_create",
+                        http_status=getattr(response, "status_code", 200),
+                        elapsed_seconds=elapsed_post,
+                        remote_state_unknown=True,
+                    ) from exc
+            name = operation.get("name")
+            if not isinstance(name, str) or not _OPERATION.fullmatch(name):
+                raise ColabError(
+                    "创建响应缺少合法 Operation，保留既定 runtimeId 待协调",
+                    error_code="colab_invalid_response",
+                    category="protocol",
+                    phase="v1beta_create",
+                    http_status=getattr(response, "status_code", 200),
+                    elapsed_seconds=elapsed_post,
+                    remote_state_unknown=True,
+                )
+            self.store.update(
+                "leases",
+                lease["id"],
+                {
+                    "operation_name": name,
+                    "operation_done": operation.get("done") is True,
+                    "last_create_error": None,
+                    "requested_spec": key,
+                },
+                self.owner_id,
+            )
+            self._raise_operation_error(
+                operation,
+                phase="v1beta_create",
+                http_status=getattr(response, "status_code", 200),
+                elapsed_seconds=elapsed_post,
+            )
+            return {
+                "runtime_name": "runtimes/" + runtime_id,
                 "operation_name": name,
-                "operation_done": operation.get("done") is True,
-                "last_create_error": None,
-                "requested_spec": key,
-            },
-            self.owner_id,
-        )
-        self._raise_operation_error(operation)
-        return {
-            "runtime_name": "runtimes/" + runtime_id,
-            "operation_name": name,
-            "ready": operation.get("done") is True,
-            "runtime_id": runtime_id,
-            "request_id": request_id,
-            "owner_id": self.owner_id,
-        }
+                "ready": operation.get("done") is True,
+                "runtime_id": runtime_id,
+                "request_id": request_id,
+                "owner_id": self.owner_id,
+            }
+        except ColabError as exc:
+            logger.warning(
+                "colab_create_failed job=%s lease=%s phase=%s code=%s category=%s http_status=%s timeout=%s outcome=%s elapsed_s=%s unknown=%s retryable=%s",
+                job_id,
+                lease.get("id"),
+                exc.phase,
+                exc.error_code,
+                exc.category,
+                exc.http_status,
+                exc.timeout_kind,
+                exc.outcome,
+                exc.elapsed_seconds,
+                exc.remote_state_unknown,
+                exc.retryable_before_post,
+            )
+            raise
 
     def _operation(self, handle, lease):
         name = handle.get("operation_name") or lease.get("operation_name")
@@ -499,7 +944,7 @@ class GoogleColabProvider:
         if lease.get("tunnel_endpoint") or lease.get("operation_done") or not lease.get("create_attempts"):
             return lease
         # Do not interpret an empty list while the original POST may still run.
-        if time.time() - float(lease.get("create_started") or time.time()) < 60:
+        if time.time() - float(lease.get("create_started") or time.time()) < TUNNEL_RECONCILE_WINDOW_SECONDS:
             return lease
         params = lease.get("tunnel_assign_params")
         if not params:

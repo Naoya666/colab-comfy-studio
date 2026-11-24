@@ -1,4 +1,4 @@
-import { apiFetch } from './gpu-api';
+import { apiFetch, type GpuErrorDetails } from './gpu-api';
 import type { TimingDetail } from './job-history';
 
 export interface HistoryLog { id?: string; state?: string; created_at?: string; message?: string; source?: string; }
@@ -7,8 +7,12 @@ export interface InstanceHistoryJob {
   id: string;
   job_id?: string;
   state?: string;
+  stage?: string | null;
   provider?: string;
   error?: { code?: string; message?: string } | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  error_details?: GpuErrorDetails | null;
   timings?: Record<string, number>;
   timing_details?: Record<string, TimingDetail>;
   logs?: HistoryLog[];

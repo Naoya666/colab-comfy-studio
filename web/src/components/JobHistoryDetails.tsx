@@ -1,4 +1,6 @@
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
+import type { GpuErrorDetails } from '../lib/gpu-api';
+import { jobErrorMessage, jobErrorRows } from '../lib/job-error-copy';
 import { timingRows, type TimingDetail } from '../lib/job-history';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
 import styles from '../gpu.module.css';
@@ -8,18 +10,30 @@ const LOG_PREVIEW_COUNT = 6;
 export interface JobHistoryDetailRecord {
   state?: string;
   stage?: string | null;
+  error?: string | { code?: string | null; message?: string | null } | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  error_details?: GpuErrorDetails | null;
   timings?: Record<string, number>;
   timing_details?: Record<string, TimingDetail>;
   logs?: Array<{ id?: string; state?: string; created_at?: string; message?: string }>;
   events?: Array<{ id?: string; state?: string; created_at?: string; message?: string }>;
 }
 
-export function JobHistoryDetails({ job }: { job: JobHistoryDetailRecord }) {
+export function JobHistoryDetails({
+  job,
+  showErrorDetails = true,
+}: {
+  job: JobHistoryDetailRecord;
+  showErrorDetails?: boolean;
+}) {
   const [showAllLogs, setShowAllLogs] = useState(false);
   const rows = timingRows(job);
   const logs = job.logs || job.events || [];
   const hiddenCount = Math.max(0, logs.length - LOG_PREVIEW_COUNT);
   const visibleLogs = showAllLogs || hiddenCount === 0 ? logs : logs.slice(-LOG_PREVIEW_COUNT);
+  const failureMessage = showErrorDetails ? jobErrorMessage(job) : '';
+  const failureRows = showErrorDetails ? jobErrorRows(job) : [];
 
   return (
     <>
@@ -27,6 +41,24 @@ export function JobHistoryDetails({ job }: { job: JobHistoryDetailRecord }) {
         状态：{jobStateLabel(job.state)}
         {job.stage ? ` · 当前阶段：${jobStageLabel(job.stage)}` : ''}
       </p>
+      {(failureMessage || failureRows.length > 0) ? (
+        <details className="foldable" open>
+          <summary>失败诊断</summary>
+          <div className="foldContent">
+            {failureMessage && <p className="status error" role="alert">{failureMessage}</p>}
+            {failureRows.length > 0 && (
+              <dl className={styles.kv}>
+                {failureRows.map((row) => (
+                  <Fragment key={row.key}>
+                    <dt>{row.label}</dt>
+                    <dd>{row.mono ? <code>{row.value}</code> : row.value}</dd>
+                  </Fragment>
+                ))}
+              </dl>
+            )}
+          </div>
+        </details>
+      ) : null}
       {rows.length ? (
         <details className="foldable" open>
           <summary>各阶段耗时</summary>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiMessage, getWorkbench, workbenchAction, type GpuParameter, type Workbench } from '../lib/gpu-api';
 import { getInstanceHistory, type InstanceHistory, type InstanceHistoryJob } from '../lib/instance-history';
+import { jobErrorRows } from '../lib/job-error-copy';
 import { formatDuration, formatTiming, timingRows, type TimingDetail } from '../lib/job-history';
 import { jobStageLabel, jobStateLabel } from '../lib/job-stage-rows';
 import { gpuLabel } from '../lib/gpu-label';
@@ -231,6 +232,7 @@ function HistoryPanel({ jobs, loading, error, offline }: { jobs: InstanceHistory
     <div className={styles.jobList}>{visibleJobs.map((job) => <article className={styles.jobItem} key={job.id}>
       <div className={styles.cardTop}><div className={styles.minWidth}><b>{jobLabel(job)}</b><p className={styles.muted}>{job.job_id || job.id}{job.provider ? ` · ${job.provider}` : ''}</p></div><span className={`${styles.stateBadge} ${String(job.state).toLowerCase() === 'failed' ? styles.bad : ''}`}>{jobStateLabel(job.state)}</span></div>
       {job.error && <p className={styles.error} role="alert">{job.error.code ? `[${job.error.code}] ` : ''}{job.error.message || '任务失败'}</p>}
+      {!!jobErrorRows(job).length && <div className={styles.detailGrid}><strong>失败诊断</strong>{jobErrorRows(job).map((row) => <span key={row.key}>{row.label}：{row.value}</span>)}</div>}
       {!!jobTiming(job).length && <div className={styles.detailGrid}><strong>耗时</strong>{jobTiming(job).map(([name, label, value]) => <span key={name}>{label}：{value}</span>)}</div>}
       {!!job.logs?.length && (
         <details className="foldable">

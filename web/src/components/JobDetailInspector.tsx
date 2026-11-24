@@ -3,6 +3,7 @@ import { ArrowUpRight, X } from 'lucide-react';
 import type { GpuJob, GpuWorkflow } from '../lib/gpu-api';
 import { formatInstanceTime } from '../lib/instance-time';
 import { jobDetailTimings, paramRows, stageSecondsTotal, taskStatusNote } from '../lib/job-detail-copy';
+import { jobErrorMessage, jobErrorRows } from '../lib/job-error-copy';
 import { jobStateLabel } from '../lib/job-stage-rows';
 import { gpuLabel } from '../lib/gpu-label';
 import { shown } from '../lib/create-runtime-prefs';
@@ -32,6 +33,8 @@ export function JobDetailInspector({
   const wfName = wfKey ? workflowTitle(wfObj || { workflow_key: wfKey }) : '';
   const outputIds = (inspectedJob?.output_asset_ids || []).filter(Boolean);
   const isVideo = /i2v|video|ref2v|t2v/i.test(wfKey);
+  const failureMessage = jobErrorMessage(inspectedJob);
+  const failureRows = jobErrorRows(inspectedJob);
 
   return (
     <>
@@ -62,6 +65,24 @@ export function JobDetailInspector({
             <dt>GPU</dt><dd>{gpuLabel(inspectedJob)}</dd>
             <dt>创建时间</dt><dd>{formatInstanceTime(inspectedJob.created_at)}</dd>
           </dl>
+          {(failureMessage || failureRows.length > 0) && (
+            <details className="foldable" open>
+              <summary>失败诊断</summary>
+              <div className="foldContent">
+                {failureMessage && <p className="status error" role="alert">{failureMessage}</p>}
+                {failureRows.length > 0 && (
+                  <dl className={styles.kv}>
+                    {failureRows.map((row) => (
+                      <Fragment key={row.key}>
+                        <dt>{row.label}</dt>
+                        <dd>{row.mono ? <code>{row.value}</code> : row.value}</dd>
+                      </Fragment>
+                    ))}
+                  </dl>
+                )}
+              </div>
+            </details>
+          )}
           {outputIds.length > 0 && onOpenOutput && (
             <div className={styles.outputStrip} aria-label="任务产出作品">
               {outputIds.slice(0, 4).map((assetId, idx) => (
@@ -93,7 +114,7 @@ export function JobDetailInspector({
             </details>
           )}
           {(inspectedJob.timings || inspectedJob.timing_details || inspectedJob.logs || inspectedJob.events) ? (
-            <JobHistoryDetails job={inspectedJob} />
+            <JobHistoryDetails job={inspectedJob} showErrorDetails={false} />
           ) : null}
           {stageSecondsTotal(jobDetailTimings(inspectedJob)) ? (
             <p className="muted small">

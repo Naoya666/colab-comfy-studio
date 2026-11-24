@@ -74,6 +74,24 @@ def instance_pool_of(instance: Mapping | None) -> str:
     return POOL_CREATION
 
 
+UNCONFIRMED_ALLOCATION_ERROR_CODES = frozenset({
+    "gpu_allocation_aborted",
+    "gpu_allocation_failed",
+    "gpu_capacity_unavailable",
+    "gpu_create_failed",
+    "gpu_provider_unavailable",
+    "gpu_spec_invalid",
+    "colab_auth_failed",
+    "colab_network_error",
+    "colab_assign_timeout",
+    "colab_upstream_unavailable",
+    "colab_rate_limited",
+    "colab_quota_exceeded",
+    "colab_request_rejected",
+    "colab_invalid_response",
+})
+
+
 def lease_allocation_unconfirmed(
     lease_state: str | None, lease_data: Mapping | None, job: Mapping | None = None,
     *, instance_state: str | None = None,
@@ -104,12 +122,7 @@ def lease_allocation_unconfirmed(
         and not data.get("operation_done")
     ):
         return True
-    if isinstance(job, Mapping) and job.get("error_code") in {
-        "gpu_allocation_aborted",
-        "gpu_create_failed",
-        "gpu_provider_unavailable",
-        "gpu_spec_invalid",
-    }:
+    if isinstance(job, Mapping) and job.get("error_code") in UNCONFIRMED_ALLOCATION_ERROR_CODES:
         if not has_tunnel and not data.get("operation_done"):
             return True
     return False

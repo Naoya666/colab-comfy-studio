@@ -1508,7 +1508,7 @@ class Repository:
             history=data.get('attempt_history') or []
             history.append({k:copy.deepcopy(v) for k,v in data.items() if k not in {'snapshot','request_body','attempt_history','attempt_retry_keys'}})
             transient={
-                'execution_id','lease_id','outputs','output_asset_ids','persisted_outputs','error_code','error_message',
+                'execution_id','lease_id','outputs','output_asset_ids','persisted_outputs','error_code','error_message','error_details',
                 'cancel_requested','requested_outcome','cleanup_final_state','cleanup_attempts','cleanup_next_epoch',
                 'upload_attempts','started_epoch','stopped_at','deadline_epoch','task_deadline_epoch','validated_epoch','budget_reserved',
                 'execution_started_at','execution_ended_at','execution_seconds','ccu_before','ccu_after','ccu_after_at',

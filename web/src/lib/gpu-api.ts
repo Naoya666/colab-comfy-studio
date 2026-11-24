@@ -59,6 +59,18 @@ export interface GpuWorkflow { id: string; workflow_key: string; workflow_versio
 export interface GpuPreset { id: string; name: string; workflow_version_id: string; overrides: Record<string, unknown>; [key: string]: unknown; }
 export type GpuExecutionPolicy = GpuExecutionPolicyV020;
 export interface GpuJobRequest extends GpuJobRequestV020 { }
+export interface GpuErrorDetails {
+  error_code?: string | null;
+  category?: string | null;
+  phase?: string | null;
+  http_status?: number | null;
+  timeout_kind?: string | null;
+  elapsed_seconds?: number | null;
+  outcome?: string | null;
+  reconciling?: boolean | null;
+  reconciliation_result?: string | null;
+  retry_attempt?: number | null;
+}
 export interface GpuJob {
   id: string;
   job_id?: string;
@@ -74,7 +86,9 @@ export interface GpuJob {
   asset_ids?: string[];
   output_asset_ids?: string[];
   error?: string;
+  error_code?: string | null;
   error_message?: string;
+  error_details?: GpuErrorDetails | null;
   message?: string;
   progress?: number;
   idempotency_key?: string;

@@ -15,7 +15,14 @@ from typing import Any, Callable
 from app.common import APIError
 
 from . import ccu
-from .colab import RUNTIME_MISSING, ColabAllocationError, GoogleColabProvider, runtime_status
+from .colab import (
+    RUNTIME_MISSING,
+    TUNNEL_RECONCILE_WINDOW_SECONDS,
+    ColabAllocationError,
+    ColabError,
+    GoogleColabProvider,
+    runtime_status,
+)
 from .compute import (
     ComputeError,
     DisabledProvider,
@@ -572,6 +579,58 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             "ccu_before_source": "google_balance",
         }, job["owner_id"])
 
+    @staticmethod
+    def _tunnel_reconcile_ready_at(lease: dict | None) -> float | None:
+        if not isinstance(lease, dict):
+            return None
+        if (
+            lease.get("tunnel_nbh")
+            and not lease.get("tunnel_endpoint")
+            and int(lease.get("create_attempts") or 0) > 0
+            and not lease.get("operation_done")
+            and lease.get("create_started") is not None
+        ):
+            try:
+                return float(lease["create_started"]) + TUNNEL_RECONCILE_WINDOW_SECONDS + 0.5
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _cleanup_retry_next_epoch(self, lease: dict | None, attempts: int) -> tuple[float, bool]:
+        now = self.clock()
+        ready_at = self._tunnel_reconcile_ready_at(lease)
+        if ready_at is not None and now < ready_at:
+            return ready_at, True
+        delay = min(
+            self.config.cleanup_retry_max_seconds,
+            self.config.cleanup_retry_base_seconds * (2 ** max(0, attempts - 1)),
+        )
+        return now + delay, False
+
+    @staticmethod
+    def _error_diagnostics(
+        exc: Exception,
+        *,
+        fallback_code: str,
+        fallback_phase: str,
+        elapsed: float | None = None,
+        attempt: int | None = None,
+    ) -> dict:
+        raw = exc.to_diagnostics() if isinstance(exc, ColabError) else {}
+        diag: dict[str, Any] = {}
+        for key in ("error_code", "category", "phase", "http_status", "timeout_kind", "elapsed_seconds", "outcome"):
+            if raw.get(key) is not None:
+                diag[key] = raw[key]
+        diag.setdefault("error_code", fallback_code)
+        diag.setdefault("phase", fallback_phase)
+        if "category" not in diag:
+            diag["category"] = "internal"
+        if diag.get("elapsed_seconds") is None and elapsed is not None:
+            diag["elapsed_seconds"] = round(max(0.0, float(elapsed)), 1)
+        if attempt is not None:
+            diag["retry_attempt"] = int(attempt)
+        return diag
+
     def _allocation(self, job: dict) -> dict:
         if job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
             existing_lease = self._lease(job)
@@ -585,6 +644,18 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         if job.get("lease_id") != lease["id"]:
             job = self._update("jobs", job["id"], {"lease_id": lease["id"]}, job.get("owner_id"))
         if lease.get("state") in {"cleanup_pending", "releasing", "deleting", "quarantined", "deleted"}:
+            saved_diag = lease.get("last_create_diagnostics")
+            saved_err = lease.get("last_create_error")
+            if isinstance(saved_diag, dict) or saved_err:
+                details = {
+                    **(saved_diag if isinstance(saved_diag, dict) else {}),
+                    "reconciling": lease.get("state") in {"cleanup_pending", "releasing", "deleting"},
+                }
+                details.setdefault("phase", "fencing")
+                code = str(details.get("error_code") or "gpu_allocation_aborted")
+                details["error_code"] = code
+                message = str(saved_err or "GPU allocation entered cleanup before execution; retry after release")
+                return self._begin_failure(job, code, message, error_details=details)
             return self._begin_failure(job, "gpu_allocation_aborted", "GPU allocation entered cleanup before execution; retry after release")
         try:
             job, lease = self._bind_instance_lease(job, lease)
@@ -615,7 +686,11 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             return self._begin_failure(job, "gpu_spec_invalid", self._safe_error(exc))
         attempts = int(lease.get("create_attempts") or 0)
         if attempts > self.config.create_retries:
-            return self._begin_failure(job, "gpu_create_failed", "GPU runtime allocation failed")
+            saved_diag = lease.get("last_create_diagnostics")
+            saved_err = lease.get("last_create_error") or "GPU runtime allocation failed"
+            code = str((saved_diag or {}).get("error_code") or "gpu_create_failed") if isinstance(saved_diag, dict) else "gpu_create_failed"
+            details = {**saved_diag, "reconciling": False} if isinstance(saved_diag, dict) else None
+            return self._begin_failure(job, code, saved_err, error_details=details)
         job = self._sample_allocation_baseline(job, lease)
         try:
             self._check_cu(job)
@@ -633,6 +708,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             },
             job.get("owner_id"),
         )
+        t_create = time.monotonic()
         try:
             handle = provider.create(spec, lease["request_id"], job["id"], lease["runtime_id"])
             if not isinstance(handle, dict) or not handle.get("runtime_name"):
@@ -648,21 +724,153 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 "owner_id": job.get("owner_id"),
             }
         except ProviderUnavailable as exc:
-            return self._begin_failure(job, "gpu_provider_unavailable", self._safe_error(exc))
+            return self._begin_failure(
+                job,
+                "gpu_provider_unavailable",
+                self._safe_error(exc),
+                error_details={
+                    "error_code": "gpu_provider_unavailable",
+                    "category": "internal",
+                    "phase": "create",
+                    "elapsed_seconds": round(time.monotonic() - t_create, 1),
+                    "reconciling": False,
+                },
+            )
         except ColabAllocationError as exc:
+            elapsed = exc.elapsed_seconds if exc.elapsed_seconds is not None else round(time.monotonic() - t_create, 1)
+            diag = self._error_diagnostics(
+                exc,
+                fallback_code="gpu_capacity_unavailable" if exc.reason == "NO_RUNTIMES" else "gpu_allocation_failed",
+                fallback_phase=exc.phase or "create",
+                elapsed=elapsed,
+                attempt=attempts,
+            )
+            safe_msg = self._safe_error(exc)
+            fresh_lease = self._get("leases", lease["id"], job.get("owner_id")) or lease
+            lease_patch: dict[str, Any] = {
+                "last_create_error": safe_msg,
+                "last_create_diagnostics": diag,
+                "last_seen": self.clock(),
+            }
+            if (
+                exc.remote_state_unknown is False
+                and not fresh_lease.get("handle")
+                and not fresh_lease.get("tunnel_endpoint")
+                and not fresh_lease.get("operation_name")
+            ):
+                lease_patch.update(
+                    state="cleanup_pending",
+                    operation_done=True,
+                    allocation_reconciliation="explicit_provider_refusal",
+                )
+            self._update("leases", lease["id"], lease_patch, job.get("owner_id"))
             return self._allocation_failed(job, exc)
-        except Exception as exc:
-            self._update("leases", lease["id"], {"last_create_error": self._safe_error(exc)}, job.get("owner_id"))
+        except ColabError as exc:
+            elapsed = exc.elapsed_seconds if exc.elapsed_seconds is not None else round(time.monotonic() - t_create, 1)
+            diag = self._error_diagnostics(
+                exc,
+                fallback_code="gpu_create_failed",
+                fallback_phase=exc.phase or "create",
+                elapsed=elapsed,
+                attempt=attempts,
+            )
+            safe_msg = self._safe_error(exc)
+            self._update(
+                "leases",
+                lease["id"],
+                {"last_create_error": safe_msg, "last_create_diagnostics": diag, "last_seen": self.clock()},
+                job.get("owner_id"),
+            )
+            if not exc.remote_state_unknown:
+                # Option A: only retry once for transient network/5xx errors strictly before POST.
+                pre_post_limit = min(self.config.create_retries, 1)
+                if exc.retryable_before_post and attempts <= pre_post_limit:
+                    self._event(
+                        job,
+                        "allocating",
+                        f"分配握手遇到临时异常，将自动重试（第 {attempts} 次）：{safe_msg}",
+                        None,
+                    )
+                    return job
+                recon_tag = "pre_post_unallocated" if exc.phase in {"auth", "assign_get"} else "explicit_provider_refusal"
+                self._update(
+                    "leases",
+                    lease["id"],
+                    {
+                        "state": "cleanup_pending",
+                        "operation_done": True,
+                        "allocation_reconciliation": recon_tag,
+                        "last_seen": self.clock(),
+                    },
+                    job.get("owner_id"),
+                )
+                diag["reconciling"] = False
+                diag["reconciliation_result"] = recon_tag
+                return self._begin_failure(job, diag["error_code"], safe_msg, error_details=diag)
             recovered = self._recover_unknown_create(job, lease, provider)
+            fresh_lease = self._get("leases", lease["id"], job.get("owner_id")) or lease
             if recovered == "cleaned":
-                return self._begin_failure(job, "gpu_create_failed", "GPU runtime allocation failed")
+                diag["reconciling"] = False
+                diag["reconciliation_result"] = "cleaned"
+                return self._begin_failure(job, diag["error_code"], safe_msg, error_details=diag)
+            if recovered is False and fresh_lease.get("state") in {
+                "cleanup_pending",
+                "releasing",
+                "deleting",
+                "quarantined",
+                "deleted",
+            }:
+                diag["reconciling"] = fresh_lease.get("state") != "deleted"
+                return self._begin_failure(job, diag["error_code"], safe_msg, error_details=diag)
+            if attempts > self.config.create_retries:
+                diag["reconciling"] = False
+                return self._begin_failure(job, diag["error_code"], safe_msg, error_details=diag)
+            return job
+        except Exception as exc:
+            elapsed = round(time.monotonic() - t_create, 1)
+            diag = self._error_diagnostics(
+                exc,
+                fallback_code="gpu_create_failed",
+                fallback_phase="create",
+                elapsed=elapsed,
+                attempt=attempts,
+            )
+            safe_msg = self._safe_error(exc)
+            self._update(
+                "leases",
+                lease["id"],
+                {"last_create_error": safe_msg, "last_create_diagnostics": diag, "last_seen": self.clock()},
+                job.get("owner_id"),
+            )
+            recovered = self._recover_unknown_create(job, lease, provider)
+            fresh_lease = self._get("leases", lease["id"], job.get("owner_id")) or lease
+            if recovered == "cleaned":
+                diag["reconciling"] = False
+                diag["reconciliation_result"] = "cleaned"
+                return self._begin_failure(job, diag["error_code"], safe_msg, error_details=diag)
+            if recovered is False and fresh_lease.get("state") in {
+                "cleanup_pending",
+                "releasing",
+                "deleting",
+                "quarantined",
+                "deleted",
+            }:
+                diag["reconciling"] = fresh_lease.get("state") != "deleted"
+                return self._begin_failure(job, diag["error_code"], safe_msg, error_details=diag)
             if recovered is False and attempts > self.config.create_retries:
-                return self._begin_failure(job, "gpu_create_failed", "GPU runtime allocation failed")
+                diag["reconciling"] = False
+                return self._begin_failure(job, diag["error_code"], safe_msg, error_details=diag)
             return job
         lease = self._update(
             "leases",
             lease["id"],
-            {"state": "active", "handle": handle, "last_create_error": None, "last_seen": self.clock()},
+            {
+                "state": "active",
+                "handle": handle,
+                "last_create_error": None,
+                "last_create_diagnostics": None,
+                "last_seen": self.clock(),
+            },
             job.get("owner_id"),
         )
         ccu.open_instance_session(self.store, job, lease, self.clock())
@@ -677,7 +885,14 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             started_at=self.clock(),
         )
 
-    def _begin_failure(self, job: dict, code: str, message: str) -> dict:
+    def _begin_failure(
+        self,
+        job: dict,
+        code: str,
+        message: str,
+        *,
+        error_details: dict | None = None,
+    ) -> dict:
         current = self.store.get("jobs", job["id"], job.get("owner_id"))
         if current and current.get("state") in TERMINAL_STATES | {"cleaning_up", "cleanup_pending"}:
             return current
@@ -688,6 +903,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             self._update(
                 "leases", lease["id"], {"state": "deleted", "last_seen": self.clock()}, job.get("owner_id")
             )
+        extra = {"error_details": error_details} if error_details is not None else {}
         if lease or job.get("instance_id"):
             return self._set_state(
                 job,
@@ -697,13 +913,19 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 error_code=code,
                 error_message=message,
                 cleanup_final_state="failed",
+                **extra,
             )
         return self._set_state(
-            job, "failed", message, requested_outcome="failed", error_code=code, error_message=message
+            job, "failed", message, requested_outcome="failed", error_code=code, error_message=message, **extra
         )
 
     def _allocation_failed(self, job: dict, exc: ColabAllocationError) -> dict:
-        code = "gpu_capacity_unavailable" if exc.reason == "NO_RUNTIMES" else "gpu_allocation_failed"
+        code = exc.error_code or ("gpu_capacity_unavailable" if exc.reason == "NO_RUNTIMES" else "gpu_allocation_failed")
+        diag = exc.to_diagnostics() if hasattr(exc, "to_diagnostics") else None
+        if diag and hasattr(self, "store") and job.get("id"):
+            if exc.remote_state_unknown is False and diag.get("phase") == "assign_post":
+                diag = {**diag, "reconciling": False, "reconciliation_result": "explicit_provider_refusal"}
+            job = self._update("jobs", job["id"], {"error_details": diag}, job.get("owner_id"))
         return self._begin_failure(job, code, str(exc))
 
     def _expired(self, job: dict) -> bool:
@@ -1456,37 +1678,49 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             from .native import protect_lease
             if protect_lease(self.store, lease, self.clock, check_remote=observation is None):
                 return job
-        provider = self._provider(job)
-        handle = self._lease_handle(lease) or self._intent_handle(job, lease)
-        if handle is None:
-            self._update(
-                "leases",
-                lease["id"],
-                {
-                    "state": "quarantined",
-                    "last_error": "lease intent is incomplete",
-                    "last_seen": self.clock(),
-                },
-                job.get("owner_id"),
-            )
-            return self._set_state(job, "failed", "GPU cleanup was refused", error_code="gpu_cleanup_refused")
-        try:
-            confirmed = False
-            if not lease.get("force_stop"):
-                status = provider.inspect(handle)
-                observation = runtime_status(status) if lease.get("provider") == "colab" else None
-                confirmed = observation == "missing" if observation else status.get("deleted") is True
-            if not confirmed and (observation != "unknown" or lease.get("force_stop")):
-                response = provider.delete(handle)
-                # A truthy response is not enough: providers may return an
-                # accepted/pending response before the remote runtime is gone.
-                confirmed = response is True or (
-                    isinstance(response, dict) and response.get("deleted") is True
+        explicit_no_remote = (
+            lease.get("allocation_reconciliation") in {"pre_post_unallocated", "explicit_provider_refusal"}
+            and not lease.get("handle")
+            and not lease.get("tunnel_endpoint")
+            and not lease.get("operation_name")
+        )
+        if explicit_no_remote:
+            confirmed, error = True, None
+            attempts = int(lease.get("delete_attempts") or 0)
+            delete_source = str(lease["allocation_reconciliation"])
+        else:
+            provider = self._provider(job)
+            handle = self._lease_handle(lease) or self._intent_handle(job, lease)
+            if handle is None:
+                self._update(
+                    "leases",
+                    lease["id"],
+                    {
+                        "state": "quarantined",
+                        "last_error": "lease intent is incomplete",
+                        "last_seen": self.clock(),
+                    },
+                    job.get("owner_id"),
                 )
-            error = None
-        except Exception as exc:
-            confirmed, error = False, self._safe_error(exc)
-        attempts = int(lease.get("delete_attempts") or 0) + 1
+                return self._set_state(job, "failed", "GPU cleanup was refused", error_code="gpu_cleanup_refused")
+            try:
+                confirmed = False
+                if not lease.get("force_stop"):
+                    status = provider.inspect(handle)
+                    observation = runtime_status(status) if lease.get("provider") == "colab" else None
+                    confirmed = observation == "missing" if observation else status.get("deleted") is True
+                if not confirmed and (observation != "unknown" or lease.get("force_stop")):
+                    response = provider.delete(handle)
+                    # A truthy response is not enough: providers may return an
+                    # accepted/pending response before the remote runtime is gone.
+                    confirmed = response is True or (
+                        isinstance(response, dict) and response.get("deleted") is True
+                    )
+                error = None
+            except Exception as exc:
+                confirmed, error = False, self._safe_error(exc)
+            attempts = int(lease.get("delete_attempts") or 0) + 1
+            delete_source = "cleanup_provider_confirmation"
         if confirmed:
             try:
                 job = self._mark_instance_deleted(job)
@@ -1494,40 +1728,65 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 confirmed = False
                 error = str(exc)
         if not confirmed:
-            delay = min(
-                self.config.cleanup_retry_max_seconds,
-                self.config.cleanup_retry_base_seconds * (2 ** max(0, attempts - 1)),
-            )
+            fresh_lease = self._get("leases", lease["id"], job.get("owner_id")) or lease
+            next_retry, waiting_window = self._cleanup_retry_next_epoch(fresh_lease, attempts)
             self._update(
                 "leases",
                 lease["id"],
                 {
                     "state": "cleanup_pending",
                     "delete_attempts": attempts,
-                    "cleanup_next_epoch": self.clock() + delay,
+                    "cleanup_next_epoch": next_retry,
                     "last_error": error or "delete not confirmed",
                     "last_seen": self.clock(),
                 },
                 job.get("owner_id"),
             )
+            pending_msg = (
+                f"等待 Colab 远端释放确认（约 {max(1, int(round(next_retry - self.clock())))} 秒后自动核验）"
+                if waiting_window
+                else "GPU cleanup is pending"
+            )
             return self._set_state(
                 job,
                 "cleanup_pending",
-                "GPU cleanup is pending",
+                pending_msg,
                 cleanup_attempts=attempts,
-                cleanup_next_epoch=self.clock() + delay,
+                cleanup_next_epoch=next_retry,
                 error_code=job.get("error_code") or "gpu_cleanup_pending",
             )
+        fresh_lease = self._get("leases", lease["id"], job.get("owner_id")) or lease
         self._update(
             "leases",
             lease["id"],
             {"state": "deleted", "delete_attempts": attempts, "last_seen": self.clock(),
              "remote_deleted": True, "remote_deleted_at": self.clock(),
-             "remote_delete_source": "cleanup_provider_confirmation"},
+             "remote_delete_source": delete_source},
             job.get("owner_id"),
         )
         self._record_usage(job, lease, self.clock())
-        return self._finish_cleanup(job, final_state, "GPU cleanup completed")
+        finish_patch: dict[str, Any] = {}
+        finish_msg = "GPU cleanup completed"
+        if isinstance(job.get("error_details"), dict):
+            was_reconciling = bool(job["error_details"].get("reconciling"))
+            recon_marker = fresh_lease.get("allocation_reconciliation")
+            if recon_marker == "exact_nbh_unassigned_and_absent":
+                recon_result = "confirmed_unassigned"
+                if was_reconciling:
+                    finish_msg = "已确认 Colab 远端未分配实例，租约已释放，可以重试"
+            elif fresh_lease.get("tunnel_endpoint") and was_reconciling:
+                recon_result = "late_runtime_deleted"
+                finish_msg = "发现 Colab 远端延迟创建了实例，已自动释放，可以重试"
+            elif recon_marker in {"pre_post_unallocated", "explicit_provider_refusal"}:
+                recon_result = str(recon_marker)
+            else:
+                recon_result = "confirmed_deleted"
+            finish_patch["error_details"] = {
+                **job["error_details"],
+                "reconciling": False,
+                "reconciliation_result": recon_result,
+            }
+        return self._finish_cleanup(job, final_state, finish_msg, **finish_patch)
 
     def _advance(self, job: dict) -> dict:
         state = job.get("state")
