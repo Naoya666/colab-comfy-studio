@@ -2385,10 +2385,21 @@ class InstanceService:
                 continue
             # Case 2: Creation Path B atomic takeover -> advance in-place with new attempt_id, NEVER hit terminal failed!
             if takeover_job_id and related.id == takeover_job_id and plan is not None and state not in {"completed", "failed", "cancelled"}:
+                old_execution_id = payload.get("execution_id")
+                if old_execution_id:
+                    try:
+                        execution = self._find(session, "executions", old_execution_id, owner)
+                    except ValueError:
+                        execution = None
+                    if execution is not None and execution.state not in {"completed", "failed", "cancelled"}:
+                        edata = self._data(execution)
+                        edata.update(state="failed", finished_at=checked_at, error_code=RUNTIME_MISSING)
+                        self._set(execution, edata, state="failed", session=session)
                 history = list(payload.get("attempt_history") or [])
                 history.append({
                     "attempt_id": payload.get("attempt_id"),
                     "attempt_number": payload.get("attempt_number"),
+                    "execution_id": old_execution_id,
                     "instance_id": instance.id,
                     "lease_id": lease.id,
                     "ended_at": checked_at,

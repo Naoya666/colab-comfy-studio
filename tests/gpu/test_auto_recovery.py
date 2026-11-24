@@ -1360,6 +1360,9 @@ def test_workspace_mutual_exclusion_api_and_manual_start_override(tmp_path, monk
 
 
 def test_disabling_auto_recovery_cancels_scheduled_plan_and_held_job(tmp_path, monkeypatch):
+    from app.db import utcnow
+    from app.gpu.repository import GpuBatchRow
+
     monkeypatch.setenv("GPU_AUTO_RECOVERY_ENABLED", "0")
     repo = _make_repo(tmp_path)
     clock = FakeClock()
@@ -1367,7 +1370,20 @@ def test_disabling_auto_recovery_cancels_scheduled_plan_and_held_job(tmp_path, m
     gid = "rec-disabled"
     job = repo.create("jobs", owner, {
         "state": "waiting_for_capacity", "recovery_hold": True, "retry_not_before_epoch": clock() + 120,
+        "batch_id": "batch-rec-1",
     })
+    with repo.store.db_lock(), repo.store.Session.begin() as session:
+        session.add(GpuBatchRow(
+            id="batch-rec-1",
+            owner_id=owner,
+            state="running",
+            idempotency_key="batch-rec-1",
+            body_hash="0" * 64,
+            data={"state": "running", "job_ids": [job["id"]], "finished_jobs": 0, "counts": {}},
+            version=0,
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        ))
     recovery.save_plan(repo, owner, {
         "plan_id": gid, "recovery_group_id": gid, "owner_id": owner, "pool": POOL_CREATION,
         "state": "scheduled", "active_job_id": job["id"], "next_retry_at": clock() + 120,
@@ -1376,11 +1392,17 @@ def test_disabling_auto_recovery_cancels_scheduled_plan_and_held_job(tmp_path, m
     assert recovery.tick(repo, clock=clock) == 1
     plan = recovery.get_plan(repo, owner, gid)
     assert plan["state"] == "cancelled"
+    assert plan["last_error_code"] == "disabled"
     assert plan["next_retry_at"] is None
     job = repo.get("jobs", job["id"], owner)
     assert job["state"] == "cancelled"
     assert job["recovery_hold"] is False
     assert job["retry_not_before_epoch"] == 0
+    assert job["error_code"] == "disabled"
+    assert "自动恢复已关闭" in (job.get("error_message") or "")
+    batch = repo.get("batches", "batch-rec-1", owner)
+    assert batch["state"] == "cancelled"
+    assert batch["finished_jobs"] == 1
     assert recovery.tick(repo, clock=clock) == 0
 
 
@@ -1413,6 +1435,150 @@ def test_native_model_restore_converges_on_timeout_or_lost_lease(tmp_path, monke
     assert plan["native_snapshot"]["model_restore_state"]["state"] == "failed"
     assert recovery.active_plan(repo, owner) is None
     assert native.workspace_offline_status(repo, owner)[0] is lease_lost
+
+
+def test_native_model_restore_allows_healthy_long_downloads_and_converges_on_quarantined_or_stall(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPU_AUTO_RECOVERY_ENABLED", "1")
+    monkeypatch.setenv("GPU_AUTO_RECOVERY_ROUND_TIMEOUT_SECONDS", "60")
+    repo = _make_repo(tmp_path)
+    clock = FakeClock()
+    owner = "owner-1"
+
+    # Case 1: Healthy multi-model download exceeds round_timeout_seconds (60s) with active progress,
+    # and poll runs BEFORE timeout check so ready at T+150s still converges cleanly to recovered!
+    lease1 = repo.create("leases", owner, {"state": "idle", "native_comfy": True})
+    gid1 = "rec-native-healthy-long"
+    recovery.save_plan(repo, owner, {
+        "plan_id": gid1, "recovery_group_id": gid1, "owner_id": owner, "pool": POOL_NATIVE,
+        "state": "restoring_env", "active_lease_id": lease1["id"],
+        "model_restore_started_at": clock(), "model_restore_last_progress_at": clock(),
+        "hard_deadline_at": clock() + 3600,
+        "native_snapshot": {
+            "model_restore_job_id": "restore-long",
+            "model_restore_state": {"state": "preparing", "total": 3, "completed": 0, "failed": 0, "skipped": 0},
+        },
+    })
+    polls = iter([
+        {"state": "preparing", "total": 3, "completed": 1, "failed": 0, "skipped": 0, "partial_disk_limit": False, "updated_at": clock() + 80},
+        {"state": "preparing", "total": 3, "completed": 2, "failed": 0, "skipped": 0, "partial_disk_limit": False, "updated_at": clock() + 160},
+        {"state": "ready", "total": 3, "completed": 3, "failed": 0, "skipped": 0, "partial_disk_limit": False, "updated_at": clock() + 240},
+    ])
+    monkeypatch.setattr(recovery, "_poll_native_model_restore", lambda *args: next(polls))
+
+    clock.advance(80)  # > 60s round_timeout_seconds, yet progress advanced -> MUST stay restoring_env!
+    assert recovery.tick(repo, clock=clock) == 1
+    p1 = recovery.get_plan(repo, owner, gid1)
+    assert p1["state"] == "restoring_env"
+    assert p1["native_snapshot"]["model_restore_state"]["completed"] == 1
+
+    clock.advance(80)
+    assert recovery.tick(repo, clock=clock) == 1
+    assert recovery.get_plan(repo, owner, gid1)["state"] == "restoring_env"
+
+    clock.advance(80)
+    assert recovery.tick(repo, clock=clock) == 1
+    p1 = recovery.get_plan(repo, owner, gid1)
+    assert p1["state"] == "recovered"
+    assert p1["native_snapshot"]["model_restore_state"]["completed"] == 3
+
+    # Case 2: Quarantined lease is treated as lost immediately and unlocks offline workspace
+    repo.update("leases", lease1["id"], {"state": "deleted"}, owner)
+    lease2 = repo.create("leases", owner, {"state": "quarantined", "native_comfy": True})
+    gid2 = "rec-native-quarantined"
+    recovery.save_plan(repo, owner, {
+        "plan_id": gid2, "recovery_group_id": gid2, "owner_id": owner, "pool": POOL_NATIVE,
+        "state": "restoring_env", "active_lease_id": lease2["id"],
+        "model_restore_started_at": clock(),
+        "native_snapshot": {"model_restore_job_id": "restore-q", "model_restore_state": {"state": "preparing"}},
+    })
+    assert recovery.tick(repo, clock=clock) == 1
+    assert recovery.get_plan(repo, owner, gid2)["state"] == "aborted_fatal"
+    assert recovery.get_plan(repo, owner, gid2)["last_error_code"] == "model_restore_lease_lost"
+    assert native.workspace_offline_status(repo, owner)[0] is True
+
+    # Case 3: Preparing with zero progress past stall timeout (1800s) converges to exhausted
+    lease3 = repo.create("leases", owner, {"state": "idle", "native_comfy": True})
+    gid3 = "rec-native-hung-download"
+    recovery.save_plan(repo, owner, {
+        "plan_id": gid3, "recovery_group_id": gid3, "owner_id": owner, "pool": POOL_NATIVE,
+        "state": "restoring_env", "active_lease_id": lease3["id"],
+        "model_restore_started_at": clock(), "model_restore_last_progress_at": clock(),
+        "native_snapshot": {
+            "model_restore_job_id": "restore-hung",
+            "model_restore_state": {"state": "preparing", "total": 2, "completed": 0, "failed": 0, "skipped": 0},
+        },
+    })
+    monkeypatch.setattr(
+        recovery,
+        "_poll_native_model_restore",
+        lambda *args: {"state": "preparing", "total": 2, "completed": 0, "failed": 0, "skipped": 0, "partial_disk_limit": False, "updated_at": clock()},
+    )
+    clock.advance(1800)
+    assert recovery.tick(repo, clock=clock) == 1
+    p3 = recovery.get_plan(repo, owner, gid3)
+    assert p3["state"] == "exhausted"
+    assert p3["last_error_code"] == "model_restore_timeout"
+
+
+def test_l3_reclaim_takeover_and_deferred_retry_close_prior_execution_rows(tmp_path, monkeypatch):
+    _enable_recovery(monkeypatch)
+    repo = _make_repo(tmp_path)
+    clock = FakeClock()
+    _seed_project(repo)
+    _seed_account(repo)
+    _seed_published_workflow(repo)
+
+    # Part 1: Running Creation Path B job reclaimed -> old execution row atomically closed as failed
+    job, inst, lease = _seed_running_instance(
+        repo, clock, pool=POOL_CREATION, instance_state="busy", lease_state="active", job_state="loading",
+        retention_mode="smart",
+    )
+    job = repo.prepare_execution(job["id"], "owner-1", lease["id"], clock())
+    job = repo.transition_job(job["id"], "owner-1", "running", "started", {}, clock())
+    exec1_id = job["execution_id"]
+
+    prov = MockColab(inspect_map={lease["runtime_id"]: {"deleted": True, "missing": True}})
+    sched = Scheduler(repo, provider_factory=lambda j: prov, executor_factory=lambda j: MockExecutor(), clock=clock)
+    sched._inspect_runtime(repo.get("leases", lease["id"], "owner-1"))
+    clock.advance(6)
+    sched._inspect_runtime(repo.get("leases", lease["id"], "owner-1"))
+
+    exec1 = repo.get("executions", exec1_id, "owner-1")
+    assert exec1["state"] == "failed"
+    assert exec1["finished_at"] == clock()
+    assert exec1["error_code"] == recovery.RUNTIME_MISSING
+    job_after = repo.get("jobs", job["id"], "owner-1")
+    assert job_after["state"] == "waiting_for_capacity"
+    assert job_after.get("execution_id") is None
+    assert job_after["attempt_history"][-1]["execution_id"] == exec1_id
+
+    # Part 2: maybe_defer_retry_job_after_cleanup also closes an open execution row before popping execution_id
+    gid = job_after["recovery_plan_id"]
+    plan = recovery.get_plan(repo, "owner-1", gid)
+    plan["state"] = "dispatching"
+    recovery.save_plan(repo, "owner-1", plan)
+
+    lease2 = repo.create("leases", "owner-1", {
+        "owner_job_id": job["id"], "state": "active", "provider": "colab", "account_id": ACC1,
+    })
+    repo.update("jobs", job["id"], {
+        "state": "loading", "lease_id": lease2["id"], "recovery_hold": False,
+    }, "owner-1")
+    job2 = repo.prepare_execution(job["id"], "owner-1", lease2["id"], clock())
+    exec2_id = job2["execution_id"]
+    repo.update("leases", lease2["id"], {"state": "deleted"}, "owner-1")
+    job2 = repo.update("jobs", job["id"], {
+        "state": "cleaning_up", "error_code": "gpu_allocation_failed", "error_message": "transient error",
+    }, "owner-1")
+
+    deferred = recovery.maybe_defer_retry_job_after_cleanup(repo, job2, repo.get("leases", lease2["id"], "owner-1"), clock())
+    assert deferred is not None
+    assert deferred["state"] == "waiting_for_capacity"
+    assert deferred.get("execution_id") is None
+    exec2 = repo.get("executions", exec2_id, "owner-1")
+    assert exec2["state"] == "failed"
+    assert exec2["finished_at"] == clock()
+    assert exec2["error_code"] == "gpu_allocation_failed"
 
 
 # ---------------------------------------------------------------------------

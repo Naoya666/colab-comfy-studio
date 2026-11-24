@@ -630,7 +630,9 @@ def _read_plugins_bundle(
     saved_settings: dict[str, Any],
     *,
     strict: bool = False,
+    strict_core: bool = False,
 ) -> dict[str, Any]:
+    require_core = strict or strict_core
     head_manifest: dict[str, Any] | None = None
     pending_manifest: dict[str, Any] | None = None
     disabled_entries: list[dict[str, Any]] = []
@@ -664,13 +666,13 @@ def _read_plugins_bundle(
                 else:
                     objects_map[sha]["duplicate_ids"].append(entry["id"])
 
-        def _safe_load(file_meta: dict[str, Any] | None) -> Any:
+        def _safe_load(file_meta: dict[str, Any] | None, *, fail_fast: bool = False) -> Any:
             if not file_meta:
                 return None
             try:
                 return wdrive.download_json(file_meta["id"], max_bytes=4 * 1024 * 1024, known_size=_int_or_zero(file_meta.get("size")))
             except Exception as exc:
-                if strict:
+                if fail_fast:
                     raise APIError("WORKSPACE_MANIFEST_UNREADABLE", f"无法读取 Drive 插件清单：{file_meta['name']}", 502) from exc
                 return None
 
@@ -686,9 +688,9 @@ def _read_plugins_bundle(
                 raise APIError("WORKSPACE_MANIFEST_INVALID", f"Drive 插件清单（{label}）包含无效归档", 502)
 
         with ThreadPoolExecutor(max_workers=4) as pool:
-            f_head = pool.submit(_safe_load, head_file)
-            f_pending = pool.submit(_safe_load, pending_file)
-            f_disabled = pool.submit(_safe_load, disabled_file)
+            f_head = pool.submit(_safe_load, head_file, fail_fast=require_core)
+            f_pending = pool.submit(_safe_load, pending_file, fail_fast=require_core)
+            f_disabled = pool.submit(_safe_load, disabled_file, fail_fast=require_core)
             raw_head = f_head.result()
             raw_pending = f_pending.result()
             raw_disabled = f_disabled.result()
@@ -698,7 +700,7 @@ def _read_plugins_bundle(
         if isinstance(raw_pending, dict) and raw_pending.get("schema") == 1 and isinstance(raw_pending.get("plugins"), list):
             pending_manifest = raw_pending
         disabled_entries = _parse_disabled_doc(raw_disabled)
-        if strict:
+        if require_core:
             if head_file:
                 _verify_manifest(raw_head, head_file)
             if pending_file:
@@ -727,7 +729,7 @@ def _read_plugins_bundle(
                     cached = _HISTORY_JSON_CACHE.get(gen)
                 if cached is not None and not strict:
                     return cached
-                doc = _safe_load(meta)
+                doc = _safe_load(meta, fail_fast=strict)
                 if strict:
                     _verify_manifest(doc, meta)
                     if doc["generation"] != gen:
@@ -958,6 +960,7 @@ def _scan_drive_workflows(
     telemetry_node_map: dict[str, str],
     plugin_lookup: dict[str, str],
     known_plugins: set[str],
+    strict_drive_errors: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     if not native_comfy_fid:
         return {"active": [], "archived": [], "warmup": []}
@@ -995,6 +998,10 @@ def _scan_drive_workflows(
             )
         except APIError as exc:
             parse_error = exc.message
+        except (DriveError, GoogleError):
+            if strict_drive_errors:
+                raise
+            parse_error = "工作流 JSON 解析失败"
         except Exception:
             parse_error = "工作流 JSON 解析失败"
         return source, {
@@ -1034,6 +1041,7 @@ def _build_overview_payload(
     keep_history: int = DEFAULT_KEEP_HISTORY,
     deactivated_workflow_ids: frozenset[str] = frozenset(),
     activated_workflow_ids: frozenset[str] = frozenset(),
+    strict_drive_errors: bool = False,
 ) -> dict[str, Any]:
     saved = repo.store.get("settings", _settings_key(owner_id), owner_id) or {}
     telemetry = saved.get("telemetry") if isinstance(saved.get("telemetry"), dict) else None
@@ -1048,7 +1056,9 @@ def _build_overview_payload(
     env_cache_fid: str | None = None
 
     if owner_fid:
-        children_map, _ = _bulk_list_app_entries(wdrive.storage)
+        children_map, truncated = _bulk_list_app_entries(wdrive.storage)
+        if strict_drive_errors and truncated:
+            raise APIError("WORKSPACE_DRIVE_INCOMPLETE", "Drive 文件列表不完整，无法准确校验插件依赖", 502)
         nc_dir = _tree_find_child(children_map, owner_fid, "native-comfy", is_folder=True)
         if nc_dir:
             native_comfy_fid = nc_dir["id"]
@@ -1059,7 +1069,13 @@ def _build_overview_payload(
             if ec_dir:
                 env_cache_fid = ec_dir["id"]
 
-    bundle = _read_plugins_bundle(wdrive, children_map, plugins_fid, saved)
+    bundle = _read_plugins_bundle(
+        wdrive,
+        children_map,
+        plugins_fid,
+        saved,
+        strict_core=strict_drive_errors,
+    )
     effective_plugins = [p for p in (bundle["effective"].get("plugins") or []) if isinstance(p, dict) and p.get("path")]
     disabled_list = bundle["disabled"]
     objects_map = bundle["objects"]
@@ -1075,6 +1091,7 @@ def _build_overview_payload(
         telemetry_node_map=telemetry_node_map,
         plugin_lookup=plugin_lookup,
         known_plugins=known_plugins,
+        strict_drive_errors=strict_drive_errors,
     )
     studio_wfs = _studio_published_workflows(
         repo,
@@ -1328,7 +1345,13 @@ def _commit_plugin_manifest(
     previous = {}
     for name in writes:
         existing = wdrive.find_files_by_name(plugins_fid, name)
-        previous[name] = wdrive.download_json(existing[0]["id"]) if existing else None
+        if existing:
+            try:
+                previous[name] = wdrive.download_json(existing[0]["id"])
+            except ValueError as exc:
+                raise APIError("WORKSPACE_MANIFEST_INVALID", f"Drive 插件清单（{name}）JSON 格式无效", 502) from exc
+        else:
+            previous[name] = None
 
     history_fid = wdrive.find_child_folder(plugins_fid, "history", create=True)
     assert history_fid is not None
@@ -1395,6 +1418,7 @@ def _check_plugins_in_use(
         account_alias=wdrive.storage.account_id,
         deactivated_workflow_ids=deactivated_workflow_ids,
         activated_workflow_ids=activated_workflow_ids,
+        strict_drive_errors=True,
     )
     in_use = {row["path"] for row in overview["plugins"]["active"] if row["used_by_active"]}
     conflicts = [path for path in paths if path in in_use]
@@ -1427,8 +1451,10 @@ def _execute_plugin_mutation(
         raise APIError("WORKSPACE_NOT_FOUND", "Drive 中尚无原生 ComfyUI 插件清单", 404)
 
     saved = repo.store.get("settings", _settings_key(owner_id), owner_id) or {}
-    children_map, _ = _bulk_list_app_entries(wdrive.storage)
-    bundle = _read_plugins_bundle(wdrive, children_map, plugins_fid, saved)
+    children_map, truncated = _bulk_list_app_entries(wdrive.storage)
+    if truncated:
+        raise APIError("WORKSPACE_DRIVE_INCOMPLETE", "Drive 文件列表不完整，无法安全修改插件清单", 502)
+    bundle = _read_plugins_bundle(wdrive, children_map, plugins_fid, saved, strict_core=True)
 
     base_manifest = bundle["pending"] or bundle["head"]
     if base_manifest is None:
@@ -1637,13 +1663,13 @@ def apply_workflow_action(
                 raise APIError("WORKSPACE_NOT_FOUND", "Drive 中尚无原生 ComfyUI 目录", 404)
 
             source_roots: dict[str, str | None] = {
-                "comfy": wdrive.find_folder_path(nc_fid, ("user", "default", "workflows"), create=(action == "restore")),
-                "archived": wdrive.find_folder_path(nc_fid, ("workflows-archived",), create=(action == "archive")),
+                "comfy": wdrive.find_folder_path(nc_fid, ("user", "default", "workflows"), create=False),
+                "archived": wdrive.find_folder_path(nc_fid, ("workflows-archived",), create=False),
                 "warmup": wdrive.find_folder_path(nc_fid, ("warmup",), create=False),
             }
 
             processed: list[dict[str, Any]] = []
-            changes = []
+            changes: list[tuple[dict[str, Any], str, str | None, tuple[str, ...], list[dict[str, Any]]]] = []
             deactivated_ids: set[str] = set()
             activated_ids: set[str] = set()
             for source, relpath in validated:
@@ -1656,24 +1682,23 @@ def apply_workflow_action(
                 file_meta, src_parent = located
 
                 if action == "trash":
-                    changes.append((file_meta, src_parent, None, []))
+                    changes.append((file_meta, src_parent, None, (), []))
                     deactivated_ids.add(file_meta["id"])
                     processed.append({"source": source, "path": relpath, "action": "trash"})
                 else:
                     dst_key = "archived" if action == "archive" else "comfy"
                     dst_root = source_roots[dst_key]
-                    assert dst_root is not None
                     parts = relpath.split("/")
-                    dst_parent = wdrive.find_folder_path(dst_root, tuple(parts[:-1]), create=True)
-                    assert dst_parent is not None
-                    existing = wdrive.find_files_by_name(dst_parent, parts[-1])
+                    subdirs = tuple(parts[:-1])
+                    dst_parent = wdrive.find_folder_path(dst_root, subdirs, create=False) if dst_root else None
+                    existing = wdrive.find_files_by_name(dst_parent, parts[-1]) if dst_parent else []
                     if existing and not overwrite:
                         raise APIError(
                             "WORKFLOW_CONFLICT",
                             f"目标目录已存在同名工作流：{relpath}",
                             409,
                         )
-                    changes.append((file_meta, src_parent, dst_parent, existing))
+                    changes.append((file_meta, src_parent, dst_key, subdirs, existing))
                     deactivated_ids.update(dup["id"] for dup in existing)
                     if action == "archive":
                         deactivated_ids.add(file_meta["id"])
@@ -1690,12 +1715,20 @@ def apply_workflow_action(
                 )
             try:
                 with _drive_changes() as undo:
-                    for file_meta, src_parent, dst_parent, existing in changes:
+                    for file_meta, src_parent, dst_key, subdirs, existing in changes:
                         file_id = file_meta["id"]
-                        if dst_parent is None:
+                        if dst_key is None:
                             undo.append(partial(wdrive.trash_file, file_id, trashed=False))
                             wdrive.trash_file(file_id)
                             continue
+                        dst_root = source_roots[dst_key]
+                        if not dst_root:
+                            root_parts = ("workflows-archived",) if dst_key == "archived" else ("user", "default", "workflows")
+                            dst_root = wdrive.find_folder_path(nc_fid, root_parts, create=True)
+                            assert dst_root is not None
+                            source_roots[dst_key] = dst_root
+                        dst_parent = wdrive.find_folder_path(dst_root, subdirs, create=True)
+                        assert dst_parent is not None
                         for dup in existing:
                             undo.append(partial(wdrive.trash_file, dup["id"], trashed=False))
                             wdrive.trash_file(dup["id"])
@@ -1753,16 +1786,22 @@ def rollback_plugins(
             if not hist_files:
                 raise APIError("WORKSPACE_NOT_FOUND", f"未找到指定历史快照：{generation[:8]}", 404)
 
+            try:
+                target_doc = wdrive.download_json(hist_files[0]["id"], max_bytes=4 * 1024 * 1024)
+            except ValueError as exc:
+                raise APIError("WORKSPACE_MANIFEST_INVALID", f"Drive 历史清单（{generation[:8]}）JSON 格式无效", 502) from exc
             target_manifest = _validate_manifest_doc(
-                wdrive.download_json(hist_files[0]["id"], max_bytes=4 * 1024 * 1024),
+                target_doc,
                 label=f"history/{generation[:8]}",
             )
             if target_manifest["generation"] != generation:
                 raise APIError("WORKSPACE_MANIFEST_INVALID", "历史快照 generation 与文件内容不匹配", 502)
 
             saved = repo.store.get("settings", _settings_key(owner_id), owner_id) or {}
-            children_map, _ = _bulk_list_app_entries(wdrive.storage)
-            bundle = _read_plugins_bundle(wdrive, children_map, plugins_fid, saved)
+            children_map, truncated = _bulk_list_app_entries(wdrive.storage)
+            if truncated:
+                raise APIError("WORKSPACE_DRIVE_INCOMPLETE", "Drive 文件列表不完整，无法安全回滚插件快照", 502)
+            bundle = _read_plugins_bundle(wdrive, children_map, plugins_fid, saved, strict_core=True)
             objects_map = bundle["objects"]
 
             missing = [

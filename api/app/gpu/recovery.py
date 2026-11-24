@@ -39,7 +39,16 @@ from .compute import GpuConfig
 from .cu_guard import CuGuardService
 from .instances import POOL_CREATION, POOL_EPHEMERAL, POOL_NATIVE
 from .manifest import digest
-from .repository import GpuAccountRow, GpuEventRow, GpuInstanceRow, GpuJobRow, GpuLeaseRow, GpuWorkflowRow
+from .repository import (
+    GpuAccountRow,
+    GpuBatchRow,
+    GpuEventRow,
+    GpuExecutionRow,
+    GpuInstanceRow,
+    GpuJobRow,
+    GpuLeaseRow,
+    GpuWorkflowRow,
+)
 
 log = logging.getLogger("studio.recovery")
 
@@ -1202,6 +1211,23 @@ def maybe_defer_retry_job_after_cleanup(
                 return None
 
             # Reset job back to waiting_for_capacity with a brand-new attempt_id & recovery_hold=True.
+            old_execution_id = jdata.get("execution_id")
+            if old_execution_id:
+                exec_row = session.get(GpuExecutionRow, old_execution_id)
+                if (
+                    exec_row is not None
+                    and exec_row.owner_id == owner_id
+                    and exec_row.state not in TERMINAL_JOB_STATES
+                ):
+                    exec_row.state = "failed"
+                    exec_row.data = {
+                        **(exec_row.data or {}),
+                        "state": "failed",
+                        "finished_at": now,
+                        "error_code": err_code or "auto_recovery_retry",
+                    }
+                    exec_row.version = int(exec_row.version or 0) + 1
+                    exec_row.updated_at = utcnow()
             old_lease_id = jdata.get("lease_id") or (lease or {}).get("id")
             retry_keys = list(jdata.get("attempt_retry_keys") or [])
             if old_lease_id and old_lease_id not in retry_keys:
@@ -1267,6 +1293,33 @@ def maybe_defer_retry_job_after_cleanup(
             return repo._row(job_row)
 
 
+def _refresh_batch_in_tx(session, owner_id: str, batch_id: str | None) -> None:
+    if not batch_id:
+        return
+    session.flush()
+    batch = session.get(GpuBatchRow, batch_id)
+    if batch is None or batch.owner_id != owner_id:
+        return
+    job_ids = list((batch.data or {}).get("job_ids") or [])
+    if not job_ids:
+        return
+    jobs = list(
+        session.scalars(
+            select(GpuJobRow).where(GpuJobRow.owner_id == owner_id, GpuJobRow.id.in_(job_ids))
+        )
+    )
+    counts = {st: sum(j.state == st for j in jobs) for st in ("completed", "failed", "cancelled")}
+    finished = sum(counts.values())
+    if jobs and finished == len(jobs):
+        bstate = next((name for name, count in counts.items() if count == len(jobs)), "partial")
+    else:
+        bstate = "running" if any(j.state != "queued" for j in jobs) else "queued"
+    batch.state = bstate
+    batch.data = {**(batch.data or {}), "state": bstate, "finished_jobs": finished, "counts": counts}
+    batch.version = int(batch.version or 0) + 1
+    batch.updated_at = utcnow()
+
+
 def _cancel_held_job_in_tx(session, owner_id: str, job_id: str | None, *, state: str, message: str, error_code: str | None = None) -> None:
     if not job_id:
         return
@@ -1281,6 +1334,10 @@ def _cancel_held_job_in_tx(session, owner_id: str, job_id: str | None, *, state:
         if state == "cancelled":
             jdata["cancel_requested"] = True
             jdata["requested_outcome"] = "cancelled"
+            if error_code:
+                jdata["error_code"] = error_code
+            if message:
+                jdata["error_message"] = message
         else:
             jdata["requested_outcome"] = "failed"
             jdata["error_code"] = error_code or "auto_recovery_aborted"
@@ -1290,12 +1347,23 @@ def _cancel_held_job_in_tx(session, owner_id: str, job_id: str | None, *, state:
         job_row.version = int(job_row.version or 0) + 1
         job_row.updated_at = utcnow()
         _emit_event_in_tx(session, owner_id, job_row.project_id, None, job_row.id, state, message)
+        _refresh_batch_in_tx(session, owner_id, jdata.get("batch_id"))
 
 
-def _cancel_scheduled_plan_in_tx(session, owner_id: str, plan: dict[str, Any], now: float, reason: str) -> None:
+def _cancel_scheduled_plan_in_tx(
+    session,
+    owner_id: str,
+    plan: dict[str, Any],
+    now: float,
+    reason: str,
+    *,
+    error_code: str | None = None,
+) -> None:
     job_id = plan.get("active_job_id")
-    _cancel_held_job_in_tx(session, owner_id, job_id, state="cancelled", message=reason)
+    _cancel_held_job_in_tx(session, owner_id, job_id, state="cancelled", message=reason, error_code=error_code)
     plan.update(state="cancelled", cancelled_at=now, updated_at=now, next_retry_at=None, last_error_message=reason)
+    if error_code:
+        plan["last_error_code"] = error_code
     save_plan_in_tx(session, owner_id, plan)
     _emit_event_in_tx(session, owner_id, None, plan.get("source_instance_id"), job_id, "cancelled", reason)
 
@@ -1822,6 +1890,7 @@ def _advance_dispatching(repo, owner_id: str, plan: dict[str, Any], now: float, 
                 if is_native_local:
                     fresh["state"] = "restoring_env"
                     fresh["model_restore_started_at"] = now
+                    fresh["model_restore_last_progress_at"] = now
                     fresh_ns = dict(fresh.get("native_snapshot") or {})
                     fresh_ns["model_restore_job_id"] = restore_job_id
                     fresh_ns["model_restore_state"] = restore_state
@@ -1977,17 +2046,7 @@ def _advance_restoring_env(repo, owner_id: str, plan: dict[str, Any], now: float
                         return True
         return False
 
-    lease_id = plan.get("active_lease_id") or (inst or {}).get("lease_id")
-    lease = repo.get("leases", lease_id, owner_id) if lease_id else None
-    lease_lost = not lease or lease.get("state") == "deleted"
-    started_at = plan.get("model_restore_started_at")
-    if started_at is None:
-        started_at = plan.get("round_started_at") or plan.get("created_at") or now
-    timed_out = now >= float(started_at) + cfg.round_timeout_seconds
-    if lease_lost or timed_out:
-        code = "model_restore_lease_lost" if lease_lost else "model_restore_timeout"
-        message = "继任实例租约已结束，本地模型回拉中止" if lease_lost else "本地模型回拉超过恢复时限"
-        state = "aborted_fatal" if lease_lost else "exhausted"
+    def _finish_restoring_env(state: str, code: str, message: str) -> bool:
         with store.dispatch_lock() as acquired:
             if not acquired:
                 return False
@@ -2003,14 +2062,42 @@ def _advance_restoring_env(repo, owner_id: str, plan: dict[str, Any], now: float
                 snapshot["model_restore_state"] = {
                     **(snapshot.get("model_restore_state") or {}), "state": "failed", "updated_at": now,
                 }
-                fresh.update(state=state, last_error_code=code, last_error_message=message,
-                             updated_at=now, native_snapshot=snapshot)
+                fresh.update(
+                    state=state,
+                    last_error_code=code,
+                    last_error_message=message,
+                    updated_at=now,
+                    native_snapshot=snapshot,
+                )
                 _append_history(fresh, state, now)
                 save_plan_in_tx(session, owner_id, fresh)
                 _emit_event_in_tx(session, owner_id, None, succ_id, fresh.get("active_job_id"), state, message)
                 return True
 
+    lease_id = plan.get("active_lease_id") or (inst or {}).get("lease_id")
+    lease = repo.get("leases", lease_id, owner_id) if lease_id else None
+    lease_lost = (
+        not lease
+        or lease.get("state") in {"deleted", "quarantined"}
+        or (inst is not None and inst.get("state") == "deleted")
+    )
+    if lease_lost:
+        return _finish_restoring_env("aborted_fatal", "model_restore_lease_lost", "继任实例租约已结束，本地模型回拉中止")
+
     ns = dict(plan.get("native_snapshot") or {})
+    prev_state = ns.get("model_restore_state") if isinstance(ns.get("model_restore_state"), dict) else {}
+    last_progress_at = (
+        plan.get("model_restore_last_progress_at")
+        or plan.get("model_restore_started_at")
+        or plan.get("round_started_at")
+        or plan.get("created_at")
+        or now
+    )
+    hard_deadline = plan.get("hard_deadline_at")
+    hard_expired = hard_deadline is not None and now >= float(hard_deadline)
+    poll_timed_out = now >= float(last_progress_at) + cfg.round_timeout_seconds
+    stall_timeout_seconds = max(float(cfg.round_timeout_seconds), 1800.0)
+
     restore_job_id = ns.get("model_restore_job_id")
     if not restore_job_id:
         if not ns.get("recoverable_models"):
@@ -2029,6 +2116,8 @@ def _advance_restoring_env(repo, owner_id: str, plan: dict[str, Any], now: float
         try:
             restore_job_id, restore_state = _trigger_native_model_restore(repo, owner_id, plan, lease, now)
         except Exception:
+            if poll_timed_out or hard_expired:
+                return _finish_restoring_env("exhausted", "model_restore_timeout", "本地模型回拉超过恢复时限")
             return False
         with store.dispatch_lock() as acquired:
             if acquired:
@@ -2040,6 +2129,7 @@ def _advance_restoring_env(repo, owner_id: str, plan: dict[str, Any], now: float
                         fresh_ns["model_restore_job_id"] = restore_job_id
                         fresh_ns["model_restore_state"] = restore_state
                         fresh["native_snapshot"] = fresh_ns
+                        fresh["model_restore_last_progress_at"] = now
                         fresh["updated_at"] = now
                         save_plan_in_tx(session, owner_id, fresh)
                         return True
@@ -2047,7 +2137,26 @@ def _advance_restoring_env(repo, owner_id: str, plan: dict[str, Any], now: float
 
     progress = _poll_native_model_restore(repo, owner_id, lease, restore_job_id, now)
     if progress is None:
+        if poll_timed_out or hard_expired:
+            return _finish_restoring_env("exhausted", "model_restore_timeout", "本地模型回拉超过恢复时限")
         return False
+
+    if progress["state"] not in {"ready", "partial_disk_limit", "failed"}:
+        prev_done = (
+            int(prev_state.get("completed") or 0)
+            + int(prev_state.get("failed") or 0)
+            + int(prev_state.get("skipped") or 0)
+        )
+        curr_done = (
+            int(progress.get("completed") or 0)
+            + int(progress.get("failed") or 0)
+            + int(progress.get("skipped") or 0)
+        )
+        made_progress = curr_done > prev_done
+        if not made_progress and (hard_expired or now >= float(last_progress_at) + stall_timeout_seconds):
+            return _finish_restoring_env("exhausted", "model_restore_timeout", "本地模型回拉长时间无进展，已中止等待")
+    else:
+        made_progress = True
 
     with store.dispatch_lock() as acquired:
         if not acquired:
@@ -2060,6 +2169,8 @@ def _advance_restoring_env(repo, owner_id: str, plan: dict[str, Any], now: float
             fresh_ns = dict(fresh.get("native_snapshot") or {})
             fresh_ns["model_restore_state"] = progress
             fresh["native_snapshot"] = fresh_ns
+            if made_progress:
+                fresh["model_restore_last_progress_at"] = now
             if progress["state"] in {"ready", "partial_disk_limit", "failed"}:
                 fresh["state"] = "recovered"
                 outcome = "partial_disk_limit" if progress.get("partial_disk_limit") else "recovered"
@@ -2100,7 +2211,14 @@ def _advance_scheduled(
                 fresh = get_plan_in_tx(session, owner_id, plan["plan_id"])
                 if not fresh or fresh.get("state") != "scheduled":
                     return False
-                _cancel_scheduled_plan_in_tx(session, owner_id, fresh, now, "跨机自动恢复已关闭，已取消等待中的恢复计划")
+                _cancel_scheduled_plan_in_tx(
+                    session,
+                    owner_id,
+                    fresh,
+                    now,
+                    "跨机自动恢复已关闭，已取消等待中的恢复计划",
+                    error_code="disabled",
+                )
                 return True
     next_retry_at = float(plan.get("next_retry_at") or 0.0)
     round_started = float(plan.get("round_started_at") or now)

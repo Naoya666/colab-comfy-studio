@@ -635,6 +635,89 @@ def test_linked_workflow_action_can_retry_after_conflict_and_drive_write_failure
         drive.close()
 
 
+def test_plugin_mutations_and_conflict_checks_fail_closed_on_drive_errors(tmp_path, monkeypatch):
+    repo = Repository(Store(f"sqlite:///{tmp_path}/studio.db"))
+    backend = FakeDriveBackend()
+    seeded = _seed_workspace(backend)
+    disabled_id = backend.put_json("disabled.json", seeded["plugins_dir"], {
+        "schema": 1,
+        "plugins": [{"entry": {"path": "kept-disabled", "archive": seeded["sha_orphan"]}}],
+    })
+    disabled_before = backend.content[disabled_id]
+    pending_id = backend.children_named(seeded["plugins_dir"], "pending.json")[0]["id"]
+    pending_before = backend.content[pending_id]
+    anima_dir = backend.children_named(seeded["wfs"], "anime")[0]["id"]
+    anima_id = backend.children_named(anima_dir, "Anima-修复版.json")[0]["id"]
+    original_request = backend.handler
+    fail_target = {"mode": None}
+
+    def request(req):
+        if req.method == "GET" and req.url.params.get("alt") == "media":
+            if fail_target["mode"] == "disabled_503" and req.url.path.endswith("/" + disabled_id):
+                return httpx.Response(503)
+            if fail_target["mode"] == "pending_503" and req.url.path.endswith("/" + pending_id):
+                return httpx.Response(503)
+            if fail_target["mode"] == "workflow_503" and req.url.path.endswith("/" + anima_id):
+                return httpx.Response(503)
+        response = original_request(req)
+        if fail_target["mode"] == "incomplete" and req.url.path == "/drive/v3/files" and req.url.params.get("pageSize") == "1000":
+            return httpx.Response(200, json={**response.json(), "incompleteSearch": True})
+        return response
+
+    monkeypatch.setattr(backend, "handler", request)
+    drive = _make_fake_drive_storage(repo, "owner", backend)
+    monkeypatch.setattr(drive, "sleeper", lambda delay: None)
+    try:
+        # 1. Transient 503 on disabled.json during plugin disable must NOT overwrite & wipe existing disabled.json
+        fail_target["mode"] = "disabled_503"
+        with pytest.raises(APIError) as exc1:
+            native_workspace.apply_plugin_action(
+                repo, "owner", action="disable", paths=["comfyui-autocomplete-aaalice"], force_in_use=True, drive=drive,
+            )
+        assert exc1.value.code == "WORKSPACE_MANIFEST_UNREADABLE"
+        assert backend.content[disabled_id] == disabled_before
+        assert backend.content[pending_id] == pending_before
+
+        # 2. Transient 503 on pending.json during plugin disable must NOT silently fall back to head.json
+        fail_target["mode"] = "pending_503"
+        with pytest.raises(APIError) as exc2:
+            native_workspace.apply_plugin_action(
+                repo, "owner", action="disable", paths=["comfyui-autocomplete-aaalice"], force_in_use=True, drive=drive,
+            )
+        assert exc2.value.code == "WORKSPACE_MANIFEST_UNREADABLE"
+        assert backend.content[pending_id] == pending_before
+
+        # 3. Incomplete Drive listing blocks rollback_plugins
+        fail_target["mode"] = "incomplete"
+        with pytest.raises(APIError) as exc3:
+            native_workspace.rollback_plugins(repo, "owner", generation=seeded["gen_head"], drive=drive)
+        assert exc3.value.code == "WORKSPACE_DRIVE_INCOMPLETE"
+
+        # 4. Transient 503 reading another active workflow JSON must fail closed during PLUGIN_IN_USE check
+        fail_target["mode"] = "workflow_503"
+        with pytest.raises(APIError) as exc4:
+            native_workspace.apply_workflow_action(
+                repo, "owner", action="archive", items=[{"source": "comfy", "path": "工作流1.json"}],
+                also_plugins={"action": "disable", "paths": ["comfyui-kjnodes"]}, drive=drive,
+            )
+        assert exc4.value.code == "WORKSPACE_DRIVE_ERROR"
+        # Neither workflow moved nor empty destination folder created on pre-check failure!
+        assert backend.children_named(seeded["wfs"], "工作流1.json")
+        assert backend.children_named(seeded["nc"], "workflows-archived") == []
+
+        # 5. Clean 409 PLUGIN_IN_USE also creates zero empty destination folders in Drive
+        fail_target["mode"] = None
+        with pytest.raises(APIError) as exc5:
+            native_workspace.apply_workflow_action(
+                repo, "owner", action="archive", items=[{"source": "comfy", "path": "工作流1.json"}],
+                also_plugins={"action": "disable", "paths": ["comfyui-kjnodes"]}, drive=drive,
+            )
+        assert exc5.value.code == "PLUGIN_IN_USE"
+        assert backend.children_named(seeded["nc"], "workflows-archived") == []
+    finally:
+        drive.close()
+
+
 def test_offline_lock_blocks_writes_when_native_active_and_blocks_admit_while_writing(tmp_path: Path, monkeypatch):
     store = Store(f"sqlite:///{tmp_path}/studio.db")
     repo = Repository(store)
