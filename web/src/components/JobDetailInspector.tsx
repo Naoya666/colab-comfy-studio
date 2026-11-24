@@ -86,15 +86,23 @@ export function JobDetailInspector({
                   </p>
                 )}
                 {Array.isArray(inspectedJob.allocation_retry.history) && inspectedJob.allocation_retry.history.length > 0 && (
-                  <ul className={styles.activityLogList}>
-                    {inspectedJob.allocation_retry.history.map((entry, idx) => (
-                      <li key={`${entry.attempt}-${idx}`} className={styles.activityLogItem}>
-                        <span className={styles.activityLogText}>
-                          第 {entry.attempt} 次 · {entry.account_alias || entry.account_id || '账号'} · {formatRetrySpec(entry.spec)} · {entry.error_code || '失败'}
-                          {entry.error_message ? `：${entry.error_message}` : ''}
-                        </span>
-                      </li>
-                    ))}
+                  <ul className={styles.retryHistoryList}>
+                    {inspectedJob.allocation_retry.history.map((entry, idx) => {
+                      const timeText = entry.at ? new Date(entry.at * 1000).toLocaleTimeString([], { hour12: false }) : '';
+                      return (
+                        <li key={`${entry.attempt}-${idx}`} className={styles.retryHistoryItem}>
+                          <div className={styles.retryHistoryHead}>
+                            <span className={styles.retryHistoryTitle}>
+                              第 {entry.attempt} 次 · {entry.account_alias || entry.account_id || '账号'} · {formatRetrySpec(entry.spec)}
+                            </span>
+                            {timeText && <span className={styles.activityLogTime}>{timeText}</span>}
+                          </div>
+                          <p className={styles.retryHistoryDetail}>
+                            {entry.error_message || entry.error_code || '分配失败'}
+                          </p>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </div>

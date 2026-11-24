@@ -4307,6 +4307,48 @@
   border: 1px solid var(--warning-line, rgba(255, 210, 125, 0.45));
   background: var(--warning-bg, rgba(255, 210, 125, 0.08));
 }
+.retryHistoryList {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 8px 0 0;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  max-height: 36dvh;
+  overflow: auto;
+}
+.retryHistoryItem {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--line);
+}
+.retryHistoryItem:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+.retryHistoryHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.retryHistoryTitle {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.retryHistoryDetail {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
 .recoveryRestoreHead {
   display: flex;
   align-items: center;
