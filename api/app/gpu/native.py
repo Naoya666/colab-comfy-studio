@@ -655,6 +655,43 @@ def runtime_secrets(repo, job):
         local = storage["model_storage_mode"] == "local"
         default = AccountService.default_account_id(job["owner_id"])
         drive_account = drive.account_id or default
+        # Pin the exact resolved Drive storage account mounted by this runtime onto both
+        # the job and its lease so mid-launch or mid-session rebindings cannot misroute sync_plugins.
+        mounted_drive = drive.account_id.strip() if isinstance(drive.account_id, str) and drive.account_id.strip() else None
+        if mounted_drive and repo is not None and hasattr(repo, "get") and hasattr(repo, "update"):
+            owner_id = job["owner_id"]
+            job_id = job.get("id")
+            if isinstance(job_id, str) and job_id:
+                try:
+                    existing_job = repo.get("jobs", job_id, owner_id)
+                    if isinstance(existing_job, dict) and (
+                        existing_job.get("native_drive_account_id") != mounted_drive
+                        or existing_job.get("drive_account_id") != mounted_drive
+                    ):
+                        repo.update(
+                            "jobs",
+                            job_id,
+                            {"native_drive_account_id": mounted_drive, "drive_account_id": mounted_drive},
+                            owner_id,
+                        )
+                except Exception:
+                    pass
+            lease_id = job.get("lease_id")
+            if isinstance(lease_id, str) and lease_id:
+                try:
+                    existing_lease = repo.get("leases", lease_id, owner_id)
+                    if isinstance(existing_lease, dict) and (
+                        existing_lease.get("native_drive_account_id") != mounted_drive
+                        or existing_lease.get("drive_account_id") != mounted_drive
+                    ):
+                        repo.update(
+                            "leases",
+                            lease_id,
+                            {"native_drive_account_id": mounted_drive, "drive_account_id": mounted_drive},
+                            owner_id,
+                        )
+                except Exception:
+                    pass
         refresh_token = decrypt_secret(cred["encrypted_refresh_token"])
         extra = {}
         if local:
@@ -1328,7 +1365,25 @@ def sync_plugins(repo, lease, client=None, *, return_state=False):
     with repo.store.dispatch_lock() as acquired:
         if not acquired:
             return (status, state_payload) if return_state else status
+        if active_workspace_write_lock(repo, owner):
+            return (status, state_payload) if return_state else status
+        lease_id = lease.get("id")
+        verified_live_lease = False
+        if isinstance(lease_id, str) and lease_id:
+            fresh_lease = repo.get("leases", lease_id, owner)
+            live = active_lease(repo, owner)
+            if fresh_lease is not None or live is not None:
+                if (
+                    fresh_lease is None
+                    or live is None
+                    or live.get("id") != lease_id
+                    or _lease_identity(fresh_lease) != identity
+                ):
+                    return (status, state_payload) if return_state else status
+                verified_live_lease = True
         saved = repo.store.get("settings", key, owner) or {}
+        if not verified_live_lease and isinstance(saved.get("offline_pending"), dict):
+            return (status, state_payload) if return_state else status
         history = saved.get("history", [])
         if manifest and (not history or history[-1]["generation"] != manifest["generation"]):
             history = [*history, manifest][-20:]

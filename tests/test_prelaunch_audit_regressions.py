@@ -1816,5 +1816,324 @@ def test_audit4_fix3_empty_default_drive_never_displays_legacy_untagged_cache(tm
         drive_none.close()
 
 
+# ---------------------------------------------------------------------------
+# Fifth-Round Audit Fixes (1-4)
+# ---------------------------------------------------------------------------
+
+
+def test_audit5_fix1_upgrade_reconciles_95fc412_legacy_default_drive_pending_commit(tmp_path):
+    import json
+
+    from app.gpu import native_workspace
+    from test_native_workspace import FakeDriveBackend, _make_fake_drive_storage, _seed_workspace
+
+    store = Store(f"sqlite:///{tmp_path / 'audit5_fix1.db'}")
+    repo = Repository(store)
+    default_id = accounts_mod.AccountService.default_account_id("owner")
+    backend = FakeDriveBackend()
+    seeded = _seed_workspace(backend)
+
+    # First disable LanPaint cleanly, then simulate a 95fc412 mid-commit lock loss during enable:
+    # Drive has pending.json updated (LanPaint added) AND disabled.json still containing LanPaint,
+    # while 95fc412 stored pending_commit in the LEGACY key tagged with drive_account_id=default_id.
+    drive_setup = _make_fake_drive_storage(repo, "owner", backend)
+    drive_setup.account_id = default_id
+    try:
+        native_workspace.apply_plugin_action(
+            repo, "owner", action="disable", paths=["LanPaint"], force_in_use=True, drive=drive_setup
+        )
+        pending_id = backend.children_named(seeded["plugins_dir"], "pending.json")[0]["id"]
+        disabled_id = backend.children_named(seeded["plugins_dir"], "disabled.json")[0]["id"]
+        head_id = backend.children_named(seeded["plugins_dir"], "head.json")[0]["id"]
+
+        head_doc = json.loads(backend.content[head_id].decode("utf-8"))
+        pending_disabled_doc = json.loads(backend.content[pending_id].decode("utf-8"))
+        disabled_before_doc = json.loads(backend.content[disabled_id].decode("utf-8"))
+        target_disabled_doc = {"schema": 1, "updated_at": 1700000500.0, "plugins": []}
+
+        # Simulate Write 1 (pending.json -> head_doc with LanPaint) landed, Write 2 (disabled.json) cut off.
+        backend.content[pending_id] = json.dumps(head_doc).encode("utf-8")
+
+        legacy_key = native.plugin_settings_key("owner", None)
+        new_key = native.plugin_settings_key("owner", default_id)
+        # Clear new key so only the 95fc412 legacy key holds the pending_commit!
+        if repo.store.get("settings", new_key, "owner"):
+            repo.store.update("settings", new_key, {"pending_commit": None, "offline_pending": None, "drive_account_id": default_id}, "owner")
+        legacy_journal = {
+            "id": "legacy-95fc412-commit",
+            "action": "enable",
+            "created_at": 1700000500.0,
+            "base_head_generation": head_doc["generation"],
+            "base_pending_generation": pending_disabled_doc["generation"],
+            "disabled_changed": True,
+            "base_disabled_present": True,
+            "base_disabled_digest": native_workspace._disabled_entries_digest(
+                native_workspace._parse_disabled_doc(disabled_before_doc)
+            ),
+            "base_disabled_doc": disabled_before_doc,
+            "target_pending": head_doc,
+            "target_disabled": target_disabled_doc,
+            "target_disabled_digest": native_workspace._disabled_entries_digest([]),
+        }
+        repo.store.create(
+            "settings",
+            "owner",
+            {"drive_account_id": default_id, "pending_commit": legacy_journal},
+            record_id=legacy_key,
+        )
+
+        # Retry enable after upgrading -> MUST reconcile legacy journal instead of raising PLUGIN_ALREADY_ACTIVE!
+        res = native_workspace.apply_plugin_action(
+            repo, "owner", action="enable", paths=["LanPaint"], drive=drive_setup
+        )
+        assert res["generation"] == seeded["gen_head"]
+        assert any(p["path"] == "LanPaint" for p in json.loads(backend.content[pending_id].decode("utf-8"))["plugins"])
+        assert not any(d["entry"]["path"] == "LanPaint" for d in json.loads(backend.content[disabled_id].decode("utf-8"))["plugins"])
+
+        legacy_after = repo.store.get("settings", legacy_key, "owner")
+        new_after = repo.store.get("settings", new_key, "owner")
+        assert legacy_after.get("pending_commit") is None
+        assert new_after["offline_pending"]["generation"] == seeded["gen_head"]
+        assert new_after["drive_account_id"] == default_id
+    finally:
+        drive_setup.close()
+
+
+def test_audit5_fix2_runtime_secrets_and_scheduler_pin_actual_mounted_drive_after_prelaunch_rebind(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+    from app.gpu import drive as drive_mod
+    from app.gpu.scheduler import GpuConfig, Scheduler
+
+    monkeypatch.setattr(settings, "encryption_key", Fernet.generate_key().decode())
+    store = Store(f"sqlite:///{tmp_path / 'audit5_fix2.db'}")
+    repo = Repository(store)
+    for acc_id, alias in (("acc-a", "Compute A"), ("acc-b", "Drive B"), ("acc-c", "Drive C")):
+        repo.create("accounts", "owner", {"account_id": acc_id, "alias": alias, "enabled": True, "connected": True}, record_id=acc_id)
+        repo.create(
+            "credentials",
+            "owner",
+            {
+                "provider": "google",
+                "purpose": "drive",
+                "account_id": acc_id,
+                "revoked": False,
+                "encrypted_refresh_token": security.encrypt_secret(f"refresh-{acc_id}"),
+                "client_id": f"cid-{acc_id}",
+                "encrypted_client_secret": security.encrypt_secret(f"csec-{acc_id}"),
+            },
+        )
+
+    # Allocation initially stored drive_account_id=acc-a on both job and lease.
+    job = repo.create(
+        "jobs",
+        "owner",
+        {
+            "state": "preparing",
+            "provider": "colab",
+            "account_id": "acc-a",
+            "drive_account_id": "acc-a",
+            "instance_id": "inst-1",
+            "execution_policy": {"model_storage_mode": "drive_mount"},
+            "snapshot": {"native_comfy": True},
+        },
+    )
+    inst = repo.create(
+        "instances",
+        "owner",
+        {"state": "busy", "provider": "colab", "account_id": "acc-a", "native_comfy": True},
+        record_id="inst-1",
+    )
+    lease = repo.create(
+        "leases",
+        "owner",
+        {
+            "state": "active",
+            "provider": "colab",
+            "account_id": "acc-a",
+            "drive_account_id": "acc-a",
+            "instance_id": inst["id"],
+            "owner_job_id": job["id"],
+            "native_comfy": True,
+            "deadline_epoch": 1_800_000_000.0,
+            "handle": {"runtime_name": "runtimes/rt-1", "endpoint": "ep-1"},
+        },
+    )
+    job = repo.update("jobs", job["id"], {"lease_id": lease["id"]}, "owner")
+
+    # BEFORE launch (runtime_secrets), user rebinds acc-a -> acc-b!
+    repo.update("accounts", "acc-a", {"drive_account_id": "acc-b"}, "owner")
+
+    monkeypatch.setattr(drive_mod.DriveStorage, "model_cache", lambda self: {"folder_id": "models-b", "access_token": "tok-b"})
+    monkeypatch.setattr(native, "secret_file", lambda _name: "tunnel-secret")
+    monkeypatch.setattr(native, "ready_models", lambda _r, _o, _acc: [])
+
+    secrets = native.runtime_secrets(repo, job)
+    assert secrets["refresh_token"] == "refresh-acc-b"
+
+    # runtime_secrets MUST immediately pin the actually mounted Drive B onto both job and lease!
+    fresh_job = repo.get("jobs", job["id"], "owner")
+    fresh_lease = repo.get("leases", lease["id"], "owner")
+    assert fresh_job["native_drive_account_id"] == "acc-b"
+    assert fresh_job["drive_account_id"] == "acc-b"
+    assert fresh_lease["native_drive_account_id"] == "acc-b"
+    assert fresh_lease["drive_account_id"] == "acc-b"
+
+    # Even if acc-a is rebound AGAIN to acc-c before scheduler marks native_ready, lease keeps acc-b!
+    repo.update("accounts", "acc-a", {"drive_account_id": "acc-c"}, "owner")
+
+    class _ReadyExecutor:
+        def poll(self, _handle, _job):
+            return {"state": "completed"}
+
+    monkeypatch.setattr(native, "ready_for", lambda *_a, **_kw: True)
+    sched = Scheduler(
+        repo,
+        executor_factory=lambda _j: _ReadyExecutor(),
+        config=GpuConfig(enabled=True, real_enabled=True),
+        clock=lambda: 1_700_000_000.0,
+    )
+    sched._run(repo.get("jobs", job["id"], "owner"))
+    ready_lease = repo.get("leases", lease["id"], "owner")
+    assert ready_lease["native_ready"] is True
+    assert ready_lease["native_drive_account_id"] == "acc-b"
+    assert ready_lease["drive_account_id"] == "acc-b"
+
+    plugins_b = [
+        {"path": "NodeOnB", "checksum": "1" * 64, "enabled": True, "repo": None, "commit": None, "version": "1.0", "archive": "b" * 64, "kind": "directory"}
+    ]
+    manifest_b = {"schema": 1, "plugins": plugins_b, "generation": node_persistence.digest(plugins_b)}
+    monkeypatch.setattr(native, "backend", lambda: ("https://internal.example.test", {}))
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"busy": False, "plugins": {"manifest": manifest_b, "durable": True}})
+        )
+    ) as client:
+        native.sync_plugins(repo, ready_lease, client=client)
+
+    assert repo.store.get("settings", native.plugin_settings_key("owner", "acc-b"), "owner")["manifest"]["generation"] == manifest_b["generation"]
+    assert repo.store.get("settings", native.plugin_settings_key("owner", "acc-a"), "owner") is None
+    assert repo.store.get("settings", native.plugin_settings_key("owner", "acc-c"), "owner") is None
+
+
+def test_audit5_fix3_active_only_remove_backfills_offline_pending_after_post_write_lock_expiry(tmp_path):
+    from app.gpu import native_workspace
+    from test_native_workspace import FakeDriveBackend, _make_fake_drive_storage, _seed_workspace
+
+    store = Store(f"sqlite:///{tmp_path / 'audit5_fix3.db'}")
+    repo = Repository(store)
+    backend = FakeDriveBackend()
+    seeded = _seed_workspace(backend)
+    pending_id = backend.children_named(seeded["plugins_dir"], "pending.json")[0]["id"]
+
+    # Expire lock right after pending.json PATCH succeeds (before _mirror_committed_manifest runs).
+    orig_handler = backend.handler
+    expired = {"fired": False}
+
+    def expire_after_pending_patch(req: httpx.Request) -> httpx.Response:
+        resp = orig_handler(req)
+        if not expired["fired"] and req.method == "PATCH" and req.url.path == f"/upload/drive/v3/files/{pending_id}":
+            expired["fired"] = True
+            repo.store.update("settings", native._workspace_lock_key("owner"), {"expires_at": 1.0}, "owner")
+        return resp
+
+    backend.handler = expire_after_pending_patch
+    drive = _make_fake_drive_storage(repo, "owner", backend)
+    try:
+        res1 = native_workspace.apply_plugin_action(
+            repo, "owner", action="remove", paths=["LanPaint"], force_in_use=True, drive=drive
+        )
+        assert res1["changed_paths"] == ["LanPaint"]
+        new_gen = res1["generation"]
+
+        # Mirror was skipped due to post-write lock expiry, but pending_commit journal was recorded!
+        saved_mid = repo.store.get("settings", native.plugin_settings_key("owner"), "owner")
+        assert saved_mid.get("offline_pending") is None
+        assert isinstance(saved_mid.get("pending_commit"), dict)
+        assert saved_mid["pending_commit"]["disabled_changed"] is False
+
+        # Retrying remove hits no_op, yet reconciliation backfills offline_pending & clears pending_commit!
+        backend.handler = orig_handler
+        res2 = native_workspace.apply_plugin_action(
+            repo, "owner", action="remove", paths=["LanPaint"], force_in_use=True, drive=drive
+        )
+        assert res2["no_op"] is True
+        assert res2["generation"] == new_gen
+        saved_after = repo.store.get("settings", native.plugin_settings_key("owner"), "owner")
+        assert saved_after["offline_pending"]["generation"] == new_gen
+        assert saved_after["status"]["pending_generation"] == new_gen
+        assert saved_after.get("pending_commit") is None
+    finally:
+        backend.handler = orig_handler
+        drive.close()
+
+
+def test_audit5_fix4_late_sync_plugins_response_from_exited_lease_cannot_clear_offline_pending(tmp_path, monkeypatch):
+    from app.gpu import native_workspace
+    from test_native_workspace import FakeDriveBackend, _make_fake_drive_storage, _seed_workspace
+
+    store = Store(f"sqlite:///{tmp_path / 'audit5_fix4.db'}")
+    repo = Repository(store)
+    backend = FakeDriveBackend()
+    seeded = _seed_workspace(backend)
+    drive = _make_fake_drive_storage(repo, "owner", backend)
+    drive.account_id = "acc-a"
+
+    old_plugins = [
+        {"path": "LanPaint", "checksum": "1" * 64, "enabled": True, "repo": None, "commit": None, "version": "2.1.0", "archive": seeded["sha_lanpaint"], "kind": "directory"}
+    ]
+    old_manifest = {"schema": 1, "plugins": old_plugins, "generation": node_persistence.digest(old_plugins)}
+
+    lease = repo.create(
+        "leases",
+        "owner",
+        {
+            "state": "active",
+            "native_comfy": True,
+            "native_ready": True,
+            "account_id": "acc-a",
+            "native_drive_account_id": "acc-a",
+            "runtime_id": "rt-old",
+            "request_id": "req-old",
+        },
+    )
+
+    offline_gen = {"value": None}
+
+    def delayed_state_handler(_req: httpx.Request) -> httpx.Response:
+        # While sync_plugins HTTP request is in flight:
+        # 1) Old instance exits (lease transitions to deleted).
+        repo.update("leases", lease["id"], {"state": "deleted"}, "owner")
+        # 2) Offline plugin removal commits a brand-new pending.json & offline_pending.
+        res = native_workspace.apply_plugin_action(
+            repo, "owner", action="remove", paths=["LanPaint"], force_in_use=True, drive=drive
+        )
+        offline_gen["value"] = res["generation"]
+        # 3) Stale response from the exited instance finally arrives carrying old pending_generation!
+        return httpx.Response(
+            200,
+            json={
+                "busy": False,
+                "plugins": {
+                    "manifest": old_manifest,
+                    "pending_generation": old_manifest["generation"],
+                    "durable": True,
+                },
+            },
+        )
+
+    monkeypatch.setattr(native, "backend", lambda: ("https://internal.example.test", {}))
+    try:
+        with httpx.Client(transport=httpx.MockTransport(delayed_state_handler)) as client:
+            native.sync_plugins(repo, lease, client=client)
+
+        saved = repo.store.get("settings", native.plugin_settings_key("owner", "acc-a"), "owner")
+        assert offline_gen["value"] is not None
+        assert saved["offline_pending"]["generation"] == offline_gen["value"]
+        assert saved["status"]["pending_generation"] == offline_gen["value"]
+    finally:
+        drive.close()
+
+
+
 
 

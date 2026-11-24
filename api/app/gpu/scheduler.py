@@ -1247,7 +1247,16 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     "deadline_epoch": deadline,
                     "native_idle_minutes": idle_minutes,
                 }
-                pinned_drive = job.get("drive_account_id")
+                pinned_drive = (
+                    lease.get("native_drive_account_id")
+                    or job.get("native_drive_account_id")
+                )
+                if not (isinstance(pinned_drive, str) and pinned_drive.strip()):
+                    raw_drive = job.get("drive_account_id") or job.get("account_id")
+                    if isinstance(raw_drive, str) and raw_drive.strip():
+                        from .accounts import AccountService
+
+                        pinned_drive = AccountService(self.store, job["owner_id"]).resolve_drive_account_id(raw_drive.strip())
                 if isinstance(pinned_drive, str) and pinned_drive.strip():
                     lease_ready_patch["native_drive_account_id"] = pinned_drive.strip()
                     lease_ready_patch["drive_account_id"] = pinned_drive.strip()

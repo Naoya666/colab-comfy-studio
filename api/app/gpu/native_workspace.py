@@ -107,6 +107,7 @@ def _update_plugin_settings(
     mutate: Callable[[dict[str, Any]], dict[str, Any]],
     *,
     write_lease: _WorkspaceWriteLease | None = None,
+    settings_key: str | None = None,
     timeout: float = 2.0,
     fail_on_timeout: bool = False,
     fail_on_lock_lost: bool = False,
@@ -115,7 +116,7 @@ def _update_plugin_settings(
         if fail_on_lock_lost:
             raise APIError("NATIVE_WORKSPACE_LOCK_LOST", "离线工作区写锁已失效或原生实例已启动，已中止后续写入", 409)
         return False
-    key = _settings_key(owner_id, drive_account_id)
+    key = settings_key or _settings_key(owner_id, drive_account_id)
     deadline = time.monotonic() + max(0.0, float(timeout))
     while True:
         with repo.store.dispatch_lock() as acquired:
@@ -1684,6 +1685,7 @@ def _clear_pending_commit(
     commit_id: str,
     *,
     write_lease: _WorkspaceWriteLease | None = None,
+    settings_key: str | None = None,
     fail_on_lock_lost: bool = False,
 ) -> None:
     try:
@@ -1699,6 +1701,7 @@ def _clear_pending_commit(
             drive_account_id,
             _clear,
             write_lease=write_lease,
+            settings_key=settings_key,
             timeout=2.0,
             fail_on_timeout=fail_on_lock_lost,
             fail_on_lock_lost=fail_on_lock_lost,
@@ -1719,24 +1722,79 @@ def _reconcile_pending_plugin_commit(
     *,
     write_lease: _WorkspaceWriteLease | None = None,
 ) -> bool:
-    """Reconcile any half-applied two-file plugin manifest commit under the active write lock."""
+    """Reconcile any unfinished plugin manifest commit (two-file or single-file) under the active write lock."""
     saved = _load_plugin_settings(repo, owner_id, drive_account_id)
     journal = saved.get("pending_commit")
-    if not isinstance(journal, dict) or not isinstance(journal.get("id"), str) or not journal["id"]:
+    journal_legacy_key: str | None = None
+    if not (isinstance(journal, dict) and isinstance(journal.get("id"), str) and journal["id"]):
+        journal = None
+        # Upgrade compatibility: 95fc412 stored default_account_id's pending_commit in the legacy
+        # user-level key WITH explicit drive_account_id == default_account_id. Only pick up rows
+        # explicitly tagged for this exact default account (never untagged pre-isolation rows).
+        if drive_account_id is not None:
+            from .accounts import AccountService
+
+            if drive_account_id == AccountService.default_account_id(owner_id):
+                legacy_key = _settings_key(owner_id, None)
+                legacy_row = repo.store.get("settings", legacy_key, owner_id) or {}
+                if isinstance(legacy_row, dict) and legacy_row.get("drive_account_id") == drive_account_id:
+                    legacy_journal = legacy_row.get("pending_commit")
+                    if (
+                        isinstance(legacy_journal, dict)
+                        and isinstance(legacy_journal.get("id"), str)
+                        and legacy_journal["id"]
+                    ):
+                        journal = legacy_journal
+                        journal_legacy_key = legacy_key
+    if journal is None:
         return False
+
     commit_id = journal["id"]
     target_pending = journal.get("target_pending")
     target_disabled = journal.get("target_disabled")
+    disabled_changed = journal.get("disabled_changed")
+    if disabled_changed is None:
+        disabled_changed = target_disabled is not None
+
+    def _clear_journal() -> None:
+        _clear_pending_commit(
+            repo,
+            owner_id,
+            drive_account_id,
+            commit_id,
+            write_lease=write_lease,
+            settings_key=journal_legacy_key,
+            fail_on_lock_lost=True,
+        )
+
+    def _mirror_and_clear(now_ts: float) -> None:
+        _mirror_committed_manifest(
+            repo,
+            owner_id,
+            drive_account_id,
+            target_pending,
+            existing_history=[],
+            now=now_ts,
+            clear_pending_commit_id=None if journal_legacy_key else commit_id,
+            write_lease=write_lease,
+            fail_on_lock_lost=True,
+        )
+        if journal_legacy_key is not None:
+            _clear_journal()
+
     if (
         not isinstance(target_pending, dict)
         or not isinstance(target_pending.get("generation"), str)
         or not isinstance(target_pending.get("plugins"), list)
-        or not isinstance(target_disabled, dict)
-        or not isinstance(target_disabled.get("plugins"), list)
-    ):
-        _clear_pending_commit(
-            repo, owner_id, drive_account_id, commit_id, write_lease=write_lease, fail_on_lock_lost=True
+        or (
+            disabled_changed
+            and (
+                not isinstance(target_disabled, dict)
+                or not isinstance(target_disabled.get("plugins"), list)
+            )
         )
+    ):
+        _clear_journal()
         return False
 
     def _read_optional_json(name: str) -> Any:
@@ -1772,14 +1830,7 @@ def _reconcile_pending_plugin_commit(
 
     base_head_gen = journal.get("base_head_generation")
     base_pending_gen = journal.get("base_pending_generation")
-    base_disabled_present = bool(journal.get("base_disabled_present"))
-    base_disabled_doc = journal.get("base_disabled_doc")
-    base_disabled_entries = _parse_disabled_doc(base_disabled_doc)
-    base_disabled_digest = journal.get("base_disabled_digest") or _disabled_entries_digest(base_disabled_entries)
-
     target_gen = target_pending["generation"]
-    target_disabled_entries = _parse_disabled_doc(target_disabled)
-    target_disabled_digest = journal.get("target_disabled_digest") or _disabled_entries_digest(target_disabled_entries)
     action = str(journal.get("action") or "")
     now = time.time()
 
@@ -1792,14 +1843,29 @@ def _reconcile_pending_plugin_commit(
         with _HISTORY_CACHE_LOCK:
             _HISTORY_JSON_CACHE[(owner_id, str(drive_account_id or wdrive.storage.account_id or "default"), target_gen)] = target_pending
 
+    # Single-file pending.json commit (e.g. removing active-only plugins without touching disabled.json).
+    if not disabled_changed:
+        if cur_pending_gen == target_gen:
+            _ensure_history_written()
+            _mirror_and_clear(now)
+            invalidate_workspace_cache(owner_id)
+            invalidate_drive_usage_cache(owner_id)
+            return True
+        _clear_journal()
+        return False
+
+    base_disabled_present = bool(journal.get("base_disabled_present"))
+    base_disabled_doc = journal.get("base_disabled_doc")
+    base_disabled_entries = _parse_disabled_doc(base_disabled_doc)
+    base_disabled_digest = journal.get("base_disabled_digest") or _disabled_entries_digest(base_disabled_entries)
+
+    target_disabled_entries = _parse_disabled_doc(target_disabled)
+    target_disabled_digest = journal.get("target_disabled_digest") or _disabled_entries_digest(target_disabled_entries)
+
     # State A: Both target files already landed on Drive.
     if cur_pending_gen == target_gen and cur_disabled_present and cur_disabled_digest == target_disabled_digest:
         _ensure_history_written()
-        _mirror_committed_manifest(
-            repo, owner_id, drive_account_id, target_pending,
-            existing_history=[], now=now, clear_pending_commit_id=commit_id,
-            write_lease=write_lease, fail_on_lock_lost=True,
-        )
+        _mirror_and_clear(now)
         return False
 
     # State B: Neither file changed from base -> earlier failure left Drive untouched.
@@ -1809,9 +1875,7 @@ def _reconcile_pending_plugin_commit(
         and cur_disabled_present == base_disabled_present
         and cur_disabled_digest == base_disabled_digest
     ):
-        _clear_pending_commit(
-            repo, owner_id, drive_account_id, commit_id, write_lease=write_lease, fail_on_lock_lost=True
-        )
+        _clear_journal()
         return False
 
     # State C: pending.json already committed, disabled.json still at base -> roll forward disabled.json.
@@ -1823,11 +1887,7 @@ def _reconcile_pending_plugin_commit(
     ):
         _ensure_history_written()
         wdrive.write_json_inplace(plugins_fid, "disabled.json", target_disabled)
-        _mirror_committed_manifest(
-            repo, owner_id, drive_account_id, target_pending,
-            existing_history=[], now=now, clear_pending_commit_id=commit_id,
-            write_lease=write_lease, fail_on_lock_lost=True,
-        )
+        _mirror_and_clear(now)
         invalidate_workspace_cache(owner_id)
         invalidate_drive_usage_cache(owner_id)
         return True
@@ -1842,9 +1902,7 @@ def _reconcile_pending_plugin_commit(
         if action == "disable":
             # Pre-staged disable without committed pending.json: undo pre-stage cleanly.
             wdrive.restore_json(plugins_fid, "disabled.json", base_disabled_doc)
-            _clear_pending_commit(
-                repo, owner_id, drive_account_id, commit_id, write_lease=write_lease, fail_on_lock_lost=True
-            )
+            _clear_journal()
             invalidate_workspace_cache(owner_id)
             invalidate_drive_usage_cache(owner_id)
             return True
@@ -1871,11 +1929,7 @@ def _reconcile_pending_plugin_commit(
             )
         _ensure_history_written()
         wdrive.write_json_inplace(plugins_fid, "pending.json", target_pending)
-        _mirror_committed_manifest(
-            repo, owner_id, drive_account_id, target_pending,
-            existing_history=[], now=now, clear_pending_commit_id=commit_id,
-            write_lease=write_lease, fail_on_lock_lost=True,
-        )
+        _mirror_and_clear(now)
         invalidate_workspace_cache(owner_id)
         invalidate_drive_usage_cache(owner_id)
         return True
@@ -1900,9 +1954,7 @@ def _reconcile_pending_plugin_commit(
                     "plugins": sorted(cleaned_disabled, key=lambda row: row["entry"]["path"]),
                 },
             )
-            _clear_pending_commit(
-                repo, owner_id, drive_account_id, commit_id, write_lease=write_lease, fail_on_lock_lost=True
-            )
+            _clear_journal()
             invalidate_workspace_cache(owner_id)
             invalidate_drive_usage_cache(owner_id)
             return True
@@ -1910,17 +1962,13 @@ def _reconcile_pending_plugin_commit(
         added_paths = {d["entry"]["path"] for d in target_disabled_entries} - {d["entry"]["path"] for d in base_disabled_entries}
         if added_paths and added_paths.issubset(active_paths):
             wdrive.restore_json(plugins_fid, "disabled.json", base_disabled_doc)
-            _clear_pending_commit(
-                repo, owner_id, drive_account_id, commit_id, write_lease=write_lease, fail_on_lock_lost=True
-            )
+            _clear_journal()
             invalidate_workspace_cache(owner_id)
             invalidate_drive_usage_cache(owner_id)
             return True
 
     # Drive diverged independently; discard obsolete pending commit journal.
-    _clear_pending_commit(
-        repo, owner_id, drive_account_id, commit_id, write_lease=write_lease, fail_on_lock_lost=True
-    )
+    _clear_journal()
     return False
 
 
@@ -1986,33 +2034,32 @@ def _commit_plugin_manifest(
         else:
             previous[name] = None
 
-    pending_commit_id: str | None = None
-    if disabled_doc is not None:
-        pending_commit_id = uuid.uuid4().hex
-        prev_disabled_entries = _parse_disabled_doc(previous.get("disabled.json"))
-        journal_record = {
-            "id": pending_commit_id,
-            "action": action,
-            "created_at": now,
-            "base_head_generation": base_head_generation,
-            "base_pending_generation": base_pending_generation,
-            "base_disabled_present": previous.get("disabled.json") is not None,
-            "base_disabled_digest": _disabled_entries_digest(prev_disabled_entries),
-            "base_disabled_doc": previous.get("disabled.json"),
-            "target_pending": manifest,
-            "target_disabled": disabled_doc,
-            "target_disabled_digest": _disabled_entries_digest(_parse_disabled_doc(disabled_doc)),
-        }
-        _update_plugin_settings(
-            repo,
-            owner_id,
-            drive_account_id,
-            lambda saved: {**saved, "pending_commit": journal_record},
-            write_lease=write_lease,
-            timeout=2.0,
-            fail_on_timeout=True,
-            fail_on_lock_lost=True,
-        )
+    pending_commit_id = uuid.uuid4().hex
+    prev_disabled_entries = _parse_disabled_doc(previous.get("disabled.json")) if disabled_doc is not None else []
+    journal_record = {
+        "id": pending_commit_id,
+        "action": action,
+        "created_at": now,
+        "base_head_generation": base_head_generation,
+        "base_pending_generation": base_pending_generation,
+        "disabled_changed": disabled_doc is not None,
+        "base_disabled_present": previous.get("disabled.json") is not None if disabled_doc is not None else False,
+        "base_disabled_digest": _disabled_entries_digest(prev_disabled_entries) if disabled_doc is not None else None,
+        "base_disabled_doc": previous.get("disabled.json") if disabled_doc is not None else None,
+        "target_pending": manifest,
+        "target_disabled": disabled_doc,
+        "target_disabled_digest": _disabled_entries_digest(_parse_disabled_doc(disabled_doc)) if disabled_doc is not None else None,
+    }
+    _update_plugin_settings(
+        repo,
+        owner_id,
+        drive_account_id,
+        lambda saved: {**saved, "pending_commit": journal_record},
+        write_lease=write_lease,
+        timeout=2.0,
+        fail_on_timeout=True,
+        fail_on_lock_lost=True,
+    )
 
     history_fid = wdrive.find_child_folder(plugins_fid, "history", create=True)
     assert history_fid is not None
