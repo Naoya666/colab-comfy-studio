@@ -94,6 +94,7 @@ class DriveStorage:
         headers=None,
         json_body=None,
         retryable: bool | None = None,
+        before_attempt=None,
     ) -> httpx.Response:
         method = method.upper()
         if retryable is None:
@@ -102,7 +103,12 @@ class DriveStorage:
         merged = {"Authorization": "Bearer " + token, "Accept": "application/json"}
         if headers:
             merged.update(headers)
+        guard = before_attempt
+        if guard is None and method not in {"GET", "HEAD"}:
+            guard = getattr(self, "_write_guard", None)
         for attempt in range(self.max_retries if retryable else 1):
+            if guard is not None:
+                guard()
             try:
                 response = self.client.request(
                     method, url, params=params, content=content, headers=merged, json=json_body

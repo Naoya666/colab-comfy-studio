@@ -939,3 +939,150 @@ def test_audit_fix4_workspace_write_lock_expiry_cannot_resurrect_and_aborts_writ
     assert exc_lost.value.status == 409
     assert deleted_ids == ["f-1"]
 
+
+# ---------------------------------------------------------------------------
+# Second-Round Audit Fixes (1-3)
+# ---------------------------------------------------------------------------
+
+
+def test_audit2_fix1_write_json_rechecks_lock_after_lookup_and_before_retry(tmp_path):
+    from app.gpu import native_workspace
+    from app.gpu.drive import DriveStorage
+
+    store = Store(f"sqlite:///{tmp_path / 'audit2_fix1.db'}")
+    repo = Repository(store)
+    fake_google = SimpleNamespace(access_token=lambda _purpose: "fake-drive-token")
+
+    # Case A: Lock expires DURING find_files_by_name() GET lookup -> PATCH must NEVER be sent!
+    methods_a: list[str] = []
+
+    def handler_a(req: httpx.Request) -> httpx.Response:
+        methods_a.append(req.method)
+        if req.method == "GET":
+            key = native._workspace_lock_key("owner")
+            repo.store.update("settings", key, {"expires_at": 1.0}, "owner")
+            return httpx.Response(200, json={"files": [{"id": "file-1", "name": "pending.json"}]})
+        raise AssertionError(f"Unexpected mutating request after lock loss: {req.method}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler_a)) as client:
+        drive = DriveStorage({"id": "ws-a", "owner_id": "owner"}, repo, client=client, google=fake_google, sleeper=lambda _: None)
+        with native_workspace._offline_write_guard(repo, "owner", reason="test-a") as lease:
+            wdrive = native_workspace._WorkspaceDrive(drive, "owner", write_guard=lease.ensure_held)
+            with pytest.raises(common.APIError) as exc_a:
+                wdrive.write_json_inplace("parent-1", "pending.json", {"schema": 1})
+    assert exc_a.value.code == "NATIVE_WORKSPACE_LOCK_LOST"
+    assert methods_a == ["GET"]
+
+    # Case B: First PATCH returns 503 and lock expires before retry -> retry PATCH must NEVER be sent!
+    patch_count = 0
+
+    def handler_b(req: httpx.Request) -> httpx.Response:
+        nonlocal patch_count
+        if req.method == "GET":
+            return httpx.Response(200, json={"files": [{"id": "file-2", "name": "pending.json"}]})
+        if req.method == "PATCH":
+            patch_count += 1
+            if patch_count == 1:
+                key = native._workspace_lock_key("owner")
+                repo.store.update("settings", key, {"expires_at": 1.0}, "owner")
+                return httpx.Response(503, json={"error": "temporary"})
+            raise AssertionError("Retry PATCH should not be sent after lock expired")
+        raise AssertionError(f"Unexpected request: {req.method}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler_b)) as client:
+        drive = DriveStorage({"id": "ws-b", "owner_id": "owner"}, repo, client=client, google=fake_google, sleeper=lambda _: None)
+        with native_workspace._offline_write_guard(repo, "owner", reason="test-b") as lease:
+            wdrive = native_workspace._WorkspaceDrive(drive, "owner", write_guard=lease.ensure_held)
+            with pytest.raises(common.APIError) as exc_b:
+                wdrive.write_json_inplace("parent-1", "pending.json", {"schema": 1})
+    assert exc_b.value.code == "NATIVE_WORKSPACE_LOCK_LOST"
+    assert patch_count == 1
+
+
+def test_audit2_fix2_transient_dispatch_lock_contention_does_not_false_lose_lease(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from app.gpu import native_workspace
+
+    store = Store(f"sqlite:///{tmp_path / 'audit2_fix2.db'}")
+    repo = Repository(store)
+    lock_id = native.acquire_workspace_write_lock(repo, "owner", reason="test", ttl_seconds=90.0)
+
+    contend = {"busy": True}
+    orig_dispatch_lock = store.dispatch_lock
+
+    @contextmanager
+    def flaky_dispatch_lock():
+        if contend["busy"]:
+            yield False
+            return
+        with orig_dispatch_lock() as ok:
+            yield ok
+
+    monkeypatch.setattr(store, "dispatch_lock", flaky_dispatch_lock)
+    # Speed up renew timeout during unit test
+    orig_status = native.renew_workspace_write_lock_status
+    monkeypatch.setattr(
+        native,
+        "renew_workspace_write_lock_status",
+        lambda *a, **kw: orig_status(*a, **{**kw, "timeout": 0.05}),
+    )
+
+    lease = native_workspace._WorkspaceWriteLease(
+        repo, "owner", lock_id, ttl_seconds=90.0, renew_interval=0.05, busy_retry_interval=0.05
+    )
+    try:
+        # Let heartbeat hit multiple transient dispatch_lock timeouts.
+        time.sleep(0.25)
+        assert not lease._lost.is_set(), "Transient dispatch_lock contention must NOT mark unexpired lease lost"
+
+        # ensure_held during transient contention raises retryable 503 SCHEDULER_BUSY (not 409 NATIVE_WORKSPACE_LOCK_LOST),
+        # and _drive_changes() STILL runs rollback once contention clears!
+        rolled_back = []
+        with pytest.raises(common.APIError) as exc_busy:
+            with native_workspace._drive_changes() as undo:
+                def do_undo():
+                    contend["busy"] = False
+                    lease.ensure_held()
+                    rolled_back.append("ok")
+                undo.append(do_undo)
+                lease.ensure_held()
+        assert exc_busy.value.code == "SCHEDULER_BUSY"
+        assert exc_busy.value.status == 503
+        assert rolled_back == ["ok"]
+        assert not lease._lost.is_set()
+    finally:
+        contend["busy"] = False
+        lease.close()
+        native.release_workspace_write_lock(repo, "owner", lock_id)
+
+
+@pytest.mark.asyncio
+async def test_audit2_fix3_cancelled_prepare_does_not_hang_executor_shutdown(tmp_path):
+    import asyncio
+    import fcntl
+
+    model_dir = tmp_path / "models"
+    (model_dir / "checkpoints").mkdir(parents=True)
+    local = native_models.LocalModels(tmp_path, model_dir, {"channel": "ch", "catalog": []})
+
+    # Hold an external exclusive lock on models-active.lock.
+    ext_lock = (tmp_path / "models-active.lock").open("a")
+    fcntl.flock(ext_lock, fcntl.LOCK_EX)
+    try:
+        prompt = {"prompt": {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "missing.safetensors"}}}}
+        task = asyncio.create_task(local.prepare(prompt, [], []))
+        await asyncio.sleep(0.12)
+        assert not task.done()
+
+        # Cancel while external process still holds LOCK_EX -> must cancel promptly without leaving stuck threadpool worker!
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+
+        loop = asyncio.get_running_loop()
+        await asyncio.wait_for(loop.shutdown_default_executor(), timeout=1.0)
+    finally:
+        ext_lock.close()
+
+

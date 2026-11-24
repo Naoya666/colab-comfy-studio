@@ -282,10 +282,12 @@ class LocalModels:
         try:
             lock_file = (self.root / "models-active.lock").open("a")
             mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-            try:
-                fcntl.flock(lock_file, mode | fcntl.LOCK_NB)
-            except BlockingIOError:
-                await asyncio.to_thread(fcntl.flock, lock_file, mode)
+            while True:
+                try:
+                    fcntl.flock(lock_file, mode | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(0.05)
             yield
         finally:
             if lock_file is not None:

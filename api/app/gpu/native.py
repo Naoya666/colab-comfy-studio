@@ -237,18 +237,24 @@ def acquire_workspace_write_lock(
         return lock_id
 
 
-def renew_workspace_write_lock(
+def renew_workspace_write_lock_status(
     repo,
     owner: str,
     lock_id: str,
     *,
     ttl_seconds: float = WORKSPACE_WRITE_LOCK_TTL_SECONDS,
+    timeout: float = 0.5,
     now: float | None = None,
-) -> bool:
-    """Extend an active, unexpired workspace write lock TTL while still offline and owned by lock_id."""
+) -> tuple[str, float | None]:
+    """Attempt to extend an active, unexpired workspace write lock.
+
+    Returns ``("renewed", new_expires_at)``, ``("lost", None)`` when DB confirms
+    the lock expired/changed or native ComfyUI is no longer offline, or
+    ``("busy", None)`` when ``dispatch_lock`` could not be acquired within ``timeout``.
+    """
     if not lock_id or not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
-        return False
-    deadline = time.monotonic() + 0.5
+        return "lost", None
+    deadline = time.monotonic() + max(0.0, float(timeout))
     while True:
         with repo.store.dispatch_lock() as acquired:
             if acquired:
@@ -262,14 +268,31 @@ def renew_workspace_write_lock(
                 ):
                     writable, _ = workspace_offline_status(repo, owner, now=current)
                     if not writable:
-                        return False
-                    repo.store.update("settings", key, {"expires_at": current + float(ttl_seconds)}, owner)
-                    return True
-                return False
+                        return "lost", None
+                    new_expires = current + float(ttl_seconds)
+                    repo.store.update("settings", key, {"expires_at": new_expires}, owner)
+                    return "renewed", new_expires
+                return "lost", None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return False
+            return "busy", None
         time.sleep(min(0.02, remaining))
+
+
+def renew_workspace_write_lock(
+    repo,
+    owner: str,
+    lock_id: str,
+    *,
+    ttl_seconds: float = WORKSPACE_WRITE_LOCK_TTL_SECONDS,
+    timeout: float = 0.5,
+    now: float | None = None,
+) -> bool:
+    """Extend an active, unexpired workspace write lock TTL while still offline and owned by lock_id."""
+    status, _ = renew_workspace_write_lock_status(
+        repo, owner, lock_id, ttl_seconds=ttl_seconds, timeout=timeout, now=now
+    )
+    return status == "renewed"
 
 
 def release_workspace_write_lock(repo, owner: str, lock_id: str) -> None:

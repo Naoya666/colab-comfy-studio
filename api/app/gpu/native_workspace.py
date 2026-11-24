@@ -358,13 +358,25 @@ class _WorkspaceDrive:
         if self._write_guard is not None:
             self._write_guard()
 
+    @contextmanager
+    def _guarded_storage(self):
+        if self._write_guard is None:
+            yield
+            return
+        prev = getattr(self.storage, "_write_guard", None)
+        self.storage._write_guard = self._write_guard
+        try:
+            yield
+        finally:
+            self.storage._write_guard = prev
+
     def prime_token(self) -> None:
         self.storage.google.access_token("drive")
 
     def find_owner_folder(self, *, create: bool = False) -> str | None:
         if create:
-            self._assert_writable()
-            return self.storage._owner_folder()
+            with self._guarded_storage():
+                return self.storage._owner_folder()
         return _find_owner_folder_readonly(self.storage, self.owner_id)
 
     def list_children(self, parent_id: str) -> list[dict[str, Any]]:
@@ -390,8 +402,8 @@ class _WorkspaceDrive:
 
     def find_child_folder(self, parent_id: str, name: str, *, create: bool = False) -> str | None:
         if create:
-            self._assert_writable()
-            return self.storage._folder(name, parent_id)
+            with self._guarded_storage():
+                return self.storage._folder(name, parent_id)
         return self.storage._find_folder(name, parent_id)
 
     def find_folder_path(self, root_id: str, parts: tuple[str, ...], *, create: bool = False) -> str | None:
@@ -471,6 +483,7 @@ class _WorkspaceDrive:
                 content=raw,
                 headers={"Content-Type": "application/json; charset=utf-8"},
                 retryable=True,
+                before_attempt=self._write_guard,
             )
             self.storage._ensure_ok(response, f"更新文件 {name}")
             # Clean up any legacy duplicate files with the exact same name in this folder.
@@ -500,6 +513,7 @@ class _WorkspaceDrive:
             content=body,
             headers={"Content-Type": f"multipart/related; boundary={boundary}"},
             retryable=False,
+            before_attempt=self._write_guard,
         )
         created = self.storage._ensure_ok(response, f"创建文件 {name}")
         file_id = created.get("id")
@@ -508,13 +522,13 @@ class _WorkspaceDrive:
         return file_id
 
     def move_file(self, file_id: str, src_parent: str, dst_parent: str) -> None:
-        self._assert_writable()
         response = self.storage._request(
             "PATCH",
             self.storage.base_url + f"/files/{file_id}",
             params={"addParents": dst_parent, "removeParents": src_parent, "fields": "id,parents"},
             json_body={},
             retryable=False,
+            before_attempt=self._write_guard,
         )
         self.storage._ensure_ok(response, "移动工作流文件")
 
@@ -523,13 +537,13 @@ class _WorkspaceDrive:
             self.move_file(file_id, dst_parent, src_parent)
 
     def trash_file(self, file_id: str, *, trashed: bool = True) -> None:
-        self._assert_writable()
         response = self.storage._request(
             "PATCH",
             self.storage.base_url + f"/files/{file_id}",
             params={"fields": "id,trashed"},
             json_body={"trashed": trashed},
             retryable=True,
+            before_attempt=self._write_guard,
         )
         self.storage._ensure_ok(response, "移入回收站" if trashed else "从回收站恢复")
 
@@ -549,11 +563,11 @@ class _WorkspaceDrive:
             self.write_json_inplace(parent_id, name, previous)
 
     def delete_file_permanent(self, file_id: str) -> None:
-        self._assert_writable()
         response = self.storage._request(
             "DELETE",
             self.storage.base_url + f"/files/{file_id}",
             retryable=False,
+            before_attempt=self._write_guard,
         )
         if response.status_code in {200, 204, 404}:
             return
@@ -672,44 +686,76 @@ class _WorkspaceWriteLease:
         *,
         ttl_seconds: float = native.WORKSPACE_WRITE_LOCK_TTL_SECONDS,
         renew_interval: float | None = None,
+        busy_retry_interval: float = 1.0,
     ):
         self.repo = repo
         self.owner_id = owner_id
         self.lock_id = lock_id
         self.ttl_seconds = float(ttl_seconds)
         self._interval = float(renew_interval) if renew_interval is not None else max(1.0, min(25.0, self.ttl_seconds / 3.0))
+        self._busy_retry_interval = max(0.05, float(busy_retry_interval))
+        self._state_lock = threading.Lock()
+        self._expires_at = time.time() + self.ttl_seconds
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread = threading.Thread(target=self._heartbeat_loop, name="workspace-lock-renew", daemon=True)
         self._thread.start()
 
     def _heartbeat_loop(self) -> None:
-        while not self._stop.wait(self._interval):
+        wait_for = self._interval
+        while not self._stop.wait(wait_for):
             try:
-                ok = native.renew_workspace_write_lock(
+                status, new_exp = native.renew_workspace_write_lock_status(
                     self.repo,
                     self.owner_id,
                     self.lock_id,
                     ttl_seconds=self.ttl_seconds,
+                    timeout=0.5,
                 )
             except Exception:
-                ok = False
-            if not ok:
+                status, new_exp = "busy", None
+            if status == "renewed" and new_exp is not None:
+                with self._state_lock:
+                    self._expires_at = new_exp
+                wait_for = self._interval
+            elif status == "lost":
                 self._lost.set()
                 return
+            else:
+                # Transient dispatch_lock contention: do NOT declare the lease lost while
+                # its known TTL has not yet expired; retry promptly instead.
+                with self._state_lock:
+                    expired = time.time() >= self._expires_at
+                if expired:
+                    self._lost.set()
+                    return
+                wait_for = self._busy_retry_interval
 
     def ensure_held(self) -> None:
         if self._lost.is_set():
             raise APIError("NATIVE_WORKSPACE_LOCK_LOST", "离线工作区写锁已失效或原生实例已启动，已中止后续写入", 409)
-        ok = native.renew_workspace_write_lock(
+        status, new_exp = native.renew_workspace_write_lock_status(
             self.repo,
             self.owner_id,
             self.lock_id,
             ttl_seconds=self.ttl_seconds,
+            timeout=2.0,
         )
-        if not ok:
+        if status == "renewed" and new_exp is not None:
+            with self._state_lock:
+                self._expires_at = new_exp
+            return
+        if status == "lost":
             self._lost.set()
             raise APIError("NATIVE_WORKSPACE_LOCK_LOST", "离线工作区写锁已失效或原生实例已启动，已中止后续写入", 409)
+        # Transient dispatch_lock contention: fail closed for this attempt without falsely
+        # marking an unexpired lease permanently lost (allowing safe rollback if lock clears).
+        with self._state_lock:
+            expired = time.time() >= self._expires_at
+        if expired:
+            self._lost.set()
+            raise APIError("NATIVE_WORKSPACE_LOCK_LOST", "离线工作区写锁已过期，已中止后续写入", 409)
+        raise APIError("SCHEDULER_BUSY", "调度锁短暂繁忙，无法复核写锁状态，请稍后重试", 503, True)
 
     def close(self) -> None:
         self._stop.set()
