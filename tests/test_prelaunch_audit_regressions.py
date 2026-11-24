@@ -1535,4 +1535,286 @@ def test_audit3_fix4_explicit_drive_b_isolated_from_drive_a_and_rejects_missing_
         drive_b.close()
 
 
+# ---------------------------------------------------------------------------
+# Fourth-Round Audit Fixes (1-3)
+# ---------------------------------------------------------------------------
+
+
+def test_audit4_fix1_expired_request_cannot_overwrite_newer_pending_commit_journal(tmp_path, monkeypatch):
+    import json
+    import threading
+
+    from app.gpu import native_workspace
+    from test_native_workspace import FakeDriveBackend, _make_fake_drive_storage, _seed_workspace
+
+    store = Store(f"sqlite:///{tmp_path / 'audit4_fix1.db'}")
+    repo = Repository(store)
+    backend = FakeDriveBackend()
+    seeded = _seed_workspace(backend)
+
+    # Start with LanPaint disabled.
+    drive_init = _make_fake_drive_storage(repo, "owner", backend)
+    try:
+        native_workspace.apply_plugin_action(
+            repo, "owner", action="disable", paths=["LanPaint"], force_in_use=True, drive=drive_init
+        )
+    finally:
+        drive_init.close()
+
+    pending_id = backend.children_named(seeded["plugins_dir"], "pending.json")[0]["id"]
+    disabled_id = backend.children_named(seeded["plugins_dir"], "disabled.json")[0]["id"]
+
+    req1_before_journal = threading.Event()
+    req1_resume = threading.Event()
+    orig_update_settings = native_workspace._update_plugin_settings
+    intercept_req1 = {"tid": None, "done": False}
+
+    def intercepted_update_settings(r, owner, drive_acc, mutate, **kwargs):
+        if (
+            not intercept_req1["done"]
+            and intercept_req1["tid"] is not None
+            and threading.get_ident() == intercept_req1["tid"]
+            and kwargs.get("fail_on_lock_lost") is True
+        ):
+            intercept_req1["done"] = True
+            req1_before_journal.set()
+            assert req1_resume.wait(5.0)
+        return orig_update_settings(r, owner, drive_acc, mutate, **kwargs)
+
+    monkeypatch.setattr(native_workspace, "_update_plugin_settings", intercepted_update_settings)
+
+    # Request 1 starts enabling LanPaint and pauses right before persisting its pending_commit.
+    req1_errors: list[Exception] = []
+    drive_1 = _make_fake_drive_storage(repo, "owner", backend)
+
+    def run_req1():
+        intercept_req1["tid"] = threading.get_ident()
+        try:
+            native_workspace.apply_plugin_action(
+                repo, "owner", action="enable", paths=["LanPaint"], drive=drive_1
+            )
+        except Exception as exc:
+            req1_errors.append(exc)
+
+    t1 = threading.Thread(target=run_req1, name="req1-expired")
+    t1.start()
+    try:
+        assert req1_before_journal.wait(3.0)
+
+        # Expire Request 1's workspace lock while it is paused before writing pending_commit.
+        lock_key = native._workspace_lock_key("owner")
+        repo.store.update("settings", lock_key, {"expires_at": 1.0}, "owner")
+
+        # Request 2 acquires a fresh lock, writes its own pending_commit + pending.json,
+        # and then loses its lock BEFORE writing disabled.json.
+        orig_handler = backend.handler
+        req2_expired = {"fired": False}
+
+        def req2_handler(req: httpx.Request) -> httpx.Response:
+            resp = orig_handler(req)
+            if (
+                not req2_expired["fired"]
+                and req.method == "PATCH"
+                and req.url.path == f"/upload/drive/v3/files/{pending_id}"
+            ):
+                req2_expired["fired"] = True
+                repo.store.update("settings", lock_key, {"expires_at": 1.0}, "owner")
+            return resp
+
+        backend.handler = req2_handler
+        drive_2 = _make_fake_drive_storage(repo, "owner", backend)
+        try:
+            with pytest.raises(common.APIError) as exc2:
+                native_workspace.apply_plugin_action(
+                    repo, "owner", action="enable", paths=["LanPaint"], drive=drive_2
+                )
+            assert exc2.value.code == "NATIVE_WORKSPACE_LOCK_LOST"
+        finally:
+            backend.handler = orig_handler
+            drive_2.close()
+
+        saved_after_req2 = repo.store.get("settings", native.plugin_settings_key("owner"), "owner")
+        req2_journal_id = saved_after_req2["pending_commit"]["id"]
+        assert isinstance(req2_journal_id, str) and req2_journal_id
+
+        # Resume expired Request 1: it MUST fail closed with NATIVE_WORKSPACE_LOCK_LOST
+        # and MUST NOT overwrite Request 2's pending_commit journal!
+        req1_resume.set()
+        t1.join(timeout=5.0)
+        assert not t1.is_alive()
+        assert len(req1_errors) == 1
+        assert isinstance(req1_errors[0], common.APIError)
+        assert req1_errors[0].code == "NATIVE_WORKSPACE_LOCK_LOST"
+
+        saved_after_req1 = repo.store.get("settings", native.plugin_settings_key("owner"), "owner")
+        assert saved_after_req1["pending_commit"]["id"] == req2_journal_id
+
+        # Request 3 retries enable -> reconciles Request 2's journal cleanly without PLUGIN_ALREADY_ACTIVE!
+        drive_3 = _make_fake_drive_storage(repo, "owner", backend)
+        try:
+            res3 = native_workspace.apply_plugin_action(
+                repo, "owner", action="enable", paths=["LanPaint"], drive=drive_3
+            )
+            assert res3["generation"] == seeded["gen_head"]
+            pending_doc = json.loads(backend.content[pending_id].decode("utf-8"))
+            disabled_doc = json.loads(backend.content[disabled_id].decode("utf-8"))
+            assert any(p["path"] == "LanPaint" for p in pending_doc["plugins"])
+            assert not any(d["entry"]["path"] == "LanPaint" for d in disabled_doc["plugins"])
+            saved_final = repo.store.get("settings", native.plugin_settings_key("owner"), "owner")
+            assert saved_final.get("pending_commit") is None
+        finally:
+            drive_3.close()
+    finally:
+        req1_resume.set()
+        t1.join(timeout=2.0)
+        drive_1.close()
+
+
+def test_audit4_fix2_runtime_sync_plugins_keeps_pinned_boot_drive_after_rebind(tmp_path, monkeypatch):
+    from app.gpu import native_workspace
+
+    store = Store(f"sqlite:///{tmp_path / 'audit4_fix2.db'}")
+    repo = Repository(store)
+    repo.create(
+        "accounts",
+        "owner",
+        {"account_id": "acc-a", "alias": "Compute A", "enabled": True, "connected": True, "drive_account_id": "acc-b"},
+        record_id="acc-a",
+    )
+    repo.create(
+        "accounts",
+        "owner",
+        {"account_id": "acc-b", "alias": "Drive B", "enabled": True, "connected": True},
+        record_id="acc-b",
+    )
+    repo.create(
+        "accounts",
+        "owner",
+        {"account_id": "acc-c", "alias": "Drive C", "enabled": True, "connected": True},
+        record_id="acc-c",
+    )
+
+    # Native bootstrap job pinned Drive B at launch time; lease only has compute account_id=acc-a.
+    boot_job = repo.create(
+        "jobs",
+        "owner",
+        {
+            "state": "running",
+            "account_id": "acc-a",
+            "drive_account_id": "acc-b",
+            "snapshot": {"native_comfy": True},
+        },
+    )
+    lease = repo.create(
+        "leases",
+        "owner",
+        {
+            "state": "active",
+            "native_comfy": True,
+            "native_ready": True,
+            "account_id": "acc-a",
+            "owner_job_id": boot_job["id"],
+            "native_bootstrap_job_id": boot_job["id"],
+        },
+    )
+
+    # Mid-session, compute account A rebinds its Drive delegation from B -> C while VM still mounts B!
+    repo.update("accounts", "acc-a", {"drive_account_id": "acc-c"}, "owner")
+
+    assert native.resolve_lease_drive_account_id(repo, "owner", lease=lease) == "acc-b"
+    assert native_workspace._preferred_native_drive_account(repo, "owner") == "acc-b"
+
+    plugins_b = [
+        {"path": "PluginOnB", "checksum": "1" * 64, "enabled": True, "repo": None, "commit": None, "version": "1.0", "archive": "a" * 64, "kind": "directory"}
+    ]
+    manifest_b = {"schema": 1, "plugins": plugins_b, "generation": node_persistence.digest(plugins_b)}
+    monkeypatch.setattr(native, "backend", lambda: ("https://internal.example.test", {}))
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"busy": False, "plugins": {"manifest": manifest_b, "durable": True}})
+        )
+    ) as client:
+        native.sync_plugins(repo, lease, client=client)
+
+    saved_b = repo.store.get("settings", native.plugin_settings_key("owner", "acc-b"), "owner")
+    saved_c = repo.store.get("settings", native.plugin_settings_key("owner", "acc-c"), "owner")
+    assert saved_b is not None
+    assert saved_b["drive_account_id"] == "acc-b"
+    assert saved_b["manifest"]["generation"] == manifest_b["generation"]
+    assert saved_c is None
+
+
+def test_audit4_fix3_empty_default_drive_never_displays_legacy_untagged_cache(tmp_path, monkeypatch):
+    from app.gpu import native_workspace
+    from test_native_workspace import FakeDriveBackend, _make_fake_drive_storage
+
+    native_workspace.invalidate_workspace_cache()
+    store = Store(f"sqlite:///{tmp_path / 'audit4_fix3.db'}")
+    repo = Repository(store)
+    default_id = accounts_mod.AccountService.default_account_id("owner")
+    assert native.plugin_settings_key("owner", default_id) != native.plugin_settings_key("owner", None)
+
+    repo.create(
+        "accounts",
+        "owner",
+        {"account_id": default_id, "alias": "Default Drive", "enabled": True, "connected": True, "legacy_default": True},
+        record_id=default_id,
+    )
+    repo.create(
+        "credentials",
+        "owner",
+        {"provider": "google", "purpose": "drive", "account_id": default_id, "revoked": False, "encrypted_refresh_token": "enc-def"},
+    )
+
+    other_plugins = [
+        {"path": "StalePluginFromOtherDrive", "checksum": "9" * 64, "enabled": True, "repo": None, "commit": None, "version": "1.0", "archive": "f" * 64, "kind": "directory"}
+    ]
+    stale_manifest = {
+        "schema": 1,
+        "plugins": other_plugins,
+        "snapshot": {"git_custom_nodes": {}},
+        "backed_up_at": 1700000100.0,
+        "generation": node_persistence.digest(other_plugins),
+    }
+
+    # Seed legacy untagged user-level cache (from another Drive before upgrade) AND an untagged row under default_id key.
+    repo.store.create(
+        "settings",
+        "owner",
+        {"manifest": stale_manifest, "history": [stale_manifest]},
+        record_id=native.plugin_settings_key("owner", None),
+    )
+    repo.store.create(
+        "settings",
+        "owner",
+        {"manifest": stale_manifest, "history": [stale_manifest]},
+        record_id=native.plugin_settings_key("owner", default_id),
+    )
+
+    # Empty default Drive (has AI-Studio/owner/native-comfy/plugins, NO head.json, NO pending.json, NO history).
+    empty_backend = FakeDriveBackend()
+    ai = empty_backend.mkdir("AI-Studio", "root")
+    ow = empty_backend.mkdir("owner", ai)
+    nc = empty_backend.mkdir("native-comfy", ow)
+    empty_backend.mkdir("plugins", nc)
+
+    drive_default = _make_fake_drive_storage(repo, "owner", empty_backend)
+    drive_default.account_id = default_id
+    drive_none = _make_fake_drive_storage(repo, "owner", empty_backend)
+    drive_none.account_id = None
+    try:
+        ov_default = native_workspace.get_workspace_overview(repo, "owner", refresh=True, drive=drive_default)
+        assert ov_default["plugins"]["active"] == []
+        assert ov_default["plugins"]["history"] == []
+
+        # Even with legacy account_id=None on an empty Drive, overview must NOT fabricate stale plugins!
+        ov_none = native_workspace.get_workspace_overview(repo, "owner", refresh=True, drive=drive_none)
+        assert ov_none["plugins"]["active"] == []
+        assert ov_none["plugins"]["history"] == []
+    finally:
+        drive_default.close()
+        drive_none.close()
+
+
+
 

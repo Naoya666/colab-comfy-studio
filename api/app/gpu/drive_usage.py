@@ -57,7 +57,7 @@ def resolve_owner_drive_account(repo, owner_id: str, preferred_account_id: str |
 
     lease = native.active_lease(repo, owner_id)
     if lease:
-        lease_acc = lease.get("drive_account_id") or lease.get("account_id")
+        lease_acc = native.resolve_lease_drive_account_id(repo, owner_id, lease=lease)
         if lease_acc:
             candidates.append(lease_acc)
 

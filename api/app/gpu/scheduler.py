@@ -420,7 +420,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         }
         if job.get("generation_timeouts"):
             payload["generation_timeouts"] = True
-        for key in ("instance_id", "account_id", "attempt_id", "hard_deadline_at"):
+        for key in ("instance_id", "account_id", "drive_account_id", "attempt_id", "hard_deadline_at"):
             if job.get(key) is not None:
                 payload[key] = job[key]
         return self._create("leases", job["owner_id"], payload)
@@ -1247,6 +1247,10 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     "deadline_epoch": deadline,
                     "native_idle_minutes": idle_minutes,
                 }
+                pinned_drive = job.get("drive_account_id")
+                if isinstance(pinned_drive, str) and pinned_drive.strip():
+                    lease_ready_patch["native_drive_account_id"] = pinned_drive.strip()
+                    lease_ready_patch["drive_account_id"] = pinned_drive.strip()
                 if inherited_idle is not None:
                     lease_ready_patch["idle_deadline_at"] = inherited_idle
                 lease = self._update("leases", lease["id"], lease_ready_patch, job["owner_id"])

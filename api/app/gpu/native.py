@@ -156,10 +156,8 @@ def _workspace_lock_key(owner: str) -> str:
 
 def plugin_settings_key(owner_id: str, drive_account_id: str | None = None) -> str:
     """Return VPS settings record ID for native plugin state, isolated per resolved Drive account."""
-    from .accounts import AccountService
-
     account = drive_account_id.strip() if isinstance(drive_account_id, str) and drive_account_id.strip() else None
-    if not account or account == AccountService.default_account_id(owner_id):
+    if not account:
         return "native-plugins-" + digest(owner_id)[:32]
     return "native-plugins-" + digest(f"{owner_id}:{account}")[:32]
 
@@ -170,32 +168,53 @@ def resolve_lease_drive_account_id(
     lease: dict | None = None,
     job: dict | None = None,
 ) -> str | None:
-    """Resolve the actual Google Drive storage account used by a native lease or job."""
+    """Resolve the actual Google Drive storage account mounted by a native lease or job.
+
+    Prefers explicit Drive accounts pinned on the lease or its bootstrap/owner job over
+    mutable compute-account delegations so rebinding a compute account mid-session does
+    not redirect plugin sync away from the currently mounted Drive.
+    """
     from .accounts import AccountService
 
-    candidate = None
+    def _non_empty(row: dict | None, *fields: str) -> str | None:
+        if not isinstance(row, dict):
+            return None
+        for field in fields:
+            val = row.get(field)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+
+    # 1. Explicit Drive account already pinned on lease or passed job.
     for row in (lease, job):
-        if isinstance(row, dict):
-            for field in ("native_drive_account_id", "drive_account_id", "account_id"):
-                val = row.get(field)
-                if isinstance(val, str) and val.strip():
-                    candidate = val.strip()
-                    break
-        if candidate:
-            break
-    if not candidate and isinstance(lease, dict) and repo is not None:
+        pinned = _non_empty(row, "native_drive_account_id", "drive_account_id")
+        if pinned:
+            return pinned
+
+    # 2. Explicit Drive account pinned on the lease's bootstrap / owner job in DB.
+    linked_jobs: list[dict] = []
+    if isinstance(lease, dict) and repo is not None:
+        seen_ids: set[str] = set()
         for jfield in ("native_bootstrap_job_id", "owner_job_id"):
             jid = lease.get(jfield)
-            if isinstance(jid, str) and jid:
+            if isinstance(jid, str) and jid and jid not in seen_ids:
+                seen_ids.add(jid)
                 try:
                     jrow = repo.get("jobs", jid, owner_id)
                 except Exception:
                     jrow = None
                 if isinstance(jrow, dict):
-                    val = jrow.get("drive_account_id") or jrow.get("account_id")
-                    if isinstance(val, str) and val.strip():
-                        candidate = val.strip()
-                        break
+                    linked_jobs.append(jrow)
+                    pinned = _non_empty(jrow, "native_drive_account_id", "drive_account_id")
+                    if pinned:
+                        return pinned
+
+    # 3. Fallback to compute account_id only when no pinned Drive account exists anywhere.
+    candidate = None
+    for row in (lease, job, *linked_jobs):
+        candidate = _non_empty(row, "account_id")
+        if candidate:
+            break
     if not candidate:
         return None
     if repo is None:
@@ -289,6 +308,35 @@ def acquire_workspace_write_lock(
         return lock_id
 
 
+def _verify_and_renew_workspace_write_lock_locked(
+    repo,
+    owner: str,
+    lock_id: str,
+    *,
+    ttl_seconds: float = WORKSPACE_WRITE_LOCK_TTL_SECONDS,
+    now: float | None = None,
+) -> tuple[str, float | None]:
+    """Verify and extend an active workspace write lock while caller already holds dispatch_lock()."""
+    if not lock_id or not hasattr(repo, "store") or not hasattr(repo.store, "get"):
+        return "lost", None
+    key = _workspace_lock_key(owner)
+    row = repo.store.get("settings", key, owner)
+    current = time.time() if now is None else float(now)
+    if (
+        isinstance(row, dict)
+        and row.get("lock_id") == lock_id
+        and float(row.get("expires_at") or 0.0) > current
+    ):
+        writable, _ = workspace_offline_status(repo, owner, now=current)
+        if not writable:
+            return "lost", None
+        existing_exp = float(row.get("expires_at") or 0.0)
+        new_expires = max(existing_exp, current + float(ttl_seconds))
+        repo.store.update("settings", key, {"expires_at": new_expires}, owner)
+        return "renewed", new_expires
+    return "lost", None
+
+
 def renew_workspace_write_lock_status(
     repo,
     owner: str,
@@ -310,22 +358,9 @@ def renew_workspace_write_lock_status(
     while True:
         with repo.store.dispatch_lock() as acquired:
             if acquired:
-                key = _workspace_lock_key(owner)
-                row = repo.store.get("settings", key, owner)
-                current = time.time() if now is None else float(now)
-                if (
-                    isinstance(row, dict)
-                    and row.get("lock_id") == lock_id
-                    and float(row.get("expires_at") or 0.0) > current
-                ):
-                    writable, _ = workspace_offline_status(repo, owner, now=current)
-                    if not writable:
-                        return "lost", None
-                    existing_exp = float(row.get("expires_at") or 0.0)
-                    new_expires = max(existing_exp, current + float(ttl_seconds))
-                    repo.store.update("settings", key, {"expires_at": new_expires}, owner)
-                    return "renewed", new_expires
-                return "lost", None
+                return _verify_and_renew_workspace_write_lock_locked(
+                    repo, owner, lock_id, ttl_seconds=ttl_seconds, now=now
+                )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return "busy", None
