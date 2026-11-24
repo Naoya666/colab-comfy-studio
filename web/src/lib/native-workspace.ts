@@ -72,6 +72,7 @@ export type WorkspaceEnvCacheItem = {
 export type WorkspaceOverview = {
   offline_writable: boolean;
   lock_reason?: string | null;
+  recovery_plan_id?: string | null;
   drive_connected: boolean;
   drive_account_id?: string | null;
   drive_account_alias?: string | null;

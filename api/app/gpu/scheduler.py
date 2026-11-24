@@ -105,6 +105,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         self.db_store = self.store.store
         self.config = config or GpuConfig.from_env()
         self.clock = clock or time.time
+        self._started_at = float(self.clock())
         if instance_service is not None:
             self.instance_service = instance_service
         elif instance_service_factory is not None:
@@ -374,11 +375,18 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
 
     def _lease(self, job: dict) -> dict | None:
         if job.get("lease_id"):
-            lease=self._get("leases", job["lease_id"], job.get("owner_id"))
-            return lease if lease and lease.get('owner_job_id')==job['id'] else None
+            lease = self._get("leases", job["lease_id"], job.get("owner_id"))
+            return lease if lease and lease.get("owner_job_id") == job["id"] else None
+        attempt_id = job.get("attempt_id")
         return next(
-            (x for x in self._leases_for(job.get("owner_id")) if x.get("owner_job_id") == job["id"]
-             and not (job.get('attempt_retry_keys') and x.get('state')=='deleted')), None
+            (
+                x
+                for x in self._leases_for(job.get("owner_id"))
+                if x.get("owner_job_id") == job["id"]
+                and not ((job.get("attempt_retry_keys") or attempt_id) and x.get("state") == "deleted")
+                and (not attempt_id or x.get("attempt_id") == attempt_id)
+            ),
+            None,
         )
 
     def _ensure_lease(self, job: dict) -> dict:
@@ -411,7 +419,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         }
         if job.get("generation_timeouts"):
             payload["generation_timeouts"] = True
-        for key in ("instance_id", "account_id"):
+        for key in ("instance_id", "account_id", "attempt_id", "hard_deadline_at"):
             if job.get(key) is not None:
                 payload[key] = job[key]
         return self._create("leases", job["owner_id"], payload)
@@ -661,6 +669,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             job, lease = self._bind_instance_lease(job, lease)
         except SchedulerError as exc:
             return self._begin_failure(job, "gpu_instance_conflict", str(exc))
+        if job.get("recovery_plan_id"):
+            from . import recovery
+
+            recovery.bind_active_lease_for_plan(
+                self.store, job["owner_id"], job["recovery_plan_id"], lease["id"], self.clock()
+            )
         try:
             self._check_cu(job)
         except APIError as exc:
@@ -984,6 +998,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 if lease_patch:
                     self._update("leases", lease["id"], lease_patch, job["owner_id"])
             job = self._mark_instance("mark_ready", job)
+            if job.get("recovery_plan_id") and job.get("instance_id"):
+                from . import recovery
+
+                recovery.on_successor_allocation_confirmed(
+                    self.store, job["owner_id"], job["recovery_plan_id"], job["instance_id"], lease["id"], self.clock()
+                )
             return self._set_state(job, "loading", "GPU runtime is ready")
         return job
 
@@ -1098,6 +1118,10 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         except Exception as exc:
             from .mcp import MCPTransient
 
+            if self._provider_name(job) == "colab":
+                from .native import record_runtime_check_hint
+
+                record_runtime_check_hint(self.store, lease["id"], job["owner_id"], now=self.clock())
             retries = int(job.get('poll_retry_count') or 0) + 1
             if isinstance(exc, MCPTransient) and retries <= 5:
                 return self._set_state(job, 'running', 'GPU connection interrupted; retry pending',
@@ -1187,17 +1211,33 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 t_mark0 = time.monotonic()
                 deadline = min(float(lease["deadline_epoch"]),
                                float(job.get("native_session_deadline_epoch") or lease["deadline_epoch"]))
-                lease = self._update("leases", lease["id"], {
-                    "native_ready": True, "native_last_busy": self.clock(),
+                idle_minutes = (job.get("execution_policy") or {}).get(
+                    "retain_idle_minutes", settings.native_comfy_idle_minutes
+                )
+                now_ready = self.clock()
+                native_last_busy = now_ready
+                inherited_idle: float | None = None
+                if (
+                    job.get("recovery_source") == "auto_recovery"
+                    and job.get("recovery_was_busy") is False
+                    and job.get("recovery_orig_idle_deadline_at") is not None
+                ):
+                    inherited_idle = min(float(job["recovery_orig_idle_deadline_at"]), deadline)
+                    native_last_busy = inherited_idle - float(idle_minutes) * 60.0
+                lease_ready_patch = {
+                    "native_ready": True, "native_last_busy": native_last_busy,
                     "native_bootstrap_job_id": job["id"],
                     "native_model_storage": model_storage(job.get("execution_policy")),
                     "deadline_epoch": deadline,
-                    "native_idle_minutes": (job.get("execution_policy") or {}).get(
-                        "retain_idle_minutes", settings.native_comfy_idle_minutes),
-                }, job["owner_id"])
-                self._update("instances", job["instance_id"], {
-                    "native_comfy": True, "hard_deadline_at": deadline,
-                }, job["owner_id"])
+                    "native_idle_minutes": idle_minutes,
+                }
+                if inherited_idle is not None:
+                    lease_ready_patch["idle_deadline_at"] = inherited_idle
+                lease = self._update("leases", lease["id"], lease_ready_patch, job["owner_id"])
+                inst_ready_patch = {"native_comfy": True, "hard_deadline_at": deadline}
+                if inherited_idle is not None:
+                    inst_ready_patch["idle_deadline_at"] = inherited_idle
+                self._update("instances", job["instance_id"], inst_ready_patch, job["owner_id"])
                 job = self._update("jobs", job["id"], {
                     "deadline_epoch": deadline, "hard_deadline_at": deadline,
                     "native_proxy_wait_started": None,
@@ -1246,11 +1286,15 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             return job
         if state == "failed":
             detail = str(result.get("message") or "")[:1400]
+            err_code = result.get("error_code", "gpu_execution_failed")
             if timings:
                 job = self._update("jobs", job["id"], {"worker_timings": timings}, job.get("owner_id"))
+            retried = self._maybe_l2_retry_creation_job(job, lease, err_code, detail)
+            if retried is not None:
+                return retried
             return self._begin_failure(
                 job,
-                result.get("error_code", "gpu_execution_failed"),
+                err_code,
                 "GPU execution failed" + (": " + detail if detail else ""),
             )
         if state != "completed":
@@ -1302,6 +1346,91 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             outputs=outputs,
             output_bytes=total,
             worker_timings=timings or {},
+        )
+
+    def _maybe_l2_retry_creation_job(self, job: dict, lease: dict, err_code: str, detail: str) -> dict | None:
+        """L2 in-VM retry for non-deterministic creation process crashes while VM is confirmed alive (§4.3(2))."""
+        from app.config import settings as app_settings
+
+        from . import recovery
+        from .instances import POOL_CREATION, job_pool
+        from .node_persistence import env_flag
+
+        if not env_flag("GPU_IN_VM_SELF_HEAL", app_settings.gpu_in_vm_self_heal):
+            return None
+        if job_pool(job) != POOL_CREATION or job.get("cancel_requested"):
+            return None
+        if self._lifecycle(job) not in {"smart", "retain"}:
+            return None
+        if not recovery.is_l2_retryable_failure(err_code, detail):
+            return None
+        cfg = recovery.RecoveryConfig.from_env()
+        retries = int(job.get("auto_retry_count") or 0)
+        if retries >= cfg.max_job_retries:
+            return None
+        now = float(self.clock())
+        deadlines = [
+            float(val)
+            for val in (
+                job.get("hard_deadline_at"),
+                job.get("deadline_epoch"),
+                job.get("task_deadline_epoch"),
+                lease.get("deadline_epoch"),
+            )
+            if val is not None
+        ]
+        if deadlines and (min(deadlines) - now) <= 120.0:
+            return None
+        # Confirm VM is genuinely still alive before retrying in-place on the same VM.
+        try:
+            provider = self._provider(job)
+            try:
+                status = provider.inspect(self._lease_handle(lease))
+            finally:
+                if isinstance(provider, GoogleColabProvider):
+                    provider.close()
+        except Exception:
+            return None
+        if self._provider_name(job) == "colab":
+            if runtime_status(status) != "present":
+                return None
+        elif status.get("deleted"):
+            return None
+
+        history = list(job.get("attempt_history") or [])
+        history.append({
+            "attempt_id": job.get("attempt_id"),
+            "attempt_number": job.get("attempt_number"),
+            "instance_id": job.get("instance_id"),
+            "lease_id": lease.get("id"),
+            "ended_at": now,
+            "reason": err_code,
+            "stage": job.get("stage"),
+            "scope": "in_vm_l2",
+        })
+        if job.get("instance_id"):
+            inst = self._get("instances", job["instance_id"], job["owner_id"])
+            if inst and isinstance(inst.get("creation_runtime"), dict):
+                self._update(
+                    "instances",
+                    job["instance_id"],
+                    {"creation_runtime": {**inst["creation_runtime"], "process": None, "status": "process_exited"}},
+                    job["owner_id"],
+                )
+        next_retries = retries + 1
+        return self._set_state(
+            job,
+            "loading",
+            f"检测到同机 ComfyUI 进程异常退出（{err_code}），正在原实例内自动重启并重试（第 {next_retries}/{cfg.max_job_retries} 次）",
+            execution_id=None,
+            stage=None,
+            stage_started=None,
+            error_code=None,
+            error_message=None,
+            poll_retry_count=0,
+            poll_retry_at=0,
+            attempt_history=history,
+            auto_retry_count=next_retries,
         )
 
     def _result_metadata(self, job: dict) -> dict:
@@ -1502,16 +1631,22 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         identity = digest(_lease_identity(lease))
         instance_version = instance.get("version", 0)
         check = lease.get("provider_runtime_check") or {}
+        now = float(self.clock())
+        hint_at = float(lease.get("provider_runtime_check_hint_at") or 0.0)
+        checked_at_prev = float(check.get("checked_at") or 0.0)
+        hint_due = hint_at > checked_at_prev and (now - checked_at_prev) >= 10.0
         if (
-            check.get("identity") == identity and check.get("instance_version") == instance_version
-            and self.clock() < float(check.get("next_check_at") or 0)
+            check.get("identity") == identity
+            and check.get("instance_version") == instance_version
+            and now < float(check.get("next_check_at") or 0)
+            and not hint_due
         ):
             return check["status"]
         job_id = lease["owner_job_id"]
         job_snapshot = self._get("jobs", job_id, owner) or {}
         if (
             job_snapshot.get("claim_token") not in {None, claim_token}
-            and float(job_snapshot.get("claim_until") or 0) > self.clock()
+            and float(job_snapshot.get("claim_until") or 0) > now
         ):
             return "stale"
         handle = {**lease["handle"], "job_id": job_id, "owner_job_id": job_id, "inspection_lease_id": lease["id"]}
@@ -1527,8 +1662,49 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         except Exception:
             # Transport, authentication and provider errors carry no deletion evidence.
             status = "unknown"
+        if status == "missing":
+            from . import recovery
+            from .instances import POOL_CREATION, POOL_NATIVE, instance_pool_of
+
+            cfg = recovery.RecoveryConfig.from_env()
+            pool = instance_pool_of(instance)
+            is_l3_candidate = (
+                cfg.enabled
+                and (
+                    pool == POOL_NATIVE
+                    or (pool == POOL_CREATION and instance.get("retention_mode") in {"smart", "retain"})
+                )
+                and not instance.get("manual_stop_requested")
+                and not instance.get("force_stop")
+                and not lease.get("force_stop")
+                and not instance.get("fuse_forced_stop")
+                and not lease.get("native_draining")
+            )
+            if is_l3_candidate:
+                first_seen = check.get("missing_first_seen_at") if check.get("identity") == identity else None
+                if first_seen is None:
+                    status = "missing_pending"
+                elif pool == POOL_NATIVE and lease.get("native_ready"):
+                    from .native import native_proxy_healthy
+
+                    if native_proxy_healthy(self.store, owner):
+                        status = "unknown"
+        import inspect as _inspect
+
+        apply_fn = getattr(self.instance_service, "apply_runtime_inspection", None)
+        kwargs: dict[str, Any] = {}
+        if apply_fn is not None and "process_started_at" in _inspect.signature(apply_fn).parameters:
+            kwargs["process_started_at"] = getattr(self, "_started_at", None)
         if not self._instance_call(
-            "apply_runtime_inspection", lease, instance_version, job_snapshot, identity, status, self.clock(), claim_token,
+            "apply_runtime_inspection",
+            lease,
+            instance_version,
+            job_snapshot,
+            identity,
+            status,
+            self.clock(),
+            claim_token,
+            **kwargs,
         ):
             return "stale"
         return status
@@ -1539,10 +1715,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         if lease:
             if not lease.get("force_stop"):
                 observation = self._inspect_runtime(lease, job.get("claim_token"))
-            if observation == "stale":
+            if observation in {"stale", "missing_pending"}:
                 return self._get("jobs", job["id"], job["owner_id"]) or job
             if observation == "missing" or lease.get("remote_delete_source") == RUNTIME_MISSING:
                 current = self._get("jobs", job["id"], job["owner_id"]) or job
+                if current.get("state") == "waiting_for_capacity":
+                    return current
                 final_state = current.get("cleanup_final_state") or "failed"
                 self._record_usage(current, lease, self.clock())
                 return self._finish_cleanup(current, final_state, "GPU cleanup completed")
@@ -1664,12 +1842,24 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 return self._set_state(job,'completed','Mock outputs verified; idle lease retained')
         if not lease:
             job = self._close_unstarted_instance(job, None)
+            if final_state == "failed" and job.get("recovery_plan_id"):
+                from . import recovery
+
+                deferred = recovery.maybe_defer_retry_job_after_cleanup(self.store, job, None, self.clock())
+                if deferred is not None:
+                    return deferred
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         if lease.get("state") == "creating" and not lease.get("handle") and not lease.get("create_attempts"):
             lease = self._update("leases", lease["id"], {"state": "deleted", "last_seen": self.clock()}, job["owner_id"])
         if lease.get("state") == "deleted":
             job = self._close_unstarted_instance(job, lease)
             self._record_usage(job, lease, self.clock())
+            if final_state == "failed" and job.get("recovery_plan_id"):
+                from . import recovery
+
+                deferred = recovery.maybe_defer_retry_job_after_cleanup(self.store, job, lease, self.clock())
+                if deferred is not None:
+                    return deferred
             return self._finish_cleanup(job, final_state, "GPU cleanup completed")
         next_epoch = float(lease.get("cleanup_next_epoch") or 0)
         if self.clock() < next_epoch or (observation == "unknown" and not lease.get("force_stop")):
@@ -1765,6 +1955,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             job.get("owner_id"),
         )
         self._record_usage(job, lease, self.clock())
+        if final_state == "failed" and job.get("recovery_plan_id"):
+            from . import recovery
+
+            deferred = recovery.maybe_defer_retry_job_after_cleanup(self.store, job, fresh_lease, self.clock())
+            if deferred is not None:
+                return deferred
         finish_patch: dict[str, Any] = {}
         finish_msg = "GPU cleanup completed"
         if isinstance(job.get("error_details"), dict):
@@ -1821,6 +2017,8 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         if state == "validating":
             return self._validate(job)
         if state == "waiting_for_capacity":
+            if job.get("recovery_hold") is True or float(job.get("retry_not_before_epoch") or 0) > self.clock():
+                return job
             # CPU cache preparation owns the first wait.  Do not allocate a
             # durable/runtime instance until the prep decision is settled.
             try:
@@ -1857,6 +2055,11 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 return job
             task_deadline = ({"task_deadline_epoch": self.clock() + self._effective_runtime(job) * 60}
                              if job.get("generation_timeouts") or job.get("creation_fingerprint") else {})
+            if job.get("hard_deadline_at") is not None:
+                hard_cap = float(job["hard_deadline_at"])
+                if "task_deadline_epoch" in task_deadline:
+                    task_deadline["task_deadline_epoch"] = min(float(task_deadline["task_deadline_epoch"]), hard_cap)
+                task_deadline["deadline_epoch"] = hard_cap
             if job.get("generation_timeouts"):
                 lease = self._lease(job)
                 if lease and lease.get("generation_timeouts") and lease.get("hard_deadline_at") is None:
@@ -1958,6 +2161,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 and not self._expired(job)
             ):
                 continue
+            if (
+                state == "waiting_for_capacity"
+                and (job.get("recovery_hold") is True or float(job.get("retry_not_before_epoch") or 0) > now)
+                and not job.get("cancel_requested")
+            ):
+                continue
             until = float(job.get("claim_until") or 0)
             if job.get("claim_token") and until > now:
                 continue
@@ -2034,9 +2243,26 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             raise KeyError(job_id)
         if job.get("state") in TERMINAL_STATES:
             return job
-        if job.get("state") == "queued" and not self._lease(job):
+        if job.get("recovery_plan_id"):
+            from . import recovery
+
+            recovery.cancel_plans_for_job(self.store, owner_id, job_id, self.clock())
+        if (
+            job.get("state") == "queued"
+            or (
+                job.get("state") == "waiting_for_capacity"
+                and job.get("recovery_hold") is True
+                and not job.get("instance_id")
+            )
+        ) and not self._lease(job):
             return self._set_state(
-                job, "cancelled", "GPU job cancelled", cancel_requested=True, requested_outcome="cancelled"
+                job,
+                "cancelled",
+                "GPU job cancelled",
+                cancel_requested=True,
+                requested_outcome="cancelled",
+                recovery_hold=False,
+                retry_not_before_epoch=0,
             )
         return self._update(
             "jobs", job_id, {"cancel_requested": True, "requested_outcome": "cancelled"}, owner_id

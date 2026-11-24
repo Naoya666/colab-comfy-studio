@@ -55,6 +55,7 @@ from .native_routes import router as native_router
 from .oauth_config_routes import router as oauth_config_router
 from .presenters import public_asset, public_job
 from .project_routes import router as project_router
+from .recovery_routes import router as recovery_router
 from .review_routes import router as review_router
 from .security import sign_session
 
@@ -943,6 +944,7 @@ if os.getenv("STUDIO_ATELIER_ENABLED", "0").strip().lower() in {"1", "true"}:
     app.include_router(atelier_router)
 app.include_router(account_router)
 app.include_router(instance_router)
+app.include_router(recovery_router)
 app.include_router(native_outputs_router)
 app.include_router(native_router)
 app.include_router(creation_api_router)

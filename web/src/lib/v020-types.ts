@@ -163,6 +163,12 @@ export interface GpuInstance {
   actual_units?: number | null;
   runtime_deleted?: boolean;
   last_error_code?: string | null;
+  recovery_group_id?: string | null;
+  recovery_generation?: number | null;
+  parent_instance_id?: string | null;
+  replaced_by_instance_id?: string | null;
+  recovery_plan_id?: string | null;
+  recovery_source?: string | null;
 }
 
 export interface InstanceRetentionRequest {

@@ -341,10 +341,12 @@ class SchedulerWatchdogMixin:
             recovered += 1
         return recovered
 
-    def _probe_creation_process(self, job, instance, lease):
+    def _probe_creation_process(self, job, instance, lease, *, observation: str | None = None):
         runtime = instance.get("creation_runtime") or {}
+        now = float(self.clock())
         if (runtime.get("lease_id") != lease["id"]
-                or self.clock() - float(runtime.get("health_checked_at") or 0) < 45):
+                or not runtime.get("process")
+                or now - float(runtime.get("health_checked_at") or 0) < 45):
             return
         try:
             executor = self._executor(job)
@@ -354,15 +356,131 @@ class SchedulerWatchdogMixin:
             return  # A temporary coordinator connection error is not proof of a dead process.
         if healthy is None:
             return
+        should_self_heal_warmup = False
+        heal_wf_key = runtime.get("workflow_key")
+        heal_wf_ver = runtime.get("workflow_version")
         with self.db_store.admission_lock() as acquired:
             if not acquired:
                 return
             latest = self._get("instances", instance["id"], instance["owner_id"])
-            if (latest and latest["state"] == "retained_idle" and latest.get("creation_runtime") == runtime
+            if not (latest and latest["state"] == "retained_idle" and latest.get("creation_runtime") == runtime
                     and latest.get("lease_id") == lease["id"]):
-                self._update("instances", instance["id"], {
-                    "creation_runtime": {**runtime, "health_checked_at": self.clock()} if healthy else None,
-                }, instance["owner_id"])
+                return
+            if healthy:
+                updated_rt = {**runtime, "health_checked_at": now, "health_failures": 0, "status": "healthy"}
+                self._update("instances", instance["id"], {"creation_runtime": updated_rt}, instance["owner_id"])
+                return
+            failures = int(runtime.get("health_failures") or 0) + 1
+            if failures < 2:
+                updated_rt = {**runtime, "health_checked_at": now, "health_failures": failures}
+                self._update("instances", instance["id"], {"creation_runtime": updated_rt}, instance["owner_id"])
+                return
+            # 2 consecutive failures: only clear process when VM is confirmed still present (L2)
+            vm_obs = observation or self._inspect_runtime(lease)
+            if vm_obs == "missing":
+                return
+            updated_rt = {
+                **runtime,
+                "process": None,
+                "status": "process_exited",
+                "health_failures": failures,
+                "health_checked_at": now,
+            }
+            patch: dict = {"creation_runtime": updated_rt}
+            from app.config import settings as app_settings
+
+            from .node_persistence import env_flag
+
+            deadlines = [
+                float(v)
+                for v in (latest.get("idle_deadline_at"), latest.get("hard_deadline_at"), lease.get("idle_deadline_at"), lease.get("deadline_epoch"))
+                if v is not None
+            ]
+            remaining_s = (min(deadlines) - now) if deadlines else 0.0
+            recent_heals = [
+                float(t) for t in (latest.get("in_vm_heal_timestamps") or [])
+                if isinstance(t, (int, float)) and now - float(t) < 600.0
+            ]
+            if (
+                env_flag("GPU_IN_VM_SELF_HEAL", app_settings.gpu_in_vm_self_heal)
+                and runtime.get("warmup_completed") is True
+                and remaining_s >= 600.0
+                and len(recent_heals) < 2
+                and heal_wf_key
+                and heal_wf_ver is not None
+            ):
+                recent_heals.append(now)
+                patch["in_vm_heal_timestamps"] = recent_heals
+                should_self_heal_warmup = True
+            self._update("instances", instance["id"], patch, instance["owner_id"])
+            self.store.create("events", instance["owner_id"], {
+                "instance_id": instance["id"],
+                "job_id": job.get("id"),
+                "state": "retained_idle",
+                "message": "检测到创作池常驻 ComfyUI 进程连续 2 次探活失败，已标记进程退出并准备同机恢复",
+            }, project_id=latest.get("project_id"))
+
+        if should_self_heal_warmup:
+            self._trigger_in_place_creation_warmup(instance, heal_wf_key, heal_wf_ver, now)
+
+    def _trigger_in_place_creation_warmup(self, instance: dict, workflow_key: str, workflow_version, now: float) -> None:
+        """L2: queue a lightweight in-place warmup reusing the same live creation VM."""
+        try:
+            from app import creation_api
+            from app.admission import admit_job
+            from app.job_schemas import JobInput, Policy
+
+            owner = instance["owner_id"]
+            wf = next(
+                (
+                    row
+                    for row in creation_api.eligible(self.store, owner)
+                    if row["workflow_key"] == workflow_key and str(row["workflow_version"]) == str(workflow_version)
+                ),
+                None,
+            )
+            if wf is None:
+                return
+            project_id = instance.get("project_id") or creation_api.get_project(self.db_store, owner)
+            spec = instance.get("runtime_spec_reported") or instance.get("runtime_spec_requested")
+            if isinstance(spec, dict) and "key" in spec:
+                spec = spec["key"]
+            mode = instance.get("retention_mode") if instance.get("retention_mode") in {"smart", "retain"} else "smart"
+            retain_min = max(1, int(round(float(instance.get("retain_idle_minutes") or 15))))
+            pol = Policy.model_validate({
+                "provider": "colab",
+                "account_id": instance.get("account_id"),
+                "instance_id": instance["id"],
+                "compute_spec": spec,
+                "lifecycle": mode,
+                "retain_idle_minutes": retain_min,
+                "max_runtime_minutes": 30,
+                "reuse_action": "reuse",
+            }).model_dump()
+            raw = JobInput(
+                project_id=project_id,
+                model_id=wf["model_id"],
+                workflow_key=wf["workflow_key"],
+                workflow_version=wf["workflow_version"],
+                params={},
+                execution_policy=pol,
+            ).model_dump()
+            idem = f"in-vm-heal-warmup:{instance['id']}:{int(now)}"
+            admit_job(
+                self.db_store,
+                {"id": owner},
+                raw,
+                idem,
+                creation={
+                    "creation_key_id": None,
+                    "creation_workflow_id": wf["id"],
+                    "creation_existing_only": True,
+                    "creation_body_hash": None,
+                    "warmup": True,
+                },
+            )
+        except Exception:
+            pass
 
     def watchdog(self) -> dict:
         """Independent process entrypoint for timeout, orphan, and cleanup compensation."""
@@ -413,8 +531,18 @@ class SchedulerWatchdogMixin:
             job_by_id = {}
         for lease in all_leases:
             observation = observations.get(lease["id"])
+            if (
+                lease.get("state") == "active"
+                and lease.get("provider") == "colab"
+                and not lease.get("force_stop")
+                and not lease.get("cleanup_claim_token")
+                and observation != "stale"
+            ):
+                from .native import keepalive_active_lease
+
+                keepalive_active_lease(self.store, lease, self.clock, provider_factory=self._provider)
             associated = job_by_id.get(lease.get("owner_job_id"))
-            if lease.get("state") == "deleted" or observation == "stale" or (
+            if lease.get("state") == "deleted" or observation in {"stale", "missing_pending"} or (
                 associated and (associated["owner_id"] != lease["owner_id"] or associated["state"] not in TERMINAL_STATES)
             ):
                 continue
@@ -445,7 +573,7 @@ class SchedulerWatchdogMixin:
                         "account_id": lease.get("account_id"),
                         "instance_id": instance["id"],
                     }
-                    self._probe_creation_process(probe_job, instance, lease)
+                    self._probe_creation_process(probe_job, instance, lease, observation=observation)
                 if (
                     lease.get("provider") == "colab"
                     and not lease.get("native_comfy")
@@ -469,4 +597,12 @@ class SchedulerWatchdogMixin:
                 if self._cleanup_orphan_lease(lease):
                     recovered += 1
         recovered += self._reconcile_deleted_lease_instances()
+        from . import recovery
+
+        recovered += recovery.tick(
+            self.store,
+            clock=self.clock,
+            scheduler=self,
+            process_started_at=getattr(self, "_started_at", None),
+        )
         return {"acquired": True, "recovered": recovered}

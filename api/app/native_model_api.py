@@ -100,3 +100,23 @@ async def start(client, base, auth, repo, lease, workflow, dependencies, *, visu
     else:
         payload["workflow"] = workflow
     return await rpc(client, "POST", base, auth, "/prepare", body=payload)
+
+
+def rpc_sync(method, base, auth, suffix, *, body=None, timeout=20, client=None):
+    """Synchronous variant of rpc() for watchdog / background recovery orchestration."""
+    owns = client is None
+    c = httpx.Client(timeout=timeout, follow_redirects=False) if owns else client
+    try:
+        request = c.build_request(method, base + PATH + suffix, headers=auth, json=body, timeout=timeout)
+        request.headers.pop("Cookie", None)
+        response = c.send(request)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Invalid model preparation response")
+        return data
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        raise APIError("NATIVE_MODEL_UPSTREAM", "无法连接 Colab 模型准备服务，请确认当前实例就绪", 502) from exc
+    finally:
+        if owns:
+            c.close()

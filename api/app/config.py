@@ -37,6 +37,16 @@ class Settings(BaseSettings):
     native_comfy_cache_max_age_minutes: int = Field(default=60, ge=1, le=153722867)
     native_comfy_cache_gb: int = Field(default=20, ge=1, le=2**31 - 1)
     native_comfy_max_upload_mb: int = Field(default=2048, ge=1)
+    gpu_auto_recovery_enabled: bool = False
+    gpu_auto_recovery_max_rounds: int = Field(default=3, ge=1, le=10)
+    gpu_auto_recovery_min_remaining_minutes: int = Field(default=15, ge=1)
+    gpu_auto_recovery_max_job_retries: int = Field(default=1, ge=0, le=3)
+    gpu_auto_recovery_backoff_base_seconds: int = Field(default=30, ge=10, le=300)
+    gpu_auto_recovery_round_timeout_seconds: int = Field(default=600, ge=60, le=3600)
+    gpu_auto_recovery_startup_grace_seconds: int = Field(default=30, ge=0, le=300)
+    gpu_auto_recovery_max_vps_outage_minutes: int = Field(default=18, ge=5, le=60)
+    gpu_active_keepalive: bool = True
+    gpu_in_vm_self_heal: bool = True
 
 
 if os.getenv("STUDIO_OFFLINE_TEST") == "1":

@@ -258,6 +258,7 @@ class InstanceService:
         "creation_runtime", "created_at", "updated_at", "last_seen_at", "generation", "selection_reason", "runtime_deleted",
         "allocation_key", "budget_reserved", "retention_reserved", "allocation_requested_at", "deletion_confirmed_at",
         "remote_delete_source", "history_cleared_at",
+        "recovery_group_id", "recovery_generation", "parent_instance_id", "replaced_by_instance_id", "recovery_plan_id", "recovery_source",
     }
 
     def __init__(self, repo, clock=time.time, config=None):
@@ -1208,6 +1209,15 @@ class InstanceService:
             payload["retain_idle_minutes"] = float(policy["retain_idle_minutes"])
         if job.get("hard_deadline_at") is not None:
             payload["hard_deadline_at"] = float(job["hard_deadline_at"])
+        for rec_key in (
+            "recovery_group_id",
+            "recovery_generation",
+            "parent_instance_id",
+            "recovery_plan_id",
+            "recovery_source",
+        ):
+            if job.get(rec_key) is not None:
+                payload[rec_key] = job[rec_key]
         row = model(id=stable_id, owner_id=job["owner_id"], project_id=job.get("project_id"), state="allocating", data=payload, version=0, created_at=now, updated_at=now)
         session.add(row)
         try:
@@ -1295,6 +1305,9 @@ class InstanceService:
             last_seen_at=self.clock(),
         )
         self._set(instance, data, state=next_state, session=session)
+        from . import recovery
+
+        recovery.cancel_plans_for_instance_in_tx(session, instance.owner_id, instance.id, self.clock())
         self._emit(
             session,
             instance.owner_id,
@@ -1851,7 +1864,15 @@ class InstanceService:
                 if not (pool == POOL_NATIVE or data.get("native_comfy")) and not job.get("generation_timeouts"):
                     minutes = min(30.0, minutes)
                 now = self.clock()
-                deadline = min(now + minutes * 60, float(hard)) if hard is not None else now + minutes * 60
+                if (
+                    job.get("recovery_source") == "auto_recovery"
+                    and job.get("recovery_was_busy") is False
+                    and job.get("recovery_orig_idle_deadline_at") is not None
+                ):
+                    orig_idle = float(job["recovery_orig_idle_deadline_at"])
+                    deadline = min(orig_idle, float(hard)) if hard is not None else orig_idle
+                else:
+                    deadline = min(now + minutes * 60, float(hard)) if hard is not None else now + minutes * 60
                 data.update(retain_idle_minutes=minutes, idle_deadline_at=deadline)
             state = "retained_idle" if retain else "releasing"
             self._set(instance, data, state=state, session=session)
@@ -2004,6 +2025,9 @@ class InstanceService:
                     retention_reserved=0.0, last_seen_at=self.clock(),
                 )
                 self._set(instance, data, state="releasing", session=session)
+                from . import recovery
+
+                recovery.cancel_plans_for_instance_in_tx(session, owner, id, self.clock())
                 result = self._dict(instance)
                 self._emit(session, owner, instance.project_id, id, data.get("current_job_id"), "releasing", "manual stop requested")
             self._finish_operation(operation, self.public(result), session)
@@ -2037,7 +2061,18 @@ class InstanceService:
             ccu.sample_and_record(self.repo, owner, account, "delete_after")
         return result
 
-    def apply_runtime_inspection(self, lease_snapshot, instance_version, job_snapshot, identity, status, checked_at, claim_token):
+    def apply_runtime_inspection(
+        self,
+        lease_snapshot,
+        instance_version,
+        job_snapshot,
+        identity,
+        status,
+        checked_at,
+        claim_token,
+        *,
+        process_started_at: float | None = None,
+    ):
         """Commit a Colab observation only while the inspected binding still owns the runtime."""
         from . import ccu
         from .native import _lease_identity
@@ -2072,10 +2107,34 @@ class InstanceService:
                         or data.get("cleanup_claim_token") or current.get("cleanup_claim_token")
                     ):
                         return False
+                    if status == "missing_pending":
+                        previous = current.get("provider_runtime_check") or {}
+                        same_id = previous.get("identity") in (None, identity)
+                        first_seen = (
+                            previous.get("missing_first_seen_at")
+                            if previous.get("identity") == identity and previous.get("missing_first_seen_at") is not None
+                            else checked_at
+                        )
+                        check = {
+                            "identity": identity,
+                            "instance_version": instance.version,
+                            "status": "missing_pending",
+                            "checked_at": checked_at,
+                            "failures": int(previous.get("failures") or 0) if same_id else 0,
+                            "missing_first_seen_at": first_seen,
+                            "next_check_at": checked_at + 5.0,
+                        }
+                        if same_id and previous.get("last_present_at") is not None:
+                            check["last_present_at"] = previous["last_present_at"]
+                        elif same_id and previous.get("status") == "present" and previous.get("checked_at") is not None:
+                            check["last_present_at"] = previous["checked_at"]
+                        self._set(lease, {**self._data(lease), "provider_runtime_check": check}, session=session)
+                        return True
                     if status != "missing":
                         previous = current.get("provider_runtime_check") or {}
+                        same_id = previous.get("identity") == identity
                         failures = int(status == "unknown")
-                        if failures and previous.get("identity") == identity:
+                        if failures and same_id:
                             failures += int(previous.get("failures") or 0)
                         check = {
                             "identity": identity, "instance_version": instance.version,
@@ -2084,6 +2143,13 @@ class InstanceService:
                                 self._RUNTIME_CHECK_MAX_BACKOFF, self._RUNTIME_CHECK_INTERVAL * 2 ** min(failures, 3),
                             ),
                         }
+                        if status == "present":
+                            check["last_present_at"] = checked_at
+                        elif same_id:
+                            if previous.get("last_present_at") is not None:
+                                check["last_present_at"] = previous["last_present_at"]
+                            elif previous.get("status") == "present" and previous.get("checked_at") is not None:
+                                check["last_present_at"] = previous["checked_at"]
                         self._set(lease, {**self._data(lease), "provider_runtime_check": check}, session=session)
                         return True
                     job = self._find(session, "jobs", job_id)
@@ -2109,48 +2175,292 @@ class InstanceService:
                             and binding.get("runtime_id") == current["runtime_id"]
                         ):
                             return False
-                    account = self._close_reclaimed_runtime(session, instance, lease, current, job_data, identity, checked_at)
+                    account = self._close_reclaimed_runtime(
+                        session, instance, lease, current, job_data, identity, checked_at,
+                        process_started_at=process_started_at,
+                    )
             if account:
                 ccu.sample_and_record(self.repo, owner, account, "delete_after")
             return True
         except InstanceConflict:
             return False
 
-    def _close_reclaimed_runtime(self, session, instance, lease, binding, job, identity, checked_at):
-        from . import ccu
+    def _close_reclaimed_runtime(
+        self,
+        session,
+        instance,
+        lease,
+        binding,
+        job,
+        identity,
+        checked_at,
+        *,
+        process_started_at: float | None = None,
+    ):
+        from . import ccu, native, recovery
         from .colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
 
         owner = instance.owner_id
         job_id = binding["owner_job_id"]
+        inst_data_before = self._data(instance)
+        lease_data_before = self._data(lease)
+        pool = self._instance_pool(session, instance)
+
+        # Freeze reclaim snapshot BEFORE mutating old lease/instance (§5.3(2))
+        prev_check = lease_data_before.get("provider_runtime_check") or {}
+        probe_candidates = []
+        if prev_check.get("last_present_at") is not None:
+            probe_candidates.append(prev_check["last_present_at"])
+        elif prev_check.get("status") == "present" and prev_check.get("checked_at") is not None:
+            probe_candidates.append(prev_check["checked_at"])
+        if lease_data_before.get("native_last_keepalive_at") and (lease_data_before.get("native_keepalive_status") or {}).get("ok") is not False:
+            probe_candidates.append(lease_data_before["native_last_keepalive_at"])
+        if lease_data_before.get("active_last_keepalive_at") and (lease_data_before.get("active_keepalive_status") or {}).get("ok") is not False:
+            probe_candidates.append(lease_data_before["active_last_keepalive_at"])
+        if lease_data_before.get("native_http_heartbeat") is not None:
+            probe_candidates.append(lease_data_before["native_http_heartbeat"])
+        if not probe_candidates:
+            for ts_val in (
+                lease_data_before.get("last_seen"),
+                inst_data_before.get("last_seen_at"),
+                lease_data_before.get("created_epoch"),
+            ):
+                if ts_val is not None:
+                    probe_candidates.append(ts_val)
+        last_successful_probe_at = max(
+            (float(v) for v in probe_candidates if isinstance(v, (int, float)) and not isinstance(v, bool) and float(v) > 0),
+            default=None,
+        )
+
+        boot_job_id = lease_data_before.get("native_bootstrap_job_id") or job_id
+        boot_job_row = self._find(session, "jobs", boot_job_id, owner) if boot_job_id else None
+        boot_job = self.repo._row(boot_job_row) if boot_job_row is not None else (job or {})
+
+        if pool == POOL_NATIVE:
+            was_busy = (
+                bool(inst_data_before.get("current_job_id"))
+                or bool(native.active_writes(lease_data_before, checked_at))
+                or (lease_data_before.get("native_last_upstream_busy") is True)
+            )
+            retain_idle_minutes = (
+                lease_data_before.get("native_idle_minutes")
+                or inst_data_before.get("retain_idle_minutes")
+                or ((boot_job or {}).get("execution_policy") or {}).get("retain_idle_minutes")
+            )
+            idle_candidates = [
+                float(v)
+                for v in (inst_data_before.get("idle_deadline_at"), lease_data_before.get("idle_deadline_at"))
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            ]
+            last_act = max(
+                float(lease_data_before.get("native_last_busy") or 0),
+                float(lease_data_before.get("native_last_write") or 0),
+            )
+            if last_act > 0 and retain_idle_minutes:
+                idle_candidates.append(last_act + float(retain_idle_minutes) * 60.0)
+            orig_idle_deadline_at = min(idle_candidates) if idle_candidates else None
+        else:
+            was_busy = bool(inst_data_before.get("current_job_id")) or instance.state in {"allocating", "ready", "busy"}
+            retain_idle_minutes = (
+                inst_data_before.get("retain_idle_minutes")
+                or ((job or {}).get("execution_policy") or {}).get("retain_idle_minutes")
+            )
+            idle_candidates = [
+                float(v)
+                for v in (inst_data_before.get("idle_deadline_at"), lease_data_before.get("idle_deadline_at"))
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            ]
+            orig_idle_deadline_at = min(idle_candidates) if idle_candidates else None
+
+        hard_candidates = [
+            float(v)
+            for v in (
+                inst_data_before.get("hard_deadline_at"),
+                lease_data_before.get("hard_deadline_at"),
+                lease_data_before.get("deadline_epoch"),
+                (job or {}).get("hard_deadline_at"),
+                (job or {}).get("deadline_epoch"),
+            )
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+        hard_deadline_at = min(hard_candidates) if hard_candidates else None
+
+        native_storage = (
+            lease_data_before.get("native_model_storage")
+            or native.model_storage((boot_job or {}).get("execution_policy"))
+            if pool == POOL_NATIVE
+            else None
+        )
+        reclaim_snapshot = {
+            "owner_id": owner,
+            "project_id": instance.project_id,
+            "instance_id": instance.id,
+            "lease_id": lease.id,
+            "owner_job_id": job_id,
+            "current_job_id": inst_data_before.get("current_job_id"),
+            "pool": pool,
+            "account_id": binding["account_id"],
+            "account_alias_snapshot": inst_data_before.get("account_alias_snapshot") or (job or {}).get("account_alias_snapshot"),
+            "drive_account_id": inst_data_before.get("drive_account_id") or (job or {}).get("drive_account_id"),
+            "requested_spec": (
+                inst_data_before.get("runtime_spec_reported")
+                or inst_data_before.get("runtime_spec_requested")
+                or lease_data_before.get("requested_spec")
+                or (job or {}).get("requested_spec")
+            ),
+            "retention_mode": inst_data_before.get("retention_mode"),
+            "retain_idle_minutes": retain_idle_minutes,
+            "hard_deadline_at": hard_deadline_at,
+            "orig_idle_deadline_at": orig_idle_deadline_at,
+            "was_busy": was_busy,
+            "manual_stop_requested": bool(inst_data_before.get("manual_stop_requested")),
+            "force_stop": bool(inst_data_before.get("force_stop") or lease_data_before.get("force_stop")),
+            "fuse_forced_stop": bool(inst_data_before.get("fuse_forced_stop")),
+            "native_draining": bool(inst_data_before.get("native_draining") or lease_data_before.get("native_draining")),
+            "last_successful_probe_at": last_successful_probe_at,
+            "recovery_group_id": inst_data_before.get("recovery_group_id"),
+            "recovery_generation": inst_data_before.get("recovery_generation"),
+            "creation_runtime": copy.deepcopy(inst_data_before.get("creation_runtime")),
+            "workflow_version_id": (job or {}).get("workflow_version_id") or (job or {}).get("creation_workflow_id"),
+            "workflow_key": (job or {}).get("workflow_key"),
+            "workflow_version": (job or {}).get("workflow_version"),
+            "model_storage": native_storage,
+            "comfy_commit": (((boot_job or {}).get("snapshot") or {}).get("manifest") or {}).get("comfy_commit"),
+            "plugin_generation": ((boot_job or {}).get("snapshot") or {}).get("native_plugin_generation"),
+        }
+
         evidence = {
             "schema_version": 1, "owner_id": owner, "account_id": binding["account_id"], "instance_id": instance.id,
             "lease_id": lease.id, "owner_job_id": job_id, "runtime_id": binding["runtime_id"],
             "identity": identity, "checked_at": checked_at, "source": "colab_inspect",
             "lease_version": lease.version, "instance_version": instance.version,
-            "instance_generation": self._data(instance).get("generation"),
+            "instance_generation": inst_data_before.get("generation"),
         }
         remote = {
             "remote_deleted": True, "remote_deleted_at": checked_at, "remote_delete_source": RUNTIME_MISSING,
             "native_ready": False, "native_draining": True, "current_job_id": None, "idle_deadline_at": None,
         }
         self._set(lease, {
-            **self._data(lease), **remote, "state": "deleted", "provider_runtime_delete_evidence": evidence,
+            **lease_data_before, **remote, "state": "deleted", "provider_runtime_delete_evidence": evidence,
             "native_remote_deleted_verified_at": checked_at if binding.get("native_comfy") else None,
             "cleanup_next_epoch": 0, "last_seen": checked_at,
         }, state="deleted", session=session)
-        data = self._data(instance)
-        self._set(instance, {
-            **data, **remote, "state": "deleted", "runtime_deleted": True, "budget_reserved": 0.0,
+        archived_inst_payload = {
+            **inst_data_before, **remote, "state": "deleted", "runtime_deleted": True, "budget_reserved": 0.0,
             "retention_reserved": 0.0, "deleted_at": checked_at, "deletion_confirmed_at": checked_at,
             "last_seen_at": checked_at, "retained_until": None,
-        }, state="deleted", session=session)
+        }
+        self._set(instance, archived_inst_payload, state="deleted", session=session)
+
+        # Evaluate and persist L3 recovery plan inside the exact same DB transaction (§5.3(2))
+        takeover = recovery.on_runtime_reclaimed_in_tx(
+            self.repo,
+            session,
+            reclaim_snapshot,
+            checked_at,
+            process_started_at=process_started_at,
+        )
+        if takeover and takeover.get("recovery_group_id") and not archived_inst_payload.get("recovery_group_id"):
+            archived_inst_payload["recovery_group_id"] = takeover["recovery_group_id"]
+            self._set(instance, archived_inst_payload, state="deleted", session=session)
+
+        takeover_job_id = takeover.get("takeover_job_id") if isinstance(takeover, dict) else None
+        plan = takeover.get("plan") if isinstance(takeover, dict) else None
+
         for related in self._rows(session, "jobs", owner):
             if related.id != job_id and self.repo._row(related).get("instance_id") != instance.id:
                 continue
             payload = self._data(related)
+            state = related.state
+            # Case 1: Uploading job whose outputs are already persisted locally on VPS -> preserve upload continuation!
+            if state == "uploading" and recovery._local_outputs_persisted(payload):
+                payload.update(
+                    instance_state="deleted",
+                    runtime_deleted=True,
+                    retained_until=None,
+                    idle_deadline_at=None,
+                    instance_deleted_reason=RUNTIME_MISSING,
+                )
+                self._set(related, payload, state="uploading", session=session)
+                continue
+            # Case 2: Creation Path B atomic takeover -> advance in-place with new attempt_id, NEVER hit terminal failed!
+            if takeover_job_id and related.id == takeover_job_id and plan is not None and state not in {"completed", "failed", "cancelled"}:
+                history = list(payload.get("attempt_history") or [])
+                history.append({
+                    "attempt_id": payload.get("attempt_id"),
+                    "attempt_number": payload.get("attempt_number"),
+                    "instance_id": instance.id,
+                    "lease_id": lease.id,
+                    "ended_at": checked_at,
+                    "reason": RUNTIME_MISSING,
+                    "stage": payload.get("stage"),
+                })
+                retry_keys = list(payload.get("attempt_retry_keys") or [])
+                if lease.id not in retry_keys:
+                    retry_keys.append(lease.id)
+                new_attempt_id = f"att-{uuid.uuid4().hex[:12]}"
+                new_retry_count = int(payload.get("auto_retry_count") or 0) + 1
+                for cleared_key in (
+                    "lease_id", "execution_id", "error_code", "error_message", "error_details",
+                    "cleanup_final_state", "requested_outcome", "cleanup_attempts", "cleanup_next_epoch",
+                    "instance_completion_recorded", "stage", "stage_started", "selection_reason",
+                    "instance_state", "runtime_id", "request_id", "poll_retry_count", "poll_retry_at",
+                    "claim_token", "claim_until", "retained_until", "idle_deadline_at",
+                ):
+                    payload.pop(cleared_key, None)
+                policy = payload.get("execution_policy")
+                if isinstance(policy, Mapping):
+                    payload["execution_policy"] = {
+                        **policy,
+                        "account_id": plan["account_id"],
+                        "instance_id": None,
+                        "requested_instance_id": None,
+                        "reuse_action": "new",
+                        "replace_instance_id": None,
+                    }
+                payload.update(
+                    state="waiting_for_capacity",
+                    instance_id=None,
+                    requested_instance_id=None,
+                    reuse_action="new",
+                    wait_for_deleted_instance_id=None,
+                    runtime_deleted=False,
+                    attempt_id=new_attempt_id,
+                    attempt_retry_keys=retry_keys,
+                    attempt_history=history,
+                    auto_retry_count=new_retry_count,
+                    requested_account_id=plan["account_id"],
+                    account_id=plan["account_id"],
+                    requested_spec={"key": plan["requested_spec"]} if isinstance(plan.get("requested_spec"), Mapping) else payload.get("requested_spec"),
+                    hard_deadline_at=plan.get("hard_deadline_at"),
+                    deadline_epoch=plan.get("hard_deadline_at"),
+                    recovery_group_id=plan["recovery_group_id"],
+                    recovery_plan_id=plan["plan_id"],
+                    recovery_generation=int(plan.get("rounds_used") or 0) + 1,
+                    parent_instance_id=instance.id,
+                    recovery_source="auto_recovery",
+                    recovery_was_busy=True,
+                    recovery_orig_idle_deadline_at=plan.get("orig_idle_deadline_at"),
+                    recovery_hold=True,
+                    retry_not_before_epoch=plan.get("next_retry_at") or checked_at,
+                )
+                self._set(related, payload, state="waiting_for_capacity", session=session)
+                max_job_retries = recovery.RecoveryConfig.from_env().max_job_retries
+                self._emit(
+                    session,
+                    owner,
+                    related.project_id,
+                    instance.id,
+                    related.id,
+                    "waiting_for_capacity",
+                    f"检测到 Colab 运行时被上游回收，正在自动拉起新实例并重跑任务（第 {new_retry_count}/{max_job_retries} 次任务重试，第 {int(plan.get('rounds_used') or 0) + 1}/{plan.get('max_rounds', 3)} 轮实例恢复）",
+                    recovery_group_id=plan["recovery_group_id"],
+                )
+                continue
+
+            # Case 3: Existing terminal failure convergence
             payload.update(instance_state="deleted", runtime_deleted=True, retained_until=None,
                            idle_deadline_at=None, instance_deleted_reason=RUNTIME_MISSING)
-            state = related.state
             if related.id == job_id and state not in {"completed", "failed", "cancelled"}:
                 outcome = payload.get("cleanup_final_state") if state in {"cleaning_up", "cleanup_pending"} else None
                 state = "cleaning_up"

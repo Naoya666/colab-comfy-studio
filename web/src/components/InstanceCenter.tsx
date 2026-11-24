@@ -1,6 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, RefreshCw, Square, Timer, Trash2, Wrench } from 'lucide-react';
-import { apiMessage, clearGpuInstanceHistory, getGpuInstance, setInstanceRetention, stopInstance } from '../lib/gpu-api';
+import {
+  apiMessage,
+  cancelRecoveryPlan,
+  clearGpuInstanceHistory,
+  getGpuInstance,
+  getRecoveryStatus,
+  setInstanceRetention,
+  stopInstance,
+  type RecoveryPlan,
+} from '../lib/gpu-api';
 import type { GpuInstance } from './AccountDirectory';
 import { InstanceWorkbench } from './InstanceWorkbench';
 import { formatInstanceTime as formatTime } from '../lib/instance-time';
@@ -67,6 +76,27 @@ function poolLabel(pool?: string): string {
   } as Record<string, string>)[String(pool || 'creation')] || String(pool);
 }
 
+function recoveryStateLabel(state?: string): string {
+  return ({
+    scheduled: '等待重试分配',
+    dispatching: '拉起继任实例中',
+    cancelling: '等待远端释放确认',
+    restoring_env: '后台恢复本地模型',
+    recovered: '已恢复',
+    exhausted: '已耗尽重试',
+    aborted_fatal: '已中止',
+    aborted_vps_outage: 'VPS 失联保护放弃',
+    cancelled: '已取消',
+  } as Record<string, string>)[String(state || '')] || String(state || '恢复中');
+}
+
+function recoverySpecLabel(spec?: Record<string, unknown> | null): string {
+  if (!spec) return '原规格';
+  const acc = typeof spec.accelerator === 'string' ? spec.accelerator : '';
+  const shape = typeof spec.shape === 'string' && spec.shape !== 'standard' ? ` ${spec.shape}` : '';
+  return acc ? `${acc}${shape}` : '原规格';
+}
+
 function isHistory(instance: GpuInstance): boolean {
   return ['deleted', 'unknown', 'cleanup_pending', 'quarantined'].includes(String(instance.state || '').toLowerCase());
 }
@@ -98,7 +128,52 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
+  const [activePlans, setActivePlans] = useState<RecoveryPlan[]>([]);
+  const [clockSec, setClockSec] = useState(() => Math.floor(Date.now() / 1000));
   const keyRef = useRef<Record<string, string>>({});
+
+  const refreshRecovery = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const res = await getRecoveryStatus(signal);
+      if (!signal?.aborted) setActivePlans(res.active_plans || []);
+    } catch {
+      // Recovery status is supplemental; do not disrupt the instance list on transient read errors.
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void refreshRecovery(controller.signal);
+    const interval = window.setInterval(() => void refreshRecovery(), activePlans.length ? 4000 : 15000);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [refreshRecovery, activePlans.length, instances.length]);
+
+  useEffect(() => {
+    if (!activePlans.some(plan => Boolean(plan.next_retry_at))) return;
+    setClockSec(Math.floor(Date.now() / 1000));
+    const timer = window.setInterval(() => setClockSec(Math.floor(Date.now() / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [activePlans]);
+
+  async function cancelPlan(plan: RecoveryPlan) {
+    if (busy) return;
+    setBusy(`cancel-plan:${plan.plan_id}`);
+    setError('');
+    setStatus('正在取消自动恢复计划…');
+    try {
+      const res = await cancelRecoveryPlan(plan.plan_id, `instance-center-cancel:${plan.plan_id}`);
+      setStatus(res.state === 'cancelling' ? '已提交取消，等待在途租约确认释放。' : '已取消自动恢复计划。');
+      await refreshRecovery();
+      onRefresh?.();
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(null);
+    }
+  }
 
   const rows = useMemo(() => {
     const seen = new Set<string>();
@@ -220,10 +295,56 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
   return <section className={styles.center} aria-label="实例中心">
     <div className={styles.sectionHeader}>
       <div><p className={styles.eyebrow}>资源管理</p><h2>实例中心</h2><p className={styles.muted}>查看真实实例状态；停止和保留均以服务端返回为准。</p></div>
-      <button type="button" className={styles.iconButton} aria-label="刷新实例" onClick={onRefresh}><RefreshCw size={18} aria-hidden /></button>
+      <button type="button" className={styles.iconButton} aria-label="刷新实例" onClick={() => { onRefresh?.(); void refreshRecovery(); }}><RefreshCw size={18} aria-hidden /></button>
     </div>
     {status && <p className={styles.status} role="status">{status}</p>}
     {error && <p className={styles.error} role="alert">{error}</p>}
+    {activePlans.length > 0 && (
+      <div className={styles.recoveryPlanStack} aria-label="自动恢复中的计划">
+        {activePlans.map((plan) => {
+          const countdown = plan.next_retry_at ? Math.max(0, Math.ceil(plan.next_retry_at - clockSec)) : 0;
+          const displayRound = plan.state === 'restoring_env'
+            ? Math.max(1, plan.rounds_used)
+            : Math.min(plan.rounds_used + 1, plan.max_rounds);
+          return (
+            <article className={styles.recoveryPlanCard} key={plan.plan_id}>
+              <div className={styles.cardTop}>
+                <div className={styles.minWidth}>
+                  <h3>
+                    自动恢复 · {poolLabel(plan.pool)}（第 {displayRound}/{plan.max_rounds} 轮）
+                  </h3>
+                  <p className={styles.muted}>
+                    {plan.account_alias_snapshot || (plan.account_id ? `账号 ${shortId(plan.account_id)}` : '原账号')} · {recoverySpecLabel(plan.requested_spec)}
+                    {plan.source_instance_id ? ` · 接替 ${shortId(plan.source_instance_id)}` : ''}
+                    {plan.state === 'scheduled' && countdown > 0 ? ` · ${countdown}s 后重试` : ''}
+                  </p>
+                </div>
+                <span className={`${styles.badge} ${styles.recoveryBadge}`}>{recoveryStateLabel(plan.state)}</span>
+              </div>
+              {plan.model_restore && plan.state === 'restoring_env' && (
+                <p className={styles.muted}>
+                  后台恢复本地模型：{plan.model_restore.completed} / {plan.model_restore.total}
+                  {plan.model_restore.skipped > 0 ? `（跳过 ${plan.model_restore.skipped}）` : ''}
+                </p>
+              )}
+              {plan.last_error_message && <p className={styles.muted}>{plan.last_error_message}</p>}
+              {plan.state !== 'cancelling' && (
+                <div className={styles.cardActions}>
+                  <button
+                    type="button"
+                    className={styles.buttonDanger}
+                    disabled={busy === `cancel-plan:${plan.plan_id}`}
+                    onClick={() => void cancelPlan(plan)}
+                  >
+                    {busy === `cancel-plan:${plan.plan_id}` ? '正在取消…' : '取消自动恢复'}
+                  </button>
+                </div>
+              )}
+            </article>
+          );
+        })}
+      </div>
+    )}
     <div className={styles.summaryRow} aria-label="实例统计">
       <div className={styles.summaryCell}><span className={styles.muted}>全部</span><b>{rows.length}</b></div>
       <div className={styles.summaryCell}><span className={styles.muted}>活动</span><b>{activeCount}</b></div>
@@ -249,7 +370,24 @@ export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, on
         const state = instance.remote_delete_source === 'provider_runtime_missing' ? '已回收' : stateLabel(instance.state);
         const runtime = instance.creation_runtime as { workflow_key?: string; workflow_version?: string | number; process?: string } | null | undefined;
         return <article className={styles.instanceCard} key={id}>
-          <div className={styles.cardTop}><div className={styles.minWidth}><h3 title={id}>{label(instance)}</h3><p className={styles.muted}>{poolLabel(instance.instance_pool)} · {instance.account_alias_snapshot || (instance.account_id ? `账号 ${shortId(instance.account_id)}` : '账号未确认')} · {instance.provider || '运行时未确认'}</p></div><span className={`${styles.badge} ${instance.state === 'ready' || instance.state === 'busy' || instance.state === 'retained_idle' ? styles.good : ''}`}>{state}</span></div>
+          <div className={styles.cardTop}>
+            <div className={styles.minWidth}>
+              <h3 title={id}>{label(instance)}</h3>
+              <p className={styles.muted}>
+                {poolLabel(instance.instance_pool)} · {instance.account_alias_snapshot || (instance.account_id ? `账号 ${shortId(instance.account_id)}` : '账号未确认')} · {instance.provider || '运行时未确认'}
+                {instance.parent_instance_id ? ` · 接替 ${shortId(instance.parent_instance_id)}` : ''}
+                {instance.replaced_by_instance_id ? ` · 已由 ${shortId(instance.replaced_by_instance_id)} 接替` : ''}
+              </p>
+            </div>
+            <div className={styles.badgeGroup}>
+              {instance.recovery_source === 'auto_recovery' && (
+                <span className={`${styles.badge} ${styles.recoveryBadge}`} title={`恢复组 ${instance.recovery_group_id || ''}`}>
+                  自动恢复 #{instance.recovery_generation ?? 1}
+                </span>
+              )}
+              <span className={`${styles.badge} ${instance.state === 'ready' || instance.state === 'busy' || instance.state === 'retained_idle' ? styles.good : ''}`}>{state}</span>
+            </div>
+          </div>
           <div className={styles.detailGrid}>
             <div className={styles.metaCell}><span>GPU</span><b>{gpuLabel(instance)}</b></div>
             <div className={styles.metaCell}><span>实例 ID</span><b title={id}>{shortId(id)}</b></div>

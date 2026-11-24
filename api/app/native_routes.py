@@ -14,7 +14,7 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 from . import native_api, native_model_api
 from .api_access import build_access_urls, get_or_create_path_code, peek_path_code, reset_path_code
 from .common import APIError, admin, current_user, ok
-from .gpu import native, native_config, native_restart, native_workspace
+from .gpu import native, native_config, native_restart, native_workspace, recovery
 from .gpu.colab import RUNTIME_MISSING, RUNTIME_MISSING_MESSAGE
 from .job_history import job_timing_details
 from .native_proxy import get_native_gateway
@@ -374,7 +374,8 @@ def _load_status_snapshot(repo, owner_id: str):
             backend_info = native.backend_for(repo, owner_id)
         except APIError:
             backend_info = None
-    return lease, restart, job, instance, job_events, ncfg, model_storage, can_restart_base, backend_info, now
+    rec_plan = recovery.public_plan(recovery.latest_plan_for_pool(repo, owner_id, "native"))
+    return lease, restart, job, instance, job_events, ncfg, model_storage, can_restart_base, backend_info, rec_plan, now
 
 
 @router.get("/status")
@@ -390,6 +391,7 @@ async def status(request: Request, user=Depends(current_user)):
         model_storage,
         can_restart_base,
         backend_info,
+        rec_plan,
         now,
     ) = await asyncio.to_thread(_load_status_snapshot, repo, user["id"])
     reclaimed = bool(instance and instance.get("state") == "deleted"
@@ -445,6 +447,8 @@ async def status(request: Request, user=Depends(current_user)):
                "timings": timings, "timing_details": timing_details,
                "restart": restart, "can_restart": can_restart,
                "has_pending_offline_plugins": has_pending_offline_plugins,
+               "recovery": rec_plan,
+               "self_heal": (lease or {}).get("native_self_heal"),
                "reason": RUNTIME_MISSING if reclaimed else None,
                "error": RUNTIME_MISSING_MESSAGE if reclaimed else (job or {}).get("error_message"),
                "events": [{"message": e.get("message"), "state": e.get("state"), "created_at": e.get("created_at")}

@@ -944,3 +944,31 @@
     flex: 0 1 auto;
   }
 }
+
+.recoveryPlanStack {
+  display: grid;
+  gap: 10px;
+}
+
+.recoveryPlanCard {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--warning-line, rgba(255, 210, 125, 0.45));
+  border-radius: var(--r-md, 12px);
+  background: var(--warning-bg, rgba(255, 210, 125, 0.08));
+}
+
+.badgeGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.recoveryBadge {
+  color: var(--warning, #8a5200);
+  background: var(--warning-bg, rgba(255, 210, 125, 0.14));
+  border-color: var(--warning-line, rgba(255, 210, 125, 0.45));
+}

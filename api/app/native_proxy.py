@@ -87,6 +87,26 @@ class NativeGateway:
     def __init__(self, studio_app):
         self.studio_app = studio_app
         self._http_client = None
+        self._upstream_failures: dict[str, list[float]] = {}
+
+    def _note_upstream_failure(self, repo, lease: dict | None) -> None:
+        if not isinstance(lease, dict) or not lease.get("id") or not lease.get("owner_id"):
+            return
+        lid = str(lease["id"])
+        now = time.time()
+        recent = [ts for ts in self._upstream_failures.get(lid, []) if now - ts <= 10.0]
+        recent.append(now)
+        self._upstream_failures[lid] = recent[-10:]
+        if len(recent) >= 3:
+            self._upstream_failures[lid] = []
+            try:
+                native.record_runtime_check_hint(repo, lid, lease["owner_id"], now=now)
+            except Exception:
+                pass
+
+    def _clear_upstream_failures(self, lease: dict | None) -> None:
+        if isinstance(lease, dict) and lease.get("id"):
+            self._upstream_failures.pop(str(lease["id"]), None)
 
     def http_client(self):
         if self._http_client is None:
@@ -458,10 +478,15 @@ class NativeGateway:
                 try:
                     response = await client.send(req, stream=True)
                 except httpx.TransportError:
+                    await asyncio.to_thread(self._note_upstream_failure, repo, lease)
                     if not retryable or attempt == 2:
                         raise
                     await asyncio.sleep(0.2 * (attempt + 1))
                     continue
+                if response.status_code in {502, 503}:
+                    await asyncio.to_thread(self._note_upstream_failure, repo, lease)
+                elif response.status_code < 500:
+                    self._clear_upstream_failures(lease)
                 if retryable and response.status_code in {502, 503, 504} and attempt < 2:
                     await response.aclose()
                     await asyncio.sleep(0.2 * (attempt + 1))

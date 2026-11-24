@@ -1131,7 +1131,14 @@ class GoogleColabProvider:
             raise ColabError("Colab connectionInfo 未就绪")
         return str(info["url"]).rstrip("/"), str(info["token"]), {}
 
-    def keep_alive(self, lease: dict, *, run_kernel_exec: bool = False, ws_connect_fn=None) -> dict:
+    def keep_alive(
+        self,
+        lease: dict,
+        *,
+        run_kernel_exec: bool = False,
+        tfe_only: bool = False,
+        ws_connect_fn=None,
+    ) -> dict:
         """Send dual-layer Colab keep-alive without mutating DB state directly."""
         is_cli = self._is_cli_tunnel(lease)
         tfe_status = "skipped"
@@ -1165,6 +1172,16 @@ class GoogleColabProvider:
                 tfe_status = "read_timeout_ack"
             except Exception as exc:
                 tfe_status = f"err:{type(exc).__name__}"
+
+        if tfe_only:
+            tfe_ok = (tfe_status.startswith("ok:") or tfe_status == "read_timeout_ack") if is_cli else False
+            return {
+                "ok": bool(tfe_ok),
+                "tfe": tfe_status,
+                "proxy": "skipped",
+                "kernel_exec": "skipped",
+                "lease_patch": {},
+            }
 
         proxy_status = "skipped"
         kernel_exec_status = "skipped"

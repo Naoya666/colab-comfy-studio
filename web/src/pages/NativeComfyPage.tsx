@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUpRight, FolderKanban, Loader2 } from 'lucide-react';
-import { apiFetch, apiMessage, type GpuUsage } from '../lib/gpu-api';
+import { apiFetch, apiMessage, cancelRecoveryPlan, type GpuUsage, type RecoveryPlan } from '../lib/gpu-api';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import { NativeModelSettings, type ModelStorage } from '../components/NativeModelSettings';
 import { NativeModelPreparation } from '../components/NativeModelPreparation';
@@ -102,6 +102,8 @@ type NativeStatus = {
   model_storage?: ModelStorage;
   model_storage_known?: boolean;
   disk?: { disk_free_bytes?: number; vfs_cache_bytes?: number };
+  recovery?: RecoveryPlan | null;
+  self_heal?: Record<string, unknown> | null;
   events: NativeEvent[];
 };
 const restartMessages: Record<RestartPhase, string> = {
@@ -236,6 +238,8 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
   const [stopConfirm, setStopConfirm] = useState(false);
   const [submittingRestart, setSubmittingRestart] = useState(false);
   const [pendingRestart, setPendingRestart] = useState<{ id: string; previous?: string }>();
+  const [cancellingRecovery, setCancellingRecovery] = useState(false);
+  const [recoveryClockSec, setRecoveryClockSec] = useState(() => Math.floor(Date.now() / 1000));
   const [autoOpen, setAutoOpen] = useState(false);
   const [statusFetchedAtMs, setStatusFetchedAtMs] = useState(() => Date.now());
   const [storage, setStorage] = useState<ModelStorage | undefined>(() => initialPrefs.storage);
@@ -323,8 +327,25 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     } catch (cause) { if (!signal.aborted) setError(apiMessage(cause)); }
   }, [autoOpen, desktop]);
 
+  const recoveryPlan = status?.recovery ?? null;
+  const recoveryState = recoveryPlan?.state || '';
+  const recoveryInProgress = recoveryState === 'scheduled' || recoveryState === 'dispatching' || recoveryState === 'cancelling';
+  const recoveryRestoringModels = recoveryState === 'restoring_env';
+  const recoveryWildModels = recoveryPlan?.wild_models || [];
+  const recoveryCountdownSec = recoveryPlan?.next_retry_at
+    ? Math.max(0, Math.ceil(recoveryPlan.next_retry_at - recoveryClockSec))
+    : 0;
+
+  useEffect(() => {
+    if (!recoveryInProgress || !recoveryPlan?.next_retry_at) return;
+    setRecoveryClockSec(Math.floor(Date.now() / 1000));
+    const timer = window.setInterval(() => setRecoveryClockSec(Math.floor(Date.now() / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [recoveryInProgress, recoveryPlan?.next_retry_at]);
+
   const nativeTransitioning = Boolean(
-    pendingStart || pendingRestart || (status && status.state !== 'stopped' && !terminalStates.has(status.state))
+    pendingStart || pendingRestart || recoveryInProgress || recoveryRestoringModels
+    || (status && status.state !== 'stopped' && !terminalStates.has(status.state))
     || status?.restart?.phase === 'checking' || status?.restart?.phase === 'syncing'
     || status?.restart?.phase === 'rebooting' || status?.restart?.phase === 'recovering',
   );
@@ -364,6 +385,20 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     const controller = new AbortController();
     void pollStatus(controller.signal);
   }, [pollStatus]);
+
+  async function handleCancelRecovery() {
+    if (!recoveryPlan?.plan_id || cancellingRecovery) return;
+    setCancellingRecovery(true);
+    setError('');
+    try {
+      await cancelRecoveryPlan(recoveryPlan.plan_id, `native-recovery-cancel:${recoveryPlan.plan_id}`);
+      refreshStatusNow();
+    } catch (cause) {
+      setError(apiMessage(cause));
+    } finally {
+      setCancellingRecovery(false);
+    }
+  }
 
   async function restartNative() {
     const instance = status?.instance_id;
@@ -455,6 +490,49 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
       已运行 {scheduledSession.elapsed_minutes.toFixed(1)} 分钟 · 实扣 {cuNumber(scheduledSession.actual_cu)} CU
       {scheduledSession.draining && <p className={styles.cuWarning}>正在排空会话，队列与 Drive 同步空闲后释放。</p>}
     </div>}
+    {recoveryPlan && recoveryInProgress && (
+      <div className={styles.recoveryBanner} role="status" aria-label="自动恢复状态">
+        <div className={styles.recoveryBannerBody}>
+          <div className={styles.recoveryBannerTitle}>
+            <Loader2 size={15} className={styles.spin} aria-hidden />
+            <strong>
+              {recoveryState === 'cancelling'
+                ? '正在安全取消原生自动恢复（等待远端租约确认释放）'
+                : recoveryState === 'dispatching'
+                  ? `原生实例自动恢复中（第 ${Math.min(recoveryPlan.rounds_used + 1, recoveryPlan.max_rounds)}/${recoveryPlan.max_rounds} 轮 · 正在拉起继任实例）`
+                  : `原生实例已触发自动恢复（第 ${Math.min(recoveryPlan.rounds_used + 1, recoveryPlan.max_rounds)}/${recoveryPlan.max_rounds} 轮）`}
+            </strong>
+          </div>
+          <p className="muted small">
+            触发原因：{recoveryPlan.last_trigger_reason === 'provider_runtime_missing' ? 'Colab 上游回收运行中实例' : (recoveryPlan.last_trigger_reason || '运行时异常中断')}
+            {recoveryState === 'scheduled' && recoveryCountdownSec > 0 && ` · 将在 ${recoveryCountdownSec} 秒后重试分配`}
+            {recoveryPlan.last_error_message && ` · ${recoveryPlan.last_error_message}`}
+          </p>
+        </div>
+        {recoveryState !== 'cancelling' && (
+          <button
+            type="button"
+            className="button secondary"
+            disabled={cancellingRecovery}
+            onClick={() => void handleCancelRecovery()}
+          >
+            {cancellingRecovery ? '正在取消…' : '取消自动恢复'}
+          </button>
+        )}
+      </div>
+    )}
+    {recoveryPlan && !status?.ready && !recoveryInProgress && !recoveryRestoringModels && ['aborted_vps_outage', 'aborted_fatal', 'exhausted'].includes(recoveryState) && (
+      <div className={styles.recoveryBannerMuted} role="status">
+        <strong>
+          {recoveryState === 'aborted_vps_outage'
+            ? '自动恢复已放弃（VPS 长时间失联保护）'
+            : recoveryState === 'exhausted'
+              ? '自动恢复已停止（达到退避或轮次上限）'
+              : '自动恢复已中止'}
+        </strong>
+        {recoveryPlan.last_error_message && <p className="muted small">{recoveryPlan.last_error_message}</p>}
+      </div>
+    )}
     <div className={styles.nativeColumns}>
       <div className={styles.nativeControls}>
         {desktop && <h2>{status?.ready || restartInProgress ? '当前会话' : '会话配置'}</h2>}
@@ -489,6 +567,48 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
             <button className="button secondary" disabled={!status?.can_restart || restartInProgress}
               onClick={() => restartDialog.current?.showModal()}>{restartInProgress ? '正在重启…' : '重启原生 ComfyUI'}</button>
           </div>
+          {recoveryPlan && recoveryRestoringModels && recoveryPlan.model_restore && (
+            <div className={styles.recoveryRestoreBar} role="status" aria-label="后台恢复本地模型进度">
+              <div className={styles.recoveryRestoreHead}>
+                <span>
+                  <Loader2 size={13} className={styles.spin} aria-hidden /> 后台恢复上次本地模型：已完成{' '}
+                  <b>{recoveryPlan.model_restore.completed}</b> / {recoveryPlan.model_restore.total}
+                  {recoveryPlan.model_restore.skipped > 0 ? `（跳过 ${recoveryPlan.model_restore.skipped}）` : ''}
+                </span>
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={cancellingRecovery}
+                  onClick={() => void handleCancelRecovery()}
+                >
+                  停止回拉
+                </button>
+              </div>
+              <progress
+                className={styles.recoveryProgress}
+                max={Math.max(1, recoveryPlan.model_restore.total)}
+                value={recoveryPlan.model_restore.completed}
+              />
+              <p className="muted small">当前实例已就绪，可直接进入 ComfyUI 操作；模型按最近使用顺序在后台回拉。</p>
+            </div>
+          )}
+          {recoveryPlan?.model_restore?.partial_disk_limit && (
+            <p className="status" role="status">
+              本地模型回拉已触及 Colab 5 GiB 空间保护线：已完成 {recoveryPlan.model_restore.completed}/{recoveryPlan.model_restore.total} 个较新模型，已跳过较早模型。
+            </p>
+          )}
+          {recoveryWildModels.length > 0 && (
+            <details className={styles.activityFold}>
+              <summary>以下 {recoveryWildModels.length} 个文件上次未登记在 Studio 模型库，无法自动回拉</summary>
+              <ul className={styles.activityLogList}>
+                {recoveryWildModels.map(item => (
+                  <li key={item} className={styles.activityLogItem}>
+                    <span className={styles.activityLogText}><code>{item}</code></span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
           {!webUiReady && (
             <p className="muted small">当前为「仅 API 模式」（未配置独立原生网页域名），可直接点右上角「API 设置」复制路径短码或独立端口地址供酒馆使用。</p>
           )}

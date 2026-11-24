@@ -230,12 +230,219 @@ class LocalModels:
         self.drive_tokens = {}
         self.partials = root / "model-transfers"
         self.partials.mkdir(mode=0o700, exist_ok=True)
+        self.inventory_path = root / "local-models-inventory.json"
+        self.usage_records = self._load_usage_records()
         self.hashes = self._load_hash_cache()
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="studio-models")
         self.jobs = {}
         self.current_rows = {}
         self.inflight = {}
         self.handoffs = 0
+
+    @staticmethod
+    def _sanitize_source(url, source_kind=None):
+        if not isinstance(url, str) or not url.strip():
+            return None
+        parsed = urlsplit(url.strip())
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            return None
+        host = parsed.hostname.lower()
+        if host.endswith("googleapis.com") or host.endswith("googleusercontent.com"):
+            return None
+        port = f":{parsed.port}" if parsed.port else ""
+        clean = f"https://{host}{port}{parsed.path}"
+        out = {"download_url": clean}
+        if isinstance(source_kind, str) and source_kind:
+            out["kind"] = source_kind
+        return out
+
+    def _load_usage_records(self) -> dict:
+        try:
+            if not self.inventory_path.is_file():
+                return {}
+            raw = json.loads(self.inventory_path.read_text())
+            if not isinstance(raw, dict) or not isinstance(raw.get("usage"), dict):
+                return {}
+            return {str(k): dict(v) for k, v in raw["usage"].items() if isinstance(k, str) and isinstance(v, dict)}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _write_inventory_doc(self, doc: dict) -> None:
+        tmp = self.inventory_path.with_name(f".local-models-inventory.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
+            tmp.replace(self.inventory_path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+
+    def _record_model_used(self, target: Path, plan: dict) -> None:
+        try:
+            rel_parts = target.relative_to(self.model_dir).parts
+            if len(rel_parts) < 2:
+                return
+            category = category_for(rel_parts[0])
+            name = "/".join(rel_parts[1:])
+            rel_key = f"{category}/{name}"
+            drive = plan.get("drive") if isinstance(plan.get("drive"), dict) else {}
+            sanitized = self._sanitize_source(plan.get("url"), plan.get("source_kind"))
+            size = plan.get("size")
+            if not size:
+                try:
+                    size = target.stat().st_size
+                except OSError:
+                    size = None
+            now = round(time.time(), 3)
+            record = {
+                "category": category,
+                "name": name,
+                "last_used_at": now,
+                "sha256": plan.get("sha256") or drive.get("sha256"),
+                "md5": plan.get("md5") or drive.get("md5"),
+                "size": size,
+                "drive_file_id": drive.get("drive_file_id"),
+                "account": drive.get("account") or (self.config.get("drive_account") if drive.get("drive_file_id") else None),
+                "source": sanitized,
+            }
+            with self._state_lock:
+                prev = self.usage_records.get(rel_key) or {}
+                merged = {**prev, **{k: v for k, v in record.items() if v is not None}}
+                merged["last_used_at"] = now
+                self.usage_records[rel_key] = merged
+                usage_copy = dict(self.usage_records)
+            try:
+                existing = json.loads(self.inventory_path.read_text()) if self.inventory_path.is_file() else {}
+                if not isinstance(existing, dict):
+                    existing = {}
+            except (OSError, ValueError):
+                existing = {}
+            existing["usage"] = usage_copy
+            existing["updated_at"] = now
+            self._write_inventory_doc(existing)
+        except Exception:
+            pass
+
+    def scan_inventory(self) -> dict:
+        """Scan local SSD models into catalog/source-backed recoverable_models vs wild_models."""
+        catalog_index: dict[tuple[str, str], dict] = {}
+        for row in self.catalog:
+            if not isinstance(row, dict):
+                continue
+            try:
+                row_cat, paths = registered_paths(row)
+            except (KeyError, ModelError, TypeError):
+                continue
+            for p in paths:
+                catalog_index.setdefault((row_cat, p), row)
+            if row.get("drive_file_id") and row.get("filename"):
+                catalog_index.setdefault((row_cat, f"{row['drive_file_id']}-{row['filename']}"), row)
+
+        with self._state_lock:
+            usage_copy = dict(self.usage_records)
+
+        recoverable: list[dict] = []
+        wild: list[str] = []
+        valid_categories = set(deps.directories().keys())
+        if self.model_dir.is_dir() and not self.model_dir.is_symlink():
+            for dirpath, dirnames, filenames in os.walk(self.model_dir, followlinks=False):
+                cur_dir = Path(dirpath)
+                dirnames[:] = sorted(
+                    d for d in dirnames
+                    if not d.startswith(".") and not (cur_dir / d).is_symlink()
+                )
+                for fname in sorted(filenames):
+                    if fname.startswith(".") or fname.endswith((".partial", ".tmp")):
+                        continue
+                    fpath = cur_dir / fname
+                    if fpath.is_symlink():
+                        continue
+                    try:
+                        rel_parts = fpath.relative_to(self.model_dir).parts
+                        if len(rel_parts) < 2:
+                            continue
+                        category = category_for(rel_parts[0])
+                        if category not in valid_categories:
+                            continue
+                        name = "/".join(rel_parts[1:])
+                        stat = fpath.stat()
+                    except (OSError, ValueError):
+                        continue
+                    if stat.st_size <= 0:
+                        continue
+                    rel_key = f"{category}/{name}"
+                    cat_row = catalog_index.get((category, name))
+                    usage = usage_copy.get(rel_key)
+                    drive_file_id = None
+                    account = None
+                    sanitized_source = None
+                    sha256 = None
+                    md5 = None
+                    size = stat.st_size
+                    if cat_row is not None:
+                        drive_file_id = cat_row.get("drive_file_id")
+                        account = cat_row.get("account")
+                        src = cat_row.get("source") if isinstance(cat_row.get("source"), dict) else None
+                        if src:
+                            sanitized_source = self._sanitize_source(src.get("download_url"), src.get("kind"))
+                        sha256 = cat_row.get("sha256") or (usage or {}).get("sha256")
+                        md5 = cat_row.get("md5") or (usage or {}).get("md5")
+                        size = cat_row.get("size") or stat.st_size
+                    if not drive_file_id and not sanitized_source and usage is not None:
+                        drive_file_id = usage.get("drive_file_id")
+                        account = usage.get("account")
+                        usrc = usage.get("source") if isinstance(usage.get("source"), dict) else None
+                        if usrc:
+                            sanitized_source = self._sanitize_source(usrc.get("download_url"), usrc.get("kind"))
+                        sha256 = sha256 or usage.get("sha256")
+                        md5 = md5 or usage.get("md5")
+                        size = usage.get("size") or size
+                    if not drive_file_id and not sanitized_source:
+                        wild.append(rel_key)
+                        continue
+                    last_used = float((usage or {}).get("last_used_at") or round(stat.st_mtime, 3))
+                    entry = {
+                        "category": category,
+                        "name": name,
+                        "last_used_at": round(last_used, 3),
+                        "size": int(size),
+                    }
+                    if sha256:
+                        entry["sha256"] = sha256
+                    if md5:
+                        entry["md5"] = md5
+                    if drive_file_id:
+                        entry["drive_file_id"] = drive_file_id
+                    if account:
+                        entry["account"] = account
+                    if sanitized_source:
+                        entry["source"] = sanitized_source
+                    recoverable.append(entry)
+
+        recoverable.sort(key=lambda item: (-float(item.get("last_used_at") or 0.0), item["category"], item["name"]))
+        wild = sorted(set(wild))
+        canonical = json.dumps(
+            {"recoverable_models": recoverable, "wild_models": wild},
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        inv_digest = hashlib.sha256(canonical).hexdigest()
+        now = round(time.time(), 3)
+        self._write_inventory_doc({
+            "digest": inv_digest,
+            "recoverable_models": recoverable,
+            "wild_models": wild,
+            "usage": usage_copy,
+            "updated_at": now,
+        })
+        return {
+            "digest": inv_digest,
+            "recoverable_models": recoverable,
+            "wild_models": wild,
+            "updated_at": now,
+        }
+
+    def inventory_digest(self) -> str:
+        return self.scan_inventory()["digest"]
 
     def _hash_cache_file(self) -> Path:
         return self.root / ".model-hash-cache.json"
@@ -676,6 +883,7 @@ class LocalModels:
         try:
             if self.local_hit(target, plan):
                 update(state="ready", source="local", cache_hit=True)
+                self._record_model_used(target, plan)
                 return
             url, drive = plan["url"], plan["drive"]
             token = None
@@ -704,6 +912,7 @@ class LocalModels:
                     update(fallback=str(exc), bytes=0)
                 else:
                     update(state="ready", integrity="sha256" if plan["sha256"] else "transport")
+                    self._record_model_used(target, plan)
                     return
             if not drive and self.config.get("models_folder"):
                 token = self.drive_token(account)
@@ -724,11 +933,16 @@ class LocalModels:
             self.transfer(f"https://www.googleapis.com/drive/v3/files/{quote(file_id)}?alt=media",
                           target, plan, update, drive_token=token)
             update(state="ready", integrity="sha256" if plan["sha256"] else "drive_md5")
+            self._record_model_used(target, plan)
+        except DiskSpaceError as exc:
+            update(state="failed", error=str(exc), disk_space_limit=True)
         except ModelError as exc:
             update(state="failed", error=str(exc))
         except OSError as exc:
-            error = str(DiskSpaceError()) if exc.errno == errno.ENOSPC else "无法写入 Colab 本地模型目录"
-            update(state="failed", error=error)
+            if exc.errno == errno.ENOSPC:
+                update(state="failed", error=str(DiskSpaceError()), disk_space_limit=True)
+            else:
+                update(state="failed", error="无法写入 Colab 本地模型目录")
         except Exception:
             # Underlying exceptions can contain signed URLs, tokens or provider responses.
             update(state="failed", error="准备模型失败，请检查网络、Drive 授权和 Colab 本地磁盘")
@@ -834,6 +1048,108 @@ class LocalModels:
             finally:
                 self.current_rows.pop(task, None)
 
+    async def restore(self, models_list, catalog, *, refresh_fn=None):
+        """Background full restore for native local mode in last_used_at desc order (§6.1(4))."""
+        if not isinstance(models_list, list) or len(models_list) > 256:
+            raise ModelError("模型恢复列表必须是至多 256 项的数组")
+        ordered = sorted(
+            [m for m in models_list if isinstance(m, dict) and m.get("category") and m.get("name")],
+            key=lambda item: (
+                -float(item.get("last_used_at") or 0.0),
+                str(item.get("category") or ""),
+                str(item.get("name") or ""),
+            ),
+        )
+        with (self.root / "models-active.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            rows = {}
+            tasks = []
+            items: list[tuple[str, str, dict, dict]] = []
+            for item in ordered:
+                try:
+                    cat = category_for(str(item["category"]))
+                    name = relative_path(str(item["name"]))
+                except (ModelError, TypeError, ValueError):
+                    continue
+                if (cat, name) in rows:
+                    continue
+                status = rows[(cat, name)] = {"category": cat, "name": name, "state": "pending"}
+                items.append((cat, name, item, status))
+            self.current_rows[asyncio.current_task()] = rows, tasks
+            disk_limit_hit = False
+            try:
+                for cat, name, item, status in items:
+                    if disk_limit_hit:
+                        status.update(state="skipped_disk_limit", error=str(DiskSpaceError()), disk_space_limit=True)
+                        continue
+                    try:
+                        src = item.get("source") if isinstance(item.get("source"), dict) else {}
+                        raw_url = src.get("download_url") or item.get("url")
+                        entry = {
+                            "category": cat,
+                            "name": name,
+                            "url": https_url(raw_url) if raw_url else None,
+                            "sha256": item.get("sha256"),
+                            "size": item.get("size"),
+                            "md5": item.get("md5"),
+                            "drive_file_id": item.get("drive_file_id"),
+                        }
+                        target, plan = self.plan([entry], catalog)
+                        if item.get("account") and isinstance(plan.get("drive"), dict) and not plan["drive"].get("account"):
+                            plan["drive"] = {**plan["drive"], "account": item["account"]}
+                        identity = (
+                            plan["sha256"],
+                            plan["md5"],
+                            plan["size"],
+                            None if plan["sha256"] else plan["url"],
+                            (plan["drive"] or {}).get("drive_file_id") if not plan["sha256"] else None,
+                        )
+                        current = self.inflight.get(target)
+                        if current and current[0] != identity:
+                            raise ModelError("该路径正在准备另一版本，请等候并核对模型身份")
+                        if not current:
+                            task = asyncio.get_running_loop().run_in_executor(
+                                self.executor, self.prepare_one, target, plan, status
+                            )
+                            self.inflight[target] = (identity, task, status)
+                            task.add_done_callback(lambda _, path=target: self.inflight.pop(path, None))
+                            current = self.inflight[target]
+                        tasks.append((current[1], status, current[2]))
+                        await asyncio.shield(current[1])
+                        shared = current[2]
+                        if shared.get("disk_space_limit") or "5 GiB" in str(shared.get("error") or ""):
+                            disk_limit_hit = True
+                            shared["state"] = "skipped_disk_limit"
+                            status.update(state="skipped_disk_limit", error=shared.get("error") or str(DiskSpaceError()), disk_space_limit=True)
+                        elif shared.get("state") == "ready" and refresh_fn is not None:
+                            try:
+                                refresh_fn()
+                            except Exception:
+                                pass
+                    except DiskSpaceError as exc:
+                        disk_limit_hit = True
+                        status.update(state="skipped_disk_limit", error=str(exc), disk_space_limit=True)
+                    except ModelError as exc:
+                        status.update(state="failed", error=str(exc))
+                return self.progress(rows, tasks)
+            finally:
+                self.current_rows.pop(asyncio.current_task(), None)
+
+    def submit_restore(self, models_list, *, refresh_fn=None):
+        expiry = time.monotonic() - 3600
+        self.jobs = {k: v for k, v in self.jobs.items() if not v[0].done() or v[1] > expiry}
+        if len(self.jobs) >= 256:
+            oldest = next((key for key, (task, _) in self.jobs.items() if task.done()), None)
+            if oldest:
+                del self.jobs[oldest]
+        if sum(not task.done() for task, _ in self.jobs.values()) >= 16:
+            raise ModelError("模型准备请求过多，请等待当前下载完成")
+        ident = uuid.uuid4().hex
+        task = asyncio.create_task(self.restore(models_list, self.catalog, refresh_fn=refresh_fn))
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        self.jobs[ident] = task, time.monotonic()
+        return ident, task
+
     def submit(self, body, explicit=None, *, visual=False, trusted=False, studio=None):
         expiry = time.monotonic() - 3600
         self.jobs = {k: v for k, v in self.jobs.items() if not v[0].done() or v[1] > expiry}
@@ -860,10 +1176,22 @@ class LocalModels:
         if task.done():
             try:
                 models = task.result()
-                return {"state": "failed" if any(m["state"] == "failed" for m in models) else "ready", "models": models}
+                partial_disk = any(
+                    m.get("state") == "skipped_disk_limit" or m.get("disk_space_limit")
+                    for m in models
+                )
+                if partial_disk:
+                    state = "partial_disk_limit"
+                elif any(m["state"] == "failed" for m in models):
+                    state = "failed"
+                else:
+                    state = "ready"
+                return {"state": state, "partial_disk_limit": partial_disk, "models": models}
             except ModelError as exc:
-                return {"state": "failed", "message": str(exc), "models": []}
-        return {"state": "preparing", "models": self.progress(*self.current_rows.get(task, ({}, [])))}
+                return {"state": "failed", "partial_disk_limit": False, "message": str(exc), "models": []}
+        models = self.progress(*self.current_rows.get(task, ({}, [])))
+        partial_disk = any(m.get("state") == "skipped_disk_limit" or m.get("disk_space_limit") for m in models)
+        return {"state": "preparing", "partial_disk_limit": partial_disk, "models": models}
 
     def names(self, category, extensions=None):
         names = set()
@@ -1129,6 +1457,45 @@ def install(server, root, folder_paths, node_types):
             raise web.HTTPNotFound()
         sync(await json_body(request))
         return web.json_response({})
+
+    @server.routes.get("/studio_native/models/inventory")
+    async def model_inventory(request):
+        if not local.signed(request):
+            raise web.HTTPNotFound()
+        try:
+            inv = await asyncio.to_thread(local.scan_inventory)
+        except ModelError as exc:
+            return web.json_response(model_problem(str(exc)), status=422)
+        return web.json_response(inv)
+
+    @server.routes.post("/studio_native/models/restore")
+    async def start_restore(request):
+        if not local.signed(request):
+            raise web.HTTPNotFound()
+        try:
+            data = await json_body(request)
+            if "catalog" in data:
+                sync(data)
+            models_list = data.get("models")
+            if not isinstance(models_list, list):
+                raise ModelError("模型恢复请求缺少有效的 models 数组")
+            ident, _ = local.submit_restore(models_list, refresh_fn=refresh)
+            await asyncio.sleep(0)
+        except ModelError as exc:
+            return web.json_response(model_problem(str(exc)), status=422)
+        return web.json_response({"id": ident}, status=202)
+
+    @server.routes.get("/studio_native/models/restore/{ident}")
+    async def restore_status(request):
+        if not local.signed(request):
+            raise web.HTTPNotFound()
+        ident = request.match_info["ident"]
+        if ident == "latest":
+            ident = next(reversed(local.jobs), None)
+        result = local.status(ident)
+        if result is None:
+            raise web.HTTPNotFound()
+        return web.json_response({"id": ident, **result})
 
     @server.routes.get("/studio_native/models/workflows")
     async def list_drive_workflows(request):

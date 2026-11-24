@@ -425,7 +425,11 @@ def repair_legacy_identity(bind) -> None:
         instance_id = _owner_instance(bind, raw_instance, owner) if raw_instance else None
         if instance_id is None and lease_key:
             instance_id = lease_to_instance.get(lease_key)
-        if instance_id is None:
+        if instance_id is None and not (
+            payload.get("attempt_id")
+            or payload.get("attempt_retry_keys")
+            or payload.get("recovery_plan_id")
+        ):
             instance_id = job_to_instance.get((owner, row["id"]))
         raw_account = _identity_from_row(row, "account_id")
         account_id = _owner_account(bind, raw_account, owner) if raw_account else None

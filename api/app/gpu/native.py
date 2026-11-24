@@ -184,6 +184,11 @@ def workspace_offline_status(repo, owner: str = "owner", now: float | None = Non
     )
     if running:
         return False, "当前原生 ComfyUI 正在启动或收尾中，请等待任务结束并停止实例后再执行修改"
+    from . import recovery
+
+    plan = recovery.active_plan(repo, owner, pool="native")
+    if plan:
+        return False, "当前原生 ComfyUI 正在自动恢复中（等待重新拉起实例），请等待恢复完成或先取消自动恢复后再执行离线修改"
     return True, None
 
 
@@ -292,7 +297,7 @@ class _borrow:
         pass
 
 
-def admit(repo, owner, body, key, *, api_key_id=None):
+def _validate_admit_request(repo, owner, body, key):
     cfg = GpuConfig.from_env()
     timeouts = {"retain_idle_minutes": settings.native_comfy_idle_minutes,
                 "max_runtime_minutes": settings.native_comfy_max_runtime_minutes}
@@ -319,76 +324,115 @@ def admit(repo, owner, body, key, *, api_key_id=None):
     account = body.get("account_id")
     if not account or not isinstance(body.get("spec"), dict):
         raise APIError("NATIVE_INPUT", "请选择账号和 GPU 规格", 422)
+    return cfg, timeouts, storage, commit, account
+
+
+def _admit_locked(
+    repo,
+    owner,
+    body,
+    key,
+    *,
+    api_key_id=None,
+    extra_job_fields: dict | None = None,
+    cancel_recovery_plan: bool = False,
+    _validated=None,
+):
+    """Admit a native ComfyUI start job while caller already holds dispatch_lock (non-reentrant)."""
+    cfg, timeouts, storage, commit, account = _validated or _validate_admit_request(repo, owner, body, key)
+    if hasattr(repo, "get_by_idempotency_key"):
+        previous = repo.get_by_idempotency_key("jobs", owner, key)
+    else:
+        previous = next((j for j in repo.list("jobs", owner) if j.get("idempotency_key") == key), None)
+    if previous:
+        if previous.get("native_request_hash") != digest(body):
+            raise APIError("IDEMPOTENCY_CONFLICT", "幂等键参数冲突", 409)
+        return previous
+    if active_workspace_write_lock(repo, owner):
+        raise APIError("NATIVE_WORKSPACE_LOCKED", "离线工作流或插件管理正在写入 Drive，请数秒后重试启动", 409)
+    from .cu_guard import CuGuardService
+    CuGuardService(repo).check(owner, "colab", account, body.get("instance_id"))
+    active_jobs = (
+        repo.list_by_states("jobs", TERMINAL, owner, exclude=True)
+        if hasattr(repo, "list_by_states")
+        else repo.list("jobs", owner)
+    )
+    running = next((j for j in active_jobs
+                    if (j.get("snapshot") or {}).get("native_comfy") and j["state"] not in TERMINAL), None)
+    live = active_lease(repo, owner)
+    if running or live:
+        source = running or repo.get("jobs", live.get("native_bootstrap_job_id") or live.get("owner_job_id"), owner)
+        if api_key_id and source:
+            return source
+        from .specs import spec_key
+        try:
+            same_spec = source and spec_key(source.get("requested_spec")) == spec_key(body["spec"])
+        except ValueError:
+            same_spec = False
+        if not source or source.get("account_id") != account or not same_spec:
+            raise APIError("NATIVE_ACTIVE", "已有原生会话；请等待任务和同步完成后停止旧实例，再切换 GPU", 409)
+        policy = source.get("execution_policy") or {}
+        if any(field in body and timeouts[field] != policy.get(field, default)
+               for field, default in (("retain_idle_minutes", settings.native_comfy_idle_minutes),
+                                      ("max_runtime_minutes", settings.native_comfy_max_runtime_minutes))):
+            raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止旧实例后重新启动以调整时间参数", 409)
+        if any(field in body and storage[field] != model_storage(policy)[field] for field in storage):
+            raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止实例并重新启动以修改模型存储配置", 409)
+        return source
+    if body.get("instance_id"):
+        raise APIError("INSTANCE_CONFLICT", "原生 ComfyUI 仅使用独立原生实例，不复用其他域实例", 409)
+    from app.compute_routes import _require_account
+    _require_account(repo, owner, account)
+    if cancel_recovery_plan:
+        from . import recovery
+
+        with repo.store.db_lock(), repo.store.Session.begin() as session:
+            repo.store.begin_immediate(session)
+            recovery.cancel_scheduled_native_plans_in_tx(session, owner, time.time())
+    from .rates import minute_rate
+    rate = minute_rate(body["spec"], fallback_rate=cfg.unit_rate)
+    project = "native-comfy-" + owner
+    if not repo.store.get("projects", project, owner):
+        repo.store.create("projects", owner, {"title": "原生 ComfyUI", "system": True}, record_id=project)
+    raw = {"kind": "native-comfy", **body}
+    job, _ = repo.create_job(owner, raw, key)
+    policy = {"provider": "colab", "lifecycle": "retain", "account_id": account,
+              **timeouts, **storage}
+    patch = {
+        **({"native_api_key_id": api_key_id} if api_key_id else {}),
+        "instance_pool": "native",
+        "native_request_hash": digest(body), "project_id": project, "provider": "colab",
+        "account_id": account, "requested_account_id": account,
+        "requested_instance_id": None, "requested_spec": body["spec"],
+        "lifecycle": "retain", "execution_policy": policy,
+        "model_id": "native-comfy", "workflow_key": "system/native-comfy", "workflow_version": 1,
+        "max_runtime_minutes": timeouts["max_runtime_minutes"], "unit_rate": rate,
+        "native_session_deadline_epoch": time.time() + timeouts["max_runtime_minutes"] * 60,
+        "estimated_units": None,
+        "snapshot": {"native_comfy": True, "native_plugin_generation": body.get("plugin_generation"), "bound_graph": {},
+                     "manifest": {"reviewed": True, "state": "published", "comfy_commit": commit,
+                                  "compute_spec": body["spec"].get("key", body["spec"])}},
+    }
+    if isinstance(extra_job_fields, dict):
+        patch.update(extra_job_fields)
+    return repo.update("jobs", job["id"], patch, owner)
+
+
+def admit(repo, owner, body, key, *, api_key_id=None):
+    validated = _validate_admit_request(repo, owner, body, key)
     # A durable dispatch lock serializes admission with both API and worker processes.
     with repo.store.dispatch_lock() as acquired:
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "调度正在同步，请使用相同幂等键重试", 503)
-        if hasattr(repo, "get_by_idempotency_key"):
-            previous = repo.get_by_idempotency_key("jobs", owner, key)
-        else:
-            previous = next((j for j in repo.list("jobs", owner) if j.get("idempotency_key") == key), None)
-        if previous:
-            if previous.get("native_request_hash") != digest(body):
-                raise APIError("IDEMPOTENCY_CONFLICT", "幂等键参数冲突", 409)
-            return previous
-        if active_workspace_write_lock(repo, owner):
-            raise APIError("NATIVE_WORKSPACE_LOCKED", "离线工作流或插件管理正在写入 Drive，请数秒后重试启动", 409)
-        from .cu_guard import CuGuardService
-        CuGuardService(repo).check(owner, "colab", account, body.get("instance_id"))
-        active_jobs = (
-            repo.list_by_states("jobs", TERMINAL, owner, exclude=True)
-            if hasattr(repo, "list_by_states")
-            else repo.list("jobs", owner)
+        return _admit_locked(
+            repo,
+            owner,
+            body,
+            key,
+            api_key_id=api_key_id,
+            cancel_recovery_plan=True,
+            _validated=validated,
         )
-        running = next((j for j in active_jobs
-                        if (j.get("snapshot") or {}).get("native_comfy") and j["state"] not in TERMINAL), None)
-        live = active_lease(repo, owner)
-        if running or live:
-            source = running or repo.get("jobs", live.get("native_bootstrap_job_id") or live.get("owner_job_id"), owner)
-            if api_key_id and source:
-                return source
-            from .specs import spec_key
-            try:
-                same_spec = source and spec_key(source.get("requested_spec")) == spec_key(body["spec"])
-            except ValueError:
-                same_spec = False
-            if not source or source.get("account_id") != account or not same_spec:
-                raise APIError("NATIVE_ACTIVE", "已有原生会话；请等待任务和同步完成后停止旧实例，再切换 GPU", 409)
-            policy = source.get("execution_policy") or {}
-            if any(field in body and timeouts[field] != policy.get(field, default)
-                   for field, default in (("retain_idle_minutes", settings.native_comfy_idle_minutes),
-                                          ("max_runtime_minutes", settings.native_comfy_max_runtime_minutes))):
-                raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止旧实例后重新启动以调整时间参数", 409)
-            if any(field in body and storage[field] != model_storage(policy)[field] for field in storage):
-                raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止实例并重新启动以修改模型存储配置", 409)
-            return source
-        if body.get("instance_id"):
-            raise APIError("INSTANCE_CONFLICT", "原生 ComfyUI 仅使用独立原生实例，不复用其他域实例", 409)
-        from app.compute_routes import _require_account
-        _require_account(repo, owner, account)
-        from .rates import minute_rate
-        rate = minute_rate(body["spec"], fallback_rate=cfg.unit_rate)
-        project = "native-comfy-" + owner
-        if not repo.store.get("projects", project, owner):
-            repo.store.create("projects", owner, {"title": "原生 ComfyUI", "system": True}, record_id=project)
-        raw = {"kind": "native-comfy", **body}
-        job, _ = repo.create_job(owner, raw, key)
-        policy = {"provider": "colab", "lifecycle": "retain", "account_id": account,
-                  **timeouts, **storage}
-        return repo.update("jobs", job["id"], {
-            **({"native_api_key_id": api_key_id} if api_key_id else {}),
-            "instance_pool": "native",
-            "native_request_hash": digest(body), "project_id": project, "provider": "colab",
-            "account_id": account, "requested_account_id": account,
-            "requested_instance_id": None, "requested_spec": body["spec"],
-            "lifecycle": "retain", "execution_policy": policy,
-            "model_id": "native-comfy", "workflow_key": "system/native-comfy", "workflow_version": 1,
-            "max_runtime_minutes": timeouts["max_runtime_minutes"], "unit_rate": rate,
-            "native_session_deadline_epoch": time.time() + timeouts["max_runtime_minutes"] * 60,
-            "estimated_units": None,
-            "snapshot": {"native_comfy": True, "native_plugin_generation": body.get("plugin_generation"), "bound_graph": {},
-                         "manifest": {"reviewed": True, "state": "published", "comfy_commit": commit,
-                                      "compute_spec": body["spec"].get("key", body["spec"])}}}, owner)
 
 
 def runtime_secrets(repo, job):
@@ -649,6 +693,128 @@ def keepalive_lease(repo, lease, clock=time.time, *, provider_factory=None, smar
     return result
 
 
+def keepalive_active_lease(repo, lease, clock=time.time, *, provider_factory=None):
+    """L0: send lightweight TFE-only keep-alive on active running Colab leases without touching Jupyter kernel."""
+    if not env_flag("GPU_ACTIVE_KEEPALIVE", settings.gpu_active_keepalive):
+        return None
+    if (
+        not isinstance(lease, dict)
+        or lease.get("provider") != "colab"
+        or lease.get("state") != "active"
+        or lease.get("force_stop")
+        or lease.get("cleanup_claim_token")
+        or not lease.get("account_id")
+        or not lease.get("tunnel_endpoint")
+    ):
+        return None
+    if provider_factory is None and not GpuConfig.from_env().real_enabled:
+        return None
+    now = float(clock())
+    deadline = lease.get("deadline_epoch")
+    if deadline is not None and now >= float(deadline):
+        return None
+    from .colab import KEEPALIVE_INTERVAL_SECONDS, KEEPALIVE_RETRY_SECONDS, GoogleColabProvider
+
+    prev_status = lease.get("active_keepalive_status")
+    interval = (
+        KEEPALIVE_RETRY_SECONDS
+        if isinstance(prev_status, dict) and prev_status.get("ok") is False
+        else KEEPALIVE_INTERVAL_SECONDS
+    )
+    last_keepalive = float(lease.get("active_last_keepalive_at") or 0)
+    if last_keepalive > 0 and now - last_keepalive < interval:
+        return None
+
+    identity = _lease_identity(lease)
+    job_stub = {
+        "id": lease.get("owner_job_id"),
+        "owner_id": lease["owner_id"],
+        "provider": "colab",
+        "account_id": lease["account_id"],
+    }
+    provider = None
+    owns_provider = False
+    try:
+        if provider_factory is not None:
+            provider = provider_factory(job_stub)
+            if not hasattr(provider, "keep_alive"):
+                return None
+        else:
+            provider = GoogleColabProvider(repo, lease["owner_id"], account_id=lease["account_id"])
+            owns_provider = True
+        import inspect
+
+        params = inspect.signature(provider.keep_alive).parameters
+        if "tfe_only" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            result = provider.keep_alive(lease, run_kernel_exec=False, tfe_only=True)
+        else:
+            result = provider.keep_alive(lease, run_kernel_exec=False)
+    except Exception as exc:
+        result = {"ok": False, "tfe": f"err:{type(exc).__name__}", "proxy": "skipped", "kernel_exec": "skipped"}
+    finally:
+        if (owns_provider or isinstance(provider, GoogleColabProvider)) and hasattr(provider, "close"):
+            provider.close()
+
+    if not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
+        return result
+    commit_now = float(clock())
+    with repo.store.dispatch_lock() as acquired:
+        if not acquired:
+            return result
+        fresh = repo.get("leases", lease["id"], lease["owner_id"])
+        if (
+            not fresh
+            or fresh.get("state") != "active"
+            or fresh.get("force_stop")
+            or fresh.get("cleanup_claim_token")
+            or _lease_identity(fresh) != identity
+        ):
+            return None
+        fresh_deadline = fresh.get("deadline_epoch")
+        if fresh_deadline is not None and commit_now >= float(fresh_deadline):
+            return None
+        repo.update(
+            "leases",
+            fresh["id"],
+            {
+                "active_last_keepalive_at": commit_now,
+                "active_keepalive_status": {
+                    "at": commit_now,
+                    "ok": bool(result.get("ok")),
+                    "tfe": result.get("tfe"),
+                },
+            },
+            fresh["owner_id"],
+        )
+    return result
+
+
+def record_runtime_check_hint(repo, lease_id: str, owner_id: str, *, now: float | None = None) -> bool:
+    """Record a throttled (>=10s) hint asking _inspect_runtime to probe Colab early."""
+    if not lease_id or not owner_id:
+        return False
+    current = time.time() if now is None else float(now)
+    lease = repo.get("leases", lease_id, owner_id)
+    if not lease or lease.get("state") == "deleted":
+        return False
+    prev = float(lease.get("provider_runtime_check_hint_at") or 0)
+    if current - prev < 10.0:
+        return False
+    repo.update("leases", lease_id, {"provider_runtime_check_hint_at": current}, owner_id)
+    return True
+
+
+def native_proxy_healthy(repo, owner: str = "owner", client=None) -> bool:
+    """Lightweight check whether the native ComfyUI tunnel responds healthy right now."""
+    try:
+        url, headers = backend_for(repo, owner)
+        with httpx.Client(timeout=3.0, follow_redirects=False) if client is None else _borrow(client) as c:
+            resp = c.get(url + "/system_stats", headers=headers)
+            return resp.status_code == 200 and isinstance(resp.json().get("system"), dict)
+    except Exception:
+        return False
+
+
 def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_factory=None):
     """Fence idle shutdown against new uploads/prompts under the existing dispatch lock."""
     if not lease.get("native_comfy") or lease.get("force_stop"):
@@ -700,11 +866,15 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
             if restart_active(lease) and not expired:
                 retained = True
             elif upstream_busy:
-                lease = repo.update("leases", lease["id"], {"native_last_busy": clock()}, lease["owner_id"])
+                lease = repo.update("leases", lease["id"], {"native_last_busy": clock(), "native_last_upstream_busy": True}, lease["owner_id"])
                 retained = True
             elif clock() - float(lease.get("native_http_heartbeat") or 0) < 30:
+                if lease.get("native_last_upstream_busy") is not False:
+                    lease = repo.update("leases", lease["id"], {"native_last_upstream_busy": False}, lease["owner_id"])
                 retained = True
             else:
+                if lease.get("native_last_upstream_busy") is not False:
+                    lease = repo.update("leases", lease["id"], {"native_last_upstream_busy": False}, lease["owner_id"])
                 last = max(float(lease.get("native_last_busy") or 0), float(lease.get("native_last_write") or 0))
                 idle_minutes = lease.get("native_idle_minutes")
                 if idle_minutes is None:
@@ -875,11 +1045,19 @@ def sync_plugins(repo, lease, client=None, *, return_state=False):
     """Pull committed metadata over the existing authenticated tunnel; no GPU token on VPS."""
     url, headers = backend_for(repo, lease["owner_id"])
     owner = lease["owner_id"]
+    from . import recovery
     from .node_persistence import digest
     key = "native-plugins-" + digest(owner)[:32]
+    models_key = recovery.local_models_key(owner)
     existing_saved = repo.store.get("settings", key, owner) or {}
+    existing_models_doc = repo.store.get("settings", models_key, owner) or {}
+    existing_by_inst = existing_models_doc.get("by_instance") if isinstance(existing_models_doc.get("by_instance"), dict) else {}
+    inst_id = lease.get("instance_id") or lease.get("id")
+    existing_inst_models = existing_by_inst.get(inst_id) if isinstance(existing_by_inst.get(inst_id), dict) else {}
     fetched_telemetry = None
     fetched_telemetry_digest = None
+    fetched_inventory = None
+    fetched_inventory_digest = None
     with httpx.Client(timeout=15) if client is None else _borrow(client) as c:
         response = c.get(url + "/studio_native/state", headers=headers)
         response.raise_for_status()
@@ -902,9 +1080,29 @@ def sync_plugins(repo, lease, client=None, *, return_state=False):
                         fetched_telemetry_digest = remote_tel_digest
             except (httpx.HTTPError, ValueError):
                 pass
+        remote_models_digest = state_payload.get("local_models_digest")
+        if (
+            isinstance(remote_models_digest, str)
+            and remote_models_digest
+            and remote_models_digest != existing_inst_models.get("digest")
+        ):
+            try:
+                from app import native_model_api
+
+                inv_headers = native_model_api.headers(url, headers, lease, repo=repo)
+                inv_resp = c.get(url + "/studio_native/models/inventory", headers=inv_headers, timeout=10)
+                if inv_resp.status_code == 200:
+                    parsed_inv = inv_resp.json()
+                    if isinstance(parsed_inv, dict) and isinstance(parsed_inv.get("recoverable_models"), list):
+                        fetched_inventory = parsed_inv
+                        fetched_inventory_digest = remote_models_digest
+            except Exception:
+                pass
     manifest = status.get("manifest")
     if manifest and (manifest.get("schema") != 1 or manifest.get("generation") != digest(manifest.get("plugins"))):
         raise ValueError("Invalid runtime plugin manifest")
+    remote_self_heal = state_payload.get("self_heal") if isinstance(state_payload.get("self_heal"), dict) else None
+    identity = _lease_identity(lease)
     # Existing settings table: each update commits the entire manifest in one transaction.
     with repo.store.dispatch_lock() as acquired:
         if not acquired:
@@ -932,6 +1130,75 @@ def sync_plugins(repo, lease, client=None, *, return_state=False):
                 repo.store.update("settings", key, data, owner)
         else:
             repo.store.create("settings", owner, data, record_id=key)
+
+        # Persist in-VM self-heal telemetry & audit events (verifying lease identity)
+        if remote_self_heal is not None:
+            fresh_lease = repo.get("leases", lease["id"], owner)
+            if fresh_lease and _lease_identity(fresh_lease) == identity:
+                prev_heal = fresh_lease.get("native_self_heal") or {}
+                if prev_heal != remote_self_heal:
+                    repo.update("leases", fresh_lease["id"], {"native_self_heal": remote_self_heal}, owner)
+                    job_id = fresh_lease.get("native_bootstrap_job_id") or fresh_lease.get("owner_job_id")
+                    if job_id and repo.get("jobs", job_id, owner):
+                        for field, label in (
+                            ("comfy_restarts", "ComfyUI 进程异常退出，已在同机自动恢复"),
+                            ("rclone_restarts", "rclone Drive 挂载进程异常退出，已在同机自动重挂"),
+                            ("tunnel_restarts", "cloudflared 隧道进程异常退出，已在同机自动拉起"),
+                        ):
+                            if int(remote_self_heal.get(field) or 0) > int(prev_heal.get(field) or 0):
+                                repo.event(job_id, owner, "running", label)
+
+        # Persist per-instance local models snapshot (verifying active lease has not switched;
+        # NEVER overwrite a frozen recovery plan target list while restoring_env is running).
+        if fetched_inventory is not None and fetched_inventory_digest:
+            live = active_lease(repo, owner)
+            if live and live.get("id") == lease["id"] and _lease_identity(live) == identity:
+                now_ts = time.time()
+                saved_models = repo.store.get("settings", models_key, owner) or {}
+                by_inst = dict(saved_models.get("by_instance") or {})
+                by_inst[inst_id] = {
+                    "lease_id": lease["id"],
+                    "digest": fetched_inventory_digest,
+                    "recoverable_models": list(fetched_inventory.get("recoverable_models") or []),
+                    "wild_models": [str(w) for w in (fetched_inventory.get("wild_models") or []) if isinstance(w, str)],
+                    "updated_at": now_ts,
+                }
+                # Keep only current active instance + at most 1 most recent prior instance
+                if len(by_inst) > 2:
+                    others = sorted(
+                        [(k, v) for k, v in by_inst.items() if k != inst_id],
+                        key=lambda kv: float((kv[1] or {}).get("updated_at") or 0.0),
+                        reverse=True,
+                    )
+                    by_inst = {inst_id: by_inst[inst_id], **{k: v for k, v in others[:1]}}
+                payload_doc = {"by_instance": by_inst, "updated_at": now_ts}
+                if saved_models:
+                    repo.store.update("settings", models_key, payload_doc, owner)
+                else:
+                    repo.store.create("settings", owner, payload_doc, record_id=models_key)
+
+                # Union-append newly added models into an active restoring_env plan without ever dropping frozen targets
+                active_rec = recovery.active_plan(repo, owner, pool="native")
+                if (
+                    active_rec
+                    and active_rec.get("state") == "restoring_env"
+                    and active_rec.get("successor_instance_id") == inst_id
+                ):
+                    ns = dict(active_rec.get("native_snapshot") or {})
+                    merged = recovery.merge_recoverable_models(
+                        ns.get("recoverable_models"),
+                        fetched_inventory.get("recoverable_models"),
+                    )
+                    wild_union = sorted(
+                        set(ns.get("wild_models") or [])
+                        | {str(w) for w in (fetched_inventory.get("wild_models") or []) if isinstance(w, str)}
+                    )
+                    if merged != ns.get("recoverable_models") or wild_union != ns.get("wild_models"):
+                        ns["recoverable_models"] = merged
+                        ns["wild_models"] = wild_union
+                        active_rec["native_snapshot"] = ns
+                        active_rec["updated_at"] = now_ts
+                        recovery.save_plan(repo, owner, active_rec)
     return (status, state_payload) if return_state else status
 
 

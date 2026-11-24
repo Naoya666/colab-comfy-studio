@@ -760,3 +760,100 @@ export interface ReusePreviewResponse {
 
 export const previewGpuJobReuse = (body: ReusePreviewRequest) =>
   apiFetch<ReusePreviewResponse>('/api/gpu/jobs/reuse-preview', post(body));
+
+export interface RecoveryConfig {
+  enabled: boolean;
+  max_rounds: number;
+  min_remaining_minutes: number;
+  max_job_retries: number;
+  backoff_base_seconds: number;
+  round_timeout_seconds: number;
+  startup_grace_seconds: number;
+  max_vps_outage_minutes: number;
+  active_keepalive: boolean;
+  in_vm_self_heal: boolean;
+}
+
+export interface RecoveryModelRestoreProgress {
+  job_id?: string | null;
+  state?: 'pending' | 'preparing' | 'ready' | 'partial_disk_limit' | 'failed' | 'cancelled' | string | null;
+  total: number;
+  completed: number;
+  failed: number;
+  skipped: number;
+  partial_disk_limit: boolean;
+  updated_at?: number | null;
+}
+
+export interface RecoveryHistoryEntry {
+  round: number;
+  from_instance_id?: string | null;
+  to_instance_id?: string | null;
+  triggered_at?: number | null;
+  recovered_at?: number | null;
+  trigger_reason?: string | null;
+  outcome?: string | null;
+}
+
+export type RecoveryPlanState =
+  | 'scheduled'
+  | 'dispatching'
+  | 'cancelling'
+  | 'restoring_env'
+  | 'recovered'
+  | 'exhausted'
+  | 'aborted_fatal'
+  | 'aborted_vps_outage'
+  | 'cancelled'
+  | string;
+
+export interface RecoveryPlan {
+  plan_id: string;
+  recovery_group_id: string;
+  pool: 'native' | 'creation' | string;
+  state: RecoveryPlanState;
+  account_id?: string | null;
+  account_alias_snapshot?: string | null;
+  requested_spec?: Record<string, unknown> | null;
+  retention_mode?: string | null;
+  retain_idle_minutes?: number | null;
+  hard_deadline_at?: number | null;
+  orig_idle_deadline_at?: number | null;
+  was_busy?: boolean;
+  rounds_used: number;
+  max_rounds: number;
+  backoff_attempt: number;
+  next_retry_at?: number | null;
+  round_started_at?: number | null;
+  source_instance_id?: string | null;
+  active_job_id?: string | null;
+  successor_instance_id?: string | null;
+  last_trigger_reason?: string | null;
+  last_error_code?: string | null;
+  last_error_message?: string | null;
+  model_restore?: RecoveryModelRestoreProgress | null;
+  wild_models?: string[];
+  creation_mode?: 'warmup' | 'retry_job' | string | null;
+  workflow_key?: string | null;
+  workflow_version?: string | number | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+  cancelled_at?: number | null;
+  history?: RecoveryHistoryEntry[];
+}
+
+export interface RecoveryStatusResponse {
+  config: RecoveryConfig;
+  active_plans: RecoveryPlan[];
+  recent_plans: RecoveryPlan[];
+}
+
+export const getRecoveryStatus = (signal?: AbortSignal) =>
+  apiFetch<RecoveryStatusResponse>('/api/gpu/recovery/status', { cache: 'no-store', signal });
+
+export const cancelRecoveryPlan = (planId: string, idempotencyKey?: string) =>
+  apiFetch<RecoveryPlan>(`/api/gpu/recovery/${encodeURIComponent(planId)}/cancel`, {
+    method: 'POST',
+    headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
+    body: JSON.stringify({}),
+  });

@@ -105,6 +105,12 @@ export interface GpuInstance {
   runtime_verified?: boolean;
   last_error_code?: string;
   last_error?: string;
+  recovery_group_id?: string | null;
+  recovery_generation?: number | null;
+  parent_instance_id?: string | null;
+  replaced_by_instance_id?: string | null;
+  recovery_plan_id?: string | null;
+  recovery_source?: string | null;
   [key: string]: unknown;
 }
 

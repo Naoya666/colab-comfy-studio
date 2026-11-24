@@ -12,7 +12,7 @@ import {
   Trash2,
   Workflow,
 } from 'lucide-react';
-import { apiFetch, apiMessage } from '../lib/gpu-api';
+import { apiFetch, apiMessage, cancelRecoveryPlan } from '../lib/gpu-api';
 import {
   computeNewlyOrphanedPlugins,
   defaultLinkedPluginSelection,
@@ -100,6 +100,7 @@ export function NativeWorkspaceManager({
   // Caches tab state
   const [confirmClearAllCache, setConfirmClearAllCache] = useState(false);
   const [confirmCleanOrphans, setConfirmCleanOrphans] = useState(false);
+  const [confirmCancelRecovery, setConfirmCancelRecovery] = useState(false);
 
   const load = useCallback(async (opts?: { refresh?: boolean; keep?: number }) => {
     const k = opts?.keep ?? keepHistory;
@@ -348,6 +349,28 @@ export function NativeWorkspaceManager({
     () => newlyOrphaned.filter(p => linkedPluginSelection[p.path]).reduce((acc, p) => acc + p.archive_size_bytes, 0),
     [newlyOrphaned, linkedPluginSelection],
   );
+  async function executeCancelRecoveryUnlock() {
+    if (busy || !data?.recovery_plan_id) return;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const res = await cancelRecoveryPlan(data.recovery_plan_id, `workspace-unlock:${data.recovery_plan_id}`);
+      setConfirmCancelRecovery(false);
+      setNotice(
+        res.state === 'cancelling'
+          ? '已提交取消自动恢复请求，正在等待在途租约释放确认后解锁写入。'
+          : '已取消原生自动恢复计划，离线管理写入权限已解锁。',
+      );
+      onMutated?.();
+      await load({ refresh: true });
+    } catch (cause) {
+      setError(apiMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const selectedLinkedImportSec = useMemo(
     () =>
       newlyOrphaned
@@ -384,9 +407,43 @@ export function NativeWorkspaceManager({
       {data && !data.offline_writable && (
         <div className={styles.wsBannerWarn} role="status">
           <ShieldAlert size={18} aria-hidden />
-          <div>
+          <div style={{ flex: 1 }}>
             <strong>当前为只读模式</strong>
             <p className="small">{data.lock_reason || '原生 ComfyUI 实例正在运行或启动中，请等待实例完全停止后再执行修改。'}</p>
+            {data.recovery_plan_id && (
+              <div className="actions" style={{ marginTop: 8 }}>
+                {!confirmCancelRecovery ? (
+                  <button
+                    type="button"
+                    className="button secondary"
+                    disabled={busy}
+                    onClick={() => setConfirmCancelRecovery(true)}
+                  >
+                    取消自动恢复以解锁
+                  </button>
+                ) : (
+                  <>
+                    <span className="small">确认取消原生自动恢复计划并解锁离线写入？</span>
+                    <button
+                      type="button"
+                      className="button danger"
+                      disabled={busy}
+                      onClick={() => void executeCancelRecoveryUnlock()}
+                    >
+                      {busy ? '正在取消…' : '确认取消并解锁'}
+                    </button>
+                    <button
+                      type="button"
+                      className="button secondary"
+                      disabled={busy}
+                      onClick={() => setConfirmCancelRecovery(false)}
+                    >
+                      暂不取消
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}

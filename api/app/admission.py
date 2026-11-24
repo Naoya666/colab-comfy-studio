@@ -146,7 +146,18 @@ def _account_alias_snapshot(repo, owner_id, account_id):
     return account.get("alias") or account.get("label") or None
 
 
-def admit_job(st, user, body, key, *, validate_only=False, creation=None, before_create=None):
+def admit_job(
+    st,
+    user,
+    body,
+    key,
+    *,
+    validate_only=False,
+    creation=None,
+    before_create=None,
+    _lock_held: bool = False,
+    extra_job_fields: dict | None = None,
+):
     repo, registry = repo_registry(st, user)
     if not key or len(key) > 200:
         raise APIError("IDEMPOTENCY_REQUIRED", "必须提供 Idempotency-Key，重试必须沿用原值")
@@ -341,7 +352,10 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
         if policy.get("reuse_action") == "replace" and policy.get("replace_instance_id")
         else None
     )
-    with st.admission_lock() as acquired:
+    from contextlib import nullcontext
+
+    lock_cm = nullcontext(True) if _lock_held else st.admission_lock()
+    with lock_cm as acquired:
         if not acquired:
             raise APIError("SCHEDULER_BUSY", "队列正在同步，请用相同幂等键稍后重试", 503, True)
         from .gpu.native import guard_generation
@@ -356,7 +370,7 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
             CuGuardService(repo).check(user["id"], policy["provider"], policy.get("account_id"), policy.get("instance_id"))
         else:
             guard_generation(repo, user["id"], policy)
-        job, created = repo.create_job(user["id"], body, key, admitted={
+        admitted_payload = {
             **compute_fields,
             "execution_policy": policy,
             **({"account_id": policy.get("account_id")} if policy.get("account_id") else {}),
@@ -370,7 +384,10 @@ def admit_job(st, user, body, key, *, validate_only=False, creation=None, before
             "atelier_project_id": project.get("atelier_project_id"),
             "max_runtime_minutes": policy["max_runtime_minutes"],
             **_job_estimate(repo, user["id"], workflow, policy, cfg, params),
-        })
+        }
+        if isinstance(extra_job_fields, dict):
+            admitted_payload.update(extra_job_fields)
+        job, created = repo.create_job(user["id"], body, key, admitted=admitted_payload)
         if created:
             repo.event(job["id"], user["id"], "queued", "任务已持久化；请求规格：" + str(requested_spec) + "；" + "；".join(compute_warnings))
     if replace_target:

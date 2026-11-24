@@ -44,6 +44,10 @@ ROOT = Path("/content/ai-studio/native")
 BOOT_ID = uuid.uuid4().hex
 LEASE_ID = (ROOT / "restart-lease").read_text() if (ROOT / "restart-lease").is_file() else None
 REBOOT_ID = None
+try:
+    (ROOT / "reboot-active").unlink(missing_ok=True)
+except OSError:
+    pass
 
 def open_writes():
     for process in Path("/proc").glob("[0-9]*"):
@@ -179,6 +183,28 @@ async def state(request):
         if not result["busy"] and (not result["plugins"].get("durable") or result["plugins"].get("error")):
             result.update(busy=True, busy_reason="plugins")
     result.update(boot_id=BOOT_ID, lease_id=LEASE_ID, reboot_id=REBOOT_ID)
+    heal_file = ROOT / "self-heal-status.json"
+    if heal_file.is_file():
+        try:
+            heal_data = json.loads(heal_file.read_text())
+            if isinstance(heal_data, dict):
+                result["self_heal"] = {
+                    "comfy_restarts": int(heal_data.get("comfy_restarts") or 0),
+                    "rclone_restarts": int(heal_data.get("rclone_restarts") or 0),
+                    "tunnel_restarts": int(heal_data.get("tunnel_restarts") or 0),
+                    "last_event_at": heal_data.get("last_event_at"),
+                    "last_component": heal_data.get("last_component"),
+                    "in_progress": bool(heal_data.get("in_progress")),
+                    "unrecoverable": bool(heal_data.get("unrecoverable")),
+                    "slow_warnings": heal_data.get("slow_warnings") or {},
+                }
+        except Exception:
+            pass
+    if LOCAL_MODELS is not None and hasattr(LOCAL_MODELS, "inventory_digest"):
+        try:
+            result["local_models_digest"] = await asyncio.to_thread(LOCAL_MODELS.inventory_digest)
+        except Exception:
+            pass
     return web.json_response(result)
 
 
@@ -231,13 +257,28 @@ async def bind_restart(request, handler):
     if REBOOT_ID:
         return web.json_response({"error": "Manager 已受理重启"}, status=409)
     REBOOT_ID = restart_id
+    reboot_marker = ROOT / "reboot-active"
+    try:
+        tmp = ROOT / "reboot-active.tmp"
+        tmp.write_text(json.dumps({"reboot_id": restart_id, "at": time.time()}))
+        tmp.replace(reboot_marker)
+    except OSError:
+        pass
     try:
         response = await handler(request)
     except web.HTTPClientError:
         REBOOT_ID = None
+        try:
+            reboot_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
     if 400 <= response.status < 500:
         REBOOT_ID = None
+        try:
+            reboot_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
     return response
 
 
@@ -257,62 +298,371 @@ NODE_CLASS_MAPPINGS = {}
 '''
 
 
-WATCHDOG = r"""import os
+WATCHDOG = r"""import json
+import os
+import shutil
 import subprocess
 import sys
-import json
 import time
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
-root = Path("/content/ai-studio/native")
-# Load only the probe definition, without importing PromptServer or registering routes.
-source = (root / "probe.py").read_text()
-namespace = {}
-exec(compile(source, "native_probe", "exec"), namespace)
-while True:
-    time.sleep(30)
+ROOT = Path("/content/ai-studio/native")
+REBOOT_GRACE_SECONDS = 300.0
+WINDOW_SECONDS = 600.0
+TUNNEL_MAX_RESTARTS = 5
+RCLONE_MAX_RESTARTS = 3
+COMFY_MAX_RESTARTS = 3
+BACKOFF_STEPS = (5.0, 15.0, 30.0)
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(path)
+
+
+def _read_json(path: Path, default=None):
     try:
-        state = json.loads((root / "state.json").read_text())
-        try:
-            pid = state["tunnel_pid"]
-            actual = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
-            alive = actual == state.get("tunnel_start_id")
-        except (OSError, KeyError, IndexError):
-            alive = False
-        if not alive:
+        if path.is_file():
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                return data
+    except (OSError, ValueError):
+        pass
+    return {} if default is None else default
+
+
+def proc_start_id(pid: int, proc_root: Path = Path("/proc")) -> str | None:
+    try:
+        raw = (proc_root / str(pid) / "stat").read_text()
+        rest = raw.rsplit(")", 1)[1].split()
+        return rest[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def proc_alive(pid, start_id, proc_root: Path = Path("/proc")) -> bool:
+    if not pid or not start_id:
+        return False
+    try:
+        raw = (proc_root / str(pid) / "stat").read_text()
+        rest = raw.rsplit(")", 1)[1].split()
+        proc_state = rest[0]
+        actual = rest[19]
+        if proc_state == "Z":
+            return False
+        return actual == str(start_id)
+    except (OSError, IndexError, ValueError):
+        return False
+
+
+def is_reboot_active(root: Path, now: float) -> bool:
+    marker = root / "reboot-active"
+    if not marker.is_file():
+        return False
+    data = _read_json(marker)
+    ts = data.get("at")
+    if isinstance(ts, (int, float)) and now - float(ts) < REBOOT_GRACE_SECONDS:
+        return True
+    try:
+        if now - marker.stat().st_mtime < REBOOT_GRACE_SECONDS:
+            return True
+    except OSError:
+        return False
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
+
+
+def _http_ok(url: str, *, data: bytes | None = None, timeout: float = 3.0) -> bool:
+    try:
+        req = Request(url, data=data, headers={"Content-Type": "application/json"}) if data is not None else url
+        with urlopen(req, timeout=timeout) as resp:
+            return 200 <= getattr(resp, "status", 200) < 300
+    except Exception:
+        return False
+
+
+def _load_status(root: Path) -> dict:
+    base = {
+        "comfy_restarts": 0,
+        "rclone_restarts": 0,
+        "tunnel_restarts": 0,
+        "last_event_at": None,
+        "last_component": None,
+        "in_progress": False,
+        "unrecoverable": False,
+        "slow_warnings": {},
+        "history": {"comfy": [], "rclone": [], "tunnel": []},
+    }
+    saved = _read_json(root / "self-heal-status.json")
+    base.update(saved)
+    history = base.get("history")
+    if not isinstance(history, dict):
+        history = {}
+    base["history"] = {
+        "comfy": list(history.get("comfy") or []),
+        "rclone": list(history.get("rclone") or []),
+        "tunnel": list(history.get("tunnel") or []),
+    }
+    if not isinstance(base.get("slow_warnings"), dict):
+        base["slow_warnings"] = {}
+    return base
+
+
+def _prune(stamps: list, now: float) -> list[float]:
+    return [float(t) for t in stamps if isinstance(t, (int, float)) and now - float(t) < WINDOW_SECONDS]
+
+
+def _save_status(root: Path, status: dict) -> None:
+    try:
+        _atomic_json(root / "self-heal-status.json", status)
+    except OSError:
+        pass
+
+
+def heal_cycle(
+    root: Path = ROOT,
+    *,
+    clock=time.time,
+    sleep_fn=time.sleep,
+    proc_root: Path = Path("/proc"),
+    popen_fn=subprocess.Popen,
+    run_fn=subprocess.run,
+    ismount_fn=os.path.ismount,
+    http_ok_fn=_http_ok,
+) -> dict:
+    now = float(clock())
+    state_path = root / "state.json"
+    state = _read_json(state_path)
+    status = _load_status(root)
+    if not state:
+        return status
+
+    self_heal_enabled = state.get("self_heal_enabled", True) is not False
+    state_dirty = False
+    status_dirty = False
+
+    # 1. cloudflared tunnel supervision (L1)
+    tunnel_pid = state.get("tunnel_pid")
+    tunnel_start_id = state.get("tunnel_start_id")
+    if not proc_alive(tunnel_pid, tunnel_start_id, proc_root=proc_root):
+        recent = _prune(status["history"]["tunnel"], now)
+        status["history"]["tunnel"] = recent
+        if len(recent) < TUNNEL_MAX_RESTARTS and state.get("tunnel_binary"):
             binary = state["tunnel_binary"]
             with (root / "tunnel.log").open("ab") as log:
-                tunnel = subprocess.Popen([binary, "tunnel", "--no-autoupdate", "--protocol", "http2", "--metrics", "127.0.0.1:20241", "run", "--token-file", str(root / "tunnel.token")], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                tunnel = popen_fn(
+                    [binary, "tunnel", "--no-autoupdate", "--protocol", "http2",
+                     "--metrics", "127.0.0.1:20241", "run", "--token-file", str(root / "tunnel.token")],
+                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                )
             state["tunnel_pid"] = tunnel.pid
-            state["tunnel_start_id"] = (Path("/proc") / str(tunnel.pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
-            temp = root / "state.tmp"
-            temp.write_text(json.dumps(state))
-            temp.replace(root / "state.json")
-    except Exception:
-        pass
-    try:
-        heartbeat = float((root / "heartbeat").read_text())
-        if time.time() - heartbeat < 1200:
-            continue
-        with urlopen("http://127.0.0.1:8188/queue", timeout=8) as response:
-            queue = json.load(response)
-        if queue.get("queue_running") or queue.get("queue_pending") or namespace["probe"]()["busy"]:
-            continue
-        # Two clear probes avoid releasing during the handoff from queued work to persistence.
-        time.sleep(10)
-        with urlopen("http://127.0.0.1:8188/queue", timeout=8) as response:
-            queue = json.load(response)
-        if time.time() - float((root / "heartbeat").read_text()) < 1200:
-            continue
-        if queue.get("queue_running") or queue.get("queue_pending") or namespace["probe"]()["busy"]:
-            continue
+            new_sid = proc_start_id(tunnel.pid, proc_root=proc_root)
+            if new_sid is not None:
+                state["tunnel_start_id"] = new_sid
+            recent.append(now)
+            status["tunnel_restarts"] = int(status.get("tunnel_restarts") or 0) + 1
+            status["last_event_at"] = now
+            status["last_component"] = "cloudflared"
+            state_dirty = True
+            status_dirty = True
+
+    # 2. rclone mount supervision (L1, anti-false-kill: only when PID dead or Z)
+    rclone_pid = state.get("rclone_pid")
+    rclone_start_id = state.get("rclone_start_id")
+    rclone_args = state.get("rclone_args")
+    mount_path = state.get("mount_path") or str(root / "drive")
+    if self_heal_enabled and rclone_pid and rclone_start_id and isinstance(rclone_args, list) and rclone_args:
+        if proc_alive(rclone_pid, rclone_start_id, proc_root=proc_root):
+            # Process is alive: NEVER kill or unmount; only record slow RC warning.
+            if not http_ok_fn("http://127.0.0.1:5572/vfs/stats", data=b"{}", timeout=3.0):
+                status["slow_warnings"]["rclone"] = {"at": now, "reason": "rc_timeout"}
+                status_dirty = True
+            elif "rclone" in status["slow_warnings"]:
+                status["slow_warnings"].pop("rclone", None)
+                status_dirty = True
+        else:
+            recent = _prune(status["history"]["rclone"], now)
+            status["history"]["rclone"] = recent
+            if len(recent) >= RCLONE_MAX_RESTARTS:
+                if not status.get("unrecoverable"):
+                    status["unrecoverable"] = True
+                    status["last_event_at"] = now
+                    status["last_component"] = "rclone"
+                    status_dirty = True
+            else:
+                delay = BACKOFF_STEPS[min(len(recent), len(BACKOFF_STEPS) - 1)]
+                status["in_progress"] = True
+                _save_status(root, status)
+                try:
+                    sleep_fn(delay)
+                    unmounter = shutil.which("fusermount3") or shutil.which("fusermount") or "fusermount3"
+                    try:
+                        run_fn([unmounter, "-uz", mount_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                    except Exception:
+                        pass
+                    with (root / "rclone.log").open("ab") as output:
+                        proc = popen_fn(
+                            rclone_args, stdin=subprocess.DEVNULL, stdout=output,
+                            stderr=subprocess.STDOUT, start_new_session=True,
+                        )
+                    deadline = time.monotonic() + 60.0
+                    mounted = False
+                    while time.monotonic() < deadline:
+                        if callable(getattr(proc, "poll", None)) and proc.poll() is not None:
+                            break
+                        if ismount_fn(mount_path):
+                            mounted = True
+                            break
+                        sleep_fn(0.2)
+                    recent.append(float(clock()))
+                    status["last_event_at"] = float(clock())
+                    status["last_component"] = "rclone"
+                    if mounted:
+                        state["rclone_pid"] = proc.pid
+                        new_sid = proc_start_id(proc.pid, proc_root=proc_root)
+                        if new_sid is not None:
+                            state["rclone_start_id"] = new_sid
+                        status["rclone_restarts"] = int(status.get("rclone_restarts") or 0) + 1
+                        status["slow_warnings"].pop("rclone", None)
+                        state_dirty = True
+                    status_dirty = True
+                finally:
+                    status["in_progress"] = False
+                    _save_status(root, status)
+
+    # 3. ComfyUI supervision (L2, anti-false-kill: only when PID dead/Z & not planned reboot)
+    comfy_pid = state.get("pid")
+    comfy_start_id = state.get("comfy_start_id")
+    comfy_args = state.get("comfy_args")
+    comfy_cwd = state.get("comfy_cwd") or state.get("comfy")
+    if self_heal_enabled and comfy_pid and comfy_start_id and isinstance(comfy_args, list) and comfy_args:
+        if proc_alive(comfy_pid, comfy_start_id, proc_root=proc_root):
+            # Process is alive: NEVER kill! Only record slow /system_stats warning.
+            if not http_ok_fn("http://127.0.0.1:8188/system_stats", timeout=3.0):
+                status["slow_warnings"]["comfy"] = {"at": now, "reason": "stats_timeout"}
+                status_dirty = True
+            elif "comfy" in status["slow_warnings"]:
+                status["slow_warnings"].pop("comfy", None)
+                status_dirty = True
+        elif is_reboot_active(root, now):
+            # Planned ComfyUI-Manager reboot in progress: do not interfere.
+            pass
+        elif http_ok_fn("http://127.0.0.1:8188/system_stats", timeout=3.0):
+            # A new ComfyUI process is already serving port 8188 (e.g. after Manager reboot).
+            pass
+        else:
+            recent = _prune(status["history"]["comfy"], now)
+            status["history"]["comfy"] = recent
+            if len(recent) >= COMFY_MAX_RESTARTS:
+                if not status.get("unrecoverable"):
+                    status["unrecoverable"] = True
+                    status["last_event_at"] = now
+                    status["last_component"] = "comfyui"
+                    status_dirty = True
+            else:
+                delay = BACKOFF_STEPS[min(len(recent), len(BACKOFF_STEPS) - 1)]
+                status["in_progress"] = True
+                _save_status(root, status)
+                try:
+                    sleep_fn(delay)
+                    if is_reboot_active(root, float(clock())) or http_ok_fn("http://127.0.0.1:8188/system_stats", timeout=3.0):
+                        return status
+                    comfy_log = Path(state.get("comfy_log") or str(root / "comfy.log"))
+                    comfy_log.parent.mkdir(parents=True, exist_ok=True)
+                    with comfy_log.open("ab") as log:
+                        log_offset = log.tell()
+                        proc = popen_fn(
+                            comfy_args, cwd=comfy_cwd, stdout=log,
+                            stderr=subprocess.STDOUT, start_new_session=True,
+                        )
+                    deadline = time.monotonic() + 300.0
+                    ready = False
+                    while time.monotonic() < deadline:
+                        if http_ok_fn("http://127.0.0.1:8188/system_stats", timeout=3.0):
+                            ready = True
+                            break
+                        if callable(getattr(proc, "poll", None)) and proc.poll() is not None:
+                            break
+                        sleep_fn(0.5)
+                    recent.append(float(clock()))
+                    status["last_event_at"] = float(clock())
+                    status["last_component"] = "comfyui"
+                    if ready:
+                        state["pid"] = proc.pid
+                        new_sid = proc_start_id(proc.pid, proc_root=proc_root)
+                        if new_sid is not None:
+                            state["comfy_start_id"] = new_sid
+                        state["comfy_log_offset"] = log_offset
+                        status["comfy_restarts"] = int(status.get("comfy_restarts") or 0) + 1
+                        status["slow_warnings"].pop("comfy", None)
+                        state_dirty = True
+                    status_dirty = True
+                finally:
+                    status["in_progress"] = False
+                    _save_status(root, status)
+
+    if state_dirty:
+        _atomic_json(state_path, state)
+    if status_dirty:
+        _save_status(root, status)
+    return status
+
+
+def check_idle_unassign(root: Path, namespace: dict, *, clock=time.time, sleep_fn=time.sleep, unassign_fn=None) -> bool:
+    status = _load_status(root)
+    if status.get("in_progress") or is_reboot_active(root, float(clock())):
+        return False
+    heartbeat = float((root / "heartbeat").read_text())
+    if float(clock()) - heartbeat < 1200:
+        return False
+    with urlopen("http://127.0.0.1:8188/queue", timeout=8) as response:
+        queue = json.load(response)
+    if queue.get("queue_running") or queue.get("queue_pending") or namespace["probe"]()["busy"]:
+        return False
+    # Two clear probes avoid releasing during the handoff from queued work to persistence.
+    sleep_fn(10)
+    if _load_status(root).get("in_progress") or is_reboot_active(root, float(clock())):
+        return False
+    with urlopen("http://127.0.0.1:8188/queue", timeout=8) as response:
+        queue = json.load(response)
+    if float(clock()) - float((root / "heartbeat").read_text()) < 1200:
+        return False
+    if queue.get("queue_running") or queue.get("queue_pending") or namespace["probe"]()["busy"]:
+        return False
+    if unassign_fn is not None:
+        unassign_fn()
+    else:
         from google.colab import runtime
         runtime.unassign()
-        break
-    except Exception:
-        # Unknown state must not interrupt generation or lose pending Drive writes.
-        continue
+    return True
+
+
+def main_loop():
+    root = ROOT
+    source = (root / "probe.py").read_text()
+    namespace = {}
+    exec(compile(source, "native_probe", "exec"), namespace)
+    while True:
+        time.sleep(15)
+        try:
+            heal_cycle(root)
+        except Exception:
+            pass
+        try:
+            if check_idle_unassign(root, namespace):
+                break
+        except Exception:
+            # Unknown state must not interrupt generation or lose pending Drive writes.
+            continue
+
+
+if __name__ == "__main__":
+    main_loop()
 """
 
 
@@ -439,6 +789,25 @@ def mount_drive(root, secret):
                 raise RuntimeError("Google Drive 挂载进程退出：" + _mount_error(log, secret))
             if os.path.ismount(mount):
                 applied.write_text(json.dumps(cache))
+                rclone_pid = getattr(process, "pid", None)
+                rclone_start_id = None
+                if isinstance(rclone_pid, int):
+                    try:
+                        stat_raw = (Path("/proc") / str(rclone_pid) / "stat").read_text()
+                        rclone_start_id = stat_raw.rsplit(")", 1)[1].split()[19]
+                    except (OSError, IndexError, ValueError):
+                        rclone_start_id = None
+                try:
+                    tmp = root / "rclone-state.json.tmp"
+                    tmp.write_text(json.dumps({
+                        "rclone_pid": rclone_pid,
+                        "rclone_start_id": rclone_start_id,
+                        "rclone_args": args,
+                        "mount_path": str(mount),
+                    }))
+                    tmp.replace(root / "rclone-state.json")
+                except OSError:
+                    pass
                 return mount
             if time.monotonic() >= deadline:
                 raise RuntimeError("Google Drive 挂载就绪超时：" + _mount_error(log, secret))
@@ -911,10 +1280,38 @@ def run(root, payload, stages):
                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                             )
                             startup.callback(_stop_startup_process, uploader)
-                    worker._atomic_json(marker, {"commit": commit, "pid": process.pid, "tunnel_pid": tunnel.pid,
-                                                 "tunnel_start_id": worker._process_metadata(tunnel.pid)["start_id"], "tunnel_binary": binary,
-                                                 "comfy": str(comfy), "comfy_log": str(comfy_log), "model_storage_mode": mode,
-                                                 "comfy_log_offset": log_offset, "started": time.time()})
+                    rclone_meta = {}
+                    rclone_state_file = ROOT / "rclone-state.json"
+                    if rclone_state_file.is_file():
+                        try:
+                            parsed_rc = json.loads(rclone_state_file.read_text())
+                            if isinstance(parsed_rc, dict):
+                                rclone_meta = {
+                                    k: parsed_rc[k]
+                                    for k in ("rclone_pid", "rclone_start_id", "rclone_args", "mount_path")
+                                    if k in parsed_rc
+                                }
+                        except (OSError, ValueError):
+                            pass
+                    tunnel_start_id = worker._process_metadata(tunnel.pid)["start_id"]
+                    comfy_start_id = worker._process_metadata(process.pid)["start_id"]
+                    worker._atomic_json(marker, {
+                        "commit": commit,
+                        "pid": process.pid,
+                        "comfy_start_id": comfy_start_id,
+                        "comfy_args": args,
+                        "comfy_cwd": str(comfy),
+                        "tunnel_pid": tunnel.pid,
+                        "tunnel_start_id": tunnel_start_id,
+                        "tunnel_binary": binary,
+                        "comfy": str(comfy),
+                        "comfy_log": str(comfy_log),
+                        "model_storage_mode": mode,
+                        "comfy_log_offset": log_offset,
+                        "self_heal_enabled": _flag("GPU_IN_VM_SELF_HEAL", True),
+                        **rclone_meta,
+                        "started": time.time(),
+                    })
                     startup.pop_all()
             finally:
                 if boot_pool is not None:

@@ -1154,13 +1154,18 @@ def get_workspace_overview(
     keep_history: int = DEFAULT_KEEP_HISTORY,
     drive: DriveStorage | None = None,
 ) -> dict[str, Any]:
+    from . import recovery
+
     keep = max(1, min(int(keep_history), MAX_HISTORY_ENTRIES))
     offline_writable, lock_reason = native.workspace_offline_status(repo, owner_id)
+    active_rec = recovery.active_plan(repo, owner_id, pool="native") if not offline_writable else None
+    recovery_plan_id = active_rec.get("plan_id") if active_rec else None
     storage, owns_storage, account_id, account_alias = _open_drive(repo, owner_id, drive=drive)
     if storage is None:
         return {
             "offline_writable": offline_writable,
             "lock_reason": lock_reason,
+            "recovery_plan_id": recovery_plan_id,
             "drive_connected": False,
             "drive_account_id": None,
             "drive_account_alias": None,
@@ -1190,7 +1195,7 @@ def get_workspace_overview(
             if cached and now - cached[0] < OVERVIEW_CACHE_TTL_SECONDS:
                 if owns_storage:
                     storage.close()
-                return {**cached[1], "offline_writable": offline_writable, "lock_reason": lock_reason}
+                return {**cached[1], "offline_writable": offline_writable, "lock_reason": lock_reason, "recovery_plan_id": recovery_plan_id}
 
     try:
         wdrive = _WorkspaceDrive(storage, owner_id)
@@ -1205,7 +1210,7 @@ def get_workspace_overview(
         if drive is None:
             with _OVERVIEW_LOCK:
                 _OVERVIEW_CACHE[cache_key] = (time.time(), payload)
-        return {**payload, "offline_writable": offline_writable, "lock_reason": lock_reason}
+        return {**payload, "offline_writable": offline_writable, "lock_reason": lock_reason, "recovery_plan_id": recovery_plan_id}
     except (DriveError, GoogleError) as exc:
         raise APIError("WORKSPACE_DRIVE_ERROR", f"读取 Google Drive 工作区失败：{exc}", 502) from exc
     finally:
