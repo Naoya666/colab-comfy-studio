@@ -386,7 +386,10 @@ def _scan_single_plugin(nodes: Path, node: Path, enabled: bool, *, snapshot_data
         def git(*args):
             return subprocess.check_output(['git', '-C', str(node), *args], text=True,
                                            stderr=subprocess.DEVNULL).strip()
-        item['commit'] = git('rev-parse', 'HEAD')
+        try:
+            item['commit'] = git('rev-parse', 'HEAD')
+        except subprocess.CalledProcessError:
+            item['commit'] = None
         try:
             item['repo'] = safe_url(git('config', '--get', 'remote.origin.url'))
         except subprocess.CalledProcessError:
@@ -394,8 +397,14 @@ def _scan_single_plugin(nodes: Path, node: Path, enabled: bool, *, snapshot_data
         if any((node / '.git' / lock).exists() for lock in ('index.lock', 'HEAD.lock', 'shallow.lock')):
             raise RuntimeError(f'Git operation still in progress: {node.name}')
     project = node / 'pyproject.toml'
-    if project.is_file():
-        item['version'] = tomllib.loads(project.read_text()).get('project', {}).get('version')
+    if project.is_file() and not project.is_symlink():
+        try:
+            parsed = tomllib.loads(project.read_text(encoding='utf-8'))
+            proj = parsed.get('project') if isinstance(parsed, dict) else None
+            if isinstance(proj, dict) and isinstance(proj.get('version'), str):
+                item['version'] = proj['version']
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError, AttributeError, ValueError):
+            pass
     return item
 
 
@@ -782,19 +791,25 @@ def _extract_plugin_archive(archive: Path, target_dir: Path, *, allow_pigz: bool
         for member in members:
             member.mode &= 0o777
             member.uid = member.gid = 0
-        source.extractall(target_dir, members=members)
+        source.extractall(target_dir, members=members, filter='data')
 
 
 def _restore_git_bundle(node: Path, item: dict) -> None:
     bundle = node / '.studio-repo.pack'
     if bundle.is_file():
-        subprocess.run(['git', 'init', str(node)], check=True, capture_output=True)
+        commit = item.get('commit')
+        if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
+            raise RuntimeError(f'Invalid git commit in plugin manifest: {item.get("path")}')
+        repo_url = safe_url(item.get('repo')) if item.get('repo') else None
+        if item.get('repo') and not repo_url:
+            raise RuntimeError(f'Unsafe git remote URL in plugin manifest: {item.get("path")}')
+        subprocess.run(['git', 'init', '--', str(node)], check=True, capture_output=True)
         with bundle.open('rb') as packed:
             subprocess.run(['git', '-C', str(node), 'index-pack', '--stdin'], stdin=packed, check=True, capture_output=True)
-        (node / '.git' / 'shallow').write_text(item['commit'] + '\n')
-        subprocess.run(['git', '-C', str(node), 'reset', '--mixed', item['commit']], check=True, capture_output=True)
-        if item.get('repo'):
-            subprocess.run(['git', '-C', str(node), 'remote', 'add', 'origin', item['repo']], check=True, capture_output=True)
+        (node / '.git' / 'shallow').write_text(commit + '\n')
+        subprocess.run(['git', '-C', str(node), 'reset', '--mixed', commit, '--'], check=True, capture_output=True)
+        if repo_url:
+            subprocess.run(['git', '-C', str(node), 'remote', 'add', '--', 'origin', repo_url], check=True, capture_output=True)
         bundle.unlink()
 
 
@@ -1236,7 +1251,8 @@ class Persistence:
 # --- Phase 2: Incremental Native Environment Cache (plugin site-packages delta v3) ---
 
 _ENV_CACHE_SCHEMA = 3
-_PROTECTED_TOP_DIRS = frozenset({'torch', 'torchvision', 'torchaudio', 'triton', 'torchgen', 'functorch'})
+_PROTECTED_TOP_DIRS = frozenset({'torch', 'torchvision', 'torchaudio', 'triton', 'torchgen', 'functorch', 'nvidia'})
+_MAX_ENV_ARCHIVE_BYTES = 8 * 1024**3
 
 
 def _normalize_dist_name(name: str) -> str:
@@ -1470,20 +1486,48 @@ def _remove_entry(path: Path) -> None:
 def _safe_extract_env_archive(archive: Path, stage_dir: Path) -> None:
     stage_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     stage_resolved = stage_dir.resolve()
+    total_bytes = 0
+
+    def _subtree_root(rel: Path) -> Path:
+        if rel.parts and rel.parts[0] in {'site', 'overlay'}:
+            return (stage_resolved / rel.parts[0]).resolve()
+        return stage_resolved
+
+    def _check_no_symlink_parents(rel: Path) -> None:
+        cur = stage_resolved
+        for part in rel.parts[:-1]:
+            cur = cur / part
+            if cur.is_symlink():
+                raise RuntimeError('Unsafe env-cache symlink parent traversal')
 
     def check_member(member: tarfile.TarInfo) -> None:
+        nonlocal total_bytes
         rel = Path(member.name)
         if not rel.parts or rel.is_absolute() or '..' in rel.parts:
             raise RuntimeError('Unsafe env-cache member path')
         if not (member.isfile() or member.isdir() or member.issym()):
             raise RuntimeError('Unsupported env-cache member type')
+        total_bytes += max(0, int(member.size or 0))
+        if total_bytes > _MAX_ENV_ARCHIVE_BYTES:
+            raise RuntimeError('env-cache archive exceeds maximum extracted size')
+        _check_no_symlink_parents(rel)
+        target_path = (stage_resolved / rel).resolve() if not member.issym() else None
+        if target_path is not None and stage_resolved != target_path and stage_resolved not in target_path.parents:
+            raise RuntimeError('Unsafe env-cache resolved member path')
         if member.issym():
-            link_target = (stage_dir / rel.parent / member.linkname).resolve()
-            if stage_resolved != link_target and stage_resolved not in link_target.parents:
+            if os.path.isabs(member.linkname):
+                raise RuntimeError('Unsafe absolute env-cache symlink target')
+            boundary = _subtree_root(rel)
+            link_target = (stage_resolved / rel.parent / member.linkname).resolve()
+            if boundary != link_target and boundary not in link_target.parents:
                 raise RuntimeError('Unsafe env-cache symlink target')
         member.uid = member.gid = 0
         if not member.issym():
             member.mode &= 0o777
+
+    def _extract_one(tar: tarfile.TarFile, member: tarfile.TarInfo) -> None:
+        check_member(member)
+        tar.extract(member, stage_dir, set_attrs=not member.issym(), filter='data')
 
     if shutil.which('pigz'):
         proc = subprocess.Popen(['pigz', '-dc', str(archive)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1491,8 +1535,7 @@ def _safe_extract_env_archive(archive: Path, stage_dir: Path) -> None:
             assert proc.stdout is not None
             with tarfile.open(fileobj=proc.stdout, mode='r|') as tar:
                 for member in tar:
-                    check_member(member)
-                    tar.extract(member, stage_dir, set_attrs=not member.issym())
+                    _extract_one(tar, member)
             _, err = proc.communicate(timeout=300)
             if proc.returncode != 0:
                 raise RuntimeError('pigz env-cache extract failed: ' + err.decode(errors='replace')[-200:])
@@ -1503,10 +1546,8 @@ def _safe_extract_env_archive(archive: Path, stage_dir: Path) -> None:
                 proc.wait(timeout=5)
             raise
     with tarfile.open(archive, 'r:gz') as tar:
-        members = tar.getmembers()
-        for member in members:
-            check_member(member)
-        tar.extractall(stage_dir, members=members)
+        for member in tar:
+            _extract_one(tar, member)
 
 
 def _walk_overlay_relpaths(overlay_root: Path) -> list[str]:

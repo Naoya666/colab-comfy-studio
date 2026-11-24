@@ -359,6 +359,14 @@ class SchedulerWatchdogMixin:
         should_self_heal_warmup = False
         heal_wf_key = runtime.get("workflow_key")
         heal_wf_ver = runtime.get("workflow_version")
+        next_failures = int(runtime.get("health_failures") or 0) + 1
+        vm_obs = observation
+        if not healthy and next_failures >= 2 and vm_obs is None:
+            # Run provider inspection OUTSIDE admission_lock to avoid blocking HTTP admissions
+            # and prevent non-reentrant admission_lock self-deadlock / lock-order inversion.
+            vm_obs = self._inspect_runtime(lease)
+        if not healthy and next_failures >= 2 and vm_obs != "present":
+            return
         with self.db_store.admission_lock() as acquired:
             if not acquired:
                 return
@@ -375,10 +383,7 @@ class SchedulerWatchdogMixin:
                 updated_rt = {**runtime, "health_checked_at": now, "health_failures": failures}
                 self._update("instances", instance["id"], {"creation_runtime": updated_rt}, instance["owner_id"])
                 return
-            # 2 consecutive failures: only clear process when VM is confirmed still present (L2)
-            vm_obs = observation or self._inspect_runtime(lease)
-            if vm_obs == "missing":
-                return
+            # 2 consecutive failures and VM confirmed present (L2)
             updated_rt = {
                 **runtime,
                 "process": None,

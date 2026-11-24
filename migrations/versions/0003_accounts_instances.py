@@ -130,9 +130,17 @@ def _migrate_legacy_credentials(bind) -> dict[str, str]:
                 "state": "connected",
                 "data": json.dumps(
                     {
+                        "account_id": account_id,
                         "alias": "Google账号",
+                        "enabled": True,
+                        "allow_allocation": False,
+                        "projects": [],
+                        "workflows": [],
+                        "budget": {},
+                        "strategy": "manual",
                         "status": "connected",
                         "legacy": True,
+                        "legacy_default": True,
                     },
                     ensure_ascii=False,
                 ),
@@ -169,6 +177,8 @@ def _migrate_legacy_leases(bind, account_by_owner: dict[str, str]):
     for lease in lease_rows:
         payload = _json(lease["data"])
         owner = lease["owner_id"]
+        if owner in (None, ""):
+            continue
         instance_id = legacy_instance_id(owner, lease["id"])
         account_id = account_by_owner.get(owner)
         state = "deleted" if lease["state"] == "deleted" else "unknown"

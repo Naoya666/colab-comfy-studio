@@ -40,6 +40,9 @@ def current_user(request: Request):
     payload = read_session(raw)
     if not payload or not payload.get("uid"):
         raise APIError("UNAUTHENTICATED", "请先登录独立 GPU 工作台", 401)
+    purpose = payload.get("purpose")
+    if (purpose is not None and purpose != "studio-session") or payload.get("aud") is not None:
+        raise APIError("UNAUTHENTICATED", "该凭证无权访问 Studio 控制面", 401)
     return {"id": payload["uid"], "role": payload.get("role", "user")}
 
 

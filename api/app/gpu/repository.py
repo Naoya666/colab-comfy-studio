@@ -573,14 +573,23 @@ class Repository:
 
     def has_unscoped_legacy_rows(self, owner_id: str) -> bool:
         """Fast SQL existence check replacing full-table scans in AccountService._ensure_default."""
+        from .accounts import AccountService
+
         with self.store.db_lock(), self.store.Session() as session:
-            for model in (GpuJobRow, GpuLeaseRow, GpuInstanceRow):
+            for model in (GpuLeaseRow, GpuInstanceRow):
                 stmt = (
                     select(model.id)
                     .where(model.owner_id == owner_id, or_(model.account_id.is_(None), model.account_id == ""))
                     .limit(1)
                 )
                 if session.scalar(stmt) is not None:
+                    return True
+            job_stmt = select(GpuJobRow).where(
+                GpuJobRow.owner_id == owner_id,
+                or_(GpuJobRow.account_id.is_(None), GpuJobRow.account_id == ""),
+            )
+            for row in session.scalars(job_stmt).all():
+                if AccountService._is_unscoped_legacy_job(self._row(row)):
                     return True
             cred_stmt = (
                 select(GpuCredentialRow)
@@ -625,6 +634,7 @@ class Repository:
         patch = {"gpu_diagnostics": clean, "gpu_reported": ", ".join(d["name"] for d in clean["devices"])}
         owner_id = job["owner_id"]
         with self.store.db_lock(), self.store.Session.begin() as session:
+            self.store.begin_immediate(session)
             row = session.get(GpuJobRow, job["id"])
             if row is None or row.owner_id != owner_id or row.state != "running":
                 return None
@@ -745,6 +755,8 @@ class Repository:
                         id=str(uuid.uuid4()),
                         owner_id=owner_id,
                         project_id=raw.get("project_id"),
+                        account_id=payload.get("account_id"),
+                        instance_id=payload.get("instance_id"),
                         state="queued",
                         data=payload,
                         version=0,
@@ -805,6 +817,7 @@ class Repository:
             raise ValueError("invalid lifecycle mode")
         body_hash = digest(request_body if request_body is not None else {"jobs": jobs, "policy": policy})
         with self.store.db_lock(), self.store.Session.begin() as session:
+            self.store.begin_immediate(session)
             existing = session.scalar(select(GpuBatchRow).where(
                 GpuBatchRow.owner_id == owner_id, GpuBatchRow.idempotency_key == idempotency_key))
             if existing:
@@ -831,6 +844,7 @@ class Repository:
                     data['provider'], data.get('snapshot') or {}, data.get('requested_spec'),
                     data.get('workflow_key'), data.get('workflow_version'))
                 row = GpuJobRow(id=job_id, owner_id=owner_id, project_id=data.get('project_id'),
+                                account_id=data.get('account_id'), instance_id=data.get('instance_id'),
                                 state='queued', data=data, version=0,
                                 idempotency_key=f'batch:{batch_id}:{index}', body_hash=digest(job),
                                 created_at=utcnow(), updated_at=utcnow())
@@ -846,6 +860,7 @@ class Repository:
 
     def attach_idle_lease(self, owner_id, job_id, lease_id, now):
         with self.store.db_lock(), self.store.Session.begin() as session:
+            self.store.begin_immediate(session)
             job=session.get(GpuJobRow,job_id)
             lease=session.get(GpuLeaseRow,lease_id)
             if not job or not lease or job.owner_id!=owner_id or lease.owner_id!=owner_id:
@@ -875,6 +890,7 @@ class Repository:
     def _handoff_lease_locked(self, owner_id, job_id, next_job_id, lease_id, now):
         """Finish old job and transfer exclusive lease ownership in one DB transaction."""
         with self.store.db_lock(), self.store.Session.begin() as session:
+            self.store.begin_immediate(session)
             job=session.get(GpuJobRow,job_id)
             following=session.get(GpuJobRow,next_job_id)
             lease=session.get(GpuLeaseRow,lease_id)
@@ -974,8 +990,11 @@ class Repository:
             if instance is not None:
                 job.instance_id = instance.id
                 job.account_id = account_id
+            handed_spec = instance_data.get('runtime_spec_reported') or (job.data or {}).get('runtime_spec_reported')
             following.data={**following.data,'lease_id':lease_id,
                             'deadline_epoch':lease.data['deadline_epoch'],
+                            'selection_reason':(job.data or {}).get('selection_reason') or 'reuse_idle',
+                            **({'runtime_spec_reported':handed_spec} if handed_spec else {}),
                             **({'instance_id':instance.id,'account_id':account_id} if instance is not None else {})}
             if instance is not None:
                 following.instance_id = instance.id
@@ -1051,6 +1070,7 @@ class Repository:
             if not acquired:
                 return None
             with self.store.db_lock(), self.store.Session.begin() as session:
+                self.store.begin_immediate(session)
                 lease = session.scalar(select(GpuLeaseRow).where(GpuLeaseRow.id == lease_id, GpuLeaseRow.owner_id == owner_id))
                 lease_instance_json = (lease.data or {}).get('instance_id') if lease is not None else None
                 lease_instance_typed = lease.instance_id if lease is not None else None
@@ -1133,6 +1153,7 @@ class Repository:
             if not acquired:
                 return False
             with self.store.db_lock(), self.store.Session.begin() as session:
+                self.store.begin_immediate(session)
                 lease = session.scalar(select(GpuLeaseRow).where(GpuLeaseRow.id == lease_id, GpuLeaseRow.owner_id == owner_id))
                 lease_instance_id = (lease.data or {}).get('instance_id') if lease is not None else None
                 lease_instance_id = lease_instance_id or (lease.instance_id if lease is not None else None)
@@ -1206,6 +1227,7 @@ class Repository:
             if not acquired:
                 return None
             with self.store.db_lock(), self.store.Session.begin() as session:
+                self.store.begin_immediate(session)
                 instance = session.scalar(select(GpuInstanceRow).where(
                     GpuInstanceRow.id == instance_id, GpuInstanceRow.owner_id == owner_id
                 ))
@@ -1488,6 +1510,7 @@ class Repository:
         if not key or len(key)>200:
             raise ValueError('idempotency key required')
         with self.store.db_lock(), self.store.Session.begin() as session:
+            self.store.begin_immediate(session)
             job=session.scalar(select(GpuJobRow).where(GpuJobRow.id==job_id,GpuJobRow.owner_id==owner_id).with_for_update())
             if not job:
                 raise KeyError(job_id)
@@ -1542,6 +1565,7 @@ class Repository:
     def prepare_execution(self, job_id, owner_id, lease_id, now):
         """Persist execution identity before start, atomically with its attempt record."""
         with self.store.db_lock(), self.store.Session.begin() as session:
+            self.store.begin_immediate(session)
             job=session.scalar(select(GpuJobRow).where(GpuJobRow.id==job_id,GpuJobRow.owner_id==owner_id).with_for_update())
             lease=session.get(GpuLeaseRow,lease_id)
             if not job or not lease or lease.owner_id!=owner_id:
@@ -1608,6 +1632,7 @@ class Repository:
         if progress is not None and (isinstance(progress,bool) or not isinstance(progress,(int,float)) or not 0<=progress<=1):
             raise ValueError('progress必须在0到1之间')
         with self.store.db_lock(), self.store.Session.begin() as session:
+            self.store.begin_immediate(session)
             job=session.scalar(select(GpuJobRow).where(GpuJobRow.id==job_id,GpuJobRow.owner_id==owner_id).with_for_update())
             if not job:
                 raise KeyError(job_id)

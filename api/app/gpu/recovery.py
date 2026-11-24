@@ -25,6 +25,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -37,7 +38,7 @@ from app.db import SettingRow, utcnow
 from .colab import RUNTIME_MISSING
 from .compute import GpuConfig
 from .cu_guard import CuGuardService
-from .instances import POOL_CREATION, POOL_EPHEMERAL, POOL_NATIVE
+from .instances import POOL_CREATION, POOL_EPHEMERAL, POOL_NATIVE, instance_pool_of
 from .manifest import digest
 from .repository import (
     GpuAccountRow,
@@ -56,7 +57,24 @@ PLAN_KEY_PREFIX = "recovery-plan:"
 ACTIVE_PLAN_STATES = frozenset({"scheduled", "dispatching", "cancelling", "restoring_env"})
 TERMINAL_PLAN_STATES = frozenset({"recovered", "exhausted", "aborted_fatal", "aborted_vps_outage", "cancelled"})
 TERMINAL_JOB_STATES = frozenset({"completed", "failed", "cancelled"})
+ACTIVE_CREATION_TAKEOVER_STATES = frozenset({"preparing", "loading", "running", "uploading"})
 INACTIVE_LEASE_STATES = frozenset({"deleted"})
+
+
+@contextmanager
+def _wait_dispatch_lock(store, timeout: float = 0.5, step: float = 0.02):
+    """Retry non-blocking dispatch_lock briefly so critical state transitions don't silently drop."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        with store.dispatch_lock() as acquired:
+            if acquired:
+                yield True
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            yield False
+            return
+        time.sleep(min(step, remaining))
 
 NON_DETERMINISTIC_L2_ERRORS = frozenset({"gpu_worker_exited", "cuda_device_lost"})
 _L2_DETERMINISTIC_MARKERS = (
@@ -620,11 +638,13 @@ def evaluate_recovery_eligibility_in_tx(
     last_successful_probe_at: float | None = None,
     process_started_at: float | None = None,
     check_vps_outage: bool = False,
+    vps_outage_now: float | None = None,
     check_concurrency: bool = True,
     active_job_id: str | None = None,
     active_lease_id: str | None = None,
     ignore_job_id: str | None = None,
     ignore_instance_id: str | None = None,
+    source_instance_id: str | None = None,
 ) -> tuple[bool, str, str]:
     """Evaluate all 10 eligibility rules from §5.4.
 
@@ -652,14 +672,10 @@ def evaluate_recovery_eligibility_in_tx(
     if manual_stop_requested or force_stop or fuse_forced_stop or native_draining:
         return False, "non_candidate", "实例已主动停止、排空或强制熔断，不触发自动恢复"
 
-    # 2. Startup grace window
-    started_at = _PROCESS_STARTED_AT if process_started_at is None else float(process_started_at)
-    if cfg.startup_grace_seconds > 0 and (now - started_at) < cfg.startup_grace_seconds:
-        return False, "startup_grace", "watchdog 处于启动宽限期，稍后复核"
-
-    # 3. VPS long outage / maintenance protection
+    # 3. VPS long outage / maintenance protection (MUST precede startup_grace!)
     if check_vps_outage and last_successful_probe_at is not None:
-        outage_s = max(0.0, now - float(last_successful_probe_at))
+        outage_ref = now if vps_outage_now is None else float(vps_outage_now)
+        outage_s = max(0.0, outage_ref - float(last_successful_probe_at))
         if outage_s >= cfg.max_vps_outage_minutes * 60.0:
             return (
                 False,
@@ -667,7 +683,7 @@ def evaluate_recovery_eligibility_in_tx(
                 f"VPS 距上次成功通信已超过 {int(outage_s // 60)} 分钟（阈值 {cfg.max_vps_outage_minutes} 分钟），疑似 VPS 停机维护或 VM 失联自释放，已放弃自动重拉",
             )
 
-    # 6. CU soft & hard fuses
+    # 6. CU soft & hard fuses (permanent vetoes evaluated before startup_grace)
     guard = CuGuardService(repo, lambda: now)
     guard_state = guard.state_in(session, owner_id)
     if guard_state.get("soft_tripped"):
@@ -702,14 +718,19 @@ def evaluate_recovery_eligibility_in_tx(
             if effective_deadline is None or (effective_deadline - now) < min_rem:
                 return False, "aborted_fatal", f"空闲剩余保留时长不足 {cfg.min_remaining_minutes} 分钟，已放弃自动恢复"
 
+    # 2. Startup grace window (evaluated after permanent vetoes, before transient concurrency/dispatch)
+    started_at = _PROCESS_STARTED_AT if process_started_at is None else float(process_started_at)
+    if cfg.startup_grace_seconds > 0 and (now - started_at) < cfg.startup_grace_seconds:
+        return False, "startup_grace", "watchdog 处于启动宽限期，稍后复核"
+
     # 10. Concurrency & inflight lease exclusion
     if active_lease_id:
         inflight_lease = session.get(GpuLeaseRow, active_lease_id)
         if inflight_lease is not None and inflight_lease.state != "deleted":
             return False, "inflight_pending", "上次继任分配租约尚未确认释放，等待核对完成"
-    if active_job_id and active_job_id != ignore_job_id:
+    if active_job_id:
         inflight_job = session.get(GpuJobRow, active_job_id)
-        if inflight_job is not None and inflight_job.state not in TERMINAL_JOB_STATES:
+        if active_job_id != ignore_job_id and inflight_job is not None and inflight_job.state not in TERMINAL_JOB_STATES:
             return False, "inflight_pending", "已有在途恢复任务正在推进"
         if inflight_job is not None:
             for lease_row in session.scalars(select(GpuLeaseRow).where(GpuLeaseRow.owner_id == owner_id)).all():
@@ -723,11 +744,17 @@ def evaluate_recovery_eligibility_in_tx(
                 ldata = lease_row.data or {}
                 if ldata.get("native_comfy") and lease_row.state not in {"deleted", "quarantined", "releasing", "deleting"}:
                     return False, "concurrent_active", "检测到已存在活跃原生实例，停止重复恢复"
+            reclaimed_ids = {i for i in (ignore_instance_id, source_instance_id) if i}
             for job_row in session.scalars(select(GpuJobRow).where(GpuJobRow.owner_id == owner_id)).all():
                 if job_row.id == ignore_job_id:
                     continue
                 jdata = job_row.data or {}
                 if (jdata.get("snapshot") or {}).get("native_comfy") and job_row.state not in TERMINAL_JOB_STATES:
+                    if job_row.state in {"cleaning_up", "cleanup_pending"} and (
+                        (reclaimed_ids and (jdata.get("instance_id") in reclaimed_ids or job_row.instance_id in reclaimed_ids))
+                        or jdata.get("error_code") == RUNTIME_MISSING
+                    ):
+                        return False, "inflight_pending", "原原生启动任务正在收尾释放，稍后复核"
                     return False, "concurrent_active", "检测到已存在进行中的原生启动任务，停止重复恢复"
         elif pool == POOL_CREATION:
             for inst_row in session.scalars(select(GpuInstanceRow).where(GpuInstanceRow.owner_id == owner_id)).all():
@@ -736,12 +763,34 @@ def evaluate_recovery_eligibility_in_tx(
                 idata = inst_row.data or {}
                 if (
                     inst_row.state in {"allocating", "ready", "busy", "retained_idle"}
-                    and idata.get("instance_pool", POOL_CREATION) == POOL_CREATION
+                    and instance_pool_of(idata) == POOL_CREATION
                     and idata.get("account_id") == account_id
                     and not idata.get("manual_stop_requested")
                     and not idata.get("runtime_deleted")
                 ):
                     return False, "concurrent_active", "原账号下已存在活跃创作池实例，取消重复自动恢复"
+            for job_row in session.scalars(select(GpuJobRow).where(GpuJobRow.owner_id == owner_id)).all():
+                if job_row.id == ignore_job_id:
+                    continue
+                if job_row.state not in {"allocating", "preparing", "loading", "running", "uploading"}:
+                    continue
+                jdata = job_row.data or {}
+                if jdata.get("cancel_requested"):
+                    continue
+                j_acct = jdata.get("account_id") or jdata.get("requested_account_id") or (jdata.get("execution_policy") or {}).get("account_id")
+                if j_acct != account_id:
+                    continue
+                j_pool = jdata.get("instance_pool")
+                if j_pool is None:
+                    snap = jdata.get("snapshot") or {}
+                    if snap.get("native_comfy"):
+                        j_pool = POOL_NATIVE
+                    elif snap.get("system_smoke") or (jdata.get("execution_policy") or {}).get("lifecycle") == "save":
+                        j_pool = POOL_EPHEMERAL
+                    else:
+                        j_pool = POOL_CREATION
+                if j_pool == POOL_CREATION:
+                    return False, "concurrent_active", "原账号下已存在推进中的创作池任务，取消重复自动恢复"
 
     return True, "ok", "满足自动恢复条件"
 
@@ -752,6 +801,9 @@ def _local_outputs_persisted(job_data: Mapping[str, Any]) -> bool:
         return True
     outputs = job_data.get("outputs")
     if isinstance(outputs, list) and outputs:
+        from pathlib import Path
+
+        artifacts_dir = settings.data_dir / "assets" / "artifacts"
         all_local = True
         for item in outputs:
             if not isinstance(item, Mapping):
@@ -760,11 +812,14 @@ def _local_outputs_persisted(job_data: Mapping[str, Any]) -> bool:
             if item.get("content"):
                 continue
             storage = item.get("storage")
-            if isinstance(storage, Mapping) and storage.get("local_path"):
-                from pathlib import Path
-
-                if Path(str(storage["local_path"])).is_file():
+            if isinstance(storage, Mapping):
+                if storage.get("local_path") and Path(str(storage["local_path"])).is_file():
                     continue
+                if storage.get("provider") in {"local", "mock"}:
+                    obj_key = str(storage.get("object_key") or item.get("artifact_id") or "").strip()
+                    if obj_key and "/" not in obj_key and "\\" not in obj_key and obj_key not in {".", ".."}:
+                        if (artifacts_dir / f"{obj_key}.data").is_file() or (artifacts_dir / obj_key).is_file():
+                            continue
             all_local = False
             break
         if all_local:
@@ -854,14 +909,16 @@ def on_runtime_reclaimed_in_tx(
         if job_lc in {"save", "batch"}:
             effective_retention = job_lc
 
-    # Check if uploading job already has local outputs on VPS -> do not re-run GPU (§5.3, §6.2)
-    uploading_local_persisted = bool(
-        interrupted_job_row is not None
-        and interrupted_job_row.state == "uploading"
-        and _local_outputs_persisted(interrupted_job_data)
-    )
-    if uploading_local_persisted:
-        return None
+    # Check if job already has local outputs persisted on VPS or is already finalizing cleanup -> do not re-run GPU (§5.3, §6.2)
+    if interrupted_job_row is not None:
+        if _local_outputs_persisted(interrupted_job_data):
+            return None
+        if (
+            interrupted_job_row.state in {"cleaning_up", "cleanup_pending"}
+            or bool(interrupted_job_data.get("cleanup_final_state"))
+            or bool(interrupted_job_data.get("cancel_requested"))
+        ):
+            return None
 
     # Check if this instance is even a candidate before persisting anything.
     eligible, code, reason_msg = evaluate_recovery_eligibility_in_tx(
@@ -884,9 +941,11 @@ def on_runtime_reclaimed_in_tx(
         last_successful_probe_at=snapshot.get("last_successful_probe_at"),
         process_started_at=process_started_at,
         check_vps_outage=True,
+        vps_outage_now=checked_at,
         check_concurrency=True,
         ignore_job_id=candidate_job_id if pool == POOL_CREATION and was_busy else snapshot.get("owner_job_id"),
         ignore_instance_id=instance_id,
+        source_instance_id=instance_id,
     )
 
     if code in {"disabled", "non_candidate"}:
@@ -919,15 +978,21 @@ def on_runtime_reclaimed_in_tx(
     elif pool == POOL_CREATION:
         cr = snapshot.get("creation_runtime") if isinstance(snapshot.get("creation_runtime"), Mapping) else {}
         prev_cs = (existing_plan or {}).get("creation_snapshot") or {}
-        if was_busy and interrupted_job_row is not None and interrupted_job_row.state not in TERMINAL_JOB_STATES:
+        if (
+            was_busy
+            and interrupted_job_row is not None
+            and interrupted_job_row.state in ACTIVE_CREATION_TAKEOVER_STATES
+            and not interrupted_job_data.get("cleanup_final_state")
+            and not _local_outputs_persisted(interrupted_job_data)
+        ):
             if interrupted_job_data.get("cancel_requested"):
                 return None
             retries = int(interrupted_job_data.get("auto_retry_count") or 0)
-            if eligible and retries >= cfg.max_job_retries:
+            if (eligible or code == "startup_grace") and retries >= cfg.max_job_retries:
                 eligible = False
                 code = "aborted_fatal"
                 reason_msg = f"该任务已达到自动重试上限（{cfg.max_job_retries} 次），已停止自动恢复"
-            elif eligible:
+            elif eligible or code == "startup_grace":
                 takeover_job_id = interrupted_job_row.id
             creation_snapshot = {
                 "mode": "retry_job",
@@ -943,7 +1008,7 @@ def on_runtime_reclaimed_in_tx(
             wf_id = cr.get("workflow_id") or snapshot.get("workflow_version_id") or prev_cs.get("workflow_id")
             wf_key = cr.get("workflow_key") or snapshot.get("workflow_key") or prev_cs.get("workflow_key")
             wf_ver = cr.get("workflow_version") if cr.get("workflow_version") is not None else (snapshot.get("workflow_version") or prev_cs.get("workflow_version"))
-            if eligible:
+            if eligible or code == "startup_grace":
                 wf_row = _workflow_eligible_in_tx(session, owner_id, wf_id, wf_key, wf_ver)
                 if wf_row is None:
                     eligible = False
@@ -963,15 +1028,11 @@ def on_runtime_reclaimed_in_tx(
                 "project_id": snapshot.get("project_id") or prev_cs.get("project_id"),
             }
 
-    # Startup grace: still persist scheduled plan with next_retry_at = started + grace!
+    # Startup grace: permanent vetoes already evaluated above; persist scheduled plan until grace ends!
     if code == "startup_grace":
         started_at = _PROCESS_STARTED_AT if process_started_at is None else float(process_started_at)
         next_retry_at = started_at + cfg.startup_grace_seconds
         plan_state = "scheduled"
-        if pool == POOL_CREATION and was_busy and interrupted_job_row is not None:
-            retries = int(interrupted_job_data.get("auto_retry_count") or 0)
-            if not interrupted_job_data.get("cancel_requested") and retries < cfg.max_job_retries:
-                takeover_job_id = interrupted_job_row.id
     elif eligible:
         plan_state = "scheduled"
         next_retry_at = checked_at
@@ -999,7 +1060,10 @@ def on_runtime_reclaimed_in_tx(
         "max_rounds": cfg.max_rounds,
         "round_counted_for_instance_id": (existing_plan or {}).get("round_counted_for_instance_id"),
         "round_started_at": checked_at,
+        "reclaimed_at": checked_at,
+        "last_successful_probe_at": snapshot.get("last_successful_probe_at"),
         "backoff_attempt": 0,
+        "dispatch_seq": int((existing_plan or {}).get("dispatch_seq") or 0),
         "next_retry_at": next_retry_at,
         "source_instance_id": instance_id,
         "active_job_id": takeover_job_id,
@@ -1050,7 +1114,7 @@ def on_successor_allocation_confirmed(
 ) -> dict[str, Any] | None:
     """Unique round-deduction point: invoked once successor VM reaches preparing->ready (§5.2)."""
     store = repo.store if hasattr(repo, "store") else repo
-    with store.dispatch_lock() as acquired:
+    with _wait_dispatch_lock(store) as acquired:
         if not acquired:
             return None
         with store.db_lock(), store.Session.begin() as session:
@@ -1115,7 +1179,7 @@ def maybe_defer_retry_job_after_cleanup(
     cfg = RecoveryConfig.from_env()
     store = repo.store if hasattr(repo, "store") else repo
 
-    with store.dispatch_lock() as acquired:
+    with _wait_dispatch_lock(store) as acquired:
         if not acquired:
             return None
         with store.db_lock(), store.Session.begin() as session:
@@ -1130,10 +1194,13 @@ def maybe_defer_retry_job_after_cleanup(
             ):
                 return None
 
-            # Ensure lease is genuinely deleted before scheduling another attempt.
+            # Ensure lease (and any other lease owned by this job) is genuinely deleted before scheduling another attempt.
             if lease and lease.get("id"):
                 lrow = session.get(GpuLeaseRow, lease["id"])
                 if lrow is not None and lrow.state != "deleted":
+                    return None
+            for lrow in session.scalars(select(GpuLeaseRow).where(GpuLeaseRow.owner_id == owner_id)).all():
+                if (lrow.data or {}).get("owner_job_id") == job["id"] and lrow.state != "deleted":
                     return None
 
             job_row = session.get(GpuJobRow, job["id"])
@@ -1417,10 +1484,21 @@ def cancel_plan(
             job_terminal = job_row is None or job_row.state in TERMINAL_JOB_STATES
             if job_row is not None and not job_terminal:
                 jdata = copy.deepcopy(job_row.data or {})
-                if job_row.state == "waiting_for_capacity" and not jdata.get("lease_id") and not jdata.get("instance_id"):
-                    _cancel_held_job_in_tx(session, owner_id, active_job_id, state="cancelled", message=reason)
-                    job_terminal = True
-                else:
+                claim_live = bool(jdata.get("claim_token")) and float(jdata.get("claim_until") or 0) > now
+                can_short_circuit = (
+                    job_row.state == "waiting_for_capacity"
+                    and not jdata.get("lease_id")
+                    and not jdata.get("instance_id")
+                    and (bool(jdata.get("recovery_hold")) or not claim_live)
+                )
+                if can_short_circuit:
+                    with store.admission_lock(timeout=0.5) as a_acquired:
+                        if a_acquired:
+                            _cancel_held_job_in_tx(session, owner_id, active_job_id, state="cancelled", message=reason)
+                            job_terminal = True
+                        else:
+                            can_short_circuit = False
+                if not can_short_circuit:
                     jdata["cancel_requested"] = True
                     jdata["requested_outcome"] = "cancelled"
                     job_row.data = jdata
@@ -1482,33 +1560,44 @@ def cancel_plans_for_instance_in_tx(session, owner_id: str, instance_id: str, no
 def cancel_plans_for_job(repo, owner_id: str, job_id: str, now: float, *, reason: str = "用户取消任务，自动停止恢复计划") -> None:
     """Cancel or transition any active recovery plan associated with a manually cancelled job."""
     store = repo.store if hasattr(repo, "store") else repo
-    with store.db_lock(), store.Session.begin() as session:
-        store.begin_immediate(session)
-        for plan in list_plans_in_tx(session, owner_id):
-            if plan.get("state") not in ACTIVE_PLAN_STATES:
-                continue
-            if plan.get("active_job_id") != job_id:
-                continue
-            if plan["state"] == "scheduled":
-                plan["state"] = "cancelled"
-                plan["cancelled_at"] = now
-            elif plan["state"] == "dispatching":
-                # Check if lease exists and is active
-                has_live_lease = False
-                for lrow in session.scalars(select(GpuLeaseRow).where(GpuLeaseRow.owner_id == owner_id)).all():
-                    if (lrow.data or {}).get("owner_job_id") == job_id and lrow.state != "deleted":
-                        has_live_lease = True
-                        plan["active_lease_id"] = lrow.id
-                        break
-                if has_live_lease:
-                    plan["state"] = "cancelling"
-                else:
+    with _wait_dispatch_lock(store):
+        with store.db_lock(), store.Session.begin() as session:
+            store.begin_immediate(session)
+            job_row = session.get(GpuJobRow, job_id)
+            job_terminal = job_row is None or job_row.state in TERMINAL_JOB_STATES
+            for plan in list_plans_in_tx(session, owner_id):
+                if plan.get("state") not in ACTIVE_PLAN_STATES:
+                    continue
+                if plan.get("active_job_id") != job_id:
+                    continue
+                if plan["state"] == "cancelling":
+                    continue
+                if plan["state"] == "scheduled":
                     plan["state"] = "cancelled"
                     plan["cancelled_at"] = now
-            plan["next_retry_at"] = None
-            plan["last_error_message"] = reason
-            plan["updated_at"] = now
-            save_plan_in_tx(session, owner_id, plan)
+                elif plan["state"] == "dispatching":
+                    # Check if job is non-terminal or any associated lease is non-deleted
+                    has_live_lease = False
+                    active_lease_id = plan.get("active_lease_id")
+                    if active_lease_id:
+                        lrow = session.get(GpuLeaseRow, active_lease_id)
+                        if lrow is not None and lrow.state != "deleted":
+                            has_live_lease = True
+                    if not has_live_lease:
+                        for lrow in session.scalars(select(GpuLeaseRow).where(GpuLeaseRow.owner_id == owner_id)).all():
+                            if (lrow.data or {}).get("owner_job_id") == job_id and lrow.state != "deleted":
+                                has_live_lease = True
+                                plan["active_lease_id"] = lrow.id
+                                break
+                    if has_live_lease or not job_terminal:
+                        plan["state"] = "cancelling"
+                    else:
+                        plan["state"] = "cancelled"
+                        plan["cancelled_at"] = now
+                plan["next_retry_at"] = None
+                plan["last_error_message"] = reason
+                plan["updated_at"] = now
+                save_plan_in_tx(session, owner_id, plan)
 
 
 def cancel_scheduled_native_plans_in_tx(session, owner_id: str, now: float, *, reason: str = "用户手动启动原生 ComfyUI，已取消等待中的自动恢复计划") -> None:
@@ -1537,6 +1626,8 @@ def _trigger_native_model_restore(repo, owner_id: str, plan: dict[str, Any], lea
     models = list(ns.get("recoverable_models") or [])
     if not models:
         return None, {"state": "ready", "total": 0, "completed": 0, "failed": 0, "skipped": 0, "partial_disk_limit": False, "updated_at": now}
+    if native.restart_active(lease):
+        raise APIError("NATIVE_RESTARTING", "原生 ComfyUI 正在重启，等待重启完成后再回拉模型", 409, True)
     url, auth = native.backend_for(repo, owner_id)
     channel_headers = native_model_api.headers(url, auth, lease, repo=repo)
     context = native_model_api.runtime_context(repo, lease)
@@ -1624,7 +1715,7 @@ def _dispatch_native_locked(repo, owner_id: str, plan: dict[str, Any], now: floa
     }
     if ns.get("plugin_generation"):
         body["plugin_generation"] = ns["plugin_generation"]
-    idem_key = f"auto-recovery:{plan['plan_id']}:r{int(plan.get('rounds_used') or 0) + 1}:a{int(plan.get('backoff_attempt') or 0)}"
+    idem_key = f"auto-recovery:{plan['plan_id']}:r{int(plan.get('rounds_used') or 0) + 1}:a{int(plan.get('backoff_attempt') or 0)}:d{int(plan.get('dispatch_seq') or 0)}"
     extra = {
         "hard_deadline_at": hard_deadline,
         "deadline_epoch": hard_deadline,
@@ -1676,7 +1767,12 @@ def _dispatch_creation_warmup_locked(repo, owner_id: str, plan: dict[str, Any], 
             repo.store.create("projects", owner_id, {"title": "创作 API"}, record_id=ident)
         project_id = ident
 
-    hard_deadline = float(plan["hard_deadline_at"])
+    raw_hard = plan.get("hard_deadline_at")
+    if raw_hard is None:
+        raw_hard = plan.get("orig_idle_deadline_at")
+    if raw_hard is None:
+        raise APIError("AUTO_RECOVERY_INVALID_DEADLINE", "缺少有效的恢复截止时间", 409)
+    hard_deadline = float(raw_hard)
     retain_minutes = max(1, int(round(float(plan.get("retain_idle_minutes") or 15))))
     approx_runtime = max(1, min(240, int((hard_deadline - now) // 60) + 1))
     lifecycle = str(plan.get("retention_mode") or "smart")
@@ -1699,7 +1795,7 @@ def _dispatch_creation_warmup_locked(repo, owner_id: str, plan: dict[str, Any], 
         params={},
         execution_policy=pol,
     ).model_dump()
-    idem_key = f"auto-recovery-warmup:{plan['plan_id']}:r{int(plan.get('rounds_used') or 0) + 1}:a{int(plan.get('backoff_attempt') or 0)}"
+    idem_key = f"auto-recovery-warmup:{plan['plan_id']}:r{int(plan.get('rounds_used') or 0) + 1}:a{int(plan.get('backoff_attempt') or 0)}:d{int(plan.get('dispatch_seq') or 0)}"
     extra = {
         "hard_deadline_at": hard_deadline,
         "deadline_epoch": hard_deadline,
@@ -1883,6 +1979,20 @@ def _advance_dispatching(repo, owner_id: str, plan: dict[str, Any], now: float, 
                 fresh = get_plan_in_tx(session, owner_id, plan["plan_id"])
                 if not fresh or fresh.get("state") != "dispatching":
                     return False
+                if successor_id and fresh.get("round_counted_for_instance_id") != successor_id:
+                    fresh["rounds_used"] = int(fresh.get("rounds_used") or 0) + 1
+                    fresh["round_counted_for_instance_id"] = successor_id
+                    parent_id = fresh.get("source_instance_id")
+                    if parent_id and parent_id != successor_id:
+                        parent_row = session.get(GpuInstanceRow, parent_id)
+                        if parent_row is not None and parent_row.owner_id == owner_id:
+                            pdata = copy.deepcopy(parent_row.data or {})
+                            if pdata.get("replaced_by_instance_id") != successor_id:
+                                pdata["replaced_by_instance_id"] = successor_id
+                                pdata.setdefault("recovery_group_id", fresh["recovery_group_id"])
+                                parent_row.data = pdata
+                                parent_row.version = int(parent_row.version or 0) + 1
+                                parent_row.updated_at = utcnow()
                 fresh["successor_instance_id"] = successor_id or fresh.get("successor_instance_id")
                 fresh["active_lease_id"] = (lease or {}).get("id") or fresh.get("active_lease_id")
                 fresh["last_error_code"] = None
@@ -2021,6 +2131,7 @@ def _advance_dispatching(repo, owner_id: str, plan: dict[str, Any], now: float, 
 
             fresh["state"] = "scheduled"
             fresh["backoff_attempt"] = next_attempt
+            fresh["dispatch_seq"] = int(fresh.get("dispatch_seq") or 0) + 1
             fresh["next_retry_at"] = next_retry_at
             fresh["last_error_message"] = f"{err_msg or err_code}；{int(round(next_retry_at - now))}s 后重试"
             fresh["updated_at"] = now
@@ -2256,14 +2367,20 @@ def _advance_scheduled(
                     rounds_used=int(fresh.get("rounds_used") or 0),
                     now=now,
                     cfg=cfg,
+                    last_successful_probe_at=fresh.get("last_successful_probe_at"),
                     process_started_at=process_started_at,
+                    check_vps_outage=fresh.get("reclaimed_at") is not None,
+                    vps_outage_now=fresh.get("reclaimed_at"),
                     check_concurrency=True,
                     ignore_job_id=fresh.get("active_job_id"),
+                    source_instance_id=fresh.get("source_instance_id"),
                 )
                 if not eligible and code not in {"startup_grace", "inflight_pending"}:
                     if code == "concurrent_active":
                         fresh["state"] = "cancelled"
                         fresh["cancelled_at"] = now
+                    elif code == "aborted_vps_outage":
+                        fresh["state"] = "aborted_vps_outage"
                     elif code == "exhausted":
                         fresh["state"] = "exhausted"
                     else:
@@ -2287,7 +2404,7 @@ def _advance_scheduled(
 
             repo_registry(store, {"id": owner_id})
         except Exception:
-            pass
+            return False
 
     # Due for dispatch: acquire dispatch_lock -> admission_lock in strict non-reentrant order (§5.4)
     with store.dispatch_lock() as d_acquired:
@@ -2338,11 +2455,15 @@ def _advance_scheduled(
                     rounds_used=int(fresh.get("rounds_used") or 0),
                     now=now,
                     cfg=cfg,
+                    last_successful_probe_at=fresh.get("last_successful_probe_at"),
                     process_started_at=process_started_at,
+                    check_vps_outage=fresh.get("reclaimed_at") is not None,
+                    vps_outage_now=fresh.get("reclaimed_at"),
                     check_concurrency=True,
                     active_job_id=fresh.get("active_job_id"),
                     active_lease_id=fresh.get("active_lease_id"),
                     ignore_job_id=fresh.get("active_job_id") if (fresh.get("creation_snapshot") or {}).get("mode") == "retry_job" else None,
+                    source_instance_id=fresh.get("source_instance_id"),
                 )
                 if code == "startup_grace":
                     started_at = _PROCESS_STARTED_AT if process_started_at is None else float(process_started_at)
@@ -2356,6 +2477,8 @@ def _advance_scheduled(
                     if code == "concurrent_active":
                         fresh["state"] = "cancelled"
                         fresh["cancelled_at"] = now
+                    elif code == "aborted_vps_outage":
+                        fresh["state"] = "aborted_vps_outage"
                     elif code == "exhausted":
                         fresh["state"] = "exhausted"
                     else:
@@ -2417,6 +2540,7 @@ def _advance_scheduled(
                     if not fresh or fresh.get("state") != "scheduled":
                         return False
                     if kind == "local_lock":
+                        fresh["dispatch_seq"] = int(fresh.get("dispatch_seq") or 0) + 1
                         fresh["next_retry_at"] = now + 5.0
                         fresh["last_error_code"] = exc.code
                         fresh["last_error_message"] = exc.message

@@ -104,9 +104,11 @@ def build_batch_router(JobInput, admit_job, public_job):
                 guard_generation(repo, user["id"], job["execution_policy"])
             try:
                 storage_mode = "batch" if lifecycle == "retain" else lifecycle
+                batch_policy = {'mode': storage_mode, 'lifecycle': lifecycle}
+                if "idle_seconds" in body.model_fields_set:
+                    batch_policy["idle_seconds"] = body.idle_seconds
                 batch, _ = repo.create_batch(user['id'],validated,key,
-                                             {'mode':storage_mode, 'lifecycle':lifecycle,
-                                              'idle_seconds':body.idle_seconds},request_body=raw_request)
+                                             batch_policy,request_body=raw_request)
             except ValueError as exc:
                 raise APIError("IDEMPOTENCY_CONFLICT", str(exc), 409) from exc
         if replace_target:

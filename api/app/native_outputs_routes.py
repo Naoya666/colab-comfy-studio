@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .common import APIError, current_user, ok
 from .gpu import native_outputs
@@ -43,8 +45,9 @@ def _etag_matches(header: str | None, etag: str) -> bool:
 
 
 def _content_disposition(filename: str) -> str:
-    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace('"', "_")
-    utf8_name = quote(filename, safe="")
+    safe_name = re.sub(r"[\x00-\x1f\x7f]+", "_", str(filename or "output"))
+    ascii_name = safe_name.encode("ascii", "replace").decode("ascii").replace("\\", "_").replace('"', "_")
+    utf8_name = quote(safe_name, safe="")
     return f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'
 
 
@@ -144,7 +147,7 @@ async def output_content(
         if owns and storage._owns_client:
             storage.client.close()
 
-    headers = {"Authorization": "Bearer " + token}
+    headers = {"Authorization": "Bearer " + token, "Accept-Encoding": "identity"}
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
@@ -192,25 +195,40 @@ async def output_content(
             else _content_disposition(item["filename"])
         ),
     }
+    has_upstream_encoding = bool(upstream.headers.get("content-encoding"))
     for key in ("content-length", "content-range", "etag"):
+        if key == "content-length" and has_upstream_encoding:
+            continue
         val = upstream.headers.get(key)
         if val:
             resp_headers[key.title()] = val
+
+    closed = False
+
+    async def close_upstream():
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        try:
+            await upstream.aclose()
+        finally:
+            if owns_client:
+                await client.aclose()
 
     async def body_stream():
         try:
             async for chunk in upstream.aiter_bytes(65536):
                 yield chunk
         finally:
-            await upstream.aclose()
-            if owns_client:
-                await client.aclose()
+            await close_upstream()
 
     return StreamingResponse(
         body_stream(),
         status_code=upstream.status_code,
         media_type=item["mime"],
         headers=resp_headers,
+        background=BackgroundTask(close_upstream),
     )
 
 

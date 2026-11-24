@@ -252,13 +252,24 @@ async def update_api_settings(body: dict, request: Request, user=Depends(current
     admin(user)
     owner = user["id"]
     repo = request.app.state.repo
+    prev_pol = await asyncio.to_thread(native_api.policy, repo.store, owner)
     values = await asyncio.to_thread(native_api.validate_policy, repo, owner, body)
     mgr = getattr(request.app.state, "port_listeners", None)
     if mgr is not None:
         await mgr.apply("native", values["listen_port"], allow_lan=values["allow_lan"], strict=True)
     elif values["listen_port"] is not None:
         probe_port_available(values["listen_port"], allow_lan=values["allow_lan"])
-    saved = await asyncio.to_thread(native_api.persist_policy, repo.store, owner, values)
+    try:
+        saved = await asyncio.to_thread(native_api.persist_policy, repo.store, owner, values)
+    except Exception:
+        if mgr is not None:
+            await mgr.apply(
+                "native",
+                prev_pol.get("listen_port"),
+                allow_lan=bool(prev_pol.get("allow_lan")),
+                strict=False,
+            )
+        raise
     return ok(saved, request)
 
 
@@ -592,7 +603,7 @@ def ticket(request: Request, user=Depends(current_user)):
     now = int(time.time())
     return ok({"url": url + "/_studio/session",
                "ticket": sign_session({"uid": user["id"], "aud": url, "purpose": "native-handoff",
-                                       "iat": now, "exp": now + 60})}, request)
+                                       "jti": uuid4().hex, "iat": now, "exp": now + 60})}, request)
 
 
 @router.get("/plugins")
@@ -612,11 +623,30 @@ def plugins(request: Request, user=Depends(current_user)):
                "offline": not online}, request)
 
 
+def _require_bool(body: dict, field: str, default: bool = False) -> bool:
+    if field not in body:
+        return default
+    val = body[field]
+    if type(val) is not bool:
+        raise APIError("WORKSPACE_INVALID_INPUT", f"{field} 必须为布尔值", 422)
+    return val
+
+
+def _optional_account_id(body: dict) -> str | None:
+    if "account_id" not in body or body["account_id"] is None:
+        return None
+    val = body["account_id"]
+    if not isinstance(val, str) or not val.strip() or len(val) > 128:
+        raise APIError("WORKSPACE_INVALID_INPUT", "account_id 格式无效", 422)
+    return val.strip()
+
+
 @router.get("/workspace/overview")
 async def workspace_overview(
     request: Request,
     refresh: bool = False,
     keep_history: int = Query(default=native_workspace.DEFAULT_KEEP_HISTORY, ge=1, le=native_workspace.MAX_HISTORY_ENTRIES),
+    account_id: str | None = Query(default=None),
     user=Depends(current_user),
 ):
     admin(user)
@@ -626,6 +656,7 @@ async def workspace_overview(
         user["id"],
         refresh=refresh,
         keep_history=keep_history,
+        account_id=account_id,
     )
     response = ok(data, request)
     response.headers["Cache-Control"] = "no-store"
@@ -637,17 +668,22 @@ async def workspace_workflows_action(body: dict, request: Request, user=Depends(
     admin(user)
     if not isinstance(body, dict):
         raise APIError("WORKSPACE_INVALID_INPUT", "请求体格式无效", 422)
-    unknown = set(body) - {"action", "items", "overwrite", "also_plugins"}
+    unknown = set(body) - {"action", "items", "overwrite", "also_plugins", "account_id"}
     if unknown:
         raise APIError("WORKSPACE_INVALID_INPUT", "包含不支持的参数字段", 422)
+    overwrite = _require_bool(body, "overwrite", False)
+    also_plugins = body.get("also_plugins")
+    if isinstance(also_plugins, dict) and "force_in_use" in also_plugins and type(also_plugins["force_in_use"]) is not bool:
+        raise APIError("WORKSPACE_INVALID_INPUT", "also_plugins.force_in_use 必须为布尔值", 422)
     result = await asyncio.to_thread(
         native_workspace.apply_workflow_action,
         request.app.state.repo,
         user["id"],
         action=str(body.get("action") or ""),
         items=body.get("items") or [],
-        overwrite=bool(body.get("overwrite", False)),
-        also_plugins=body.get("also_plugins"),
+        overwrite=overwrite,
+        also_plugins=also_plugins,
+        account_id=_optional_account_id(body),
     )
     return ok(result, request)
 
@@ -657,18 +693,20 @@ async def workspace_plugins_action(body: dict, request: Request, user=Depends(cu
     admin(user)
     if not isinstance(body, dict):
         raise APIError("WORKSPACE_INVALID_INPUT", "请求体格式无效", 422)
-    unknown = set(body) - {"action", "paths", "force_in_use"}
+    unknown = set(body) - {"action", "paths", "force_in_use", "account_id"}
     if unknown:
         raise APIError("WORKSPACE_INVALID_INPUT", "包含不支持的参数字段", 422)
     if not isinstance(body.get("paths"), list):
         raise APIError("WORKSPACE_INVALID_INPUT", "paths 必须为数组", 422)
+    force_in_use = _require_bool(body, "force_in_use", False)
     result = await asyncio.to_thread(
         native_workspace.apply_plugin_action,
         request.app.state.repo,
         user["id"],
         action=str(body.get("action") or ""),
         paths=body["paths"],
-        force_in_use=bool(body.get("force_in_use", False)),
+        force_in_use=force_in_use,
+        account_id=_optional_account_id(body),
     )
     return ok(result, request)
 
@@ -676,13 +714,14 @@ async def workspace_plugins_action(body: dict, request: Request, user=Depends(cu
 @router.post("/workspace/plugins/rollback")
 async def workspace_plugins_rollback(body: dict, request: Request, user=Depends(current_user)):
     admin(user)
-    if not isinstance(body, dict) or set(body) != {"generation"}:
+    if not isinstance(body, dict) or not (set(body) - {"account_id"}) == {"generation"}:
         raise APIError("WORKSPACE_INVALID_INPUT", "必须提供 generation", 422)
     result = await asyncio.to_thread(
         native_workspace.rollback_plugins,
         request.app.state.repo,
         user["id"],
         generation=str(body.get("generation") or ""),
+        account_id=_optional_account_id(body),
     )
     return ok(result, request)
 
@@ -692,30 +731,36 @@ async def workspace_delete_env_cache(
     request: Request,
     all_caches: bool = Query(default=False, alias="all"),
     keys_query: list[str] | None = Query(default=None, alias="key"),
+    account_id: str | None = Query(default=None),
     body: dict | None = Body(default=None),
     user=Depends(current_user),
 ):
     admin(user)
     keys = list(keys_query or [])
     delete_all = bool(all_caches)
+    acct = account_id
     if body is not None:
         if not isinstance(body, dict):
             raise APIError("WORKSPACE_INVALID_INPUT", "请求体格式无效", 422)
-        unknown = set(body) - {"keys", "all"}
+        unknown = set(body) - {"keys", "all", "account_id"}
         if unknown:
             raise APIError("WORKSPACE_INVALID_INPUT", "包含不支持的参数字段", 422)
         if "keys" in body:
             if not isinstance(body["keys"], list):
                 raise APIError("WORKSPACE_INVALID_INPUT", "keys 必须为数组", 422)
             keys.extend(body["keys"])
-        if body.get("all") is True:
-            delete_all = True
+        if "all" in body:
+            delete_all = _require_bool(body, "all", False) or delete_all
+        body_acct = _optional_account_id(body)
+        if body_acct is not None:
+            acct = body_acct
     result = await asyncio.to_thread(
         native_workspace.delete_env_caches,
         request.app.state.repo,
         user["id"],
         keys=keys,
         delete_all=delete_all,
+        account_id=acct,
     )
     return ok(result, request)
 
@@ -725,15 +770,17 @@ async def workspace_cleanup_orphans(body: dict, request: Request, user=Depends(c
     admin(user)
     if not isinstance(body, dict):
         raise APIError("WORKSPACE_INVALID_INPUT", "请求体格式无效", 422)
-    unknown = set(body) - {"keep_history", "dry_run"}
+    unknown = set(body) - {"keep_history", "dry_run", "account_id"}
     if unknown:
         raise APIError("WORKSPACE_INVALID_INPUT", "包含不支持的参数字段", 422)
     keep_history = body.get("keep_history", native_workspace.DEFAULT_KEEP_HISTORY)
+    dry_run = _require_bool(body, "dry_run", False)
     result = await asyncio.to_thread(
         native_workspace.cleanup_orphan_objects,
         request.app.state.repo,
         user["id"],
         keep_history=keep_history,
-        dry_run=bool(body.get("dry_run", False)),
+        dry_run=dry_run,
+        account_id=_optional_account_id(body),
     )
     return ok(result, request)

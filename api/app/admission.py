@@ -107,6 +107,9 @@ def _validate_allocation(repo, user, policy: dict) -> dict:
                            "INSTANCE_NOT_FOUND", "待替换的 GPU 实例不存在或不属于当前用户")
         if instance_pool_of(target) != POOL_CREATION:
             raise APIError("INSTANCE_POOL_MISMATCH", "只能温和替换创作池实例，不能操作原生或一次性实例", 409)
+        target_state = str(target.get("state", "")).lower()
+        if target_state in {"unknown", "quarantined"}:
+            raise APIError("INSTANCE_UNAVAILABLE", "待替换的 GPU 实例状态未知或异常，请先在算力页处理", 409)
         if target.get("provider") and target["provider"] != checked["provider"]:
             raise APIError("PROVIDER_INVALID", "待替换实例与请求 Provider 不匹配", 422)
 

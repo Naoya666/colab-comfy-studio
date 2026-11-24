@@ -9,9 +9,23 @@ import re
 from pathlib import PurePosixPath
 
 try:
-    from .model_sources import SHA, ModelError, hf_download_url, https_url, normalize_hf_repo_type, relative_path
+    from .model_sources import (
+        SHA,
+        ModelError,
+        hf_download_url,
+        https_url,
+        normalize_hf_repo_type,
+        relative_path,
+    )
 except ImportError:  # Standalone Colab bootstrap.
-    from model_sources import SHA, ModelError, hf_download_url, https_url, normalize_hf_repo_type, relative_path
+    from model_sources import (
+        SHA,
+        ModelError,
+        hf_download_url,
+        https_url,
+        normalize_hf_repo_type,
+        relative_path,
+    )
 
 # field -> model category; widget positions are explicit, never guessed from a suffix.
 RULES = {

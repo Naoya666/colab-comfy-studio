@@ -62,11 +62,11 @@ def job_pool(job: Mapping | None) -> str:
 def instance_pool_of(instance: Mapping | None) -> str:
     if not isinstance(instance, Mapping):
         return POOL_CREATION
+    if instance.get("native_comfy") is True:
+        return POOL_NATIVE
     explicit = instance.get("instance_pool")
     if explicit in VALID_POOLS:
         return str(explicit)
-    if instance.get("native_comfy") is True:
-        return POOL_NATIVE
     req = instance.get("runtime_spec_requested")
     key = req.get("key", req) if isinstance(req, Mapping) else None
     if isinstance(key, Mapping) and key.get("variant") in {"CPU", "VARIANT_CPU"}:
@@ -274,6 +274,7 @@ class InstanceService:
     @contextmanager
     def _tx(self):
         with self.store.db_lock(), self.store.Session.begin() as session:
+            self.store.begin_immediate(session)
             yield session
 
     @contextmanager
@@ -449,11 +450,11 @@ class InstanceService:
 
     def _instance_pool(self, session, instance) -> str:
         data = self._data(instance)
+        if data.get("native_comfy") is True:
+            return POOL_NATIVE
         explicit = data.get("instance_pool")
         if explicit in VALID_POOLS:
             return str(explicit)
-        if data.get("native_comfy") is True:
-            return POOL_NATIVE
         req = data.get("runtime_spec_requested")
         key = req.get("key", req) if isinstance(req, Mapping) else None
         if isinstance(key, Mapping) and key.get("variant") in {"CPU", "VARIANT_CPU"}:
@@ -1218,7 +1219,18 @@ class InstanceService:
         ):
             if job.get(rec_key) is not None:
                 payload[rec_key] = job[rec_key]
-        row = model(id=stable_id, owner_id=job["owner_id"], project_id=job.get("project_id"), state="allocating", data=payload, version=0, created_at=now, updated_at=now)
+        row = model(
+            id=stable_id,
+            owner_id=job["owner_id"],
+            project_id=job.get("project_id"),
+            account_id=payload["account_id"],
+            current_job_id=payload["current_job_id"],
+            state="allocating",
+            data=payload,
+            version=0,
+            created_at=now,
+            updated_at=now,
+        )
         session.add(row)
         try:
             session.flush()
@@ -1391,13 +1403,16 @@ class InstanceService:
 
         earliest_key: tuple[float, int, str] | None = None
         earliest_id: str | None = None
+        now_ts = self.clock()
         for other in self._rows(session, "jobs", owner_id):
-            if other.id == job_id or other.state != "waiting_for_capacity":
+            if other.id == job_id or other.state not in {"validating", "waiting_for_capacity"}:
                 continue
             other_data = self._dict(other)
             if other_data.get("instance_id"):
                 continue
             if other_data.get("cancel_requested"):
+                continue
+            if other_data.get("recovery_hold") is True or float(other_data.get("retry_not_before_epoch") or 0) > now_ts:
                 continue
             if other_data.get("awaiting_prep"):
                 prep_id = other_data.get("prep_job_id")
@@ -1482,7 +1497,9 @@ class InstanceService:
                     selected_account = selected.account_id if selected else None
                     if selected_account in keys:
                         keys = [selected_account]
-                eligible = guard.filter_accounts(guard.state_in(session, owner_id), keys)
+                eligible = guard.filter_accounts(
+                    guard.state_in(session, owner_id, fail_closed_on_sample_error=True), keys
+                )
                 accounts = [account for account in accounts if self._account_id(account) in eligible]
             account_id = self._account_id(accounts[0]) if requested_account else None
 
@@ -1681,6 +1698,34 @@ class InstanceService:
                     session, job, account, key, stable_id, "requested_account" if requested_account else "round_robin"
                 )
 
+            # Frontend creation (`reuse_action == "auto"`):
+            # If this job is part of a batch, wait for any earlier active job in the same batch
+            # so handoff_lease can reuse its warm VM instead of spawning parallel GPUs.
+            batch_id = job.get("batch_id")
+            if batch_id and not job.get("lease_id") and not job.get("instance_id"):
+                cur_order = job.get("queue_order")
+                cur_order_int = int(cur_order) if isinstance(cur_order, (int, float)) and not isinstance(cur_order, bool) else 0
+                cur_fifo = job_fifo_key(job)
+                terminal_batch = {"completed", "failed", "cancelled"}
+                earlier_batch_job: str | None = None
+                for other in self._rows(session, "jobs", owner_id):
+                    if other.id == job.get("id") or other.state in terminal_batch:
+                        continue
+                    other_data = self._dict(other)
+                    if other_data.get("batch_id") != batch_id:
+                        continue
+                    other_order = other_data.get("queue_order")
+                    other_order_int = int(other_order) if isinstance(other_order, (int, float)) and not isinstance(other_order, bool) else 0
+                    if (other_order_int, job_fifo_key(other_data)) < (cur_order_int, cur_fifo):
+                        earlier_batch_job = other.id
+                        break
+                if earlier_batch_job is not None:
+                    raise CreationInstancePending(
+                        "等待同批次前置任务完成以复用同一实例",
+                        fifo_blocked=True,
+                        blocker_job_id=earlier_batch_job,
+                    )
+
             # Frontend creation (`reuse_action == "auto"`): reuse top-ranked idle compatible creation instance, else create new.
             candidates = [
                 r
@@ -1741,9 +1786,11 @@ class InstanceService:
             instance = self._instance_for_job(session, job)
             if instance is None:
                 raise AllocationError("job has no instance")
-            if instance.state in {"unknown", "deleted"}:
-                raise InstanceConflict("unknown or deleted instance cannot be advanced")
+            if instance.state in {"unknown", "deleted", "releasing", "cleanup_pending", "quarantined"}:
+                raise InstanceConflict("stopping, quarantined, unknown or deleted instance cannot be advanced")
             data = self._data(instance)
+            if data.get("force_stop") or data.get("fuse_forced_stop") or data.get("cleanup_claim_token"):
+                raise InstanceConflict("stopping instance cannot be advanced")
             if data.get("current_job_id") not in {None, job.get("id")}:
                 raise InstanceConflict("instance is owned by another job")
             data["current_job_id"] = job.get("id")
@@ -1971,6 +2018,9 @@ class InstanceService:
                 raise InstanceConflict("instance version conflict")
             if instance.state in {"releasing", "deleted", "unknown", "cleanup_pending", "quarantined"}:
                 raise InstanceConflict("instance can no longer be retained")
+            pool = self._instance_pool(session, instance)
+            if pool == POOL_EPHEMERAL:
+                raise AllocationError("一次性实例不支持修改保留策略")
             data = self._data(instance)
             lease = self._find(session, "leases", data["lease_id"], owner) if data.get("lease_id") else None
             lease_data = self._data(lease) if lease is not None else {}
@@ -1986,7 +2036,7 @@ class InstanceService:
                 deadline = self.clock() + minutes * 60
                 data["idle_deadline_at"] = min(deadline, float(hard)) if hard is not None else deadline
                 data["retention_mode"] = mode
-                state = "retained_idle"
+                state = "busy" if instance.state == "busy" else "retained_idle"
                 if not data.get("native_comfy") and not data.get("current_job_id") and lease is not None and lease.state == "idle":
                     if lease_data.get("instance_id") != id or lease_data.get("current_job_id"):
                         raise InstanceConflict("GPU 租约已发生变更")
@@ -1996,6 +2046,11 @@ class InstanceService:
                     self._set(lease, lease_data, session=session)
             else:
                 data.update(retention_mode="save", idle_deadline_at=None, retention_reserved=0.0)
+                if pool == POOL_NATIVE and data.get("current_job_id") is None:
+                    data.update(manual_stop_requested=True, native_draining=True)
+                    if lease is not None and lease.state != "deleted":
+                        lease_data["native_draining"] = True
+                        self._set(lease, lease_data, session=session)
                 state = "releasing" if data.get("current_job_id") is None else instance.state
             self._set(instance, data, state=state, session=session)
             result = self.public(self._dict(instance))
@@ -2247,18 +2302,19 @@ class InstanceService:
                 or inst_data_before.get("retain_idle_minutes")
                 or ((boot_job or {}).get("execution_policy") or {}).get("retain_idle_minutes")
             )
-            idle_candidates = [
-                float(v)
-                for v in (inst_data_before.get("idle_deadline_at"), lease_data_before.get("idle_deadline_at"))
-                if isinstance(v, (int, float)) and not isinstance(v, bool)
-            ]
             last_act = max(
                 float(lease_data_before.get("native_last_busy") or 0),
                 float(lease_data_before.get("native_last_write") or 0),
             )
             if last_act > 0 and retain_idle_minutes:
-                idle_candidates.append(last_act + float(retain_idle_minutes) * 60.0)
-            orig_idle_deadline_at = min(idle_candidates) if idle_candidates else None
+                orig_idle_deadline_at = last_act + float(retain_idle_minutes) * 60.0
+            else:
+                idle_candidates = [
+                    float(v)
+                    for v in (inst_data_before.get("idle_deadline_at"), lease_data_before.get("idle_deadline_at"))
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                ]
+                orig_idle_deadline_at = min(idle_candidates) if idle_candidates else None
         else:
             was_busy = bool(inst_data_before.get("current_job_id")) or instance.state in {"allocating", "ready", "busy"}
             retain_idle_minutes = (
@@ -2272,18 +2328,31 @@ class InstanceService:
             ]
             orig_idle_deadline_at = min(idle_candidates) if idle_candidates else None
 
-        hard_candidates = [
-            float(v)
-            for v in (
-                inst_data_before.get("hard_deadline_at"),
-                lease_data_before.get("hard_deadline_at"),
-                lease_data_before.get("deadline_epoch"),
+        hard_sources = [
+            inst_data_before.get("hard_deadline_at"),
+            lease_data_before.get("hard_deadline_at"),
+            lease_data_before.get("deadline_epoch"),
+        ]
+        if pool == POOL_NATIVE or was_busy:
+            hard_sources.extend([
                 (job or {}).get("hard_deadline_at"),
                 (job or {}).get("deadline_epoch"),
-            )
+            ])
+        hard_candidates = [
+            float(v)
+            for v in hard_sources
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         ]
         hard_deadline_at = min(hard_candidates) if hard_candidates else None
+
+        lease_only_remote_deleted_drain = bool(
+            lease_data_before.get("native_remote_deleted_verified_at")
+            and not inst_data_before.get("native_draining")
+        )
+        effective_native_draining = bool(
+            inst_data_before.get("native_draining")
+            or (lease_data_before.get("native_draining") and not lease_only_remote_deleted_drain)
+        )
 
         native_storage = (
             lease_data_before.get("native_model_storage")
@@ -2316,7 +2385,7 @@ class InstanceService:
             "manual_stop_requested": bool(inst_data_before.get("manual_stop_requested")),
             "force_stop": bool(inst_data_before.get("force_stop") or lease_data_before.get("force_stop")),
             "fuse_forced_stop": bool(inst_data_before.get("fuse_forced_stop")),
-            "native_draining": bool(inst_data_before.get("native_draining") or lease_data_before.get("native_draining")),
+            "native_draining": effective_native_draining,
             "last_successful_probe_at": last_successful_probe_at,
             "recovery_group_id": inst_data_before.get("recovery_group_id"),
             "recovery_generation": inst_data_before.get("recovery_generation"),

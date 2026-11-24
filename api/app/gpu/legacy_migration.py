@@ -490,6 +490,30 @@ def _backfill_instance_pool(bind) -> None:
         inst_id = _identity_from_row(job, "instance_id")
         if inst_id:
             jobs_by_instance[inst_id].append(job)
+    leases_by_instance: dict[str, list[dict]] = defaultdict(list)
+    leases_by_id: dict[str, dict] = {}
+    for lease in _rows(bind, "gpu_leases"):
+        leases_by_id[lease["id"]] = lease
+        inst_id = _identity_from_row(lease, "instance_id")
+        if inst_id:
+            leases_by_instance[inst_id].append(lease)
+
+    def _is_native_job(job: dict | None) -> bool:
+        if not job:
+            return False
+        jp = _json(job.get("data"))
+        snap = jp.get("snapshot") if isinstance(jp.get("snapshot"), dict) else {}
+        return bool(
+            jp.get("native_comfy") is True
+            or snap.get("native_comfy") is True
+            or jp.get("model_id") == "native-comfy"
+            or jp.get("workflow_key") == "system/native-comfy"
+        )
+
+    def _is_native_lease(lease: dict | None) -> bool:
+        if not lease:
+            return False
+        return _json(lease.get("data")).get("native_comfy") is True
 
     def _is_ephemeral_job(job: dict | None) -> bool:
         if not job:
@@ -511,18 +535,30 @@ def _backfill_instance_pool(bind) -> None:
         payload = _json(row.get("data"))
         if payload.get("instance_pool") in valid_pools:
             continue
-        if payload.get("native_comfy") is True:
+        related = list(jobs_by_instance.get(row["id"], []))
+        current_job_id = _identity_from_row(row, "current_job_id")
+        if current_job_id and current_job_id in jobs_by_id:
+            related.append(jobs_by_id[current_job_id])
+        legacy_owner_job_id = payload.get("legacy_owner_job_id")
+        if isinstance(legacy_owner_job_id, str) and legacy_owner_job_id in jobs_by_id:
+            related.append(jobs_by_id[legacy_owner_job_id])
+        alloc_key = payload.get("allocation_key")
+        if isinstance(alloc_key, str) and ":" in alloc_key:
+            first_job_id = alloc_key.split(":", 1)[0]
+            if first_job_id in jobs_by_id:
+                related.append(jobs_by_id[first_job_id])
+        related_leases = list(leases_by_instance.get(row["id"], []))
+        for lkey in ("lease_id", "legacy_lease_id"):
+            lid = payload.get(lkey)
+            if isinstance(lid, str) and lid in leases_by_id:
+                related_leases.append(leases_by_id[lid])
+        if (
+            payload.get("native_comfy") is True
+            or any(_is_native_lease(ls) for ls in related_leases)
+            or any(_is_native_job(j) for j in related)
+        ):
             pool = "native"
         else:
-            related = list(jobs_by_instance.get(row["id"], []))
-            current_job_id = _identity_from_row(row, "current_job_id")
-            if current_job_id and current_job_id in jobs_by_id:
-                related.append(jobs_by_id[current_job_id])
-            alloc_key = payload.get("allocation_key")
-            if isinstance(alloc_key, str) and ":" in alloc_key:
-                first_job_id = alloc_key.split(":", 1)[0]
-                if first_job_id in jobs_by_id:
-                    related.append(jobs_by_id[first_job_id])
             req_spec = payload.get("runtime_spec_requested")
             req_key = req_spec.get("key", req_spec) if isinstance(req_spec, dict) else {}
             is_cpu = isinstance(req_key, dict) and req_key.get("variant") in {"CPU", "VARIANT_CPU"}

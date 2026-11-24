@@ -17,7 +17,7 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
 
@@ -237,10 +237,18 @@ class LocalModels:
         self.jobs = {}
         self.current_rows = {}
         self.inflight = {}
+        self._reserved_bytes: dict[Path, int] = {}
         self.handoffs = 0
 
-    @staticmethod
-    def _sanitize_source(url, source_kind=None):
+    _SENSITIVE_QUERY_KEYS = frozenset({
+        "token", "access_token", "auth", "key", "api_key", "apikey",
+        "sig", "signature", "x-amz-signature", "x-amz-credential",
+        "x-amz-security-token", "x-goog-signature", "x-goog-credential",
+        "expires", "policy", "key-pair-id", "password", "secret",
+    })
+
+    @classmethod
+    def _sanitize_source(cls, url, source_kind=None):
         if not isinstance(url, str) or not url.strip():
             return None
         parsed = urlsplit(url.strip())
@@ -250,7 +258,14 @@ class LocalModels:
         if host.endswith("googleapis.com") or host.endswith("googleusercontent.com"):
             return None
         port = f":{parsed.port}" if parsed.port else ""
-        clean = f"https://{host}{port}{parsed.path}"
+        safe_params = [
+            (k, v)
+            for k, v in parse_qsl(parsed.query, keep_blank_values=False)
+            if k.lower() not in cls._SENSITIVE_QUERY_KEYS
+            and not any(tok in k.lower() for tok in ("token", "secret", "sig", "auth", "key"))
+        ]
+        query = ("?" + urlencode(safe_params)) if safe_params else ""
+        clean = f"https://{host}{port}{parsed.path}{query}"
         out = {"download_url": clean}
         if isinstance(source_kind, str) and source_kind:
             out["kind"] = source_kind
@@ -427,11 +442,13 @@ class LocalModels:
         ).encode("utf-8")
         inv_digest = hashlib.sha256(canonical).hexdigest()
         now = round(time.time(), 3)
+        with self._state_lock:
+            latest_usage = dict(self.usage_records)
         self._write_inventory_doc({
             "digest": inv_digest,
             "recoverable_models": recoverable,
             "wild_models": wild,
-            "usage": usage_copy,
+            "usage": latest_usage,
             "updated_at": now,
         })
         return {
@@ -501,15 +518,16 @@ class LocalModels:
         return path
 
     def drive_token(self, account):
-        if account not in self.drive_auth:
-            raise ModelError("Drive 副本所属账号未授权，请检查模型库存储账号")
-        identity = graph_key(self.drive_auth[account])
         with self._state_lock:
+            if account not in self.drive_auth:
+                raise ModelError("Drive 副本所属账号未授权，请检查模型库存储账号")
+            auth = dict(self.drive_auth[account])
+            identity = graph_key(auth)
             current = self.drive_tokens.get(account)
             if current and current[1] > time.monotonic() and current[2] == identity:
                 return current[0]
         response = self.client.post("https://oauth2.googleapis.com/token", data={
-            "grant_type": "refresh_token", **self.drive_auth[account],
+            "grant_type": "refresh_token", **auth,
         })
         if not response.is_success:
             raise ModelError(f"Drive 授权刷新失败（HTTP {response.status_code}）")
@@ -640,8 +658,14 @@ class LocalModels:
         if not drive:
             drive = next((r for r in candidates if r.get("drive_file_id")), None)
         if drive_ids:
-            drive = {"drive_file_id": next(iter(drive_ids)), "sha256": digest,
-                     "account": self.config.get("drive_account")}
+            fid = next(iter(drive_ids))
+            matched_drive = next((r for r in candidates if r.get("drive_file_id") == fid), None)
+            entry_account = next((e.get("account") for e in entries if e.get("account")), None)
+            drive = {
+                "drive_file_id": fid,
+                "sha256": digest,
+                "account": (matched_drive or {}).get("account") or entry_account or self.config.get("drive_account"),
+            }
         row = next(iter(verified or candidates), {})
         digest = digest or row.get("sha256") or (drive or {}).get("sha256")
         size = size or row.get("size") or (drive or {}).get("size")
@@ -715,9 +739,20 @@ class LocalModels:
                 md5.update(block)
         return sha.hexdigest(), md5.hexdigest()
 
-    def ensure_space(self, needed):
-        if shutil.disk_usage(self.partials).free < RESERVE + needed:
-            raise DiskSpaceError()
+    def ensure_space(self, needed, *, scratch: Path | None = None):
+        with self._state_lock:
+            other_reserved = sum(
+                amount for path, amount in self._reserved_bytes.items() if path != scratch
+            )
+            free = shutil.disk_usage(self.partials).free
+            if free - other_reserved < RESERVE + needed:
+                raise DiskSpaceError()
+            if scratch is not None:
+                self._reserved_bytes[scratch] = max(0, int(needed))
+
+    def _release_reserved(self, scratch: Path) -> None:
+        with self._state_lock:
+            self._reserved_bytes.pop(scratch, None)
 
     def transfer(self, url, target, plan, update, *, drive_token=None):
         key = hashlib.sha256(str(target).encode()).hexdigest()
@@ -732,7 +767,7 @@ class LocalModels:
         md5_hasher = hashlib.md5(usedforsecurity=False)
         hasher_aligned = True
         try:
-            self.ensure_space(total or CHUNK)
+            self.ensure_space(total or CHUNK, scratch=scratch)
             deadline = time.monotonic() + 3600
             for attempt in range(3):
                 offset = written if etag else 0
@@ -772,7 +807,9 @@ class LocalModels:
                             raise ModelError("来源未提供可校验的完整文件大小")
                         etag = current_etag if current_etag and current_etag.startswith('"') else None
                         resource = current_resource
-                        self.ensure_space(total - offset)
+                        if offset == 0:
+                            scratch.unlink(missing_ok=True)
+                        self.ensure_space(total - offset, scratch=scratch)
                         next_space_check = written + 32 * CHUNK
                         with scratch.open("ab" if offset else "wb") as output:
                             for chunk in response.iter_raw(CHUNK):
@@ -781,7 +818,7 @@ class LocalModels:
                                 if written + len(chunk) > total:
                                     raise ModelError("下载内容超过声明的文件大小")
                                 if written >= next_space_check:
-                                    self.ensure_space(len(chunk))
+                                    self.ensure_space(max(len(chunk), total - written), scratch=scratch)
                                     next_space_check = written + 32 * CHUNK
                                 output.write(chunk)
                                 if hasher_aligned:
@@ -838,6 +875,7 @@ class LocalModels:
                     except OSError:
                         LOG.warning("Could not save model provenance for process restart")
         finally:
+            self._release_reserved(scratch)
             scratch.unlink(missing_ok=True)
 
     def publish(self, scratch, target):
@@ -926,10 +964,11 @@ class LocalModels:
             update(state="downloading", source="drive", host=None)
             token = token or self.drive_token(drive.get("account", account))
             if not (plan["sha256"] or plan["md5"] or drive.get("sha256") or drive.get("md5")):
-                drive = self.drive_metadata(file_id, token)
+                meta = self.drive_metadata(file_id, token)
+                drive = {**drive, **meta}
                 if plan["size"] and drive["size"] != plan["size"]:
                     raise ModelError("Drive 文件大小与记录不符，请重新校验模型库")
-            plan = {**plan, **{key: plan[key] or drive.get(key) for key in ("sha256", "size", "md5")}}
+            plan = {**plan, "drive": drive, **{key: plan[key] or drive.get(key) for key in ("sha256", "size", "md5")}}
             self.transfer(f"https://www.googleapis.com/drive/v3/files/{quote(file_id)}?alt=media",
                           target, plan, update, drive_token=token)
             update(state="ready", integrity="sha256" if plan["sha256"] else "drive_md5")
@@ -1000,14 +1039,18 @@ class LocalModels:
 
     @staticmethod
     def progress(rows, tasks):
-        copied = {id(status): dict(shared, category=status["category"], name=status["name"])
-                  for _, status, shared in tasks}
+        copied = {}
+        for _, status, shared in tasks:
+            if status.get("state") == "skipped_disk_limit":
+                copied[id(status)] = dict(status)
+            else:
+                copied[id(status)] = dict(shared, category=status["category"], name=status["name"])
         return [copied.get(id(status), dict(status)) for status in rows.values()]
 
     async def prepare_studio(self, weights, loras, cache_payload, verify_paths, paths, timeout):
         # Keep the existing native activity fence and serialize with native prepares.
         with (self.root / "models-active.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_SH)
+            fcntl.flock(lock, fcntl.LOCK_EX)
             rows = {}
             for target in [*(item["target"] for item in weights), *("loras/" + item["target"] for item in loras)]:
                 category, _, name = target.partition("/")
@@ -1085,16 +1128,30 @@ class LocalModels:
                     try:
                         src = item.get("source") if isinstance(item.get("source"), dict) else {}
                         raw_url = src.get("download_url") or item.get("url")
+                        has_catalog_source = False
+                        for crow in catalog:
+                            if not isinstance(crow, dict):
+                                continue
+                            try:
+                                crow_cat, crow_paths = registered_paths(crow)
+                            except (KeyError, ModelError, TypeError):
+                                continue
+                            if crow_cat == cat and name in crow_paths and isinstance(crow.get("source"), dict) and crow["source"].get("download_url"):
+                                has_catalog_source = True
+                                break
                         entry = {
                             "category": cat,
                             "name": name,
-                            "url": https_url(raw_url) if raw_url else None,
+                            "url": https_url(raw_url) if (raw_url and not has_catalog_source) else None,
                             "sha256": item.get("sha256"),
                             "size": item.get("size"),
                             "md5": item.get("md5"),
                             "drive_file_id": item.get("drive_file_id"),
+                            "account": item.get("account"),
                         }
                         target, plan = self.plan([entry], catalog)
+                        if not plan.get("source_kind") and isinstance(src.get("kind"), str) and src.get("kind"):
+                            plan["source_kind"] = src["kind"]
                         if item.get("account") and isinstance(plan.get("drive"), dict) and not plan["drive"].get("account"):
                             plan["drive"] = {**plan["drive"], "account": item["account"]}
                         identity = (
@@ -1119,7 +1176,6 @@ class LocalModels:
                         shared = current[2]
                         if shared.get("disk_space_limit") or "5 GiB" in str(shared.get("error") or ""):
                             disk_limit_hit = True
-                            shared["state"] = "skipped_disk_limit"
                             status.update(state="skipped_disk_limit", error=shared.get("error") or str(DiskSpaceError()), disk_space_limit=True)
                         elif shared.get("state") == "ready" and refresh_fn is not None:
                             try:
@@ -1445,17 +1501,21 @@ def install(server, root, folder_paths, node_types):
         raise ModelError("工作流请求必须是有效的 JSON 对象")
 
     def sync(body):
-        local.catalog = body["catalog"]
-        if "tokens" in body:
-            local.tokens = body["tokens"]
-        if "drive_auth" in body:
-            local.drive_auth = body["drive_auth"]
+        with local._state_lock:
+            local.catalog = body["catalog"]
+            if "tokens" in body:
+                local.tokens = body["tokens"]
+            if "drive_auth" in body:
+                local.drive_auth = body["drive_auth"]
 
     @server.routes.post("/studio_native/models/catalog")
     async def model_catalog(request):
         if not local.signed(request):
             raise web.HTTPNotFound()
-        sync(await json_body(request))
+        try:
+            sync(await json_body(request))
+        except (ModelError, KeyError, TypeError) as exc:
+            return web.json_response(model_problem(str(exc)), status=422)
         return web.json_response({})
 
     @server.routes.get("/studio_native/models/inventory")
@@ -1536,7 +1596,7 @@ def install(server, root, folder_paths, node_types):
             result = await asyncio.to_thread(local.delete_workflow, data.get("source"), data.get("path"))
         except WorkflowNotFoundError as exc:
             return web.json_response(model_problem(str(exc), code="NATIVE_WORKFLOW_NOT_FOUND"), status=404)
-        except ModelError as exc:
+        except (ModelError, KeyError, TypeError) as exc:
             return web.json_response(model_problem(str(exc)), status=422)
         return web.json_response(result)
 
@@ -1565,7 +1625,7 @@ def install(server, root, folder_paths, node_types):
                 del completed[old]
         except WorkflowNotFoundError as exc:
             return web.json_response(model_problem(str(exc), code="NATIVE_WORKFLOW_NOT_FOUND"), status=404)
-        except ModelError as exc:
+        except (ModelError, KeyError, TypeError) as exc:
             return web.json_response(model_problem(str(exc)), status=422)
         return web.json_response({"id": ident}, status=202)
 
@@ -1639,9 +1699,9 @@ def install(server, root, folder_paths, node_types):
                     rows = await asyncio.shield(task)
                 except ModelError as exc:
                     return web.json_response(model_problem(str(exc)), status=422)
-                failed = [row for row in rows if row["state"] == "failed"]
+                failed = [row for row in rows if row.get("state") != "ready"]
                 if failed:
-                    problem = model_problem("、".join(f"{r['category']}/{r['name']} · {r['error']}" for r in failed)[:3000])
+                    problem = model_problem("、".join(f"{r['category']}/{r['name']} · {r.get('error') or r.get('state')}" for r in failed)[:3000])
                     return web.json_response({**problem, "models": rows}, status=422)
             refresh()
             local.handoffs += 1

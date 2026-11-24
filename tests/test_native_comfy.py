@@ -2072,7 +2072,7 @@ def test_scheduler_native_wait_event_emitted_even_when_stage_already_native_tunn
     assert events1.count("等待代理健康检查及内部隧道鉴权验证") == 1
 
     # Second unready poll does not spam duplicate wait events
-    after2 = sched._run(after1)
+    sched._run(after1)
     events2 = [e["message"] for e in sched.store.list("events", "owner") if e.get("job_id") == job["id"]]
     assert events2.count("等待代理健康检查及内部隧道鉴权验证") == 1
 
@@ -2264,12 +2264,12 @@ def test_mcp_poll_inlines_small_artifacts_without_second_chunk_roundtrip(monkeyp
 def test_mcp_tunnel_skips_kernel_get_when_known_and_recreates_on_ws_404(monkeypatch, tmp_path):
     import json
     from types import SimpleNamespace
-    from websockets.exceptions import InvalidStatus
-    import websockets.sync.client as ws_client
 
+    import websockets.sync.client as ws_client
     from app.db import Store
     from app.gpu import mcp
     from app.gpu.repository import Repository
+    from websockets.exceptions import InvalidStatus
 
     store = Store(f"sqlite:///{tmp_path / 'tunnel_fast.db'}")
     repo = Repository(store)
@@ -2326,7 +2326,7 @@ def test_mcp_tunnel_skips_kernel_get_when_known_and_recreates_on_ws_404(monkeypa
 
     with httpx.Client(transport=httpx.MockTransport(http_handler)) as client:
         ex = mcp.MCPGPUExecutor(repo, "owner", google=object(), client=client)
-        monkeypatch.setattr(ex, "_refresh_tunnel_proxy", lambda l: ("https://proxy.example", "tok"))
+        monkeypatch.setattr(ex, "_refresh_tunnel_proxy", lambda _lease: ("https://proxy.example", "tok"))
 
         # Case 1: kernel_id already known -> ZERO HTTP GET /api/kernels/{id} calls!
         out1 = ex._execute_tunnel_code(dict(lease), "print(1)")

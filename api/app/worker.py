@@ -31,11 +31,15 @@ def _run_ccu_tick(store: Store) -> None:
         owner_ids = sorted(
             {str(account["owner_id"]) for account in repo.list("accounts") if account.get("owner_id")}
         )
-        for owner_id in owner_ids:
+    except Exception as exc:  # noqa: BLE001 - never stop the queue for accounting
+        log.warning("ccu tick owner scan failed: %s", type(exc).__name__)
+        return
+    for owner_id in owner_ids:
+        try:
             tick_ccu(repo, owner_id)
             CuGuardService(repo).enforce(owner_id)
-    except Exception as exc:  # noqa: BLE001 - never stop the queue for accounting
-        log.warning("ccu tick failed: %s", type(exc).__name__)
+        except Exception as exc:  # noqa: BLE001 - isolate owner failures
+            log.warning("ccu tick failed for owner=%s: %s", owner_id, type(exc).__name__)
 
 
 def main():
@@ -74,19 +78,28 @@ def main():
 
                 if restart_future is not None:
                     completed, restart_future = restart_future, None
-                    completed.result()
+                    try:
+                        completed.result()
+                    except Exception as exc:  # noqa: BLE001 - isolate restart worker failures
+                        log.warning("native restart tick failed: %s", type(exc).__name__)
                 if restart_pool:
                     restart_future = restart_pool.submit(restart_tick, repo)
                 else:
-                    restart_tick(repo)
+                    try:
+                        restart_tick(repo)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("native restart tick failed: %s", type(exc).__name__)
             if args.mode == "worker" and os.getenv("STUDIO_ATELIER_ENABLED", "0") == "1":
                 from .atelier_routes import auto_export_tick
 
                 auto_export_tick(store)
             if args.mode == "worker" and time.time() - last_ccu_tick >= 60:
                 if ccu_future is not None and ccu_future.done():
-                    ccu_future.result()
-                    ccu_future = None
+                    completed_ccu, ccu_future = ccu_future, None
+                    try:
+                        completed_ccu.result()
+                    except Exception as exc:  # noqa: BLE001 - never let ccu_future wedge
+                        log.warning("ccu background tick failed: %s", type(exc).__name__)
                 if ccu_future is None:
                     last_ccu_tick = time.time()
                     if fast_control and ccu_pool is not None:

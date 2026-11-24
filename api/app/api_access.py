@@ -23,7 +23,15 @@ _NATIVE_TOKEN_PREFIXES = ("/comfy/n/", "/comfy/native/t/")
 _NATIVE_OPEN_PREFIX = "/comfy/native"
 _DEDICATED_TOKEN_PREFIXES = ("/t/", "/c/", "/n/")
 
-_FORWARDED_HEADERS = ("x-forwarded-for", "x-real-ip", "cf-connecting-ip")
+_FORWARDED_HEADERS = (
+    "x-forwarded-for",
+    "x-real-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "fastly-client-ip",
+)
 _CORS_ALLOW_METHODS = "GET, HEAD, POST, PUT, DELETE, OPTIONS"
 _CORS_ALLOW_HEADERS = "Authorization, Content-Type, Idempotency-Key, Accept, X-Requested-With"
 
@@ -34,8 +42,52 @@ _NATIVE_BLOCKED_PREFIXES = (
     "/v2/manager",
     "/customnode",
     "/v2/customnode",
+    "/model/install",
+    "/v2/model/install",
+    "/externalmodel",
+    "/v2/externalmodel",
+    "/snapshot",
+    "/v2/snapshot",
+    "/comfyui_manager",
+    "/v2/comfyui_manager",
+    "/component",
+    "/v2/component",
+    "/userdata",
+    "/settings",
+    "/free",
     "/internal",
     "/reboot",
+)
+
+_NATIVE_WEAK_GET_EXACT = frozenset(
+    {
+        "/system_stats",
+        "/object_info",
+        "/models",
+        "/embeddings",
+        "/extensions",
+        "/queue",
+        "/history",
+        "/prompt",
+        "/view",
+        "/view_metadata",
+        "/features",
+    }
+)
+_NATIVE_WEAK_GET_PREFIXES = (
+    "/object_info/",
+    "/models/",
+    "/history/",
+    "/view_metadata/",
+)
+_NATIVE_WEAK_POST_EXACT = frozenset(
+    {
+        "/prompt",
+        "/upload/image",
+        "/upload/mask",
+        "/interrupt",
+        "/queue",
+    }
 )
 
 
@@ -205,9 +257,18 @@ def match_gateway_route(
     # 3. Dedicated port or dedicated Host domain
     host_matched = False
     if not dedicated_port and dedicated_host_url:
-        target = urlsplit(dedicated_host_url).netloc.lower()
-        host = next((v.decode("latin1").lower() for k, v in scope.get("headers", []) if k == b"host"), "")
-        host_matched = bool(target and host == target)
+        parsed_target = urlsplit(dedicated_host_url)
+        target_host = (parsed_target.hostname or "").lower()
+        target_port = parsed_target.port or (443 if parsed_target.scheme == "https" else 80 if parsed_target.scheme == "http" else None)
+        raw_host = next((v.decode("latin1").strip().lower() for k, v in scope.get("headers", []) if k == b"host"), "")
+        parsed_req_host = urlsplit(f"{parsed_target.scheme or 'http'}://{raw_host}") if raw_host else None
+        req_host = (parsed_req_host.hostname or "").lower() if parsed_req_host else ""
+        req_port = (
+            parsed_req_host.port
+            if parsed_req_host and parsed_req_host.port is not None
+            else (443 if parsed_target.scheme == "https" else 80 if parsed_target.scheme == "http" else None)
+        )
+        host_matched = bool(target_host and req_host == target_host and req_port == target_port)
 
     if dedicated_port or host_matched:
         matched = _extract_token_prefix(path, raw_path, _DEDICATED_TOKEN_PREFIXES)
@@ -242,12 +303,30 @@ def _in_container() -> bool:
     return Path("/.dockerenv").exists() or os.getenv("STUDIO_CONTAINER") == "1"
 
 
-def _ip_allowed(raw_ip: str, *, allow_lan: bool, allow_docker_loopback_nat: bool) -> bool:
+def _is_test_runtime() -> bool:
+    return bool(
+        os.getenv("PYTEST_CURRENT_TEST")
+        or os.getenv("STUDIO_OFFLINE_TEST") == "1"
+        or settings.environment == "offline-test"
+    )
+
+
+def _ip_allowed(raw_ip: str, *, allow_lan: bool, allow_docker_loopback_nat: bool, is_peer: bool = False) -> bool:
     value = raw_ip.strip()
     if not value:
         return False
-    if value in {"testclient", "localhost"}:
+    if is_peer and value == "testclient" and _is_test_runtime():
         return True
+    if is_peer and value == "localhost":
+        return True
+    # Strip IPv6 brackets and optional port (e.g. "[::1]:1234" or "127.0.0.1:1234" from RFC 7239 Forwarded)
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            return False
+        value = value[1:end]
+    elif value.count(":") == 1 and "." in value:
+        value = value.split(":", 1)[0]
     # Strip IPv6 zone index if present
     if "%" in value:
         value = value.split("%", 1)[0]
@@ -264,6 +343,38 @@ def _ip_allowed(raw_ip: str, *, allow_lan: bool, allow_docker_loopback_nat: bool
     return False
 
 
+def _header_values(scope: dict, headers, name: str) -> list[str]:
+    """Return ALL values for a header name (never truncating duplicate Starlette headers)."""
+    target = name.lower().encode("latin1")
+    raw_headers = scope.get("headers") if isinstance(scope, dict) else None
+    if raw_headers is not None:
+        return [v.decode("latin1") for k, v in raw_headers if k.lower() == target]
+    getlist = getattr(headers, "getlist", None) or getattr(headers, "get_list", None)
+    if callable(getlist):
+        return list(getlist(name))
+    val = headers.get(name)
+    return [val] if val else []
+
+
+def _parse_rfc7239_forwarded(values: list[str]) -> tuple[bool, list[str]]:
+    """Extract all `for=` values from RFC 7239 Forwarded headers; return (ok, ips)."""
+    ips: list[str] = []
+    for raw in values:
+        for element in raw.split(","):
+            found_for = False
+            for param in element.split(";"):
+                k, sep, v = param.strip().partition("=")
+                if sep and k.strip().lower() == "for":
+                    found_for = True
+                    cleaned = v.strip().strip('"').strip()
+                    if not cleaned or cleaned.lower() == "unknown" or cleaned.startswith("_"):
+                        return False, []
+                    ips.append(cleaned)
+            if element.strip() and not found_for:
+                return False, []
+    return True, ips
+
+
 def is_trusted_local_client(scope: dict, headers, *, allow_lan: bool = False) -> bool:
     """Verify request originates from loopback (or private LAN when allow_lan=True), resisting XFF spoofing and Docker NAT pitfalls."""
     client = scope.get("client")
@@ -271,21 +382,27 @@ def is_trusted_local_client(scope: dict, headers, *, allow_lan: bool = False) ->
 
     forwarded_ips: list[str] = []
     for name in _FORWARDED_HEADERS:
-        raw = headers.get(name)
-        if raw:
-            forwarded_ips.extend(part.strip() for part in raw.split(",") if part.strip())
+        for raw in _header_values(scope, headers, name):
+            if raw:
+                forwarded_ips.extend(part.strip() for part in raw.split(",") if part.strip())
 
-    bind_ip = os.getenv("BIND_IP", "127.0.0.1").strip().lower()
+    rfc_forwarded = _header_values(scope, headers, "forwarded")
+    if rfc_forwarded:
+        ok_fwd, rfc_ips = _parse_rfc7239_forwarded(rfc_forwarded)
+        if not ok_fwd:
+            return False
+        forwarded_ips.extend(rfc_ips)
+
     docker_loopback_nat = (
         not forwarded_ips
         and _in_container()
-        and bind_ip in {"127.0.0.1", "::1", "localhost"}
+        and os.getenv("STUDIO_TRUST_DOCKER_BRIDGE_LOOPBACK") == "1"
     )
 
-    if not _ip_allowed(peer_ip, allow_lan=allow_lan, allow_docker_loopback_nat=docker_loopback_nat):
+    if not _ip_allowed(peer_ip, allow_lan=allow_lan, allow_docker_loopback_nat=docker_loopback_nat, is_peer=True):
         return False
     for fwd in forwarded_ips:
-        if not _ip_allowed(fwd, allow_lan=allow_lan, allow_docker_loopback_nat=False):
+        if not _ip_allowed(fwd, allow_lan=allow_lan, allow_docker_loopback_nat=False, is_peer=False):
             return False
     return True
 
@@ -399,6 +516,28 @@ def is_native_blocked_path(path: str, raw_path: bytes | None = None) -> bool:
         for candidate in (normalized, internal)
         for blocked in _NATIVE_BLOCKED_PREFIXES
     )
+
+
+def is_native_weak_allowed(
+    path: str,
+    raw_path: bytes | None = None,
+    *,
+    method: str = "GET",
+    websocket: bool = False,
+) -> bool:
+    """Strict method+path allowlist for Tier-2 (url_path) and Tier-3 (local_open) native ComfyUI access."""
+    if is_native_blocked_path(path, raw_path):
+        return False
+    normalized = path.lower().rstrip("/") or "/"
+    internal = normalized.removeprefix("/api") if normalized.startswith("/api/") else normalized
+    if websocket:
+        return internal == "/ws"
+    verb = method.upper()
+    if verb in {"GET", "HEAD"}:
+        return internal in _NATIVE_WEAK_GET_EXACT or internal.startswith(_NATIVE_WEAK_GET_PREFIXES)
+    if verb == "POST":
+        return internal in _NATIVE_WEAK_POST_EXACT
+    return False
 
 
 def build_access_urls(

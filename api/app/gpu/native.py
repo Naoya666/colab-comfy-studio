@@ -38,7 +38,10 @@ UNAUTHENTICATED_TUNNEL_PROBES = (
 
 def native_optimization_flags() -> dict[str, str]:
     """Snapshot independent startup optimization switches from server environment."""
-    return {name: ("1" if env_flag(name, True) else "0") for name in NATIVE_FLAG_NAMES}
+    return {
+        name: ("1" if env_flag(name, settings.gpu_in_vm_self_heal if name == "GPU_IN_VM_SELF_HEAL" else True) else "0")
+        for name in NATIVE_FLAG_NAMES
+    }
 
 
 def timeout_options():
@@ -173,6 +176,14 @@ def workspace_offline_status(repo, owner: str = "owner", now: float | None = Non
         if restart_active(lease):
             return False, "当前原生 ComfyUI 正在重启，请等待实例完全停止后再执行修改"
         return False, "当前原生 ComfyUI 实例正在运行，仅支持只读查看；停止实例后可进行停用、删除与缓存清理"
+    all_leases = (
+        repo.list_by_states("leases", ("deleted", "quarantined"), owner, exclude=True)
+        if hasattr(repo, "list_by_states")
+        else repo.list("leases", owner)
+    )
+    lingering = next((x for x in all_leases if x.get("native_comfy") and x.get("state") not in {"deleted", "quarantined"}), None)
+    if lingering:
+        return False, "当前原生 ComfyUI 实例正在释放或核对中，请等待实例完全停止后再执行修改"
     active_jobs = (
         repo.list_by_states("jobs", TERMINAL, owner, exclude=True)
         if hasattr(repo, "list_by_states")
@@ -226,17 +237,51 @@ def acquire_workspace_write_lock(
         return lock_id
 
 
+def renew_workspace_write_lock(
+    repo,
+    owner: str,
+    lock_id: str,
+    *,
+    ttl_seconds: float = WORKSPACE_WRITE_LOCK_TTL_SECONDS,
+    now: float | None = None,
+) -> bool:
+    """Extend an active workspace write lock TTL while owned by lock_id."""
+    if not lock_id or not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
+        return False
+    deadline = time.monotonic() + 0.5
+    while True:
+        with repo.store.dispatch_lock() as acquired:
+            if acquired:
+                key = _workspace_lock_key(owner)
+                row = repo.store.get("settings", key, owner)
+                if isinstance(row, dict) and row.get("lock_id") == lock_id:
+                    current = time.time() if now is None else float(now)
+                    repo.store.update("settings", key, {"expires_at": current + float(ttl_seconds)}, owner)
+                    return True
+                return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.02, remaining))
+
+
 def release_workspace_write_lock(repo, owner: str, lock_id: str) -> None:
-    """Release workspace write lock if still owned by lock_id."""
+    """Release workspace write lock if still owned by lock_id (retrying brief lock contention)."""
     if not lock_id or not hasattr(repo, "store") or not hasattr(repo.store, "dispatch_lock"):
         return
-    with repo.store.dispatch_lock() as acquired:
-        if not acquired:
+    deadline = time.monotonic() + 2.0
+    while True:
+        with repo.store.dispatch_lock() as acquired:
+            if acquired:
+                key = _workspace_lock_key(owner)
+                row = repo.store.get("settings", key, owner)
+                if isinstance(row, dict) and row.get("lock_id") == lock_id:
+                    repo.store.update("settings", key, {"lock_id": None, "expires_at": 0.0, "reason": None}, owner)
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return
-        key = _workspace_lock_key(owner)
-        row = repo.store.get("settings", key, owner)
-        if isinstance(row, dict) and row.get("lock_id") == lock_id:
-            repo.store.update("settings", key, {"lock_id": None, "expires_at": 0.0, "reason": None}, owner)
+        time.sleep(min(0.02, remaining))
 
 
 def active_lease(repo, owner="owner"):
@@ -257,8 +302,11 @@ def guard_generation(repo, owner, policy):
         CuGuardService(repo).check(owner, "colab", policy.get("account_id"), policy.get("instance_id"))
 
 
-def busy(client=None, *, repo=None, owner="owner", state_payload=None):
-    """Unknown is busy: network errors must never stop a video or an upload."""
+def busy_state(client=None, *, repo=None, owner="owner", state_payload=None) -> tuple[str, str | None]:
+    """Distinguish confirmed busy, confirmed idle, and unreachable/unknown upstream state.
+
+    Returns ``(status, reason)`` where ``status`` is ``"busy"``, ``"idle"``, or ``"unknown"``.
+    """
     try:
         url, headers = backend_for(repo, owner)
         with httpx.Client(timeout=8) if client is None else _borrow(client) as c:
@@ -266,24 +314,45 @@ def busy(client=None, *, repo=None, owner="owner", state_payload=None):
             q.raise_for_status()
             data = q.json()
             if not isinstance(data.get("queue_running"), list) or not isinstance(data.get("queue_pending"), list):
-                return True
-            queued = bool(data["queue_running"] or data["queue_pending"])
+                return "unknown", "queue_malformed"
+            if data["queue_running"] or data["queue_pending"]:
+                return "busy", "queue"
             if state_payload is None:
                 state = c.get(url + "/studio_native/state", headers=headers)
                 state.raise_for_status()
                 state_payload = state.json()
-            return queued or state_payload.get("busy") is not False
+            if not isinstance(state_payload, dict):
+                return "unknown", "state_malformed"
+            flag = state_payload.get("busy")
+            if flag is False:
+                return "idle", None
+            reason = state_payload.get("busy_reason")
+            if flag is True and reason != "unknown":
+                return "busy", str(reason) if reason is not None else None
+            return "unknown", str(reason or "unknown")
     except Exception:
-        return True
+        return "unknown", "unreachable"
+
+
+def busy(client=None, *, repo=None, owner="owner", state_payload=None):
+    """Unknown is busy: network errors must never stop a video or an upload."""
+    status, _ = busy_state(client=client, repo=repo, owner=owner, state_payload=state_payload)
+    return status != "idle"
 
 
 _default_busy = busy
 
 
-def busy_for(repo=None, owner="owner", client=None, *, state_payload=None):
+def busy_state_for(repo=None, owner="owner", client=None, *, state_payload=None) -> tuple[str, str | None]:
     if busy is not _default_busy:
-        return busy() if client is None else busy(client)
-    return busy(client=client, repo=repo, owner=owner, state_payload=state_payload)
+        val = busy() if client is None else busy(client)
+        return ("busy", None) if val else ("idle", None)
+    return busy_state(client=client, repo=repo, owner=owner, state_payload=state_payload)
+
+
+def busy_for(repo=None, owner="owner", client=None, *, state_payload=None):
+    status, _ = busy_state_for(repo=repo, owner=owner, client=client, state_payload=state_payload)
+    return status != "idle"
 
 
 class _borrow:
@@ -303,7 +372,7 @@ def _validate_admit_request(repo, owner, body, key):
                 "max_runtime_minutes": settings.native_comfy_max_runtime_minutes}
     for field in timeouts:
         value = body.get(field, timeouts[field])
-        if type(value) is not int or value < 1:
+        if type(value) is not int or not 1 <= value <= 153722867:
             raise APIError("NATIVE_INPUT", f"{field} 必须为正整数（分钟）", 422)
         timeouts[field] = value
     storage = model_storage(body, validate=True)
@@ -322,7 +391,7 @@ def _validate_admit_request(repo, owner, body, key):
     if generation is not None and (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)):
         raise APIError("NATIVE_INPUT", "plugin_generation 必须为历史清单的 64 位 SHA256", 422)
     account = body.get("account_id")
-    if not account or not isinstance(body.get("spec"), dict):
+    if not isinstance(account, str) or not account.strip() or not isinstance(body.get("spec"), dict):
         raise APIError("NATIVE_INPUT", "请选择账号和 GPU 规格", 422)
     return cfg, timeouts, storage, commit, account
 
@@ -381,11 +450,23 @@ def _admit_locked(
         return source
     if body.get("instance_id"):
         raise APIError("INSTANCE_CONFLICT", "原生 ComfyUI 仅使用独立原生实例，不复用其他域实例", 409)
+    # Prevent double native VM allocation while an old native lease is still releasing/deleting
+    # or while an L3 native recovery plan is actively dispatching/cancelling.
+    all_leases = (
+        repo.list_by_states("leases", ("deleted", "quarantined"), owner, exclude=True)
+        if hasattr(repo, "list_by_states")
+        else repo.list("leases", owner)
+    )
+    lingering_lease = next((x for x in all_leases if x.get("native_comfy") and x.get("state") not in {"deleted", "quarantined"}), None)
+    if lingering_lease:
+        raise APIError("NATIVE_ACTIVE", "旧原生实例正在释放或核对中，请等待释放完成后再启动", 409)
+    from . import recovery
+    inflight_plan = recovery.active_plan(repo, owner, pool="native")
+    if inflight_plan and inflight_plan.get("state") in {"dispatching", "cancelling"}:
+        raise APIError("NATIVE_ACTIVE", "原生 ComfyUI 自动恢复正在推进或取消中，请稍后重试", 409)
     from app.compute_routes import _require_account
     _require_account(repo, owner, account)
     if cancel_recovery_plan:
-        from . import recovery
-
         with repo.store.db_lock(), repo.store.Session.begin() as session:
             repo.store.begin_immediate(session)
             recovery.cancel_scheduled_native_plans_in_tx(session, owner, time.time())
@@ -828,7 +909,9 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
                 _, state_payload = sync_plugins(repo, lease, client=shared_client, return_state=True)
             except Exception as exc:
                 repo.update("leases", lease["id"], {"native_plugin_sync_error": type(exc).__name__}, lease["owner_id"])
-            upstream_busy = busy_for(repo, lease["owner_id"], client=shared_client, state_payload=state_payload)
+            upstream_status, busy_reason = busy_state_for(
+                repo, lease["owner_id"], client=shared_client, state_payload=state_payload
+            )
     else:
         if GpuConfig.from_env().real_enabled:
             try:
@@ -838,8 +921,9 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
                 # Busy probe fails closed if persistence has an error or dirty files.
                 # A VPS mirror outage must not replace the last committed manifest.
                 pass
-        upstream_busy = busy_for(repo, lease["owner_id"])
-    # An offline tunnel also reports "busy". It cannot veto reconciliation of
+        upstream_status, busy_reason = busy_state_for(repo, lease["owner_id"])
+    upstream_busy = upstream_status != "idle"
+    # An offline tunnel also reports "unknown" (conservative busy). It cannot veto reconciliation of
     # a VM already confirmed absent by Colab's independent control plane.
     remote_deleted = check_remote and upstream_busy and _runtime_deleted(repo, lease)
     retained = False
@@ -865,8 +949,26 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
         elif not manual:
             if restart_active(lease) and not expired:
                 retained = True
-            elif upstream_busy:
-                lease = repo.update("leases", lease["id"], {"native_last_busy": clock(), "native_last_upstream_busy": True}, lease["owner_id"])
+            elif upstream_status == "busy":
+                now_ts = clock()
+                inherited_idle = lease.get("idle_deadline_at")
+                skip_clock_bump = (
+                    busy_reason in {"model_preparation", "plugins"}
+                    and inherited_idle is not None
+                    and lease.get("native_last_busy") is not None
+                    and float(lease.get("native_last_busy") or 0) < now_ts
+                    and lease.get("native_last_write") is None
+                )
+                patch = {"native_last_upstream_busy": True}
+                if not skip_clock_bump:
+                    patch["native_last_busy"] = now_ts
+                lease = repo.update("leases", lease["id"], patch, lease["owner_id"])
+                retained = True
+            elif upstream_status == "unknown":
+                # Unreachable/errored tunnel: retain conservatively without fabricating
+                # busy evidence or extending idle clocks.
+                if lease.get("native_last_upstream_busy") is True:
+                    lease = repo.update("leases", lease["id"], {"native_last_upstream_busy": False}, lease["owner_id"])
                 retained = True
             elif clock() - float(lease.get("native_http_heartbeat") or 0) < 30:
                 if lease.get("native_last_upstream_busy") is not False:

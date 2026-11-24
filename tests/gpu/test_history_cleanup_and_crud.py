@@ -131,6 +131,7 @@ def test_gallery_batch_enrichment_and_batch_delete_assets(client):
     )
     # 1x1 valid PNG
     import io
+
     from PIL import Image
 
     buf = io.BytesIO()

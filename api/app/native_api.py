@@ -337,18 +337,36 @@ def reserve(store, key, lease, observed=None):
         return ident
 
 
+def refresh_reservation(store, key, lease, reservation):
+    """Extend an in-flight prompt reservation while long model preparation is still running."""
+    if not reservation:
+        return
+    with store.admission_lock(timeout=2) as acquired:
+        if not acquired:
+            return
+        row = store.get(KEYS, key["id"], key["owner_id"])
+        if not row or row.get("revoked_at"):
+            return
+        active = dict(row.get("active") or {})
+        if reservation in active and not active[reservation].get("prompt"):
+            active[reservation] = {**active[reservation], "time": time.time()}
+            store.update(KEYS, key["id"], {"active": active}, key["owner_id"])
+
+
 def finish_submission(store, key, lease, reservation, prompt_id=None):
     with store.admission_lock(timeout=5) as acquired:
         if not acquired:
             raise APIError("NATIVE_API_BUSY", "无法记录提交状态", 503)
         row = store.get(KEYS, key["id"], key["owner_id"])
+        if not row:
+            return
         active = dict(row.get("active") or {})
         patch = {"active": active}
         if prompt_id:
             store.create(PROMPTS, key["owner_id"], {"prompt_id": prompt_id, "lease_id": lease["id"]},
                          project_id=key["id"], record_id=prompt_record_id(key, lease, prompt_id))
-            if reservation in active:
-                active[reservation] = {**active[reservation], "prompt": prompt_id}
+            entry = active.get(reservation) or {"lease": lease["id"], "time": time.time()}
+            active[reservation] = {**entry, "lease": lease["id"], "prompt": prompt_id}
             patch["submitted"] = row.get("submitted", 0) + 1
         else:
             active.pop(reservation, None)

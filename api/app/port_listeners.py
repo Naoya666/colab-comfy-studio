@@ -7,7 +7,6 @@ import os
 import socket
 from contextlib import nullcontext
 from dataclasses import dataclass
-from pathlib import Path
 
 import uvicorn
 
@@ -15,7 +14,7 @@ from .common import APIError
 
 
 def _default_bind_host(allow_lan: bool) -> str:
-    if allow_lan or Path("/.dockerenv").exists() or os.getenv("STUDIO_CONTAINER") == "1":
+    if allow_lan or os.getenv("STUDIO_CONTAINER_BIND_ALL") == "1":
         return "0.0.0.0"
     return "127.0.0.1"
 
@@ -106,6 +105,7 @@ class PortListenerManager:
                 return self.status(kind)
 
             same_port_rebind = bool(current and not current.task.done() and current.port == port)
+            prev_host = current.host if same_port_rebind else None
             if same_port_rebind:
                 await self._stop_unlocked(kind)
 
@@ -119,6 +119,32 @@ class PortListenerManager:
                 sock.close()
                 msg = f"独立端口 {port} 已被占用或无法绑定：{exc.strerror or exc}"
                 self._errors[kind] = msg
+                if same_port_rebind and prev_host:
+                    # Best-effort restore of the previously working listener on same_port_rebind failure.
+                    rollback_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        rollback_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        rollback_sock.bind((prev_host, port))
+                        rollback_sock.listen(128)
+                        rollback_sock.setblocking(False)
+                        rb_server = _DedicatedPortServer(
+                            uvicorn.Config(
+                                _DedicatedPortASGI(self.studio_app, kind),
+                                host=prev_host,
+                                port=port,
+                                access_log=False,
+                                log_level="error",
+                                lifespan="off",
+                            )
+                        )
+                        rb_task = asyncio.create_task(
+                            rb_server.serve(sockets=[rollback_sock]), name=f"studio-{kind}-port-{port}"
+                        )
+                        self._listeners[kind] = _RunningListener(
+                            host=prev_host, port=port, sock=rollback_sock, server=rb_server, task=rb_task
+                        )
+                    except OSError:
+                        rollback_sock.close()
                 if strict:
                     raise APIError("PORT_IN_USE", msg, 409) from exc
                 return self.status(kind)
@@ -137,10 +163,33 @@ class PortListenerManager:
             )
             server = _DedicatedPortServer(cfg)
             task = asyncio.create_task(server.serve(sockets=[sock]), name=f"studio-{kind}-port-{port}")
+
+            def _on_done(finished: asyncio.Task, _kind: str = kind, _sock: socket.socket = sock) -> None:
+                try:
+                    exc_done = finished.exception() if not finished.cancelled() else None
+                except asyncio.CancelledError:
+                    exc_done = None
+                if exc_done is not None:
+                    self._errors[_kind] = f"独立端口监听异常退出：{type(exc_done).__name__}"
+                try:
+                    _sock.close()
+                except OSError:
+                    pass
+
+            task.add_done_callback(_on_done)
             self._listeners[kind] = _RunningListener(host=target_host, port=port, sock=sock, server=server, task=task)
             self._errors.pop(kind, None)
-            # Yield briefly so uvicorn initializes the server loop cleanly.
-            await asyncio.sleep(0.01)
+            # Wait cleanly for uvicorn to enter started state (bounded to 2s).
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 2.0
+            while not server.started and not task.done() and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            if task.done():
+                self._listeners.pop(kind, None)
+                msg = self._errors.get(kind) or f"独立端口 {port} 启动失败"
+                self._errors[kind] = msg
+                if strict:
+                    raise APIError("PORT_IN_USE", msg, 409)
             return self.status(kind)
 
     async def start_from_store(self, store, owner: str = "owner") -> None:
@@ -160,9 +209,15 @@ class PortListenerManager:
         item.server.should_exit = True
         try:
             await asyncio.wait_for(item.task, timeout=2.0)
-        except (TimeoutError, asyncio.CancelledError):
+        except TimeoutError:
+            item.server.force_exit = True
             item.task.cancel()
             await asyncio.gather(item.task, return_exceptions=True)
+        except asyncio.CancelledError:
+            item.server.force_exit = True
+            item.task.cancel()
+            await asyncio.gather(item.task, return_exceptions=True)
+            raise
         finally:
             try:
                 item.sock.close()

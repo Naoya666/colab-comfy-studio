@@ -103,7 +103,7 @@ def is_below_workflow_default(
     workflow_default = manifest.get("compute_spec")
     if not isinstance(workflow_default, Mapping):
         return False
-    return compare_specs(dict(candidate_spec), dict(workflow_default), order_table) == "lower"
+    return compare_specs(dict(candidate_spec), dict(workflow_default), order_table) not in {"equal", "higher"}
 
 
 def _base_store(store):

@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -201,6 +201,44 @@ def accounts(repo, owner):
     }
 
 
+def monitored_accounts(repo, owner):
+    """Return enabled Colab accounts plus any disabled Colab account still holding active/reconciling GPU resources."""
+    result = accounts(repo, owner)
+    all_rows = {
+        row.get("account_id") or row["id"]: row
+        for row in repo.list("accounts", owner)
+        if row.get("provider", "colab") in {"colab", "google"} and not row.get("is_mock")
+    }
+    missing = set(all_rows) - set(result)
+    if not missing:
+        return result
+    active_ids: set[str] = set()
+    with repo.store.db_lock(), repo.store.Session() as session:
+        for inst in session.scalars(
+            select(GpuInstanceRow).where(GpuInstanceRow.owner_id == owner, GpuInstanceRow.state != "deleted")
+        ):
+            aid = inst.account_id or (inst.data or {}).get("account_id")
+            if aid in missing:
+                active_ids.add(aid)
+        for ls in session.scalars(
+            select(GpuLeaseRow).where(GpuLeaseRow.owner_id == owner, GpuLeaseRow.state != "deleted")
+        ):
+            aid = ls.account_id or (ls.data or {}).get("account_id")
+            if aid in missing:
+                active_ids.add(aid)
+        for seg in session.scalars(
+            select(GpuInstanceUsageSegmentRow).where(
+                GpuInstanceUsageSegmentRow.owner_id == owner,
+                GpuInstanceUsageSegmentRow.state.in_(("open", "reconciling")),
+            )
+        ):
+            if seg.account_id in missing:
+                active_ids.add(seg.account_id)
+    for aid in active_ids:
+        result[aid] = all_rows[aid]
+    return result
+
+
 def _snapshot_key(owner, account):
     return "ccu:" + uuid.uuid5(uuid.NAMESPACE_URL, f"{owner}:{account}").hex
 
@@ -215,7 +253,7 @@ def instance_live_rate(session, owner, account, instance_id):
 
 
 def snapshots(repo, owner):
-    directory = accounts(repo, owner)
+    directory = monitored_accounts(repo, owner)
     creds = repo.list("credentials", owner) if directory else []
     colab_flags = {key: has_colab_credential(repo, owner, key, credentials=creds) for key in directory}
     real_mode = sample_account_balance is _DEFAULT_SAMPLE_ACCOUNT_BALANCE
@@ -445,8 +483,13 @@ def sample_and_record(repo, owner, account, source, *, sampler=None, now=None):
             check_now = time.time() if now is None else float(now)
             with repo.store.db_lock(), repo.store.Session() as session:
                 prev = setting(session, _snapshot_key(owner, account))
+                guard_limits = setting(session, f"cu-guard:{owner}")
+            floor_cu = guard_limits.get("min_balance_cu")
+            prev_bal = prev.get("balance")
+            at_or_below_floor = floor_cu is not None and prev_bal is not None and float(prev_bal) <= float(floor_cu)
             if (
                 prev.get("error") == "sample_failed"
+                and not at_or_below_floor
                 and check_now - float(prev.get("attempted_at") or 0) < 300
                 and active_job_count(repo, owner, account) == 0
                 and active_lease_count(repo, owner, account) == 0
@@ -554,7 +597,7 @@ def _detect(snapshots: dict[str, dict], previous: list[dict], now: float) -> lis
 
 def balance_snapshots(repo, owner_id, *, sampler=None, source="manual", now=None):
     real_sampler = sampler is None and sample_account_balance is _DEFAULT_SAMPLE_ACCOUNT_BALANCE
-    for account in accounts(repo, owner_id):
+    for account in monitored_accounts(repo, owner_id):
         if real_sampler and not has_colab_credential(repo, owner_id, account):
             continue
         sample_and_record(repo, owner_id, account, source, sampler=sampler, now=now)
@@ -612,12 +655,37 @@ def summarize(values):
     }
 
 
-def daily_spend(session, owner, date):
+def _shift_iso_date(day_str: str, delta_days: int) -> str | None:
+    try:
+        return (date.fromisoformat(day_str) + timedelta(days=delta_days)).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def _ledger_effective_day(row: GpuCcuLedgerRow) -> str:
+    sampled = (row.data or {}).get("sampled_at")
+    if isinstance(sampled, (int, float)) and not isinstance(sampled, bool):
+        return local_date(float(sampled))
+    return row.local_date
+
+
+def daily_spend(session, owner, target_date):
     ledger = GpuCcuLedgerRow
-    spent = session.scalar(select(func.sum(ledger.data["delta_spent"].as_float())).where(
-        ledger.owner_id == owner, ledger.local_date == date, ledger.state == "spend",
-    ))
-    return round(spent or 0, 6)
+    prev_day = _shift_iso_date(target_date, -1)
+    next_day = _shift_iso_date(target_date, 1)
+    day_window = tuple(d for d in (prev_day, target_date, next_day) if d)
+    rows = session.scalars(
+        select(ledger).where(
+            ledger.owner_id == owner,
+            ledger.local_date.in_(day_window) if day_window else ledger.local_date == target_date,
+            ledger.state == "spend",
+        )
+    )
+    spent = 0.0
+    for row in rows:
+        if _ledger_effective_day(row) == target_date:
+            spent += float((row.data or {}).get("delta_spent") or 0.0)
+    return round(spent, 6)
 
 
 def sessions_page(repo, owner, *, date=None, start_date=None, end_date=None, kind="all", limit=10, offset=0, active=False):
@@ -687,14 +755,19 @@ def _collect_daily_entries(session, rows, owner, *, today=None, start_date=None,
     ledger = GpuCcuLedgerRow
     ledger_conds = [ledger.owner_id == owner, ledger.state == "spend"]
     if start_date:
-        ledger_conds.append(ledger.local_date >= start_date)
+        padded_start = _shift_iso_date(start_date, -1) or start_date
+        ledger_conds.append(ledger.local_date >= padded_start)
     if end_date:
-        ledger_conds.append(ledger.local_date <= end_date)
-    totals = select(ledger.local_date, ledger.account_id, func.sum(ledger.data["delta_spent"].as_float())).where(
-        *ledger_conds,
-    ).group_by(ledger.local_date, ledger.account_id)
-    for day, account, units in session.execute(totals):
-        add(day, account, units)
+        padded_end = _shift_iso_date(end_date, 1) or end_date
+        ledger_conds.append(ledger.local_date <= padded_end)
+    for row in session.scalars(select(ledger).where(*ledger_conds)):
+        day = _ledger_effective_day(row)
+        if start_date and day < start_date:
+            continue
+        if end_date and day > end_date:
+            continue
+        units = float((row.data or {}).get("delta_spent") or 0.0)
+        add(day, row.account_id, units)
 
     segments = GpuInstanceUsageSegmentRow
     day_col = segments.data["local_date"].as_string()
@@ -714,7 +787,10 @@ def _collect_daily_entries(session, rows, owner, *, today=None, start_date=None,
             continue
         row_moment = row.get("created_epoch") or row.get("stopped_at")
         if row_moment is None:
-            row_moment = datetime.fromisoformat(row["created_at"]).timestamp()
+            parsed_dt = datetime.fromisoformat(row["created_at"])
+            if parsed_dt.tzinfo is None:
+                parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+            row_moment = parsed_dt.timestamp()
         if cutover is None or row_moment < cutover:
             # Legacy usage contributes to history. The daily fuse uses only account ledger debits.
             day = local_date(row_moment)

@@ -82,6 +82,12 @@ def _validate(repo, lease, instance_id, operation=None, *, check_jobs=True):
         raise APIError("NATIVE_NOT_READY", "原生 ComfyUI 尚未就绪", 409)
     if lease.get("current_job_id") or instance.get("current_job_id"):
         raise _busy("Studio 生成或启动任务仍在执行")
+    if operation is None:
+        from . import recovery
+
+        plan = recovery.active_plan(repo, owner, pool="native")
+        if plan and plan.get("state") == "restoring_env":
+            raise _busy("自动恢复正在后台回拉本地模型")
     if check_jobs:
         from .instances import POOL_NATIVE, job_pool
 
@@ -136,13 +142,13 @@ def _fresh(repo, lease):
     return repo.get("leases", lease["id"], lease["owner_id"])
 
 
-def _save(repo, lease, operation, *, validate=False, **changes):
+def _save(repo, lease, operation, *, validate=False, check_jobs=True, **changes):
     with _transition(repo):
         fresh = _fresh(repo, lease)
         if not fresh or (fresh.get("native_restart") or {}).get("id") != operation["id"]:
             return None
         if validate:
-            _validate(repo, fresh, operation["instance_id"], operation)
+            _validate(repo, fresh, operation["instance_id"], operation, check_jobs=check_jobs)
         now = time.time()
         result = _apply_phase_timings(fresh["native_restart"], changes, now)
         patch = {"native_restart": result}
@@ -316,7 +322,7 @@ def _recover(repo, lease, operation, client, url, headers):
         if healthy and state["boot_id"] != operation["boot_id"]:
             missing = _check_models(client, url, headers, lease, state["boot_id"], operation["models"])
             if not missing:
-                return _save(repo, lease, operation, validate=True, phase="succeeded",
+                return _save(repo, lease, operation, validate=True, check_jobs=not review, phase="succeeded",
                              retry_blocked=False, failed_phase=None, error=None)
             if time.time() >= operation["recover_until"]:
                 return _fail(repo, lease, operation, "加载器列表中找不到模型：" + str(missing[0]))
@@ -327,7 +333,7 @@ def _recover(repo, lease, operation, client, url, headers):
         pass
     if review:
         if healthy and (state["boot_id"] != operation["boot_id"] or state.get("reboot_id") is None):
-            return _save(repo, lease, operation, validate=True, retry_blocked=False)
+            return _save(repo, lease, operation, validate=True, check_jobs=False, retry_blocked=False)
         return _save(repo, lease, operation, probe_after=time.time() + 15)
     if time.time() >= operation["recover_until"]:
         reason = "旧 ComfyUI 进程仍在线，等待重启超时" if healthy and state["boot_id"] == operation["boot_id"] else "等待 ComfyUI 恢复超时"

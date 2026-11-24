@@ -315,19 +315,30 @@ def validate_weight_file(path: Path, filename_value: str, size: int, *, model_ty
         if prefix.startswith(b"PK\x03\x04"):
             try:
                 with zipfile.ZipFile(path, "r") as archive:
-                    names = archive.namelist()
-                    if any(n.startswith("/") or ".." in PurePosixPath(n).parts for n in names):
-                        raise ModelError("PyTorch ZIP 权重包含非法路径，已拒绝导入")
-                    pkl_entries = [n for n in names if n == "data.pkl" or n.endswith("/data.pkl")]
-                    if not pkl_entries:
+                    infos = archive.infolist()
+                    seen_names: set[str] = set()
+                    pkl_infos: list[zipfile.ZipInfo] = []
+                    for info in infos:
+                        name = info.filename
+                        if name.startswith("/") or ".." in PurePosixPath(name).parts:
+                            raise ModelError("PyTorch ZIP 权重包含非法路径，已拒绝导入")
+                        norm = name.lstrip("./")
+                        if norm in seen_names:
+                            raise ModelError("PyTorch ZIP 权重包含重复条目，已拒绝导入")
+                        seen_names.add(norm)
+                        if name == "data.pkl" or name.endswith("/data.pkl"):
+                            pkl_infos.append(info)
+                    if not pkl_infos:
                         raise ModelError("ZIP 文件缺少 PyTorch data.pkl 权重元数据，禁止伪造扩展名")
                     saw_tensor = False
-                    for entry_name in pkl_entries:
-                        info = archive.getinfo(entry_name)
+                    for info in pkl_infos:
                         if info.file_size <= 0 or info.file_size > MAX_PICKLE_ENTRY_BYTES:
                             raise ModelError("PyTorch 权重元数据大小异常，已拒绝导入")
                         with archive.open(info, "r") as entry_stream:
-                            _, has_tensor = _inspect_pickle_stream(io.BytesIO(entry_stream.read()))
+                            raw_pkl = entry_stream.read(MAX_PICKLE_ENTRY_BYTES + 1)
+                            if not raw_pkl or len(raw_pkl) > MAX_PICKLE_ENTRY_BYTES:
+                                raise ModelError("PyTorch 权重元数据大小异常，已拒绝导入")
+                            _, has_tensor = _inspect_pickle_stream(io.BytesIO(raw_pkl))
                             saw_tensor = saw_tensor or has_tensor
                     if not saw_tensor:
                         raise ModelError("权重文件不包含有效的 PyTorch 张量重建结构，已拒绝导入")
@@ -342,6 +353,12 @@ def validate_weight_file(path: Path, filename_value: str, size: int, *, model_ty
                 _, has_tensor = _inspect_pickle_stream(stream)
                 if not has_tensor:
                     raise ModelError("权重文件不包含有效的 PyTorch 张量重建结构，已拒绝导入")
+                # PyTorch _legacy_load also unpickles a 5th stream (deserialized_storage_keys)
+                # immediately after stream 4; inspect it whenever additional bytes exist.
+                pos = stream.tell()
+                if stream.read(1):
+                    stream.seek(pos)
+                    _inspect_pickle_stream(stream)
                 return
         raise ModelError("无效或不受支持的 PyTorch 权重文件格式（文件内容与 .pt/.pth 不匹配）")
 
@@ -503,8 +520,8 @@ class SourceHTTP:
                     ).hexdigest()
                     yield response
                     return
-            except httpx.HTTPError as exc:
-                raise ModelError("来源网络连接中断，请重试；不会记录可能含凭据的响应内容") from exc
+            except httpx.HTTPError:
+                raise ModelError("来源网络连接中断，请重试；不会记录可能含凭据的响应内容") from None
         raise ModelError("下载来源重定向次数过多")
 
     @staticmethod

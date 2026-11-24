@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from app.common import APIError
@@ -109,6 +110,33 @@ class AccountService:
             raise
         return result
 
+    @staticmethod
+    def _is_unscoped_legacy_job(row: Mapping[str, Any]) -> bool:
+        """Return True only for genuine pre-v0.2 unscoped jobs, never modern unassigned auto-allocation/mock jobs."""
+        if row.get("account_id") not in (None, ""):
+            return False
+        policy = row.get("execution_policy") if isinstance(row.get("execution_policy"), Mapping) else {}
+        provider = row.get("provider") or policy.get("provider")
+        if provider == "mock":
+            return False
+        # Any modern v0.2+ marker indicates a job created under the multi-account schema where
+        # account_id=None is legal while awaiting auto-allocation or after pre-allocation exit.
+        if (
+            row.get("instance_pool")
+            or row.get("generation_timeouts") is True
+            or row.get("attempt_id")
+            or row.get("attempt_retry_keys")
+            or policy.get("allocation") is not None
+            or policy.get("lifecycle") is not None
+            or policy.get("reuse_action") is not None
+        ):
+            return False
+        if row.get("state") in {"queued", "validating", "waiting_for_capacity"} and not (
+            row.get("lease_id") or row.get("instance_id")
+        ):
+            return False
+        return True
+
     def _ensure_default(self) -> None:
         # Existing explicit accounts must remain untouched, but they do not
         # prove that unscoped pre-v0.2 rows were repaired.  Materialize the
@@ -119,7 +147,7 @@ class AccountService:
         else:
             legacy = [
                 *[row for row in self._rows("credentials") if row.get("purpose") in {"colab", "drive"}],
-                *self._rows("jobs"),
+                *[row for row in self._rows("jobs") if self._is_unscoped_legacy_job(row)],
                 *self._rows("leases"),
                 *self._rows("instances"),
             ]
@@ -146,6 +174,8 @@ class AccountService:
         for kind in ("credentials", "jobs", "leases", "instances", "executions", "files"):
             for row in self._rows(kind):
                 if row.get("account_id") in (None, ""):
+                    if kind == "jobs" and not self._is_unscoped_legacy_job(row):
+                        continue
                     self.repo.update(kind, row["id"], {"account_id": account_id}, self.owner_id)
 
     @staticmethod
@@ -536,12 +566,29 @@ class AccountService:
             for key_prefix, label in (("creation-api", "创作 API"), ("native-api", "原生 ComfyUI API")):
                 setting_id = f"{key_prefix}:{self.owner_id}"
                 saved = store.get("settings", setting_id, self.owner_id)
-                if isinstance(saved, dict) and saved.get("account_id") == account_id:
-                    patch: dict[str, Any] = {"account_id": None}
+                if not isinstance(saved, dict):
+                    continue
+                policy = saved.get("policy")
+                patch: dict[str, Any] = {}
+                if isinstance(policy, dict) and policy.get("account_id") == account_id:
+                    next_policy = {**policy, "account_id": None}
+                    if key_prefix == "native-api":
+                        next_policy["auto_start"] = False
+                        next_policy["gpu"] = None
+                    elif key_prefix == "creation-api":
+                        next_policy["auto_start"] = False
+                    patch["policy"] = next_policy
+                if saved.get("account_id") == account_id:
+                    patch["account_id"] = None
                     if key_prefix == "native-api":
                         patch["auto_start"] = False
                         patch["gpu"] = None
-                    store.update("settings", setting_id, patch, self.owner_id)
+                if patch:
+                    if hasattr(store, "admission_lock"):
+                        with store.admission_lock(timeout=1.0):
+                            store.update("settings", setting_id, patch, self.owner_id)
+                    else:
+                        store.update("settings", setting_id, patch, self.owner_id)
                     cleared_defaults.append(label)
 
             # Clear CCU balance snapshot & stale anomalies referencing the deleted account.

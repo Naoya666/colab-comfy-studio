@@ -44,10 +44,31 @@ ROOT = Path("/content/ai-studio/native")
 BOOT_ID = uuid.uuid4().hex
 LEASE_ID = (ROOT / "restart-lease").read_text() if (ROOT / "restart-lease").is_file() else None
 REBOOT_ID = None
-try:
-    (ROOT / "reboot-active").unlink(missing_ok=True)
-except OSError:
-    pass
+
+
+def _publish_comfy_runtime():
+    try:
+        (ROOT / "reboot-active").unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        raw = Path("/proc/self/stat").read_text()
+        start_id = raw.rsplit(")", 1)[1].split()[19]
+        tmp = ROOT / "comfy-runtime.json.tmp"
+        tmp.write_text(json.dumps({"pid": os.getpid(), "comfy_start_id": start_id, "at": time.time()}))
+        tmp.replace(ROOT / "comfy-runtime.json")
+    except (OSError, IndexError, ValueError):
+        pass
+
+
+async def _on_comfy_startup(app):
+    _publish_comfy_runtime()
+
+
+if hasattr(getattr(PromptServer.instance, "app", None), "on_startup"):
+    PromptServer.instance.app.on_startup.append(_on_comfy_startup)
+else:
+    _publish_comfy_runtime()
 
 def open_writes():
     for process in Path("/proc").glob("[0-9]*"):
@@ -308,7 +329,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 ROOT = Path("/content/ai-studio/native")
-REBOOT_GRACE_SECONDS = 300.0
+REBOOT_GRACE_SECONDS = 2100.0
 WINDOW_SECONDS = 600.0
 TUNNEL_MAX_RESTARTS = 5
 RCLONE_MAX_RESTARTS = 3
@@ -530,17 +551,37 @@ def heal_cycle(
                         status["rclone_restarts"] = int(status.get("rclone_restarts") or 0) + 1
                         status["slow_warnings"].pop("rclone", None)
                         state_dirty = True
+                    elif callable(getattr(proc, "poll", None)) and proc.poll() is None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
                     status_dirty = True
                 finally:
                     status["in_progress"] = False
                     _save_status(root, status)
 
     # 3. ComfyUI supervision (L2, anti-false-kill: only when PID dead/Z & not planned reboot)
+    def _adopt_comfy_runtime() -> bool:
+        info = _read_json(root / "comfy-runtime.json")
+        npid = info.get("pid")
+        nsid = info.get("comfy_start_id")
+        if npid and nsid and proc_alive(npid, nsid, proc_root=proc_root):
+            if state.get("pid") != npid or state.get("comfy_start_id") != nsid:
+                state["pid"] = npid
+                state["comfy_start_id"] = nsid
+                return True
+        return False
+
     comfy_pid = state.get("pid")
     comfy_start_id = state.get("comfy_start_id")
     comfy_args = state.get("comfy_args")
     comfy_cwd = state.get("comfy_cwd") or state.get("comfy")
     if self_heal_enabled and comfy_pid and comfy_start_id and isinstance(comfy_args, list) and comfy_args:
+        if not proc_alive(comfy_pid, comfy_start_id, proc_root=proc_root) and _adopt_comfy_runtime():
+            comfy_pid = state["pid"]
+            comfy_start_id = state["comfy_start_id"]
+            state_dirty = True
         if proc_alive(comfy_pid, comfy_start_id, proc_root=proc_root):
             # Process is alive: NEVER kill! Only record slow /system_stats warning.
             if not http_ok_fn("http://127.0.0.1:8188/system_stats", timeout=3.0):
@@ -554,7 +595,8 @@ def heal_cycle(
             pass
         elif http_ok_fn("http://127.0.0.1:8188/system_stats", timeout=3.0):
             # A new ComfyUI process is already serving port 8188 (e.g. after Manager reboot).
-            pass
+            if _adopt_comfy_runtime():
+                state_dirty = True
         else:
             recent = _prune(status["history"]["comfy"], now)
             status["history"]["comfy"] = recent
@@ -571,37 +613,44 @@ def heal_cycle(
                 try:
                     sleep_fn(delay)
                     if is_reboot_active(root, float(clock())) or http_ok_fn("http://127.0.0.1:8188/system_stats", timeout=3.0):
-                        return status
-                    comfy_log = Path(state.get("comfy_log") or str(root / "comfy.log"))
-                    comfy_log.parent.mkdir(parents=True, exist_ok=True)
-                    with comfy_log.open("ab") as log:
-                        log_offset = log.tell()
-                        proc = popen_fn(
-                            comfy_args, cwd=comfy_cwd, stdout=log,
-                            stderr=subprocess.STDOUT, start_new_session=True,
-                        )
-                    deadline = time.monotonic() + 300.0
-                    ready = False
-                    while time.monotonic() < deadline:
-                        if http_ok_fn("http://127.0.0.1:8188/system_stats", timeout=3.0):
-                            ready = True
-                            break
-                        if callable(getattr(proc, "poll", None)) and proc.poll() is not None:
-                            break
-                        sleep_fn(0.5)
-                    recent.append(float(clock()))
-                    status["last_event_at"] = float(clock())
-                    status["last_component"] = "comfyui"
-                    if ready:
-                        state["pid"] = proc.pid
-                        new_sid = proc_start_id(proc.pid, proc_root=proc_root)
-                        if new_sid is not None:
-                            state["comfy_start_id"] = new_sid
-                        state["comfy_log_offset"] = log_offset
-                        status["comfy_restarts"] = int(status.get("comfy_restarts") or 0) + 1
-                        status["slow_warnings"].pop("comfy", None)
-                        state_dirty = True
-                    status_dirty = True
+                        if _adopt_comfy_runtime():
+                            state_dirty = True
+                    else:
+                        comfy_log = Path(state.get("comfy_log") or str(root / "comfy.log"))
+                        comfy_log.parent.mkdir(parents=True, exist_ok=True)
+                        with comfy_log.open("ab") as log:
+                            log_offset = log.tell()
+                            proc = popen_fn(
+                                comfy_args, cwd=comfy_cwd, stdout=log,
+                                stderr=subprocess.STDOUT, start_new_session=True,
+                            )
+                        deadline = time.monotonic() + 300.0
+                        ready = False
+                        while time.monotonic() < deadline:
+                            if http_ok_fn("http://127.0.0.1:8188/system_stats", timeout=3.0):
+                                ready = True
+                                break
+                            if callable(getattr(proc, "poll", None)) and proc.poll() is not None:
+                                break
+                            sleep_fn(0.5)
+                        recent.append(float(clock()))
+                        status["last_event_at"] = float(clock())
+                        status["last_component"] = "comfyui"
+                        if ready:
+                            state["pid"] = proc.pid
+                            new_sid = proc_start_id(proc.pid, proc_root=proc_root)
+                            if new_sid is not None:
+                                state["comfy_start_id"] = new_sid
+                            state["comfy_log_offset"] = log_offset
+                            status["comfy_restarts"] = int(status.get("comfy_restarts") or 0) + 1
+                            status["slow_warnings"].pop("comfy", None)
+                            state_dirty = True
+                        elif callable(getattr(proc, "poll", None)) and proc.poll() is None:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                        status_dirty = True
                 finally:
                     status["in_progress"] = False
                     _save_status(root, status)

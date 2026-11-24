@@ -916,10 +916,12 @@ try:
         accepted = 200 <= resp.status < 300
     deadline = time.monotonic() + 4.0
     while accepted and time.monotonic() < deadline:
-        status = json.loads(status_path.read_text()) if status_path.is_file() else {{}}
+        has_status = status_path.is_file()
+        status = json.loads(status_path.read_text()) if has_status else {{}}
         with urllib.request.urlopen({queue_url!r}, timeout=2) as qresp:
             qdata = json.loads(qresp.read().decode("utf-8"))
-        if status.get("state") in {{"completed", "failed"}} and qdata.get("queue_running") == qdata.get("queue_pending") == []:
+        queue_empty = qdata.get("queue_running") == qdata.get("queue_pending") == []
+        if queue_empty and (not has_status or status.get("state") in {{"completed", "failed"}}):
             interrupted = True
             break
         time.sleep(0.3)

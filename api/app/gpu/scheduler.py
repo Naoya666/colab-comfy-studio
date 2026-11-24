@@ -998,6 +998,20 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     lease_patch["last_create_error"] = None
                 if lease_patch:
                     self._update("leases", lease["id"], lease_patch, job["owner_id"])
+            latest_job = self._get("jobs", job["id"], job.get("owner_id")) or job
+            if (
+                latest_job.get("cancel_requested")
+                or latest_job.get("error_code") == "CU_BALANCE_FLOOR_REACHED"
+                or latest_job.get("state") in {"cleaning_up", "cleanup_pending", "cancelled", "failed", "completed"}
+            ):
+                if latest_job.get("state") in {"cleaning_up", "cleanup_pending", "cancelled", "failed", "completed"}:
+                    return latest_job
+                return self._set_state(
+                    latest_job,
+                    "cleaning_up",
+                    "任务已取消或触发熔断，停止推进至就绪",
+                    {"cleanup_final_state": "cancelled", "requested_outcome": "cancelled"},
+                )
             job = self._mark_instance("mark_ready", job)
             if job.get("recovery_plan_id") and job.get("instance_id"):
                 from . import recovery
@@ -1671,6 +1685,10 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
 
             cfg = recovery.RecoveryConfig.from_env()
             pool = instance_pool_of(instance)
+            voluntary_drain = bool(
+                instance.get("native_draining")
+                or (lease.get("native_draining") and not lease.get("native_remote_deleted_verified_at"))
+            )
             is_l3_candidate = (
                 cfg.enabled
                 and (
@@ -1681,11 +1699,11 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 and not instance.get("force_stop")
                 and not lease.get("force_stop")
                 and not instance.get("fuse_forced_stop")
-                and not lease.get("native_draining")
+                and not voluntary_drain
             )
             if is_l3_candidate:
                 first_seen = check.get("missing_first_seen_at") if check.get("identity") == identity else None
-                if first_seen is None:
+                if first_seen is None or (now - float(first_seen)) < 5.0:
                     status = "missing_pending"
                 elif pool == POOL_NATIVE and lease.get("native_ready"):
                     from .native import native_proxy_healthy
@@ -1771,19 +1789,23 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             and not lease.get("force_stop")
             and not job.get("creation_interrupt_confirmed")
         ):
-            interrupted = False
-            try:
-                executor = self._executor(job)
-                interrupt_fn = getattr(executor, "interrupt_creation_service", None)
-                if callable(interrupt_fn):
-                    interrupted = interrupt_fn(self._lease_handle(lease), job) is True
-            except Exception:
-                pass
-            if interrupted:
+            if not job.get("execution_id"):
+                # Job was cancelled before any remote execution started; no prompt was queued on ComfyUI.
                 job = self._update("jobs", job["id"], {"creation_interrupt_confirmed": True}, job.get("owner_id"))
             else:
-                # Keep the lease unavailable until the provider confirms deletion.
-                lease = self._update("leases", lease["id"], {"force_stop": True}, job["owner_id"])
+                interrupted = False
+                try:
+                    executor = self._executor(job)
+                    interrupt_fn = getattr(executor, "interrupt_creation_service", None)
+                    if callable(interrupt_fn):
+                        interrupted = interrupt_fn(self._lease_handle(lease), job) is True
+                except Exception:
+                    pass
+                if interrupted:
+                    job = self._update("jobs", job["id"], {"creation_interrupt_confirmed": True}, job.get("owner_id"))
+                else:
+                    # Keep the lease unavailable until the provider confirms deletion.
+                    lease = self._update("leases", lease["id"], {"force_stop": True}, job["owner_id"])
         owns_instance = bool(
             instance is None
             or instance.get("current_job_id") in {None, job["id"]}

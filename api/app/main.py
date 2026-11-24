@@ -8,6 +8,7 @@ import io
 import json
 import os
 import secrets
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -100,7 +101,9 @@ async def lifespan(app):
 
 app = FastAPI(title="Colab GPU Studio", version=__version__, lifespan=lifespan)
 router = APIRouter()
-_login_limits = {}
+_login_limits: dict[str, list[float]] = {}
+_login_limits_lock = threading.Lock()
+_MAX_LOGIN_LIMIT_KEYS = 4096
 
 
 @app.middleware("http")
@@ -112,10 +115,20 @@ async def security_context(request, call_next):
             if origin and origin.rstrip("/") != settings.site_url.rstrip("/"):
                 from urllib.parse import urlsplit
 
-                if urlsplit(origin).netloc != request.url.netloc:
+                parsed_origin = urlsplit(origin)
+                if (parsed_origin.scheme.lower(), parsed_origin.netloc.lower()) != (
+                    request.url.scheme.lower(),
+                    request.url.netloc.lower(),
+                ):
                     raise APIError("CSRF_ORIGIN", "跨站写入被拒绝", 403)
-        if int(request.headers.get("Content-Length", "0")) > settings.max_upload_bytes + 1048576:
-            raise APIError("PAYLOAD_TOO_LARGE", "请求超过上传限制", 413)
+        raw_cl = request.headers.get("Content-Length")
+        if raw_cl is not None:
+            try:
+                content_length = int(raw_cl.strip())
+            except ValueError as exc:
+                raise APIError("VALIDATION_ERROR", "无效的 Content-Length 请求头", 400) from exc
+            if content_length < 0 or content_length > settings.max_upload_bytes + 1048576:
+                raise APIError("PAYLOAD_TOO_LARGE", "请求超过上传限制", 413)
         response = await call_next(request)
     except APIError as exc:
         response = error_response(request, exc)
@@ -140,6 +153,35 @@ _NON_COMPRESSIBLE_PREFIXES = ("image/", "video/", "audio/")
 _NON_COMPRESSIBLE_TYPES = frozenset({"application/octet-stream", "text/event-stream"})
 
 
+def _accepts_gzip(header_value: str) -> bool:
+    if not header_value:
+        return False
+    for part in header_value.split(","):
+        token, *params = [seg.strip() for seg in part.split(";")]
+        if token.lower() != "gzip":
+            continue
+        q = 1.0
+        for param in params:
+            if param.lower().startswith("q="):
+                try:
+                    q = float(param[2:].strip())
+                except ValueError:
+                    q = 0.0
+        if q > 0.0:
+            return True
+    return False
+
+
+def _prepare_gzip_headers(headers: MutableHeaders) -> None:
+    headers["Content-Encoding"] = "gzip"
+    if "accept-ranges" in headers:
+        del headers["accept-ranges"]
+    etag = headers.get("etag")
+    if etag and not etag.startswith("W/"):
+        headers["ETag"] = f"W/{etag}"
+    headers.add_vary_header("Accept-Encoding")
+
+
 class SelectiveGZipMiddleware:
     """Compress JSON/text/JS/CSS responses >= minimum_size while leaving media/range streams untouched."""
 
@@ -152,10 +194,8 @@ class SelectiveGZipMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        accept = Headers(scope=scope).get("accept-encoding", "")
-        if "gzip" not in accept.lower():
-            await self.app(scope, receive, send)
-            return
+        method = str(scope.get("method", "GET")).upper()
+        accepts_gzip = method != "HEAD" and _accepts_gzip(Headers(scope=scope).get("accept-encoding", ""))
 
         initial_message = None
         passthrough = False
@@ -169,12 +209,16 @@ class SelectiveGZipMiddleware:
                 status = message.get("status", 200)
                 headers = Headers(raw=message.get("headers", []))
                 ctype = headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                if (
-                    status in {204, 206, 304}
+                compressible = not (
+                    status < 200
+                    or status in {204, 206, 304}
                     or "content-encoding" in headers
                     or ctype.startswith(_NON_COMPRESSIBLE_PREFIXES)
                     or ctype in _NON_COMPRESSIBLE_TYPES
-                ):
+                )
+                if not compressible or not accepts_gzip:
+                    if compressible:
+                        MutableHeaders(raw=message["headers"]).add_vary_header("Accept-Encoding")
                     passthrough = True
                     await send(message)
                     return
@@ -190,14 +234,14 @@ class SelectiveGZipMiddleware:
                     # Single-chunk response (JSONResponse, small text, FileResponse single body):
                     if len(body) < self.minimum_size:
                         passthrough = True
+                        MutableHeaders(raw=initial_message["headers"]).add_vary_header("Accept-Encoding")
                         await send(initial_message)
                         await send(message)
                         return
                     compressed = gzip.compress(body, compresslevel=self.compresslevel)
                     headers = MutableHeaders(raw=initial_message["headers"])
-                    headers["Content-Encoding"] = "gzip"
+                    _prepare_gzip_headers(headers)
                     headers["Content-Length"] = str(len(compressed))
-                    headers.add_vary_header("Accept-Encoding")
                     await send(initial_message)
                     await send({"type": "http.response.body", "body": compressed, "more_body": False})
                     return
@@ -205,13 +249,14 @@ class SelectiveGZipMiddleware:
                     gzip_buffer = io.BytesIO()
                     gzip_file = gzip.GzipFile(mode="wb", fileobj=gzip_buffer, compresslevel=self.compresslevel)
                     headers = MutableHeaders(raw=initial_message["headers"])
-                    headers["Content-Encoding"] = "gzip"
+                    _prepare_gzip_headers(headers)
                     if "content-length" in headers:
                         del headers["content-length"]
-                    headers.add_vary_header("Accept-Encoding")
                     await send(initial_message)
                 if body:
                     gzip_file.write(body)
+                    if more_body:
+                        gzip_file.flush()
                 if not more_body:
                     gzip_file.close()
                 chunk = gzip_buffer.getvalue()
@@ -283,15 +328,31 @@ class Login(BaseModel):
 @app.post("/api/auth/login")
 def login(body: Login, request: Request):
     key = request.client.host if request.client else "unknown"
-    previous = [t for t in _login_limits.get(key, []) if t > time.monotonic() - 60]
-    if len(previous) >= 10:
-        raise APIError("RATE_LIMITED", "登录尝试过于频繁，请稍后重试", 429)
-    previous.append(time.monotonic())
-    _login_limits[key] = previous
+    now_mono = time.monotonic()
+    cutoff = now_mono - 60
+    with _login_limits_lock:
+        if len(_login_limits) >= _MAX_LOGIN_LIMIT_KEYS:
+            stale_keys = [k for k, ts_list in _login_limits.items() if not ts_list or ts_list[-1] <= cutoff]
+            for stale in stale_keys:
+                _login_limits.pop(stale, None)
+            while len(_login_limits) >= _MAX_LOGIN_LIMIT_KEYS:
+                _login_limits.pop(next(iter(_login_limits)), None)
+        previous = [t for t in _login_limits.get(key, []) if t > cutoff]
+        if len(previous) >= 10:
+            _login_limits[key] = previous
+            raise APIError("RATE_LIMITED", "登录尝试过于频繁，请稍后重试", 429)
+        previous.append(now_mono)
+        _login_limits[key] = previous
     if not settings.studio_password or not secrets.compare_digest(body.password, settings.studio_password):
         raise APIError("INVALID_CREDENTIALS", "密码不正确或尚未初始化", 401)
     token = sign_session(
-        {"uid": "owner", "role": "admin", "iat": int(time.time()), "exp": int(time.time()) + 43200}
+        {
+            "uid": "owner",
+            "role": "admin",
+            "purpose": "studio-session",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 43200,
+        }
     )
     response = JSONResponse({"access_token": token, "token_type": "bearer", "expires_in": 43200})
     response.set_cookie(

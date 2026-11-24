@@ -67,11 +67,22 @@ _COMPAT_API_PREFIXES = (
     "/api/object_info",
     "/api/models",
     "/api/prompt",
-    "/api/history/",
+    "/api/history",
     "/api/view",
     "/api/interrupt",
     "/api/queue",
 )
+
+
+async def _read_bounded_body(request: Request, limit: int, error_message: str) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise APIError("PAYLOAD_TOO_LARGE", error_message, 413)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 class Config(BaseModel):
@@ -358,21 +369,16 @@ def get_project(store, owner):
 
 
 def submit(store, owner, workflow, params, *, key=None, idem=None, graph_hash=None):
-    repo = Repository(store)
     cfg = config(store, owner)
     warmup = key is None
     key_id = key["id"] if key else None
     is_virtual_key = bool(key and key.get("virtual"))
     existing_only = not warmup and not cfg["auto_start"]
-    key_value = "creation:" + key_id + ":" + hashlib.sha256(idem.encode()).hexdigest() if idem else (
-        "creation:" + uuid.uuid4().hex
+    key_value = (
+        "creation:" + (key_id or "warmup") + ":" + hashlib.sha256(idem.encode()).hexdigest()
+        if idem
+        else "creation:" + uuid.uuid4().hex
     )
-    if idem:
-        prior = next((row for row in repo.list("jobs", owner) if row.get("idempotency_key") == key_value), None)
-        if prior:
-            if prior.get("creation_body_hash") != graph_hash:
-                raise APIError("IDEMPOTENCY_CONFLICT", "相同幂等键不能用于不同工作流参数", 409)
-            return prior
 
     raw = JobInput(project_id=get_project(store, owner), model_id=workflow["model_id"],
                    workflow_key=workflow["workflow_key"], workflow_version=workflow["workflow_version"],
@@ -630,6 +636,7 @@ async def save_config(body: Config, request: Request, user=Depends(current_user)
             cfg_local["project_id"] = raw_project_id
         return cfg_local
 
+    prev_cfg = await asyncio.to_thread(config, store, owner)
     cfg = await asyncio.to_thread(_validate_cfg)
 
     mgr = getattr(request.app.state, "port_listeners", None)
@@ -652,7 +659,17 @@ async def save_config(body: Config, request: Request, user=Depends(current_user)
             else:
                 store.create("settings", owner, patch, record_id=ident)
 
-    await asyncio.to_thread(_persist_cfg)
+    try:
+        await asyncio.to_thread(_persist_cfg)
+    except Exception:
+        if mgr is not None:
+            await mgr.apply(
+                "creation",
+                prev_cfg.get("listen_port"),
+                allow_lan=bool(prev_cfg.get("allow_lan")),
+                strict=False,
+            )
+        raise
     return ok(cfg, request)
 
 
@@ -819,11 +836,9 @@ def queue_status(store=Depends(get_store), key=Depends(authorize)):
 
 @compat.post("/queue")
 async def queue_manage(request: Request, store=Depends(get_store), key=Depends(authorize)):
-    raw = await request.body()
+    raw = await _read_bounded_body(request, 65536, "队列请求过大")
     if not raw:
         return {}
-    if len(raw) > 65536:
-        raise APIError("PAYLOAD_TOO_LARGE", "队列请求过大", 413)
     try:
         payload = json.loads(raw)
     except ValueError as exc:
@@ -918,8 +933,8 @@ def view(filename: str, subfolder: str = "", type: str = "output", store=Depends
 @compat.post("/interrupt")
 async def interrupt(request: Request, prompt_id: str | None = None, store=Depends(get_store), key=Depends(authorize)):
     if not prompt_id:
-        raw = await request.body()
-        if raw and len(raw) <= 8192:
+        raw = await _read_bounded_body(request, 8192, "取消请求过大")
+        if raw:
             try:
                 payload = json.loads(raw)
                 if isinstance(payload, dict) and isinstance(payload.get("prompt_id"), str):
@@ -994,7 +1009,7 @@ def _get_compat_app(studio_app):
     async def private(request: Request, call_next):
         if request.method == "OPTIONS":
             try:
-                cors = _preflight_cors_headers(request, studio_app.state.store)
+                cors = await asyncio.to_thread(_preflight_cors_headers, request, studio_app.state.store)
             except APIError as exc:
                 return JSONResponse(
                     {"error": {"type": exc.code, "message": exc.message}, "node_errors": {}},

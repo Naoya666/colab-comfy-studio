@@ -21,6 +21,7 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - run: uv sync --locked --extra test
+      - run: uv run --no-sync ruff check api tests
       - run: uv run --no-sync pytest -q
 
   frontend:

@@ -64,6 +64,7 @@ def test_png_import_scans_and_preserves_metadata_http(client):
 
 def test_http_hf_dataset_resolve_and_add_roundtrip(client, monkeypatch):
     import hashlib
+
     import httpx
     from app.gpu.model_sources import SourceHTTP
 

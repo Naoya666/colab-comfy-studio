@@ -91,6 +91,10 @@ with sync_playwright() as playwright:
     screenshot(page, "create-result")
 
     preview.get_by_role("button", name="查看任务").click()
+    expect(page.locator("button:has-text('展开'), button:has-text('查看详情')").first).to_be_visible(timeout=15_000)
+    expand_batch = page.get_by_role("button", name="展开", exact=False)
+    if expand_batch.count() > 0:
+        expand_batch.first.click()
     page.get_by_role("button", name="查看详情").first.click()
     expect(page.get_by_role("region", name="任务详情").get_by_text("执行记录")).to_be_visible()
     expect(page.get_by_role("dialog", name="任务详情")).to_have_count(0)
@@ -111,7 +115,7 @@ with sync_playwright() as playwright:
         page.evaluate("(theme) => { document.documentElement.dataset.theme = theme; }", theme)
         for width in [360, 390, 799, 800, 960, 1024, 1100, 1440, 1920]:
             page.set_viewport_size({"width": width, "height": 900})
-            for name in ["创作", "任务", "作品", "原生 ComfyUI", "工作流与模型", "模型库", "算力", "设置"]:
+            for name in ["创作", "任务", "作品", "原生 ComfyUI", "资产", "算力", "设置"]:
                 if name == "设置":
                     page.get_by_role("button", name="打开设置").click()
                 else:
@@ -144,7 +148,10 @@ with sync_playwright() as playwright:
     def native_status(status_route):
         response = status_route.fetch()
         fixture = response.json()
-        fixture["data"].update(configured=True, ready=True, can_restart=False, state="running")
+        fixture["data"].update(
+            configured=True, web_ui_configured=True, tunnel_configured=True,
+            ready=True, can_restart=False, state="running",
+        )
         status_route.fulfill(response=response, json=fixture)
 
     page.route("**/api/gpu/native/status", native_status)

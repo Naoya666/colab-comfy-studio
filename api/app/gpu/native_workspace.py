@@ -62,16 +62,22 @@ _BUILTIN_CNR_IDS = frozenset({"comfy-core"})
 _OVERVIEW_LOCK = threading.Lock()
 _OVERVIEW_CACHE: dict[tuple[str, str, int], tuple[float, dict[str, Any]]] = {}
 _HISTORY_CACHE_LOCK = threading.Lock()
-_HISTORY_JSON_CACHE: dict[str, dict[str, Any]] = {}
+_HISTORY_JSON_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
 def invalidate_workspace_cache(owner_id: str | None = None) -> None:
     with _OVERVIEW_LOCK:
         if owner_id is None:
             _OVERVIEW_CACHE.clear()
-            return
-        for key in [k for k in _OVERVIEW_CACHE if k[0] == owner_id]:
-            _OVERVIEW_CACHE.pop(key, None)
+        else:
+            for key in [k for k in _OVERVIEW_CACHE if k[0] == owner_id]:
+                _OVERVIEW_CACHE.pop(key, None)
+    with _HISTORY_CACHE_LOCK:
+        if owner_id is None:
+            _HISTORY_JSON_CACHE.clear()
+        else:
+            for key in [k for k in _HISTORY_JSON_CACHE if k[0] == owner_id]:
+                _HISTORY_JSON_CACHE.pop(key, None)
 
 
 def _settings_key(owner_id: str) -> str:
@@ -408,18 +414,34 @@ class _WorkspaceDrive:
     def download_bytes(self, file_id: str, *, max_bytes: int = MAX_WORKFLOW_JSON_BYTES, known_size: int | None = None) -> bytes:
         if known_size is not None and known_size > max_bytes:
             raise APIError("WORKSPACE_FILE_TOO_LARGE", f"文件超过大小上限（{max_bytes // (1024 * 1024)} MiB）", 413)
-        response = self.storage._request(
-            "GET",
-            self.storage.base_url + f"/files/{file_id}",
-            params={"alt": "media"},
-            headers={"Accept": "application/octet-stream"},
-        )
-        if response.status_code < 200 or response.status_code >= 300:
-            raise DriveError(f"Drive 文件下载失败（HTTP {response.status_code}）")
-        data = response.content
-        if len(data) > max_bytes:
-            raise APIError("WORKSPACE_FILE_TOO_LARGE", f"文件超过大小上限（{max_bytes // (1024 * 1024)} MiB）", 413)
-        return data
+        token = self.storage.google.access_token("drive")
+        url = self.storage.base_url + f"/files/{file_id}"
+        headers = {"Authorization": "Bearer " + token, "Accept": "application/octet-stream"}
+        buf = bytearray()
+        try:
+            with self.storage.client.stream("GET", url, params={"alt": "media"}, headers=headers) as response:
+                if response.status_code < 200 or response.status_code >= 300:
+                    raise DriveError(f"Drive 文件下载失败（HTTP {response.status_code}）")
+                cl_raw = response.headers.get("content-length")
+                if cl_raw is not None:
+                    try:
+                        if int(cl_raw) > max_bytes:
+                            raise APIError("WORKSPACE_FILE_TOO_LARGE", f"文件超过大小上限（{max_bytes // (1024 * 1024)} MiB）", 413)
+                    except ValueError:
+                        pass
+                for chunk in response.iter_bytes(65536):
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    if len(buf) > max_bytes:
+                        raise APIError("WORKSPACE_FILE_TOO_LARGE", f"文件超过大小上限（{max_bytes // (1024 * 1024)} MiB）", 413)
+        except APIError:
+            raise
+        except DriveError:
+            raise
+        except Exception as exc:
+            raise DriveError("Drive 文件下载连接失败") from exc
+        return bytes(buf)
 
     def download_json(self, file_id: str, *, max_bytes: int = MAX_WORKFLOW_JSON_BYTES, known_size: int | None = None) -> Any:
         raw = self.download_bytes(file_id, max_bytes=max_bytes, known_size=known_size)
@@ -506,7 +528,14 @@ class _WorkspaceDrive:
         if previous is None:
             for item in existing:
                 self.trash_file(item["id"])
-        elif not existing or self.download_json(existing[0]["id"]) != previous:
+            return
+        needs_write = True
+        if existing:
+            try:
+                needs_write = self.download_json(existing[0]["id"]) != previous
+            except (ValueError, APIError):
+                needs_write = True
+        if needs_write:
             self.write_json_inplace(parent_id, name, previous)
 
     def delete_file_permanent(self, file_id: str) -> None:
@@ -532,25 +561,78 @@ class _WorkspaceDrive:
         return matches[0], cur
 
 
-def _open_drive(repo, owner_id: str, drive: DriveStorage | None = None) -> tuple[DriveStorage | None, bool, str | None, str | None]:
+def _preferred_native_drive_account(repo, owner_id: str) -> str | None:
+    """Prefer the Drive account used by the latest native ComfyUI lease/job when no explicit account is requested."""
+    try:
+        leases = [row for row in repo.list("leases", owner_id) if row.get("native_comfy")]
+    except Exception:
+        leases = []
+    if leases:
+        leases.sort(
+            key=lambda row: _iso_to_epoch(row.get("updated_at") or row.get("created_at")) or float(row.get("created_epoch") or 0.0),
+            reverse=True,
+        )
+        for row in leases:
+            acc = row.get("drive_account_id") or row.get("account_id")
+            if isinstance(acc, str) and acc.strip():
+                return acc.strip()
+    try:
+        jobs = [row for row in repo.list("jobs", owner_id) if (row.get("snapshot") or {}).get("native_comfy")]
+    except Exception:
+        jobs = []
+    if jobs:
+        jobs.sort(
+            key=lambda row: _iso_to_epoch(row.get("updated_at") or row.get("created_at")) or 0.0,
+            reverse=True,
+        )
+        for row in jobs:
+            acc = row.get("drive_account_id") or row.get("account_id")
+            if isinstance(acc, str) and acc.strip():
+                return acc.strip()
+    return None
+
+
+def _open_drive(
+    repo,
+    owner_id: str,
+    drive: DriveStorage | None = None,
+    *,
+    account_id: str | None = None,
+) -> tuple[DriveStorage | None, bool, str | None, str | None]:
     if drive is not None:
         return drive, False, drive.account_id, drive.account_id or "默认 Drive 账号"
-    account_id, account_alias = resolve_owner_drive_account(repo, owner_id)
-    if account_id is None and account_alias is None:
+    preferred = account_id.strip() if isinstance(account_id, str) and account_id.strip() else _preferred_native_drive_account(repo, owner_id)
+    resolved_account_id, account_alias = resolve_owner_drive_account(repo, owner_id, preferred_account_id=preferred)
+    if resolved_account_id is None and account_alias is None:
         return None, False, None, None
     storage = DriveStorage(
         {"id": "native-workspace", "owner_id": owner_id},
         repo,
-        account_id=account_id,
+        account_id=resolved_account_id,
     )
-    return storage, True, account_id, account_alias
+    return storage, True, resolved_account_id, account_alias
+
+
+_default_open_drive = _open_drive
+
+
+def _open_drive_for(
+    repo,
+    owner_id: str,
+    drive: DriveStorage | None = None,
+    *,
+    account_id: str | None = None,
+) -> tuple[DriveStorage | None, bool, str | None, str | None]:
+    if _open_drive is not _default_open_drive and account_id is None:
+        return _open_drive(repo, owner_id, drive=drive)
+    return _open_drive(repo, owner_id, drive=drive, account_id=account_id)
 
 
 @contextmanager
 def _offline_write_guard(repo, owner_id: str, *, reason: str):
     lock_id = native.acquire_workspace_write_lock(repo, owner_id, reason=reason)
     try:
-        yield lock_id
+        yield partial(native.renew_workspace_write_lock, repo, owner_id, lock_id)
     finally:
         native.release_workspace_write_lock(repo, owner_id, lock_id)
 
@@ -654,11 +736,14 @@ def _read_plugins_bundle(
                 sha = name[: -len(".tar.gz")]
                 if not _HEX64_RE.fullmatch(sha):
                     continue
+                size_bytes = _int_or_zero(item.get("size"))
+                if item.get("size") is not None and size_bytes <= 0:
+                    continue
                 entry = {
                     "id": str(item["id"]),
                     "name": name,
                     "sha256": sha,
-                    "size_bytes": _int_or_zero(item.get("size")),
+                    "size_bytes": size_bytes,
                     "modified_at": _iso_to_epoch(item.get("modifiedTime")),
                 }
                 if sha not in objects_map:
@@ -725,8 +810,9 @@ def _read_plugins_bundle(
 
             def _load_hist(meta: dict[str, Any]) -> dict[str, Any] | None:
                 gen = str(meta["name"])[: -len(".json")]
+                hist_key = (wdrive.owner_id, str(wdrive.storage.account_id or "default"), gen)
                 with _HISTORY_CACHE_LOCK:
-                    cached = _HISTORY_JSON_CACHE.get(gen)
+                    cached = _HISTORY_JSON_CACHE.get(hist_key)
                 if cached is not None and not strict:
                     return cached
                 doc = _safe_load(meta, fail_fast=strict)
@@ -738,7 +824,7 @@ def _read_plugins_bundle(
                     if not doc.get("backed_up_at"):
                         doc = {**doc, "backed_up_at": _iso_to_epoch(meta.get("modifiedTime")) or 0.0}
                     with _HISTORY_CACHE_LOCK:
-                        _HISTORY_JSON_CACHE[gen] = doc
+                        _HISTORY_JSON_CACHE[hist_key] = doc
                     return doc
                 return None
 
@@ -894,7 +980,7 @@ def _read_env_caches(
             "flags": flags,
             "comfy_commit": spec.get("comfy_commit"),
             "python": spec.get("python"),
-            "gpu_tag": spec.get("gpu"),
+            "gpu_tag": spec.get("gpu_tag") or spec.get("gpu"),
             "added_count": meta_doc.get("added_count"),
             "overlay_count": meta_doc.get("overlay_count"),
             "file_ids": [str(f["id"]) for f in [*tar_files, *meta_files]],
@@ -1241,6 +1327,7 @@ def get_workspace_overview(
     *,
     refresh: bool = False,
     keep_history: int = DEFAULT_KEEP_HISTORY,
+    account_id: str | None = None,
     drive: DriveStorage | None = None,
 ) -> dict[str, Any]:
     from . import recovery
@@ -1249,7 +1336,9 @@ def get_workspace_overview(
     offline_writable, lock_reason = native.workspace_offline_status(repo, owner_id)
     active_rec = recovery.active_plan(repo, owner_id, pool="native") if not offline_writable else None
     recovery_plan_id = active_rec.get("plan_id") if active_rec else None
-    storage, owns_storage, account_id, account_alias = _open_drive(repo, owner_id, drive=drive)
+    storage, owns_storage, resolved_account_id, account_alias = _open_drive_for(
+        repo, owner_id, drive=drive, account_id=account_id
+    )
     if storage is None:
         return {
             "offline_writable": offline_writable,
@@ -1276,7 +1365,7 @@ def get_workspace_overview(
             "orphan_objects": {"keep_history": keep, "total_objects_count": 0, "total_objects_bytes": 0, "protected_count": 0, "protected_bytes": 0, "orphan_count": 0, "orphan_bytes": 0, "items": []},
         }
 
-    cache_key = (owner_id, str(account_id or "default"), keep)
+    cache_key = (owner_id, str(resolved_account_id or "default"), keep)
     now = time.time()
     if not refresh and drive is None:
         with _OVERVIEW_LOCK:
@@ -1292,7 +1381,7 @@ def get_workspace_overview(
             repo,
             owner_id,
             wdrive,
-            account_id=account_id,
+            account_id=resolved_account_id,
             account_alias=account_alias,
             keep_history=keep,
         )
@@ -1364,37 +1453,45 @@ def _commit_plugin_manifest(
             undo.append(partial(wdrive.restore_json, plugins_fid, name, previous[name]))
             wdrive.write_json_inplace(plugins_fid, name, payload)
     with _HISTORY_CACHE_LOCK:
-        _HISTORY_JSON_CACHE[new_gen] = manifest
+        _HISTORY_JSON_CACHE[(owner_id, str(wdrive.storage.account_id or "default"), new_gen)] = manifest
 
     # Mirror offline pending state to VPS settings so status/UI reflects immediately.
     try:
         key = _settings_key(owner_id)
-        with repo.store.dispatch_lock() as acquired:
-            if acquired:
-                saved = repo.store.get("settings", key, owner_id) or {}
-                history = list(saved.get("history") or [])
-                if not history:
-                    history = list(existing_history)
-                if not history or history[-1].get("generation") != new_gen:
-                    history = [*history, manifest][-MAX_HISTORY_ENTRIES:]
-                status = dict(saved.get("status") or {})
-                head_gen = (saved.get("manifest") or {}).get("generation")
-                status["pending_generation"] = new_gen
-                status["restart_required"] = bool(head_gen and head_gen != new_gen)
-                data = {
-                    **saved,
-                    "status": status,
-                    "history": history,
-                    "offline_pending": {
-                        "generation": new_gen,
-                        "updated_at": now,
-                        "manifest": manifest,
-                    },
-                }
-                if saved:
-                    repo.store.update("settings", key, data, owner_id)
-                else:
-                    repo.store.create("settings", owner_id, data, record_id=key)
+        mirror_deadline = time.monotonic() + 2.0
+        while True:
+            with repo.store.dispatch_lock() as acquired:
+                if acquired:
+                    saved = repo.store.get("settings", key, owner_id) or {}
+                    history = list(saved.get("history") or [])
+                    if not history:
+                        history = list(existing_history)
+                    if not history or history[-1].get("generation") != new_gen:
+                        history = [*history, manifest][-MAX_HISTORY_ENTRIES:]
+                    status = dict(saved.get("status") or {})
+                    head_gen = (saved.get("manifest") or {}).get("generation")
+                    status["pending_generation"] = new_gen
+                    status["restart_required"] = bool(head_gen and head_gen != new_gen)
+                    data = {
+                        **saved,
+                        "status": status,
+                        "history": history,
+                        "offline_pending": {
+                            "generation": new_gen,
+                            "updated_at": now,
+                            "manifest": manifest,
+                        },
+                    }
+                    if saved:
+                        repo.store.update("settings", key, data, owner_id)
+                    else:
+                        repo.store.create("settings", owner_id, data, record_id=key)
+                    break
+            remaining = mirror_deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning("Timed out waiting for dispatch_lock to mirror Drive plugin manifest")
+                break
+            time.sleep(min(0.02, remaining))
     except Exception:
         log.exception("Could not mirror committed Drive plugin manifest")
 
@@ -1491,6 +1588,12 @@ def _execute_plugin_mutation(
             record = disabled_by_path.get(path)
             if record is None:
                 continue
+            if path in active_by_path:
+                raise APIError(
+                    "PLUGIN_ALREADY_ACTIVE",
+                    f"插件 {path} 已在启用列表中，请先处理冲突后再恢复",
+                    409,
+                )
             entry = record["entry"]
             archive = str(entry.get("archive") or "")
             if archive not in objects_map:
@@ -1581,10 +1684,11 @@ def apply_plugin_action(
     action: str,
     paths: list[str],
     force_in_use: bool = False,
+    account_id: str | None = None,
     drive: DriveStorage | None = None,
 ) -> dict[str, Any]:
     with _offline_write_guard(repo, owner_id, reason=f"plugins:{action}"):
-        storage, owns_storage, _, _ = _open_drive(repo, owner_id, drive=drive)
+        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
@@ -1614,6 +1718,7 @@ def apply_workflow_action(
     items: list[dict[str, Any]],
     overwrite: bool = False,
     also_plugins: dict[str, Any] | None = None,
+    account_id: str | None = None,
     drive: DriveStorage | None = None,
 ) -> dict[str, Any]:
     if action not in {"archive", "restore", "trash"}:
@@ -1649,8 +1754,8 @@ def apply_workflow_action(
             raise APIError("WORKSPACE_INVALID_INPUT", "联动插件列表必须为数组", 422)
         plugin_paths = list(dict.fromkeys(_validate_plugin_path(path) for path in also_plugins["paths"]))
 
-    with _offline_write_guard(repo, owner_id, reason=f"workflows:{action}"):
-        storage, owns_storage, _, _ = _open_drive(repo, owner_id, drive=drive)
+    with _offline_write_guard(repo, owner_id, reason=f"workflows:{action}") as renew_lock:
+        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
@@ -1715,7 +1820,9 @@ def apply_workflow_action(
                 )
             try:
                 with _drive_changes() as undo:
-                    for file_meta, src_parent, dst_key, subdirs, existing in changes:
+                    for idx, (file_meta, src_parent, dst_key, subdirs, existing) in enumerate(changes):
+                        if idx > 0 and idx % 5 == 0:
+                            renew_lock()
                         file_id = file_meta["id"]
                         if dst_key is None:
                             undo.append(partial(wdrive.trash_file, file_id, trashed=False))
@@ -1762,13 +1869,14 @@ def rollback_plugins(
     owner_id: str,
     *,
     generation: str,
+    account_id: str | None = None,
     drive: DriveStorage | None = None,
 ) -> dict[str, Any]:
     if not isinstance(generation, str) or not _HEX64_RE.fullmatch(generation):
         raise APIError("WORKSPACE_INVALID_GENERATION", "目标快照 generation 必须为 64 位 SHA256", 422)
 
     with _offline_write_guard(repo, owner_id, reason="plugins:rollback"):
-        storage, owns_storage, _, _ = _open_drive(repo, owner_id, drive=drive)
+        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
@@ -1850,6 +1958,7 @@ def delete_env_caches(
     *,
     keys: list[str] | None = None,
     delete_all: bool = False,
+    account_id: str | None = None,
     drive: DriveStorage | None = None,
 ) -> dict[str, Any]:
     clean_keys = [k.strip() for k in (keys or []) if isinstance(k, str) and k.strip()]
@@ -1859,10 +1968,11 @@ def delete_env_caches(
         if "/" in k or "\\" in k or ".." in k:
             raise APIError("WORKSPACE_INVALID_INPUT", "缓存 Key 格式无效", 422)
 
-    with _offline_write_guard(repo, owner_id, reason="env_cache:delete"):
-        storage, owns_storage, _, _ = _open_drive(repo, owner_id, drive=drive)
+    with _offline_write_guard(repo, owner_id, reason="env_cache:delete") as renew_lock:
+        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
+        deleted_files = 0
         try:
             wdrive = _WorkspaceDrive(storage, owner_id)
             owner_fid = wdrive.find_owner_folder(create=False)
@@ -1874,7 +1984,6 @@ def delete_env_caches(
             files = wdrive.list_children(ec_fid)
             target_set = set(clean_keys)
             deleted_keys: set[str] = set()
-            deleted_files = 0
             freed_bytes = 0
             for item in files:
                 name = str(item.get("name") or "")
@@ -1887,14 +1996,14 @@ def delete_env_caches(
                     continue
                 if key is None and not delete_all:
                     continue
+                if deleted_files > 0 and deleted_files % 5 == 0:
+                    renew_lock()
                 wdrive.delete_file_permanent(str(item["id"]))
                 deleted_files += 1
                 freed_bytes += _int_or_zero(item.get("size"))
                 if key:
                     deleted_keys.add(key)
 
-            invalidate_workspace_cache(owner_id)
-            invalidate_drive_usage_cache(owner_id)
             return {
                 "deleted_keys": sorted(deleted_keys),
                 "deleted_files": deleted_files,
@@ -1905,6 +2014,9 @@ def delete_env_caches(
         except (DriveError, GoogleError) as exc:
             raise APIError("WORKSPACE_DRIVE_ERROR", f"清理构建缓存失败：{exc}", 502) from exc
         finally:
+            if deleted_files > 0:
+                invalidate_workspace_cache(owner_id)
+                invalidate_drive_usage_cache(owner_id)
             if owns_storage:
                 storage.close()
 
@@ -1915,12 +2027,13 @@ def cleanup_orphan_objects(
     *,
     keep_history: int = DEFAULT_KEEP_HISTORY,
     dry_run: bool = False,
+    account_id: str | None = None,
     drive: DriveStorage | None = None,
 ) -> dict[str, Any]:
     if type(keep_history) is not int or not 1 <= keep_history <= MAX_HISTORY_ENTRIES:
         raise APIError("WORKSPACE_INVALID_INPUT", f"keep_history 必须为 1 到 {MAX_HISTORY_ENTRIES} 之间的整数", 422)
 
-    def _run_scan_and_delete(storage: DriveStorage) -> dict[str, Any]:
+    def _run_scan_and_delete(storage: DriveStorage, renew_lock: Callable[[], Any] | None = None) -> dict[str, Any]:
         wdrive = _WorkspaceDrive(storage, owner_id)
         owner_fid = wdrive.find_owner_folder(create=False)
         if not owner_fid:
@@ -1948,15 +2061,20 @@ def cleanup_orphan_objects(
 
         deleted_count = 0
         freed_bytes = 0
-        for item in report["items"]:
-            wdrive.delete_file_permanent(item["id"])
-            for dup_id in item.get("duplicate_ids") or []:
-                wdrive.delete_file_permanent(dup_id)
-            deleted_count += 1
-            freed_bytes += item["size_bytes"]
+        try:
+            for item in report["items"]:
+                if renew_lock is not None and deleted_count > 0 and deleted_count % 5 == 0:
+                    renew_lock()
+                wdrive.delete_file_permanent(item["id"])
+                for dup_id in item.get("duplicate_ids") or []:
+                    wdrive.delete_file_permanent(dup_id)
+                deleted_count += 1
+                freed_bytes += item["size_bytes"]
+        finally:
+            if deleted_count > 0:
+                invalidate_workspace_cache(owner_id)
+                invalidate_drive_usage_cache(owner_id)
 
-        invalidate_workspace_cache(owner_id)
-        invalidate_drive_usage_cache(owner_id)
         return {
             "dry_run": False,
             "keep_history": report["keep_history"],
@@ -1967,7 +2085,7 @@ def cleanup_orphan_objects(
         }
 
     if dry_run:
-        storage, owns_storage, _, _ = _open_drive(repo, owner_id, drive=drive)
+        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
@@ -1978,12 +2096,12 @@ def cleanup_orphan_objects(
             if owns_storage:
                 storage.close()
 
-    with _offline_write_guard(repo, owner_id, reason="orphan_objects:cleanup"):
-        storage, owns_storage, _, _ = _open_drive(repo, owner_id, drive=drive)
+    with _offline_write_guard(repo, owner_id, reason="orphan_objects:cleanup") as renew_lock:
+        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
-            return _run_scan_and_delete(storage)
+            return _run_scan_and_delete(storage, renew_lock=renew_lock)
         except APIError:
             raise
         except (DriveError, GoogleError) as exc:
