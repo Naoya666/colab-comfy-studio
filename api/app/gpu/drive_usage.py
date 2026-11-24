@@ -169,12 +169,13 @@ def _bulk_list_app_entries(drive: DriveStorage) -> tuple[dict[str, list[dict[str
         params: dict[str, str] = {
             "q": "trashed = false",
             "pageSize": "1000",
-            "fields": "nextPageToken,files(id,name,mimeType,size,parents)",
+            "fields": "nextPageToken,incompleteSearch,files(id,name,mimeType,size,parents,modifiedTime)",
         }
         if page_token:
             params["pageToken"] = page_token
         response = drive._request("GET", drive.base_url + "/files", params=params)
         payload = drive._ensure_ok(response, "空间统计批量读取")
+        truncated = truncated or payload.get("incompleteSearch") is True
         pages += 1
         for item in payload.get("files") or []:
             if not isinstance(item, dict):

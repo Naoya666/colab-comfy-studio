@@ -681,14 +681,16 @@ def test_l2_creation_in_vm_retry_and_idle_process_probe(tmp_path, monkeypatch):
 
     # Part 1: Running creation smart job fails with gpu_worker_exited while VM present -> retries once in-VM
     job, inst, lease = _seed_running_instance(
-        repo, clock, pool=POOL_CREATION, instance_state="busy", lease_state="active", job_state="running",
+        repo, clock, pool=POOL_CREATION, instance_state="busy", lease_state="active", job_state="loading",
         retention_mode="smart",
         creation_runtime={"workflow_key": "txt2img", "workflow_version": 1, "process": "pid-99", "fingerprint": "fp-abc"},
-        job_extra={"execution_id": "exec-1"},
     )
+    job = repo.prepare_execution(job["id"], "owner-1", lease["id"], clock())
+    job = repo.transition_job(job["id"], "owner-1", "running", "started", {}, clock())
+    old_execution_id = job["execution_id"]
     provider = MockColab(inspect_map={lease["runtime_id"]: {"ready": True, "deleted": False, "state": "RUNNING"}})
     executor = MockExecutor(poll_plan=[
-        {"state": "failed", "execution_id": "exec-1", "error_code": "gpu_worker_exited", "message": "worker crashed"},
+        {"state": "failed", "execution_id": old_execution_id, "error_code": "gpu_worker_exited", "message": "worker crashed"},
     ])
     sched = Scheduler(repo, provider_factory=lambda j: provider, executor_factory=lambda j: executor, clock=clock)
     updated = sched._run(repo.get("jobs", job["id"], "owner-1"))
@@ -696,6 +698,14 @@ def test_l2_creation_in_vm_retry_and_idle_process_probe(tmp_path, monkeypatch):
     assert updated["auto_retry_count"] == 1
     assert len(updated["attempt_history"]) == 1
     assert repo.get("instances", inst["id"], "owner-1")["creation_runtime"]["process"] is None
+    old_execution = repo.get("executions", old_execution_id, "owner-1")
+    assert old_execution["state"] == "failed"
+    assert old_execution["finished_at"] == clock()
+    assert old_execution["error_code"] == "gpu_worker_exited"
+    restarted = sched._load(updated)
+    assert restarted["state"] == "running"
+    assert restarted["execution_id"] != old_execution_id
+    assert repo.get("executions", old_execution_id, "owner-1")["state"] == "failed"
 
     # Deterministic OOM must NEVER retry
     job_oom, _, lease_oom = _seed_running_instance(
@@ -1347,6 +1357,62 @@ def test_workspace_mutual_exclusion_api_and_manual_start_override(tmp_path, monk
     manual_job = native.admit(repo, "owner-1", {"account_id": ACC1, "spec": {"key": SPEC_L4}}, "manual-idem-1")
     assert manual_job["id"]
     assert recovery.get_plan(repo, "owner-1", gid2)["state"] == "cancelled"
+
+
+def test_disabling_auto_recovery_cancels_scheduled_plan_and_held_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPU_AUTO_RECOVERY_ENABLED", "0")
+    repo = _make_repo(tmp_path)
+    clock = FakeClock()
+    owner = "owner-1"
+    gid = "rec-disabled"
+    job = repo.create("jobs", owner, {
+        "state": "waiting_for_capacity", "recovery_hold": True, "retry_not_before_epoch": clock() + 120,
+    })
+    recovery.save_plan(repo, owner, {
+        "plan_id": gid, "recovery_group_id": gid, "owner_id": owner, "pool": POOL_CREATION,
+        "state": "scheduled", "active_job_id": job["id"], "next_retry_at": clock() + 120,
+    })
+
+    assert recovery.tick(repo, clock=clock) == 1
+    plan = recovery.get_plan(repo, owner, gid)
+    assert plan["state"] == "cancelled"
+    assert plan["next_retry_at"] is None
+    job = repo.get("jobs", job["id"], owner)
+    assert job["state"] == "cancelled"
+    assert job["recovery_hold"] is False
+    assert job["retry_not_before_epoch"] == 0
+    assert recovery.tick(repo, clock=clock) == 0
+
+
+@pytest.mark.parametrize("lease_lost", [False, True])
+def test_native_model_restore_converges_on_timeout_or_lost_lease(tmp_path, monkeypatch, lease_lost):
+    monkeypatch.setenv("GPU_AUTO_RECOVERY_ENABLED", "1")
+    monkeypatch.setenv("GPU_AUTO_RECOVERY_ROUND_TIMEOUT_SECONDS", "60")
+    monkeypatch.setattr(recovery, "_poll_native_model_restore", lambda *args: None)
+    repo = _make_repo(tmp_path)
+    clock = FakeClock()
+    owner = "owner-1"
+    gid = "rec-native-stalled"
+    lease = repo.create("leases", owner, {"state": "idle", "native_comfy": True})
+    recovery.save_plan(repo, owner, {
+        "plan_id": gid, "recovery_group_id": gid, "owner_id": owner, "pool": POOL_NATIVE,
+        "state": "restoring_env", "active_lease_id": lease["id"], "model_restore_started_at": clock(),
+        "native_snapshot": {"model_restore_job_id": "restore-1", "model_restore_state": {"state": "preparing"}},
+    })
+
+    clock.advance(30)
+    assert recovery.tick(repo, clock=clock) == 0
+    if lease_lost:
+        repo.update("leases", lease["id"], {"state": "deleted"}, owner)
+    else:
+        clock.advance(30)
+    assert recovery.tick(repo, clock=clock) == 1
+    plan = recovery.get_plan(repo, owner, gid)
+    assert plan["state"] == ("aborted_fatal" if lease_lost else "exhausted")
+    assert plan["last_error_code"] == ("model_restore_lease_lost" if lease_lost else "model_restore_timeout")
+    assert plan["native_snapshot"]["model_restore_state"]["state"] == "failed"
+    assert recovery.active_plan(repo, owner) is None
+    assert native.workspace_offline_status(repo, owner)[0] is lease_lost
 
 
 # ---------------------------------------------------------------------------

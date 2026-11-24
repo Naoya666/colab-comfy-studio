@@ -1598,7 +1598,10 @@ class Repository:
             session.flush()
             return self._row(job)
 
-    def transition_job(self, job_id, owner_id, state, message, patch, now, expected_state=None, expected_execution_id=...):
+    def transition_job(
+        self, job_id, owner_id, state, message, patch, now, expected_state=None, expected_execution_id=...,
+        *, retry_execution_error=None,
+    ):
         """Commit job, execution, batch aggregate and audit event together."""
         terminal={'completed','failed','cancelled'}
         progress=patch.get('progress')
@@ -1620,22 +1623,25 @@ class Repository:
             if state in terminal | {'cleaning_up', 'cleanup_pending'}:
                 from .ccu import execution_finished
                 patch = {**patch, **execution_finished(job.data, now)}
+            execution_id = job.data.get('execution_id') if retry_execution_error else patch.get(
+                'execution_id', job.data.get('execution_id')
+            )
+            execution_state = 'failed' if retry_execution_error else state
             job.state=state
             job.data={**job.data,**copy.deepcopy(patch),'state':state}
             job.version+=1
             job.updated_at=utcnow()
-            execution_id=job.data.get('execution_id')
-            if execution_id and state in terminal|{'running','uploading'}:
+            if execution_id and execution_state in terminal|{'running','uploading'}:
                 execution=session.get(GpuExecutionRow,execution_id)
                 if execution and execution.owner_id!=owner_id:
                     raise ValueError('execution owner mismatch')
                 if execution and execution.data.get('job_id') not in {None,job_id}:
                     raise ValueError('execution job identity mismatch')
-                if execution:
-                    changes={'state':state}
-                    if state in terminal:
-                        changes.update(finished_at=now,error_code=job.data.get('error_code'))
-                    execution.state=state
+                if execution and (not retry_execution_error or execution.state not in terminal):
+                    changes={'state':execution_state}
+                    if execution_state in terminal:
+                        changes.update(finished_at=now,error_code=retry_execution_error or job.data.get('error_code'))
+                    execution.state=execution_state
                     execution.data={**execution.data,**changes}
                     execution.version+=1
                     execution.updated_at=utcnow()

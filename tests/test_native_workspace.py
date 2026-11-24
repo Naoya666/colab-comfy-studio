@@ -141,9 +141,10 @@ class FakeDriveBackend:
                 if fid not in self.files:
                     return httpx.Response(404)
                 body = json.loads(request.content.decode("utf-8")) if request.content else {}
-                if body.get("trashed") is True:
-                    self.files[fid]["trashed"] = True
-                    self.trashed_calls.append(fid)
+                if "trashed" in body:
+                    self.files[fid]["trashed"] = body["trashed"]
+                    if body["trashed"]:
+                        self.trashed_calls.append(fid)
                 add_p = (qs.get("addParents") or [""])[0]
                 rem_p = (qs.get("removeParents") or [""])[0]
                 if add_p or rem_p:
@@ -537,6 +538,101 @@ def test_workspace_overview_linked_cleanup_disable_enable_rollback_and_cache(tmp
     # Rollback to head generation succeeds
     rb_ok = native_workspace.rollback_plugins(repo, "owner", generation=seeded["gen_head"], drive=drive)
     assert rb_ok["generation"] == seeded["gen_head"]
+
+
+@pytest.mark.parametrize("failure", ["disabled_unreadable", "pending_corrupt", "history_unreadable", "incomplete_listing"])
+def test_orphan_cleanup_requires_complete_verified_manifests(tmp_path, monkeypatch, failure):
+    repo = Repository(Store(f"sqlite:///{tmp_path}/studio.db"))
+    backend = FakeDriveBackend()
+    seeded = _seed_workspace(backend)
+    archive = seeded["sha_orphan"]
+    disabled_id = backend.put_json("disabled.json", seeded["plugins_dir"], {
+        "schema": 1, "plugins": [{"entry": {"path": "disabled-node", "archive": archive}}],
+    })
+    pending_id = backend.children_named(seeded["plugins_dir"], "pending.json")[0]["id"]
+    history_id = backend.children_named(seeded["history_dir"], f"{seeded['gen_head']}.json")[0]["id"]
+    original_request = backend.handler
+
+    def request(req):
+        if req.method == "GET" and req.url.params.get("alt") == "media":
+            if (failure == "disabled_unreadable" and req.url.path.endswith("/" + disabled_id)
+                    or failure == "history_unreadable" and req.url.path.endswith("/" + history_id)):
+                return httpx.Response(503)
+            if failure == "pending_corrupt" and req.url.path.endswith("/" + pending_id):
+                return httpx.Response(200, json={"schema": 1, "plugins": [], "generation": "bad-checksum"})
+        response = original_request(req)
+        if failure == "incomplete_listing" and req.url.path == "/drive/v3/files" and req.url.params.get("pageSize") == "1000":
+            return httpx.Response(200, json={**response.json(), "incompleteSearch": True})
+        return response
+
+    monkeypatch.setattr(backend, "handler", request)
+    drive = _make_fake_drive_storage(repo, "owner", backend)
+    monkeypatch.setattr(drive, "sleeper", lambda delay: None)
+    try:
+        with pytest.raises(APIError) as exc_info:
+            native_workspace.cleanup_orphan_objects(repo, "owner", keep_history=1, drive=drive)
+        assert exc_info.value.code == {
+            "disabled_unreadable": "WORKSPACE_MANIFEST_UNREADABLE",
+            "pending_corrupt": "WORKSPACE_MANIFEST_INVALID",
+            "history_unreadable": "WORKSPACE_MANIFEST_UNREADABLE",
+            "incomplete_listing": "WORKSPACE_DRIVE_INCOMPLETE",
+        }[failure]
+        assert backend.deleted_calls == []
+    finally:
+        drive.close()
+
+
+def test_linked_workflow_action_can_retry_after_conflict_and_drive_write_failure(tmp_path, monkeypatch):
+    repo = Repository(Store(f"sqlite:///{tmp_path}/studio.db"))
+    backend = FakeDriveBackend()
+    seeded = _seed_workspace(backend)
+    pending_id = backend.children_named(seeded["plugins_dir"], "pending.json")[0]["id"]
+    pending_base = backend.content[pending_id]
+    workflow = {"source": "comfy", "path": "工作流1.json"}
+    original_request = backend.handler
+    reject_pending_write = False
+
+    def request(req):
+        if reject_pending_write and req.method == "PATCH" and req.url.path == f"/upload/drive/v3/files/{pending_id}":
+            return httpx.Response(503)
+        return original_request(req)
+
+    monkeypatch.setattr(backend, "handler", request)
+    drive = _make_fake_drive_storage(repo, "owner", backend)
+    monkeypatch.setattr(drive, "sleeper", lambda delay: None)
+    try:
+        archived = backend.mkdir("workflows-archived", seeded["nc"])
+        original_archive = backend.put_json(workflow["path"], archived, {"older": True})
+        with pytest.raises(APIError) as conflict:
+            native_workspace.apply_workflow_action(
+                repo, "owner", action="archive", items=[workflow], overwrite=True,
+                also_plugins={"action": "disable", "paths": ["comfyui-kjnodes"]}, drive=drive,
+            )
+        assert conflict.value.code == "PLUGIN_IN_USE"
+        assert backend.trashed_calls == []
+        assert backend.children_named(seeded["wfs"], workflow["path"])
+
+        reject_pending_write = True
+        with pytest.raises(APIError) as failed_write:
+            native_workspace.apply_workflow_action(
+                repo, "owner", action="archive", items=[workflow], overwrite=True,
+                also_plugins={"action": "disable", "paths": ["LanPaint"]}, drive=drive,
+            )
+        assert failed_write.value.code == "WORKSPACE_DRIVE_ERROR"
+        assert backend.children_named(seeded["wfs"], workflow["path"])
+        assert backend.children_named(archived, workflow["path"])[0]["id"] == original_archive
+        assert backend.content[pending_id] == pending_base
+        assert backend.children_named(seeded["plugins_dir"], "disabled.json") == []
+
+        reject_pending_write = False
+        result = native_workspace.apply_workflow_action(
+            repo, "owner", action="archive", items=[workflow], overwrite=True,
+            also_plugins={"action": "disable", "paths": ["LanPaint"]}, drive=drive,
+        )
+        assert result["plugins_result"]["changed_paths"] == ["LanPaint"]
+        assert backend.children_named(seeded["wfs"], workflow["path"]) == []
+    finally:
+        drive.close()
 
 
 def test_offline_lock_blocks_writes_when_native_active_and_blocks_admit_while_writing(tmp_path: Path, monkeypatch):

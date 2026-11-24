@@ -1292,6 +1292,14 @@ def _cancel_held_job_in_tx(session, owner_id: str, job_id: str | None, *, state:
         _emit_event_in_tx(session, owner_id, job_row.project_id, None, job_row.id, state, message)
 
 
+def _cancel_scheduled_plan_in_tx(session, owner_id: str, plan: dict[str, Any], now: float, reason: str) -> None:
+    job_id = plan.get("active_job_id")
+    _cancel_held_job_in_tx(session, owner_id, job_id, state="cancelled", message=reason)
+    plan.update(state="cancelled", cancelled_at=now, updated_at=now, next_retry_at=None, last_error_message=reason)
+    save_plan_in_tx(session, owner_id, plan)
+    _emit_event_in_tx(session, owner_id, None, plan.get("source_instance_id"), job_id, "cancelled", reason)
+
+
 def cancel_plan(
     repo,
     owner_id: str,
@@ -1319,14 +1327,7 @@ def cancel_plan(
                 return public_plan(plan)
 
             if state == "scheduled":
-                _cancel_held_job_in_tx(session, owner_id, plan.get("active_job_id"), state="cancelled", message=reason)
-                plan["state"] = "cancelled"
-                plan["cancelled_at"] = now
-                plan["updated_at"] = now
-                plan["next_retry_at"] = None
-                plan["last_error_message"] = reason
-                save_plan_in_tx(session, owner_id, plan)
-                _emit_event_in_tx(session, owner_id, None, plan.get("source_instance_id"), plan.get("active_job_id"), "cancelled", reason)
+                _cancel_scheduled_plan_in_tx(session, owner_id, plan, now, reason)
                 return public_plan(plan)
 
             if state == "restoring_env":
@@ -1820,6 +1821,7 @@ def _advance_dispatching(repo, owner_id: str, plan: dict[str, Any], now: float, 
                 fresh["last_error_message"] = None
                 if is_native_local:
                     fresh["state"] = "restoring_env"
+                    fresh["model_restore_started_at"] = now
                     fresh_ns = dict(fresh.get("native_snapshot") or {})
                     fresh_ns["model_restore_job_id"] = restore_job_id
                     fresh_ns["model_restore_state"] = restore_state
@@ -1957,7 +1959,7 @@ def _advance_dispatching(repo, owner_id: str, plan: dict[str, Any], now: float, 
             return True
 
 
-def _advance_restoring_env(repo, owner_id: str, plan: dict[str, Any], now: float) -> bool:
+def _advance_restoring_env(repo, owner_id: str, plan: dict[str, Any], now: float, cfg: RecoveryConfig) -> bool:
     store = repo.store if hasattr(repo, "store") else repo
     succ_id = plan.get("successor_instance_id")
     inst = repo.get("instances", succ_id, owner_id) if succ_id else None
@@ -1977,8 +1979,36 @@ def _advance_restoring_env(repo, owner_id: str, plan: dict[str, Any], now: float
 
     lease_id = plan.get("active_lease_id") or (inst or {}).get("lease_id")
     lease = repo.get("leases", lease_id, owner_id) if lease_id else None
-    if not lease or lease.get("state") == "deleted":
-        return False
+    lease_lost = not lease or lease.get("state") == "deleted"
+    started_at = plan.get("model_restore_started_at")
+    if started_at is None:
+        started_at = plan.get("round_started_at") or plan.get("created_at") or now
+    timed_out = now >= float(started_at) + cfg.round_timeout_seconds
+    if lease_lost or timed_out:
+        code = "model_restore_lease_lost" if lease_lost else "model_restore_timeout"
+        message = "继任实例租约已结束，本地模型回拉中止" if lease_lost else "本地模型回拉超过恢复时限"
+        state = "aborted_fatal" if lease_lost else "exhausted"
+        with store.dispatch_lock() as acquired:
+            if not acquired:
+                return False
+            with store.db_lock(), store.Session.begin() as session:
+                store.begin_immediate(session)
+                fresh = get_plan_in_tx(session, owner_id, plan["plan_id"])
+                if not fresh or fresh.get("state") != "restoring_env" or any(
+                    fresh.get(key) != plan.get(key)
+                    for key in ("successor_instance_id", "active_lease_id", "model_restore_started_at")
+                ):
+                    return False
+                snapshot = dict(fresh.get("native_snapshot") or {})
+                snapshot["model_restore_state"] = {
+                    **(snapshot.get("model_restore_state") or {}), "state": "failed", "updated_at": now,
+                }
+                fresh.update(state=state, last_error_code=code, last_error_message=message,
+                             updated_at=now, native_snapshot=snapshot)
+                _append_history(fresh, state, now)
+                save_plan_in_tx(session, owner_id, fresh)
+                _emit_event_in_tx(session, owner_id, None, succ_id, fresh.get("active_job_id"), state, message)
+                return True
 
     ns = dict(plan.get("native_snapshot") or {})
     restore_job_id = ns.get("model_restore_job_id")
@@ -2061,6 +2091,17 @@ def _advance_scheduled(
     from . import native
 
     store = repo.store if hasattr(repo, "store") else repo
+    if not cfg.enabled:
+        with store.dispatch_lock() as acquired:
+            if not acquired:
+                return False
+            with store.db_lock(), store.Session.begin() as session:
+                store.begin_immediate(session)
+                fresh = get_plan_in_tx(session, owner_id, plan["plan_id"])
+                if not fresh or fresh.get("state") != "scheduled":
+                    return False
+                _cancel_scheduled_plan_in_tx(session, owner_id, fresh, now, "跨机自动恢复已关闭，已取消等待中的恢复计划")
+                return True
     next_retry_at = float(plan.get("next_retry_at") or 0.0)
     round_started = float(plan.get("round_started_at") or now)
 
@@ -2326,11 +2367,9 @@ def tick(
                 if _advance_dispatching(repo, owner_id, plan, now, cfg):
                     progressed += 1
             elif state == "restoring_env":
-                if _advance_restoring_env(repo, owner_id, plan, now):
+                if _advance_restoring_env(repo, owner_id, plan, now, cfg):
                     progressed += 1
             elif state == "scheduled":
-                if not cfg.enabled:
-                    continue
                 if _advance_scheduled(repo, owner_id, plan, now, cfg, process_started_at=process_started_at):
                     progressed += 1
         except Exception as exc:

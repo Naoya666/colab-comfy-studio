@@ -211,7 +211,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
     def _event(self, job: dict, state: str, message: str, progress: float | None = None) -> None:
         self.store.event(job["id"], job.get("owner_id"), state, message, progress)
 
-    def _set_state(self, job: dict, state: str, message: str, **patch) -> dict:
+    def _set_state(self, job: dict, state: str, message: str, *, retry_execution_error=None, **patch) -> dict:
         if state in TERMINAL_STATES:
             # Worker and watchdog can both finish the same cleanup; only the first one records it.
             current = self.store.get("jobs", job["id"], job.get("owner_id")) or job
@@ -222,6 +222,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         return self.store.transition_job(
             job["id"], job.get("owner_id"), state, message, patch, self.clock(),
             expected_state=job.get("state"), expected_execution_id=job.get("execution_id"),
+            retry_execution_error=retry_execution_error,
         )
 
     def _provider_name(self, job: dict) -> str:
@@ -1401,6 +1402,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         history.append({
             "attempt_id": job.get("attempt_id"),
             "attempt_number": job.get("attempt_number"),
+            "execution_id": job.get("execution_id"),
             "instance_id": job.get("instance_id"),
             "lease_id": lease.get("id"),
             "ended_at": now,
@@ -1422,6 +1424,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             job,
             "loading",
             f"检测到同机 ComfyUI 进程异常退出（{err_code}），正在原实例内自动重启并重试（第 {next_retries}/{cfg.max_job_retries} 次）",
+            retry_execution_error=err_code,
             execution_id=None,
             stage=None,
             stage_started=None,
