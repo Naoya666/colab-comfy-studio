@@ -80,8 +80,55 @@ def invalidate_workspace_cache(owner_id: str | None = None) -> None:
                 _HISTORY_JSON_CACHE.pop(key, None)
 
 
-def _settings_key(owner_id: str) -> str:
-    return "native-plugins-" + digest(owner_id)[:32]
+def _settings_key(owner_id: str, drive_account_id: str | None = None) -> str:
+    return native.plugin_settings_key(owner_id, drive_account_id)
+
+
+def _load_plugin_settings(repo, owner_id: str, drive_account_id: str | None = None) -> dict[str, Any]:
+    saved = repo.store.get("settings", _settings_key(owner_id, drive_account_id), owner_id) or {}
+    if not isinstance(saved, dict):
+        return {}
+    if drive_account_id is not None:
+        recorded_acc = saved.get("drive_account_id")
+        if recorded_acc not in {None, "", drive_account_id}:
+            return {}
+    return saved
+
+
+def _disabled_entries_digest(entries: list[dict[str, Any]]) -> str:
+    canonical = sorted(entries, key=lambda row: str((row.get("entry") or {}).get("path") or ""))
+    return digest(canonical)
+
+
+def _update_plugin_settings(
+    repo,
+    owner_id: str,
+    drive_account_id: str | None,
+    mutate: Callable[[dict[str, Any]], dict[str, Any]],
+    *,
+    timeout: float = 2.0,
+    fail_on_timeout: bool = False,
+) -> bool:
+    key = _settings_key(owner_id, drive_account_id)
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        with repo.store.dispatch_lock() as acquired:
+            if acquired:
+                saved = repo.store.get("settings", key, owner_id) or {}
+                data = mutate(dict(saved))
+                if drive_account_id is not None:
+                    data["drive_account_id"] = drive_account_id
+                if saved:
+                    repo.store.update("settings", key, data, owner_id)
+                else:
+                    repo.store.create("settings", owner_id, data, record_id=key)
+                return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if fail_on_timeout:
+                raise APIError("SCHEDULER_BUSY", "调度锁短暂繁忙，无法记录插件提交状态，请稍后重试", 503, True)
+            return False
+        time.sleep(min(0.02, remaining))
 
 
 def _int_or_zero(value: Any) -> int:
@@ -716,7 +763,7 @@ class _WorkspaceWriteLease:
                 status, new_exp = "busy", None
             if status == "renewed" and new_exp is not None:
                 with self._state_lock:
-                    self._expires_at = new_exp
+                    self._expires_at = max(self._expires_at, new_exp)
                 wait_for = self._interval
             elif status == "lost":
                 self._lost.set()
@@ -743,7 +790,7 @@ class _WorkspaceWriteLease:
         )
         if status == "renewed" and new_exp is not None:
             with self._state_lock:
-                self._expires_at = new_exp
+                self._expires_at = max(self._expires_at, new_exp)
             return
         if status == "lost":
             self._lost.set()
@@ -851,6 +898,7 @@ def _read_plugins_bundle(
     *,
     strict: bool = False,
     strict_core: bool = False,
+    allow_saved_fallback: bool = True,
 ) -> dict[str, Any]:
     require_core = strict or strict_core
     head_manifest: dict[str, Any] | None = None
@@ -971,10 +1019,11 @@ def _read_plugins_bundle(
                     if loaded is not None:
                         history_entries.append(loaded)
 
-    if head_manifest is None and isinstance(saved_settings.get("manifest"), dict):
-        head_manifest = saved_settings["manifest"]
-    if not history_entries and isinstance(saved_settings.get("history"), list):
-        history_entries = [h for h in saved_settings["history"] if isinstance(h, dict) and isinstance(h.get("plugins"), list)]
+    if allow_saved_fallback:
+        if head_manifest is None and isinstance(saved_settings.get("manifest"), dict):
+            head_manifest = saved_settings["manifest"]
+        if not history_entries and isinstance(saved_settings.get("history"), list):
+            history_entries = [h for h in saved_settings["history"] if isinstance(h, dict) and isinstance(h.get("plugins"), list)]
 
     # Deduplicate history by generation and sort newest first
     dedup_hist: dict[str, dict[str, Any]] = {}
@@ -1267,7 +1316,7 @@ def _build_overview_payload(
     activated_workflow_ids: frozenset[str] = frozenset(),
     strict_drive_errors: bool = False,
 ) -> dict[str, Any]:
-    saved = repo.store.get("settings", _settings_key(owner_id), owner_id) or {}
+    saved = _load_plugin_settings(repo, owner_id, account_id)
     telemetry = saved.get("telemetry") if isinstance(saved.get("telemetry"), dict) else None
     telemetry_node_map = telemetry.get("node_map") if isinstance((telemetry or {}).get("node_map"), dict) else {}
     import_times = telemetry.get("import_times") if isinstance((telemetry or {}).get("import_times"), dict) else {}
@@ -1299,6 +1348,7 @@ def _build_overview_payload(
         plugins_fid,
         saved,
         strict_core=strict_drive_errors,
+        allow_saved_fallback=not strict_drive_errors,
     )
     effective_plugins = [p for p in (bundle["effective"].get("plugins") or []) if isinstance(p, dict) and p.get("path")]
     disabled_list = bundle["disabled"]
@@ -1534,16 +1584,280 @@ def get_workspace_overview(
             storage.close()
 
 
+def _mirror_committed_manifest(
+    repo,
+    owner_id: str,
+    drive_account_id: str | None,
+    manifest: dict[str, Any],
+    *,
+    existing_history: list[dict[str, Any]],
+    now: float,
+    clear_pending_commit_id: str | None = None,
+) -> None:
+    new_gen = manifest["generation"]
+    try:
+        def _apply(saved: dict[str, Any]) -> dict[str, Any]:
+            history = list(saved.get("history") or [])
+            if not history:
+                history = list(existing_history)
+            if not history or history[-1].get("generation") != new_gen:
+                history = [*history, manifest][-MAX_HISTORY_ENTRIES:]
+            status = dict(saved.get("status") or {})
+            head_gen = (saved.get("manifest") or {}).get("generation")
+            status["pending_generation"] = new_gen
+            status["restart_required"] = bool(head_gen and head_gen != new_gen)
+            data = {
+                **saved,
+                "status": status,
+                "history": history,
+                "offline_pending": {
+                    "generation": new_gen,
+                    "updated_at": now,
+                    "manifest": manifest,
+                },
+            }
+            if clear_pending_commit_id is not None:
+                cur_pc = saved.get("pending_commit")
+                if isinstance(cur_pc, dict) and cur_pc.get("id") == clear_pending_commit_id:
+                    data["pending_commit"] = None
+            return data
+
+        mirrored = _update_plugin_settings(repo, owner_id, drive_account_id, _apply, timeout=2.0)
+        if not mirrored:
+            log.warning("Timed out waiting for dispatch_lock to mirror Drive plugin manifest")
+    except Exception:
+        log.exception("Could not mirror committed Drive plugin manifest")
+
+
+def _clear_pending_commit(
+    repo,
+    owner_id: str,
+    drive_account_id: str | None,
+    commit_id: str,
+) -> None:
+    try:
+        def _clear(saved: dict[str, Any]) -> dict[str, Any]:
+            cur = saved.get("pending_commit")
+            if isinstance(cur, dict) and cur.get("id") == commit_id:
+                return {**saved, "pending_commit": None}
+            return saved
+
+        _update_plugin_settings(repo, owner_id, drive_account_id, _clear, timeout=2.0)
+    except Exception:
+        log.exception("Could not clear pending plugin commit journal")
+
+
+def _reconcile_pending_plugin_commit(
+    repo,
+    owner_id: str,
+    drive_account_id: str | None,
+    wdrive: _WorkspaceDrive,
+    plugins_fid: str,
+) -> bool:
+    """Reconcile any half-applied two-file plugin manifest commit under the active write lock."""
+    saved = _load_plugin_settings(repo, owner_id, drive_account_id)
+    journal = saved.get("pending_commit")
+    if not isinstance(journal, dict) or not isinstance(journal.get("id"), str) or not journal["id"]:
+        return False
+    commit_id = journal["id"]
+    target_pending = journal.get("target_pending")
+    target_disabled = journal.get("target_disabled")
+    if (
+        not isinstance(target_pending, dict)
+        or not isinstance(target_pending.get("generation"), str)
+        or not isinstance(target_pending.get("plugins"), list)
+        or not isinstance(target_disabled, dict)
+        or not isinstance(target_disabled.get("plugins"), list)
+    ):
+        _clear_pending_commit(repo, owner_id, drive_account_id, commit_id)
+        return False
+
+    def _read_optional_json(name: str) -> Any:
+        matches = wdrive.find_files_by_name(plugins_fid, name)
+        if not matches:
+            return None
+        try:
+            return wdrive.download_json(matches[0]["id"], max_bytes=4 * 1024 * 1024)
+        except Exception as exc:
+            raise APIError("WORKSPACE_MANIFEST_UNREADABLE", f"无法读取 Drive 插件清单：{name}", 502) from exc
+
+    cur_head = _read_optional_json("head.json")
+    cur_pending = _read_optional_json("pending.json")
+    cur_disabled = _read_optional_json("disabled.json")
+
+    if cur_head is not None:
+        _validate_manifest_doc(cur_head, label="head.json")
+    if cur_pending is not None:
+        _validate_manifest_doc(cur_pending, label="pending.json")
+    cur_disabled_entries = _parse_disabled_doc(cur_disabled)
+    if cur_disabled is not None and (
+        not isinstance(cur_disabled, dict)
+        or cur_disabled.get("schema") != 1
+        or not isinstance(cur_disabled.get("plugins"), list)
+        or len(cur_disabled_entries) != len(cur_disabled["plugins"])
+    ):
+        raise APIError("WORKSPACE_MANIFEST_INVALID", "Drive 插件清单（disabled.json）格式无效", 502)
+
+    cur_head_gen = cur_head["generation"] if isinstance(cur_head, dict) else None
+    cur_pending_gen = cur_pending["generation"] if isinstance(cur_pending, dict) else None
+    cur_disabled_present = cur_disabled is not None
+    cur_disabled_digest = _disabled_entries_digest(cur_disabled_entries)
+
+    base_head_gen = journal.get("base_head_generation")
+    base_pending_gen = journal.get("base_pending_generation")
+    base_disabled_present = bool(journal.get("base_disabled_present"))
+    base_disabled_doc = journal.get("base_disabled_doc")
+    base_disabled_entries = _parse_disabled_doc(base_disabled_doc)
+    base_disabled_digest = journal.get("base_disabled_digest") or _disabled_entries_digest(base_disabled_entries)
+
+    target_gen = target_pending["generation"]
+    target_disabled_entries = _parse_disabled_doc(target_disabled)
+    target_disabled_digest = journal.get("target_disabled_digest") or _disabled_entries_digest(target_disabled_entries)
+    action = str(journal.get("action") or "")
+    now = time.time()
+
+    def _ensure_history_written() -> None:
+        history_fid = wdrive.find_child_folder(plugins_fid, "history", create=True)
+        assert history_fid is not None
+        history_name = f"{target_gen}.json"
+        if not wdrive.find_files_by_name(history_fid, history_name):
+            wdrive.write_json_inplace(history_fid, history_name, target_pending)
+        with _HISTORY_CACHE_LOCK:
+            _HISTORY_JSON_CACHE[(owner_id, str(drive_account_id or wdrive.storage.account_id or "default"), target_gen)] = target_pending
+
+    # State A: Both target files already landed on Drive.
+    if cur_pending_gen == target_gen and cur_disabled_present and cur_disabled_digest == target_disabled_digest:
+        _ensure_history_written()
+        _mirror_committed_manifest(
+            repo, owner_id, drive_account_id, target_pending,
+            existing_history=[], now=now, clear_pending_commit_id=commit_id,
+        )
+        return False
+
+    # State B: Neither file changed from base -> earlier failure left Drive untouched.
+    if (
+        cur_head_gen == base_head_gen
+        and cur_pending_gen == base_pending_gen
+        and cur_disabled_present == base_disabled_present
+        and cur_disabled_digest == base_disabled_digest
+    ):
+        _clear_pending_commit(repo, owner_id, drive_account_id, commit_id)
+        return False
+
+    # State C: pending.json already committed, disabled.json still at base -> roll forward disabled.json.
+    if (
+        cur_head_gen == base_head_gen
+        and cur_pending_gen == target_gen
+        and cur_disabled_present == base_disabled_present
+        and cur_disabled_digest == base_disabled_digest
+    ):
+        _ensure_history_written()
+        wdrive.write_json_inplace(plugins_fid, "disabled.json", target_disabled)
+        _mirror_committed_manifest(
+            repo, owner_id, drive_account_id, target_pending,
+            existing_history=[], now=now, clear_pending_commit_id=commit_id,
+        )
+        invalidate_workspace_cache(owner_id)
+        invalidate_drive_usage_cache(owner_id)
+        return True
+
+    # State D: disabled.json landed while pending.json is still at base.
+    if (
+        cur_head_gen == base_head_gen
+        and cur_pending_gen == base_pending_gen
+        and cur_disabled_present
+        and cur_disabled_digest == target_disabled_digest
+    ):
+        if action == "disable":
+            # Pre-staged disable without committed pending.json: undo pre-stage cleanly.
+            wdrive.restore_json(plugins_fid, "disabled.json", base_disabled_doc)
+            _clear_pending_commit(repo, owner_id, drive_account_id, commit_id)
+            invalidate_workspace_cache(owner_id)
+            invalidate_drive_usage_cache(owner_id)
+            return True
+        # Defensive roll-forward for enable / rollback / remove if disabled.json changed before pending.json.
+        objects_fid = wdrive.find_child_folder(plugins_fid, "objects", create=False)
+        existing_archives: set[str] = set()
+        if objects_fid:
+            for item in wdrive.list_children(objects_fid):
+                name = str(item.get("name") or "")
+                if name.endswith(".tar.gz"):
+                    sha = name[: -len(".tar.gz")]
+                    if _HEX64_RE.fullmatch(sha):
+                        existing_archives.add(sha)
+        missing = [
+            str(p.get("path") or p.get("archive"))
+            for p in target_pending["plugins"]
+            if isinstance(p, dict) and str(p.get("archive") or "") not in existing_archives
+        ]
+        if missing:
+            raise APIError(
+                "PLUGIN_ARCHIVE_MISSING",
+                f"恢复未完成插件提交时缺少归档对象：{'、'.join(missing[:5])}",
+                409,
+            )
+        _ensure_history_written()
+        wdrive.write_json_inplace(plugins_fid, "pending.json", target_pending)
+        _mirror_committed_manifest(
+            repo, owner_id, drive_account_id, target_pending,
+            existing_history=[], now=now, clear_pending_commit_id=commit_id,
+        )
+        invalidate_workspace_cache(owner_id)
+        invalidate_drive_usage_cache(owner_id)
+        return True
+
+    # State E: head.json advanced (e.g., native ComfyUI booted between lock loss and now).
+    effective_doc = cur_pending or cur_head
+    active_paths = {
+        str(p["path"])
+        for p in ((effective_doc or {}).get("plugins") or [])
+        if isinstance(p, dict) and isinstance(p.get("path"), str)
+    }
+    if action in {"enable", "rollback"} and cur_disabled_present == base_disabled_present and cur_disabled_digest == base_disabled_digest:
+        removed_paths = {d["entry"]["path"] for d in base_disabled_entries} - {d["entry"]["path"] for d in target_disabled_entries}
+        if removed_paths and removed_paths.issubset(active_paths):
+            cleaned_disabled = [d for d in cur_disabled_entries if d["entry"]["path"] not in removed_paths]
+            wdrive.write_json_inplace(
+                plugins_fid,
+                "disabled.json",
+                {
+                    "schema": 1,
+                    "updated_at": now,
+                    "plugins": sorted(cleaned_disabled, key=lambda row: row["entry"]["path"]),
+                },
+            )
+            _clear_pending_commit(repo, owner_id, drive_account_id, commit_id)
+            invalidate_workspace_cache(owner_id)
+            invalidate_drive_usage_cache(owner_id)
+            return True
+    if action == "disable" and cur_disabled_present and cur_disabled_digest == target_disabled_digest:
+        added_paths = {d["entry"]["path"] for d in target_disabled_entries} - {d["entry"]["path"] for d in base_disabled_entries}
+        if added_paths and added_paths.issubset(active_paths):
+            wdrive.restore_json(plugins_fid, "disabled.json", base_disabled_doc)
+            _clear_pending_commit(repo, owner_id, drive_account_id, commit_id)
+            invalidate_workspace_cache(owner_id)
+            invalidate_drive_usage_cache(owner_id)
+            return True
+
+    # Drive diverged independently; discard obsolete pending commit journal.
+    _clear_pending_commit(repo, owner_id, drive_account_id, commit_id)
+    return False
+
+
 def _commit_plugin_manifest(
     repo,
     owner_id: str,
     wdrive: _WorkspaceDrive,
     plugins_fid: str,
     *,
+    action: str,
+    drive_account_id: str | None,
     new_plugins: list[dict[str, Any]],
     new_disabled: list[dict[str, Any]],
     disabled_changed: bool,
     base_snapshot: Any,
+    base_head_generation: str | None,
+    base_pending_generation: str | None,
     existing_history: list[dict[str, Any]],
 ) -> dict[str, Any]:
     normalized_plugins = sorted(
@@ -1560,14 +1874,25 @@ def _commit_plugin_manifest(
         "generation": new_gen,
     }
 
-    writes: dict[str, dict[str, Any]] = {}
+    disabled_doc: dict[str, Any] | None = None
     if disabled_changed:
-        writes["disabled.json"] = {
+        disabled_doc = {
             "schema": 1,
             "updated_at": now,
             "plugins": sorted(new_disabled, key=lambda row: row["entry"]["path"]),
         }
-    writes["pending.json"] = manifest
+
+    # Always write the additive side before the subtractive side so mid-commit lock loss
+    # can never remove a plugin from both pending.json and disabled.json simultaneously.
+    writes: dict[str, dict[str, Any]] = {}
+    if action == "disable":
+        if disabled_doc is not None:
+            writes["disabled.json"] = disabled_doc
+        writes["pending.json"] = manifest
+    else:
+        writes["pending.json"] = manifest
+        if disabled_doc is not None:
+            writes["disabled.json"] = disabled_doc
 
     previous = {}
     for name in writes:
@@ -1580,58 +1905,65 @@ def _commit_plugin_manifest(
         else:
             previous[name] = None
 
+    pending_commit_id: str | None = None
+    if disabled_doc is not None:
+        pending_commit_id = uuid.uuid4().hex
+        prev_disabled_entries = _parse_disabled_doc(previous.get("disabled.json"))
+        journal_record = {
+            "id": pending_commit_id,
+            "action": action,
+            "created_at": now,
+            "base_head_generation": base_head_generation,
+            "base_pending_generation": base_pending_generation,
+            "base_disabled_present": previous.get("disabled.json") is not None,
+            "base_disabled_digest": _disabled_entries_digest(prev_disabled_entries),
+            "base_disabled_doc": previous.get("disabled.json"),
+            "target_pending": manifest,
+            "target_disabled": disabled_doc,
+            "target_disabled_digest": _disabled_entries_digest(_parse_disabled_doc(disabled_doc)),
+        }
+        _update_plugin_settings(
+            repo,
+            owner_id,
+            drive_account_id,
+            lambda saved: {**saved, "pending_commit": journal_record},
+            timeout=2.0,
+            fail_on_timeout=True,
+        )
+
     history_fid = wdrive.find_child_folder(plugins_fid, "history", create=True)
     assert history_fid is not None
     history_name = f"{new_gen}.json"
-    with _drive_changes() as undo:
-        if not wdrive.find_files_by_name(history_fid, history_name):
-            undo.append(partial(wdrive.restore_json, history_fid, history_name, None))
-            wdrive.write_json_inplace(history_fid, history_name, manifest)
-        for name, payload in writes.items():
-            undo.append(partial(wdrive.restore_json, plugins_fid, name, previous[name]))
-            wdrive.write_json_inplace(plugins_fid, name, payload)
-    with _HISTORY_CACHE_LOCK:
-        _HISTORY_JSON_CACHE[(owner_id, str(wdrive.storage.account_id or "default"), new_gen)] = manifest
-
-    # Mirror offline pending state to VPS settings so status/UI reflects immediately.
     try:
-        key = _settings_key(owner_id)
-        mirror_deadline = time.monotonic() + 2.0
-        while True:
-            with repo.store.dispatch_lock() as acquired:
-                if acquired:
-                    saved = repo.store.get("settings", key, owner_id) or {}
-                    history = list(saved.get("history") or [])
-                    if not history:
-                        history = list(existing_history)
-                    if not history or history[-1].get("generation") != new_gen:
-                        history = [*history, manifest][-MAX_HISTORY_ENTRIES:]
-                    status = dict(saved.get("status") or {})
-                    head_gen = (saved.get("manifest") or {}).get("generation")
-                    status["pending_generation"] = new_gen
-                    status["restart_required"] = bool(head_gen and head_gen != new_gen)
-                    data = {
-                        **saved,
-                        "status": status,
-                        "history": history,
-                        "offline_pending": {
-                            "generation": new_gen,
-                            "updated_at": now,
-                            "manifest": manifest,
-                        },
-                    }
-                    if saved:
-                        repo.store.update("settings", key, data, owner_id)
-                    else:
-                        repo.store.create("settings", owner_id, data, record_id=key)
-                    break
-            remaining = mirror_deadline - time.monotonic()
-            if remaining <= 0:
-                log.warning("Timed out waiting for dispatch_lock to mirror Drive plugin manifest")
-                break
-            time.sleep(min(0.02, remaining))
-    except Exception:
-        log.exception("Could not mirror committed Drive plugin manifest")
+        with _drive_changes() as undo:
+            if not wdrive.find_files_by_name(history_fid, history_name):
+                undo.append(partial(wdrive.restore_json, history_fid, history_name, None))
+                wdrive.write_json_inplace(history_fid, history_name, manifest)
+            for name, payload in writes.items():
+                undo.append(partial(wdrive.restore_json, plugins_fid, name, previous[name]))
+                wdrive.write_json_inplace(plugins_fid, name, payload)
+    except Exception as exc:
+        # Preserve pending_commit when rollback was skipped (lock lost) or incomplete so the
+        # next locked operation can reconcile Drive; clear it if rollback restored Drive cleanly.
+        if pending_commit_id is not None and not (
+            isinstance(exc, APIError) and exc.code in {"NATIVE_WORKSPACE_LOCK_LOST", "WORKSPACE_ROLLBACK_FAILED"}
+        ):
+            _clear_pending_commit(repo, owner_id, drive_account_id, pending_commit_id)
+        raise
+
+    with _HISTORY_CACHE_LOCK:
+        _HISTORY_JSON_CACHE[(owner_id, str(drive_account_id or wdrive.storage.account_id or "default"), new_gen)] = manifest
+
+    # Mirror offline pending state to account-scoped VPS settings and clear pending_commit.
+    _mirror_committed_manifest(
+        repo,
+        owner_id,
+        drive_account_id,
+        manifest,
+        existing_history=existing_history,
+        now=now,
+        clear_pending_commit_id=pending_commit_id,
+    )
 
     invalidate_workspace_cache(owner_id)
     invalidate_drive_usage_cache(owner_id)
@@ -1644,13 +1976,15 @@ def _check_plugins_in_use(
     wdrive: _WorkspaceDrive,
     paths: list[str],
     *,
+    drive_account_id: str | None = None,
     deactivated_workflow_ids: frozenset[str] = frozenset(),
     activated_workflow_ids: frozenset[str] = frozenset(),
 ) -> None:
+    resolved_account = drive_account_id if drive_account_id is not None else wdrive.storage.account_id
     overview = _build_overview_payload(
         repo, owner_id, wdrive,
-        account_id=wdrive.storage.account_id,
-        account_alias=wdrive.storage.account_id,
+        account_id=resolved_account,
+        account_alias=resolved_account,
         deactivated_workflow_ids=deactivated_workflow_ids,
         activated_workflow_ids=activated_workflow_ids,
         strict_drive_errors=True,
@@ -1670,6 +2004,7 @@ def _execute_plugin_mutation(
     action: str,
     paths: list[str],
     force_in_use: bool = False,
+    drive_account_id: str | None = None,
 ) -> dict[str, Any]:
     if action not in {"disable", "enable", "remove", "purge_disabled"}:
         raise APIError("WORKSPACE_INVALID_ACTION", "不支持的插件操作类型", 422)
@@ -1677,6 +2012,7 @@ def _execute_plugin_mutation(
     if not clean_paths:
         raise APIError("WORKSPACE_INVALID_PLUGIN", "请至少选择一个插件", 422)
 
+    resolved_account = drive_account_id if drive_account_id is not None else wdrive.storage.account_id
     owner_fid = wdrive.find_owner_folder(create=False)
     if not owner_fid:
         raise APIError("WORKSPACE_NOT_FOUND", "Drive 中尚无原生 ComfyUI 插件记录", 404)
@@ -1685,11 +2021,20 @@ def _execute_plugin_mutation(
     if not plugins_fid:
         raise APIError("WORKSPACE_NOT_FOUND", "Drive 中尚无原生 ComfyUI 插件清单", 404)
 
-    saved = repo.store.get("settings", _settings_key(owner_id), owner_id) or {}
+    _reconcile_pending_plugin_commit(repo, owner_id, resolved_account, wdrive, plugins_fid)
+
+    saved = _load_plugin_settings(repo, owner_id, resolved_account)
     children_map, truncated = _bulk_list_app_entries(wdrive.storage)
     if truncated:
         raise APIError("WORKSPACE_DRIVE_INCOMPLETE", "Drive 文件列表不完整，无法安全修改插件清单", 502)
-    bundle = _read_plugins_bundle(wdrive, children_map, plugins_fid, saved, strict_core=True)
+    bundle = _read_plugins_bundle(
+        wdrive,
+        children_map,
+        plugins_fid,
+        saved,
+        strict_core=True,
+        allow_saved_fallback=False,
+    )
 
     base_manifest = bundle["pending"] or bundle["head"]
     if base_manifest is None:
@@ -1701,7 +2046,7 @@ def _execute_plugin_mutation(
     objects_map = bundle["objects"]
 
     if action in {"disable", "remove"} and not force_in_use:
-        _check_plugins_in_use(repo, owner_id, wdrive, clean_paths)
+        _check_plugins_in_use(repo, owner_id, wdrive, clean_paths, drive_account_id=resolved_account)
 
     now = time.time()
     changed_paths: list[str] = []
@@ -1799,10 +2144,14 @@ def _execute_plugin_mutation(
         owner_id,
         wdrive,
         plugins_fid,
+        action=action,
+        drive_account_id=resolved_account,
         new_plugins=list(active_by_path.values()),
         new_disabled=list(disabled_by_path.values()),
         disabled_changed=disabled_changed,
         base_snapshot=base_manifest.get("snapshot"),
+        base_head_generation=(bundle["head"] or {}).get("generation"),
+        base_pending_generation=(bundle["pending"] or {}).get("generation"),
         existing_history=bundle["history"],
     )
     return {
@@ -1826,7 +2175,7 @@ def apply_plugin_action(
     drive: DriveStorage | None = None,
 ) -> dict[str, Any]:
     with _offline_write_guard(repo, owner_id, reason=f"plugins:{action}") as write_lease:
-        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
+        storage, owns_storage, resolved_account_id, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
@@ -1838,6 +2187,7 @@ def apply_plugin_action(
                 action=action,
                 paths=paths,
                 force_in_use=force_in_use,
+                drive_account_id=resolved_account_id,
             )
         except APIError:
             raise
@@ -1893,7 +2243,7 @@ def apply_workflow_action(
         plugin_paths = list(dict.fromkeys(_validate_plugin_path(path) for path in also_plugins["paths"]))
 
     with _offline_write_guard(repo, owner_id, reason=f"workflows:{action}") as write_lease:
-        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
+        storage, owns_storage, resolved_account_id, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
@@ -1950,9 +2300,14 @@ def apply_workflow_action(
                     processed.append({"source": source, "path": relpath, "action": action, "target_source": dst_key})
 
             plugin_result = None
+            if plugin_paths:
+                wf_plugins_fid = wdrive.find_child_folder(nc_fid, "plugins", create=False)
+                if wf_plugins_fid:
+                    _reconcile_pending_plugin_commit(repo, owner_id, resolved_account_id, wdrive, wf_plugins_fid)
             if plugin_paths and not also_plugins.get("force_in_use"):
                 _check_plugins_in_use(
                     repo, owner_id, wdrive, plugin_paths,
+                    drive_account_id=resolved_account_id,
                     deactivated_workflow_ids=frozenset(deactivated_ids),
                     activated_workflow_ids=frozenset(activated_ids),
                 )
@@ -1981,6 +2336,7 @@ def apply_workflow_action(
                         plugin_result = _execute_plugin_mutation(
                             repo, owner_id, wdrive,
                             action=also_plugins["action"], paths=plugin_paths, force_in_use=True,
+                            drive_account_id=resolved_account_id,
                         )
             finally:
                 invalidate_workspace_cache(owner_id)
@@ -2012,7 +2368,7 @@ def rollback_plugins(
         raise APIError("WORKSPACE_INVALID_GENERATION", "目标快照 generation 必须为 64 位 SHA256", 422)
 
     with _offline_write_guard(repo, owner_id, reason="plugins:rollback") as write_lease:
-        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
+        storage, owns_storage, resolved_account_id, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
@@ -2022,6 +2378,8 @@ def rollback_plugins(
             plugins_fid = wdrive.find_child_folder(nc_fid, "plugins", create=False) if nc_fid else None
             if not plugins_fid:
                 raise APIError("WORKSPACE_NOT_FOUND", "Drive 中尚无插件历史记录", 404)
+
+            _reconcile_pending_plugin_commit(repo, owner_id, resolved_account_id, wdrive, plugins_fid)
 
             history_fid = wdrive.find_child_folder(plugins_fid, "history", create=False)
             if not history_fid:
@@ -2041,11 +2399,18 @@ def rollback_plugins(
             if target_manifest["generation"] != generation:
                 raise APIError("WORKSPACE_MANIFEST_INVALID", "历史快照 generation 与文件内容不匹配", 502)
 
-            saved = repo.store.get("settings", _settings_key(owner_id), owner_id) or {}
+            saved = _load_plugin_settings(repo, owner_id, resolved_account_id)
             children_map, truncated = _bulk_list_app_entries(wdrive.storage)
             if truncated:
                 raise APIError("WORKSPACE_DRIVE_INCOMPLETE", "Drive 文件列表不完整，无法安全回滚插件快照", 502)
-            bundle = _read_plugins_bundle(wdrive, children_map, plugins_fid, saved, strict_core=True)
+            bundle = _read_plugins_bundle(
+                wdrive,
+                children_map,
+                plugins_fid,
+                saved,
+                strict_core=True,
+                allow_saved_fallback=False,
+            )
             objects_map = bundle["objects"]
 
             missing = [
@@ -2069,10 +2434,14 @@ def rollback_plugins(
                 owner_id,
                 wdrive,
                 plugins_fid,
+                action="rollback",
+                drive_account_id=resolved_account_id,
                 new_plugins=target_manifest["plugins"],
                 new_disabled=remaining_disabled,
                 disabled_changed=disabled_changed,
                 base_snapshot=target_manifest.get("snapshot"),
+                base_head_generation=(bundle["head"] or {}).get("generation"),
+                base_pending_generation=(bundle["pending"] or {}).get("generation"),
                 existing_history=bundle["history"],
             )
             return {
@@ -2167,12 +2536,21 @@ def cleanup_orphan_objects(
     if type(keep_history) is not int or not 1 <= keep_history <= MAX_HISTORY_ENTRIES:
         raise APIError("WORKSPACE_INVALID_INPUT", f"keep_history 必须为 1 到 {MAX_HISTORY_ENTRIES} 之间的整数", 422)
 
-    def _run_scan_and_delete(storage: DriveStorage, write_guard: Callable[[], None] | None = None) -> dict[str, Any]:
+    def _run_scan_and_delete(
+        storage: DriveStorage,
+        resolved_account_id: str | None,
+        write_guard: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         wdrive = _WorkspaceDrive(storage, owner_id, write_guard=write_guard)
         owner_fid = wdrive.find_owner_folder(create=False)
         if not owner_fid:
             return {"dry_run": dry_run, "keep_history": keep_history, "deleted_count": 0, "freed_bytes": 0, "items": []}
-        saved = repo.store.get("settings", _settings_key(owner_id), owner_id) or {}
+        if write_guard is not None:
+            nc_fid = wdrive.find_child_folder(owner_fid, "native-comfy", create=False)
+            plugins_fid = wdrive.find_child_folder(nc_fid, "plugins", create=False) if nc_fid else None
+            if plugins_fid:
+                _reconcile_pending_plugin_commit(repo, owner_id, resolved_account_id, wdrive, plugins_fid)
+        saved = _load_plugin_settings(repo, owner_id, resolved_account_id)
         children_map, truncated = _bulk_list_app_entries(wdrive.storage)
         if truncated:
             raise APIError("WORKSPACE_DRIVE_INCOMPLETE", "Drive 文件列表不完整，无法安全清理插件归档", 502)
@@ -2217,11 +2595,11 @@ def cleanup_orphan_objects(
         }
 
     if dry_run:
-        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
+        storage, owns_storage, resolved_account_id, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
-            return _run_scan_and_delete(storage)
+            return _run_scan_and_delete(storage, resolved_account_id)
         except (DriveError, GoogleError) as exc:
             raise APIError("WORKSPACE_DRIVE_ERROR", f"扫描孤立归档失败：{exc}", 502) from exc
         finally:
@@ -2229,11 +2607,11 @@ def cleanup_orphan_objects(
                 storage.close()
 
     with _offline_write_guard(repo, owner_id, reason="orphan_objects:cleanup") as write_lease:
-        storage, owns_storage, _, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
+        storage, owns_storage, resolved_account_id, _ = _open_drive_for(repo, owner_id, drive=drive, account_id=account_id)
         if storage is None:
             raise APIError("DRIVE_NOT_CONNECTED", "尚未连接 Google Drive 账号", 503)
         try:
-            return _run_scan_and_delete(storage, write_guard=write_lease.ensure_held)
+            return _run_scan_and_delete(storage, resolved_account_id, write_guard=write_lease.ensure_held)
         except APIError:
             raise
         except (DriveError, GoogleError) as exc:

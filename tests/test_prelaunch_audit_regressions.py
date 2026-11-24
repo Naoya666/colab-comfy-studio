@@ -1086,3 +1086,453 @@ async def test_audit2_fix3_cancelled_prepare_does_not_hang_executor_shutdown(tmp
         ext_lock.close()
 
 
+# ---------------------------------------------------------------------------
+# Third-Round Audit Fixes (1-4)
+# ---------------------------------------------------------------------------
+
+
+def test_audit3_fix1_plugin_manifest_mid_commit_lock_loss_is_recoverable(tmp_path):
+    import json
+
+    from app.gpu import native_workspace
+    from test_native_workspace import FakeDriveBackend, _make_fake_drive_storage, _seed_workspace
+
+    store = Store(f"sqlite:///{tmp_path / 'audit3_fix1.db'}")
+    repo = Repository(store)
+    backend = FakeDriveBackend()
+    seeded = _seed_workspace(backend)
+
+    # First cleanly disable LanPaint so we can test mid-commit lock loss during enable.
+    base_drive = _make_fake_drive_storage(repo, "owner", backend)
+    try:
+        native_workspace.apply_plugin_action(
+            repo, "owner", action="disable", paths=["LanPaint"], force_in_use=True, drive=base_drive
+        )
+    finally:
+        base_drive.close()
+
+    pending_id = backend.children_named(seeded["plugins_dir"], "pending.json")[0]["id"]
+    disabled_id = backend.children_named(seeded["plugins_dir"], "disabled.json")[0]["id"]
+
+    # Part A: Enable LanPaint, expire lock right after pending.json PATCH succeeds (before disabled.json write).
+    orig_handler = backend.handler
+    expire_after = {"target_id": pending_id, "fired": False}
+
+    def flaky_handler(req: httpx.Request) -> httpx.Response:
+        resp = orig_handler(req)
+        if (
+            not expire_after["fired"]
+            and req.method == "PATCH"
+            and req.url.path == f"/upload/drive/v3/files/{expire_after['target_id']}"
+        ):
+            expire_after["fired"] = True
+            key = native._workspace_lock_key("owner")
+            repo.store.update("settings", key, {"expires_at": 1.0}, "owner")
+        return resp
+
+    backend.handler = flaky_handler
+    drive_a = _make_fake_drive_storage(repo, "owner", backend)
+    try:
+        with pytest.raises(common.APIError) as exc_enable:
+            native_workspace.apply_plugin_action(
+                repo, "owner", action="enable", paths=["LanPaint"], drive=drive_a
+            )
+        assert exc_enable.value.code == "NATIVE_WORKSPACE_LOCK_LOST"
+
+        # Immediately after lock loss: LanPaint MUST NOT disappear from both manifests!
+        pending_after = json.loads(backend.content[pending_id].decode("utf-8"))
+        disabled_after = json.loads(backend.content[disabled_id].decode("utf-8"))
+        assert any(p["path"] == "LanPaint" for p in pending_after["plugins"])
+        assert any(d["entry"]["path"] == "LanPaint" for d in disabled_after["plugins"])
+        saved_mid = repo.store.get("settings", native.plugin_settings_key("owner"), "owner")
+        assert isinstance(saved_mid.get("pending_commit"), dict)
+
+        # Retrying enable under a fresh lock reconciles disabled.json and clears pending_commit.
+        backend.handler = orig_handler
+        retry_res = native_workspace.apply_plugin_action(
+            repo, "owner", action="enable", paths=["LanPaint"], drive=drive_a
+        )
+        assert retry_res["generation"] == seeded["gen_head"]
+        pending_final = json.loads(backend.content[pending_id].decode("utf-8"))
+        disabled_final = json.loads(backend.content[disabled_id].decode("utf-8"))
+        assert any(p["path"] == "LanPaint" for p in pending_final["plugins"])
+        assert not any(d["entry"]["path"] == "LanPaint" for d in disabled_final["plugins"])
+        saved_after = repo.store.get("settings", native.plugin_settings_key("owner"), "owner")
+        assert saved_after.get("pending_commit") is None
+
+        # Part B: Disable LanPaint, expire lock right after disabled.json PATCH (before pending.json).
+        expire_after["target_id"] = disabled_id
+        expire_after["fired"] = False
+        backend.handler = flaky_handler
+        with pytest.raises(common.APIError) as exc_disable:
+            native_workspace.apply_plugin_action(
+                repo, "owner", action="disable", paths=["LanPaint"], force_in_use=True, drive=drive_a
+            )
+        assert exc_disable.value.code == "NATIVE_WORKSPACE_LOCK_LOST"
+        # Plugin is in both pending.json and disabled.json (never lost).
+        assert any(p["path"] == "LanPaint" for p in json.loads(backend.content[pending_id].decode("utf-8"))["plugins"])
+        assert any(d["entry"]["path"] == "LanPaint" for d in json.loads(backend.content[disabled_id].decode("utf-8"))["plugins"])
+
+        # Retrying disable reconciles uncommitted pre-stage and cleanly disables LanPaint.
+        backend.handler = orig_handler
+        retry_dis = native_workspace.apply_plugin_action(
+            repo, "owner", action="disable", paths=["LanPaint"], force_in_use=True, drive=drive_a
+        )
+        assert retry_dis["changed_paths"] == ["LanPaint"]
+        assert not any(p["path"] == "LanPaint" for p in json.loads(backend.content[pending_id].decode("utf-8"))["plugins"])
+        assert any(d["entry"]["path"] == "LanPaint" for d in json.loads(backend.content[disabled_id].decode("utf-8"))["plugins"])
+    finally:
+        backend.handler = orig_handler
+        drive_a.close()
+
+
+def test_audit3_fix2_concurrent_renewal_never_overwrites_newer_expiry(tmp_path, monkeypatch):
+    import threading
+    from contextlib import contextmanager
+
+    from app.gpu import native_workspace
+
+    store = Store(f"sqlite:///{tmp_path / 'audit3_fix2.db'}")
+    repo = Repository(store)
+    clock = {"now": 1_700_000_000.0}
+    monkeypatch.setattr(native.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(native_workspace.time, "time", lambda: clock["now"])
+
+    lock_id = native.acquire_workspace_write_lock(repo, "owner", reason="test", ttl_seconds=90.0)
+    hb_db_done = threading.Event()
+    hb_release = threading.Event()
+    contend = {"busy": False}
+    orig_renew = native.renew_workspace_write_lock_status
+    orig_dispatch_lock = store.dispatch_lock
+
+    @contextmanager
+    def flaky_dispatch_lock():
+        if contend["busy"]:
+            yield False
+            return
+        with orig_dispatch_lock() as ok:
+            yield ok
+
+    monkeypatch.setattr(store, "dispatch_lock", flaky_dispatch_lock)
+
+    def controlled_renew(r, owner, lid, *, ttl_seconds=90.0, timeout=0.5, now=None):
+        is_heartbeat = threading.current_thread().name == "workspace-lock-renew"
+        if is_heartbeat and not hb_db_done.is_set():
+            clock["now"] = 1_700_000_010.0  # DB expires_at -> 1_700_000_100.0
+            res = orig_renew(r, owner, lid, ttl_seconds=ttl_seconds, timeout=0.05, now=clock["now"])
+            hb_db_done.set()
+            # Pause heartbeat after DB commit so main thread commits a newer expiry first!
+            assert hb_release.wait(5.0)
+            return res
+        return orig_renew(r, owner, lid, ttl_seconds=ttl_seconds, timeout=0.05, now=now)
+
+    monkeypatch.setattr(native, "renew_workspace_write_lock_status", controlled_renew)
+
+    lease = native_workspace._WorkspaceWriteLease(
+        repo, "owner", lock_id, ttl_seconds=90.0, renew_interval=0.02, busy_retry_interval=0.05
+    )
+    try:
+        assert hb_db_done.wait(3.0)
+        # Main thread renews at t=+50s -> DB expires_at becomes +140s.
+        clock["now"] = 1_700_000_050.0
+        lease.ensure_held()
+        assert lease._expires_at == pytest.approx(1_700_000_140.0)
+
+        # Let heartbeat return its earlier (+100s) renewal result.
+        hb_release.set()
+        time.sleep(0.08)
+        assert lease._expires_at >= 1_700_000_140.0
+
+        # Advance past stale +100s (still well before real DB +140s) and simulate transient busy contention.
+        clock["now"] = 1_700_000_110.0
+        contend["busy"] = True
+        with pytest.raises(common.APIError) as exc:
+            lease.ensure_held()
+        assert exc.value.code == "SCHEDULER_BUSY"
+        assert exc.value.status == 503
+        assert not lease._lost.is_set()
+    finally:
+        contend["busy"] = False
+        hb_release.set()
+        lease.close()
+        native.release_workspace_write_lock(repo, "owner", lock_id)
+
+
+@pytest.mark.asyncio
+async def test_audit3_fix3_cancelled_prepare_and_restore_keep_activity_lock_until_thread_exits(tmp_path, monkeypatch):
+    import asyncio
+    import fcntl
+    import hashlib
+    import threading
+
+    monkeypatch.setattr(model_sources, "public_addresses", lambda host: ["8.8.8.8"])
+    orig_source_http = native_models.SourceHTTP
+    monkeypatch.setattr(
+        native_models,
+        "SourceHTTP",
+        lambda *args, **kw: orig_source_http(*args, **kw, resolver=model_sources.public_addresses),
+    )
+    monkeypatch.setattr(native_models, "RESERVE", 1)
+
+    body_bytes = b"model-payload-for-cancel-lock-test"
+    sha = hashlib.sha256(body_bytes).hexdigest()
+    url = "https://huggingface.co/owner/repo/resolve/main/slow.safetensors"
+
+    class _Stream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield body_bytes
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_handler(_req):
+        entered.set()
+        assert release.wait(5.0)
+        return httpx.Response(200, headers={"content-length": str(len(body_bytes)), "etag": '"v1"'}, stream=_Stream())
+
+    catalog = [
+        {
+            "model_type": "checkpoints",
+            "filename": "slow.safetensors",
+            "relative_path": "slow.safetensors",
+            "sha256": sha,
+            "size": len(body_bytes),
+            "source": {"download_url": url, "status": "verified"},
+        }
+    ]
+    model_dir = tmp_path / "models"
+    (model_dir / "checkpoints").mkdir(parents=True)
+    client = httpx.Client(transport=httpx.MockTransport(slow_handler))
+    local = native_models.LocalModels(tmp_path, model_dir, {"channel": "ch", "catalog": catalog}, http=client)
+
+    studio_restore_entered = threading.Event()
+    studio_restore_release = threading.Event()
+    studio_restore_block = {"enabled": False}
+
+    def fake_restore_weights(*_args, **_kwargs):
+        if studio_restore_block["enabled"]:
+            studio_restore_entered.set()
+            assert studio_restore_release.wait(5.0)
+        return []
+
+    monkeypatch.setattr(native_models.studio_worker, "_drive_cache", lambda _p: None)
+    monkeypatch.setattr(native_models.studio_worker, "_lora_drive_cache", lambda _p: None)
+    monkeypatch.setattr(native_models.studio_worker, "_restore_weights", fake_restore_weights)
+    monkeypatch.setattr(native_models.studio_worker, "_restore_user_loras", lambda *_a, **_kw: [])
+    try:
+        # Part A: Cancelled prepare() keeps models-active.lock & rw-lock held until worker thread finishes.
+        prompt = {"prompt": {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "slow.safetensors"}}}}
+        prep_task = asyncio.create_task(local.prepare(prompt, [], catalog))
+        assert await asyncio.to_thread(entered.wait, 2.0)
+
+        prep_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(prep_task, timeout=1.0)
+
+        # Download thread is still running -> external probe MUST fail LOCK_EX and prepare_studio MUST wait!
+        with (tmp_path / "models-active.lock").open("rb") as probe_handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        studio_entered = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def studio_verify(rows, require_files=False):
+            loop.call_soon_threadsafe(studio_entered.set)
+            return {}
+
+        studio_task = asyncio.create_task(
+            local.prepare_studio([], [], {"use_drive_cache": False}, studio_verify, {}, 30)
+        )
+        await asyncio.sleep(0.1)
+        assert not studio_entered.is_set(), "prepare_studio acquired exclusive lock while background download still active!"
+
+        release.set()
+        await asyncio.wait_for(studio_task, timeout=3.0)
+        assert studio_entered.is_set()
+        with (tmp_path / "models-active.lock").open("rb") as probe_handle:
+            fcntl.flock(probe_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        # Part B: Cancelled restore() also keeps models-active.lock held until worker thread finishes.
+        (model_dir / "checkpoints" / "slow.safetensors").unlink()
+        entered.clear()
+        release.clear()
+        restore_task = asyncio.create_task(
+            local.restore([{"category": "checkpoints", "name": "slow.safetensors", "last_used_at": 100.0}], catalog)
+        )
+        assert await asyncio.to_thread(entered.wait, 2.0)
+        restore_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(restore_task, timeout=1.0)
+
+        with (tmp_path / "models-active.lock").open("rb") as probe_handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        release.set()
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            with (tmp_path / "models-active.lock").open("rb") as probe_handle:
+                try:
+                    fcntl.flock(probe_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    continue
+        else:
+            pytest.fail("models-active.lock was not released after background restore thread finished")
+
+        # Part C: Cancelled prepare_studio() keeps exclusive lock held until restore thread finishes.
+        studio_restore_block["enabled"] = True
+        studio_restore_entered.clear()
+        studio_restore_release.clear()
+        studio_cancel_task = asyncio.create_task(
+            local.prepare_studio([], [], {"use_drive_cache": False}, lambda rows, require_files=False: {}, {}, 30)
+        )
+        assert await asyncio.to_thread(studio_restore_entered.wait, 2.0)
+        studio_cancel_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(studio_cancel_task, timeout=1.0)
+
+        with (tmp_path / "models-active.lock").open("rb") as probe_handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe_handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+
+        studio_restore_release.set()
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            with (tmp_path / "models-active.lock").open("rb") as probe_handle:
+                try:
+                    fcntl.flock(probe_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    continue
+        else:
+            pytest.fail("models-active.lock was not released after background prepare_studio thread finished")
+    finally:
+        release.set()
+        studio_restore_release.set()
+        local.executor.shutdown(wait=True)
+        client.close()
+
+
+def test_audit3_fix4_explicit_drive_b_isolated_from_drive_a_and_rejects_missing_manifest(tmp_path, monkeypatch):
+    import json
+
+    from app.gpu import native_workspace
+    from test_native_workspace import FakeDriveBackend, _make_fake_drive_storage
+
+    native_workspace.invalidate_workspace_cache()
+    store = Store(f"sqlite:///{tmp_path / 'audit3_fix4.db'}")
+    repo = Repository(store)
+    repo.create("accounts", "owner", {"account_id": "acc-a", "alias": "Drive A", "enabled": True, "connected": True}, record_id="acc-a")
+    repo.create("accounts", "owner", {"account_id": "acc-b", "alias": "Drive B", "enabled": True, "connected": True}, record_id="acc-b")
+    for acc in ("acc-a", "acc-b"):
+        repo.create(
+            "credentials",
+            "owner",
+            {"provider": "google", "purpose": "drive", "account_id": acc, "revoked": False, "encrypted_refresh_token": f"enc-{acc}"},
+        )
+
+    sha_a1 = "1" * 64
+    sha_a2 = "2" * 64
+    plugins_a = [
+        {"path": "PluginA1", "checksum": "a" * 64, "enabled": True, "repo": None, "commit": None, "version": "1.0", "archive": sha_a1, "kind": "directory"},
+        {"path": "PluginA2", "checksum": "b" * 64, "enabled": True, "repo": None, "commit": None, "version": "1.0", "archive": sha_a2, "kind": "directory"},
+    ]
+    manifest_a = {
+        "schema": 1,
+        "plugins": plugins_a,
+        "snapshot": {"git_custom_nodes": {}},
+        "backed_up_at": 1700000100.0,
+        "generation": node_persistence.digest(plugins_a),
+    }
+
+    # Sync Account A via native.sync_plugins (saved under acc-a's isolated key) AND also seed legacy owner key
+    # to ensure neither Account A's key nor legacy key can ever bleed into explicit Account B!
+    monkeypatch.setattr(native, "backend", lambda: ("https://internal.example.test", {}))
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"busy": False, "plugins": {"manifest": manifest_a, "durable": True}})
+        )
+    ) as c:
+        native.sync_plugins(repo, {"id": "lease-a", "owner_id": "owner", "drive_account_id": "acc-a"}, client=c)
+    repo.store.create(
+        "settings",
+        "owner",
+        {"manifest": manifest_a, "history": [manifest_a]},
+        record_id=native.plugin_settings_key("owner", None),
+    )
+
+    # Drive B has native-comfy/plugins directory, but NO head.json and NO pending.json.
+    backend_b = FakeDriveBackend()
+    ai_b = backend_b.mkdir("AI-Studio", "root")
+    ow_b = backend_b.mkdir("owner", ai_b)
+    nc_b = backend_b.mkdir("native-comfy", ow_b)
+    plugins_b_dir = backend_b.mkdir("plugins", nc_b)
+    objects_b_dir = backend_b.mkdir("objects", plugins_b_dir)
+
+    drive_b = _make_fake_drive_storage(repo, "owner", backend_b)
+    drive_b.account_id = "acc-b"
+
+    def fake_open_drive(r, owner_id, drive=None, *, account_id=None):
+        if account_id == "acc-b":
+            return drive_b, False, "acc-b", "Drive B"
+        raise AssertionError(f"Unexpected account_id={account_id}")
+
+    monkeypatch.setattr(native_workspace, "_open_drive", fake_open_drive)
+    try:
+        # 1. Overview for Drive B must NOT display Drive A's plugins or history.
+        ov_b = native_workspace.get_workspace_overview(repo, "owner", refresh=True, account_id="acc-b")
+        assert ov_b["plugins"]["active"] == []
+        assert ov_b["plugins"]["history"] == []
+
+        # 2. Mutating Drive B without its own head.json/pending.json must fail with 404 WORKSPACE_NOT_FOUND
+        # and NEVER write Drive A's manifest into Drive B's pending.json!
+        with pytest.raises(common.APIError) as exc_b:
+            native_workspace.apply_plugin_action(
+                repo, "owner", action="remove", paths=["PluginA1"], force_in_use=True, account_id="acc-b"
+            )
+        assert exc_b.value.code == "WORKSPACE_NOT_FOUND"
+        assert exc_b.value.status == 404
+        assert backend_b.children_named(plugins_b_dir, "pending.json") == []
+
+        # 3. Once Drive B has its own head.json, mutating Drive B stays isolated from Drive A's VPS settings.
+        sha_b1 = "3" * 64
+        sha_b2 = "4" * 64
+        backend_b.put_file(f"{sha_b1}.tar.gz", objects_b_dir, b"b1", mime="application/gzip")
+        backend_b.put_file(f"{sha_b2}.tar.gz", objects_b_dir, b"b2", mime="application/gzip")
+        plugins_b = [
+            {"path": "PluginB1", "checksum": "c" * 64, "enabled": True, "repo": None, "commit": None, "version": "1.0", "archive": sha_b1, "kind": "directory"},
+            {"path": "PluginB2", "checksum": "d" * 64, "enabled": True, "repo": None, "commit": None, "version": "1.0", "archive": sha_b2, "kind": "directory"},
+        ]
+        manifest_b = {
+            "schema": 1,
+            "plugins": plugins_b,
+            "snapshot": {"git_custom_nodes": {}},
+            "backed_up_at": 1700000200.0,
+            "generation": node_persistence.digest(plugins_b),
+        }
+        backend_b.put_json("head.json", plugins_b_dir, manifest_b)
+
+        res_b = native_workspace.apply_plugin_action(
+            repo, "owner", action="remove", paths=["PluginB1"], force_in_use=True, account_id="acc-b"
+        )
+        assert res_b["changed_paths"] == ["PluginB1"]
+        pending_b_files = backend_b.children_named(plugins_b_dir, "pending.json")
+        assert len(pending_b_files) == 1
+        pending_b_doc = json.loads(backend_b.content[pending_b_files[0]["id"]].decode("utf-8"))
+        assert [p["path"] for p in pending_b_doc["plugins"]] == ["PluginB2"]
+        assert [p["archive"] for p in pending_b_doc["plugins"]] == [sha_b2]
+
+        # Drive A's VPS settings must remain untouched while Drive B's settings hold Drive B's offline_pending.
+        saved_a = repo.store.get("settings", native.plugin_settings_key("owner", "acc-a"), "owner")
+        saved_b = repo.store.get("settings", native.plugin_settings_key("owner", "acc-b"), "owner")
+        assert saved_a["manifest"]["generation"] == manifest_a["generation"]
+        assert saved_a.get("offline_pending") is None
+        assert saved_b["offline_pending"]["generation"] == pending_b_doc["generation"]
+        assert saved_b["drive_account_id"] == "acc-b"
+    finally:
+        drive_b.close()
+
+
+

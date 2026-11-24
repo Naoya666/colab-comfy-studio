@@ -154,6 +154,58 @@ def _workspace_lock_key(owner: str) -> str:
     return "native-workspace-lock-" + digest(owner)[:32]
 
 
+def plugin_settings_key(owner_id: str, drive_account_id: str | None = None) -> str:
+    """Return VPS settings record ID for native plugin state, isolated per resolved Drive account."""
+    from .accounts import AccountService
+
+    account = drive_account_id.strip() if isinstance(drive_account_id, str) and drive_account_id.strip() else None
+    if not account or account == AccountService.default_account_id(owner_id):
+        return "native-plugins-" + digest(owner_id)[:32]
+    return "native-plugins-" + digest(f"{owner_id}:{account}")[:32]
+
+
+def resolve_lease_drive_account_id(
+    repo,
+    owner_id: str,
+    lease: dict | None = None,
+    job: dict | None = None,
+) -> str | None:
+    """Resolve the actual Google Drive storage account used by a native lease or job."""
+    from .accounts import AccountService
+
+    candidate = None
+    for row in (lease, job):
+        if isinstance(row, dict):
+            for field in ("native_drive_account_id", "drive_account_id", "account_id"):
+                val = row.get(field)
+                if isinstance(val, str) and val.strip():
+                    candidate = val.strip()
+                    break
+        if candidate:
+            break
+    if not candidate and isinstance(lease, dict) and repo is not None:
+        for jfield in ("native_bootstrap_job_id", "owner_job_id"):
+            jid = lease.get(jfield)
+            if isinstance(jid, str) and jid:
+                try:
+                    jrow = repo.get("jobs", jid, owner_id)
+                except Exception:
+                    jrow = None
+                if isinstance(jrow, dict):
+                    val = jrow.get("drive_account_id") or jrow.get("account_id")
+                    if isinstance(val, str) and val.strip():
+                        candidate = val.strip()
+                        break
+    if not candidate:
+        return None
+    if repo is None:
+        return candidate
+    try:
+        return AccountService(repo, owner_id).resolve_drive_account_id(candidate)
+    except Exception:
+        return candidate
+
+
 def active_workspace_write_lock(repo, owner: str = "owner", now: float | None = None) -> dict | None:
     """Return active offline workspace write lock row if held and unexpired."""
     if not hasattr(repo, "store") or not hasattr(repo.store, "get"):
@@ -269,7 +321,8 @@ def renew_workspace_write_lock_status(
                     writable, _ = workspace_offline_status(repo, owner, now=current)
                     if not writable:
                         return "lost", None
-                    new_expires = current + float(ttl_seconds)
+                    existing_exp = float(row.get("expires_at") or 0.0)
+                    new_expires = max(existing_exp, current + float(ttl_seconds))
                     repo.store.update("settings", key, {"expires_at": new_expires}, owner)
                     return "renewed", new_expires
                 return "lost", None
@@ -1179,7 +1232,8 @@ def sync_plugins(repo, lease, client=None, *, return_state=False):
     owner = lease["owner_id"]
     from . import recovery
     from .node_persistence import digest
-    key = "native-plugins-" + digest(owner)[:32]
+    drive_account_id = resolve_lease_drive_account_id(repo, owner, lease=lease)
+    key = plugin_settings_key(owner, drive_account_id)
     models_key = recovery.local_models_key(owner)
     existing_saved = repo.store.get("settings", key, owner) or {}
     existing_models_doc = repo.store.get("settings", models_key, owner) or {}
@@ -1257,6 +1311,10 @@ def sync_plugins(repo, lease, client=None, *, return_state=False):
             "telemetry_digest": fetched_telemetry_digest if fetched_telemetry_digest is not None else saved.get("telemetry_digest"),
             "offline_pending": offline_pending,
         }
+        if drive_account_id is not None:
+            data["drive_account_id"] = drive_account_id
+        if "pending_commit" in saved:
+            data["pending_commit"] = saved.get("pending_commit")
         if saved:
             if any(saved.get(k) != value for k, value in data.items()):
                 repo.store.update("settings", key, data, owner)

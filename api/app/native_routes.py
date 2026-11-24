@@ -437,8 +437,16 @@ async def status(request: Request, user=Depends(current_user)):
     }
     gpu_reported = (job or {}).get("gpu_reported") or (lease or {}).get("gpu_reported") or (instance or {}).get("gpu_reported")
     can_restart = ready and can_restart_base
-    from .gpu.node_persistence import digest as _plugin_digest
-    saved_plugins = repo.store.get("settings", "native-plugins-" + _plugin_digest(user["id"])[:32], user["id"]) or {}
+    status_drive_account = native.resolve_lease_drive_account_id(repo, user["id"], lease=lease, job=job)
+    if status_drive_account is None:
+        try:
+            preferred_acc = native_workspace._preferred_native_drive_account(repo, user["id"])
+            status_drive_account, _ = native_workspace.resolve_owner_drive_account(
+                repo, user["id"], preferred_account_id=preferred_acc
+            )
+        except Exception:
+            status_drive_account = None
+    saved_plugins = repo.store.get("settings", native.plugin_settings_key(user["id"], status_drive_account), user["id"]) or {}
     offline_pending = saved_plugins.get("offline_pending")
     has_pending_offline_plugins = bool(
         isinstance(offline_pending, dict)
@@ -608,7 +616,6 @@ def ticket(request: Request, user=Depends(current_user)):
 
 @router.get("/plugins")
 def plugins(request: Request, user=Depends(current_user)):
-    from .gpu.node_persistence import digest
     repo = request.app.state.repo
     lease = native.active_lease(repo, user["id"])
     online = False
@@ -618,7 +625,16 @@ def plugins(request: Request, user=Depends(current_user)):
             online = True
         except (httpx.HTTPError, ValueError, APIError):
             pass
-    saved = repo.store.get("settings", "native-plugins-" + digest(user["id"])[:32], user["id"]) or {}
+    drive_account = native.resolve_lease_drive_account_id(repo, user["id"], lease=lease)
+    if drive_account is None:
+        try:
+            preferred_acc = native_workspace._preferred_native_drive_account(repo, user["id"])
+            drive_account, _ = native_workspace.resolve_owner_drive_account(
+                repo, user["id"], preferred_account_id=preferred_acc
+            )
+        except Exception:
+            drive_account = None
+    saved = repo.store.get("settings", native.plugin_settings_key(user["id"], drive_account), user["id"]) or {}
     return ok({**saved.get("status", {}), "manifest": saved.get("manifest"), "history": saved.get("history", []),
                "offline": not online}, request)
 

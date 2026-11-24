@@ -248,35 +248,65 @@ class LocalModels:
         if self._rw_loop is not loop or self._rw_state is None:
             self._rw_loop = loop
             self._rw_state = {
-                "cond": asyncio.Condition(),
                 "readers": 0,
                 "writer": False,
                 "writers_waiting": 0,
+                "waiters": [],
             }
         return self._rw_state
+
+    @staticmethod
+    def _notify_rw_waiters(state):
+        waiters = state["waiters"]
+        if waiters:
+            state["waiters"] = []
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(None)
 
     @asynccontextmanager
     async def _activity_lock(self, *, exclusive: bool = False):
         """Serialize studio vs native prepares asynchronously without blocking the event loop,
-        while holding models-active.lock for cross-process probe visibility."""
+        while holding models-active.lock for cross-process probe visibility.
+
+        Yields a refcounted lock handle whose ``track(future)`` method extends both the
+        in-process rw-lock and cross-process flock until tracked background executor futures
+        finish, even if the awaiting coroutine is cancelled mid-download.
+        """
+        loop = asyncio.get_running_loop()
         state = self._rw_lock_state()
-        cond = state["cond"]
         if exclusive:
-            async with cond:
-                state["writers_waiting"] += 1
-                try:
-                    await cond.wait_for(lambda: not state["writer"] and state["readers"] == 0)
-                    state["writer"] = True
-                except BaseException:
-                    state["writers_waiting"] -= 1
-                    cond.notify_all()
-                    raise
-                else:
-                    state["writers_waiting"] -= 1
+            state["writers_waiting"] += 1
+            try:
+                while state["writer"] or state["readers"] > 0:
+                    waiter = loop.create_future()
+                    state["waiters"].append(waiter)
+                    try:
+                        await waiter
+                    finally:
+                        try:
+                            state["waiters"].remove(waiter)
+                        except ValueError:
+                            pass
+                state["writer"] = True
+            except BaseException:
+                state["writers_waiting"] -= 1
+                self._notify_rw_waiters(state)
+                raise
+            else:
+                state["writers_waiting"] -= 1
         else:
-            async with cond:
-                await cond.wait_for(lambda: not state["writer"] and state["writers_waiting"] == 0)
-                state["readers"] += 1
+            while state["writer"] or state["writers_waiting"] > 0:
+                waiter = loop.create_future()
+                state["waiters"].append(waiter)
+                try:
+                    await waiter
+                finally:
+                    try:
+                        state["waiters"].remove(waiter)
+                    except ValueError:
+                        pass
+            state["readers"] += 1
 
         lock_file = None
         try:
@@ -288,19 +318,62 @@ class LocalModels:
                     break
                 except BlockingIOError:
                     await asyncio.sleep(0.05)
-            yield
-        finally:
+        except BaseException:
             if lock_file is not None:
                 try:
                     lock_file.close()
                 except OSError:
                     pass
-            async with cond:
+            if exclusive:
+                state["writer"] = False
+            else:
+                state["readers"] -= 1
+            self._notify_rw_waiters(state)
+            raise
+
+        notify = self._notify_rw_waiters
+
+        class _ActivityLockHold:
+            def __init__(self):
+                self._refs = 1
+                self._released = False
+
+            def track(self, fut: asyncio.Future) -> None:
+                if self._released or fut.done():
+                    return
+                self._refs += 1
+                fut.add_done_callback(self._on_done)
+
+            def _on_done(self, fut) -> None:
+                if not fut.cancelled():
+                    try:
+                        fut.exception()
+                    except Exception:
+                        pass
+                self.release()
+
+            def release(self) -> None:
+                if self._released:
+                    return
+                self._refs -= 1
+                if self._refs > 0:
+                    return
+                self._released = True
+                try:
+                    lock_file.close()
+                except OSError:
+                    pass
                 if exclusive:
                     state["writer"] = False
                 else:
                     state["readers"] -= 1
-                cond.notify_all()
+                notify(state)
+
+        hold = _ActivityLockHold()
+        try:
+            yield hold
+        finally:
+            hold.release()
 
     _SENSITIVE_QUERY_KEYS = frozenset({
         "token", "access_token", "auth", "key", "api_key", "apikey",
@@ -1053,7 +1126,7 @@ class LocalModels:
 
     async def prepare(self, body, explicit, catalog, *, visual=False, trusted=False):
         # A separate process can test the lock even when the gateway is disconnected.
-        async with self._activity_lock(exclusive=False):
+        async with self._activity_lock(exclusive=False) as lock_hold:
             rows = {}
             tasks = []
             grouped = defaultdict(list)
@@ -1086,7 +1159,10 @@ class LocalModels:
                         task = asyncio.get_running_loop().run_in_executor(self.executor, self.prepare_one, target, plan, status)
                         self.inflight[target] = (identity, task, status)
                         task.add_done_callback(lambda _, path=target: self.inflight.pop(path, None))
+                        lock_hold.track(task)
                         current = self.inflight[target]
+                    else:
+                        lock_hold.track(current[1])
                     tasks.append((current[1], status, current[2]))
                 except ModelError as exc:
                     status.update(state="failed", error=str(exc))
@@ -1110,7 +1186,7 @@ class LocalModels:
 
     async def prepare_studio(self, weights, loras, cache_payload, verify_paths, paths, timeout):
         # Keep the existing native activity fence and serialize with native prepares off the event loop.
-        async with self._activity_lock(exclusive=True):
+        async with self._activity_lock(exclusive=True) as lock_hold:
             rows = {}
             for target in [*(item["target"] for item in weights), *("loras/" + item["target"] for item in loras)]:
                 category, _, name = target.partition("/")
@@ -1143,11 +1219,8 @@ class LocalModels:
 
             try:
                 future = asyncio.get_running_loop().run_in_executor(self.executor, restore)
-                try:
-                    return await asyncio.shield(future)
-                except asyncio.CancelledError:
-                    await asyncio.shield(future)
-                    raise
+                lock_hold.track(future)
+                return await asyncio.shield(future)
             finally:
                 self.current_rows.pop(task, None)
 
@@ -1163,7 +1236,7 @@ class LocalModels:
                 str(item.get("name") or ""),
             ),
         )
-        async with self._activity_lock(exclusive=False):
+        async with self._activity_lock(exclusive=False) as lock_hold:
             rows = {}
             tasks = []
             items: list[tuple[str, str, dict, dict]] = []
@@ -1229,7 +1302,10 @@ class LocalModels:
                             )
                             self.inflight[target] = (identity, task, status)
                             task.add_done_callback(lambda _, path=target: self.inflight.pop(path, None))
+                            lock_hold.track(task)
                             current = self.inflight[target]
+                        else:
+                            lock_hold.track(current[1])
                         tasks.append((current[1], status, current[2]))
                         await asyncio.shield(current[1])
                         shared = current[2]
