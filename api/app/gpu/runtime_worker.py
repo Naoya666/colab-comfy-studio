@@ -3562,7 +3562,7 @@ def run_teardown(payload: dict, root: Path, *, home_dir: Path | None = None, mou
     studio_root = _default_studio_root(root)
     native_root = studio_root / "native"
     from_pool = str(payload.get("from_pool") or "creation")
-    native_bootstrap_failed = bool(payload.get("native_bootstrap_failed"))
+    native_bootstrap_failed = bool(payload.get("native_bootstrap_failed") or payload.get("skip_native_stop"))
     clean_native_only = bool(payload.get("clean_native_only"))
     expected_digest = str(payload.get("expected_baseline_digest") or "")
     allow_mock_gpu = bool(payload.get("allow_mock_gpu") or os.getenv("STUDIO_OFFLINE_TEST") == "1")

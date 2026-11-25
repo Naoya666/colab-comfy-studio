@@ -13,7 +13,7 @@ from app.db import Store
 from app.gpu import ccu, native, recovery, transfer
 from app.gpu.compute import GpuConfig
 from app.gpu.instances import POOL_CREATION, POOL_EPHEMERAL, POOL_NATIVE, InstanceConflict, InstanceService
-from app.gpu.mcp import MCPTransient
+from app.gpu.mcp import MCPTransient, _uuid4
 from app.gpu.repository import Repository
 from app.gpu.scheduler import Scheduler
 from app.instance_routes import router as instance_router
@@ -56,6 +56,7 @@ class FakeTransferExecutor:
         }
 
     def start_teardown(self, handle, job, execution_id: str, payload: dict[str, Any]):
+        execution_id = _uuid4(execution_id)
         self.start_calls.append((execution_id, dict(payload)))
         if self.start_error is not None:
             err = self.start_error
@@ -64,7 +65,7 @@ class FakeTransferExecutor:
         return {"execution_id": execution_id}
 
     def poll(self, handle, job):
-        exec_id = str(job.get("execution_id") or "")
+        exec_id = _uuid4(str(job.get("execution_id") or ""))
         self.poll_calls.append(exec_id)
         if self.poll_script:
             nxt = self.poll_script.pop(0)

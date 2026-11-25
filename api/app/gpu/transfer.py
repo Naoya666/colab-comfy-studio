@@ -652,7 +652,7 @@ def start_transfer(
 
             transfer_id = f"tr-{uuid.uuid4().hex[:12]}"
             transfer_job_id = str(uuid.uuid4())
-            transfer_exec_id = f"transfer-{transfer_id}"
+            transfer_exec_id = str(uuid.uuid4())
             hard_timeout = transfer_hard_timeout_seconds()
             transfer_deadline = now + hard_timeout
             provider = str(idata.get("provider") or "mock")
@@ -1381,7 +1381,12 @@ def _handle_teardown_result(
     report = result.get("teardown_report") if isinstance(result.get("teardown_report"), dict) else None
 
     if state == "aborted_unsynced" or (report and report.get("aborted_unsynced")):
-        detail = str(result.get("message") or (report or {}).get("reason") or "检测到原生 ComfyUI 仍有未完成任务或未上传的 Drive VFS 缓存，已中止清理以保护数据")
+        detail = str(
+            result.get("error_message")
+            or result.get("message")
+            or (report or {}).get("reason")
+            or "检测到原生 ComfyUI 仍有未完成任务或未上传的 Drive VFS 缓存，已中止清理以保护数据"
+        )
         return _quarantine_instance(
             scheduler,
             job,
@@ -1401,7 +1406,7 @@ def _handle_teardown_result(
         return _commit_clean_transfer(scheduler, job, teardown_report=report)
 
     err_code = str(result.get("error_code") or "teardown_failed")
-    err_msg = str(result.get("message") or "远端环境清理或纯净度校验未通过，已按安全策略释放实例")
+    err_msg = str(result.get("error_message") or result.get("message") or "远端环境清理或纯净度校验未通过，已按安全策略释放实例")
     return _fail_transfer_to_releasing(
         scheduler,
         job,
@@ -1474,14 +1479,17 @@ def advance_transfer_job(scheduler, job: dict[str, Any]) -> dict[str, Any]:
             final_state="cancelled",
         )
 
-    execution_id = job.get("execution_id") or f"transfer-{job.get('transfer_id') or job['id']}"
+    execution_id = job.get("execution_id")
+    if not isinstance(execution_id, str) or not execution_id:
+        execution_id = str(uuid.uuid4())
+        job = scheduler._update("jobs", job["id"], {"execution_id": execution_id}, owner_id)
     executor = scheduler._executor(job)
 
     if job.get("state") == "loading":
         teardown_payload = {
             "from_pool": from_pool,
             "to_pool": job.get("to_pool"),
-            "skip_native_stop": from_native_failed,
+            "native_bootstrap_failed": from_native_failed,
             "expected_baseline_digest": (
                 job.get("expected_baseline_digest")
                 or instance.get("vm_baseline_digest")
@@ -1592,10 +1600,10 @@ def advance_transfer_job(scheduler, job: dict[str, Any]) -> dict[str, Any]:
 
         if result.get("state") == "running":
             stage = result.get("stage")
-            if stage in {"transfer_cleaning", "transfer_verifying"} and stage != job.get("stage"):
+            if stage in {"transfer_cleaning", "transfer_verifying", "teardown_stop_processes", "teardown_clean_files", "teardown_verify_purity"} and stage != job.get("stage"):
                 job = scheduler._update("jobs", job["id"], {"stage": stage}, owner_id)
                 if instance and isinstance(instance.get("transfer_state"), dict):
-                    phase = "verifying" if stage == "transfer_verifying" else "cleaning"
+                    phase = "verifying" if stage in {"transfer_verifying", "teardown_verify_purity"} else "cleaning"
                     if instance["transfer_state"].get("phase") != phase:
                         scheduler._update(
                             "instances",
@@ -1658,17 +1666,21 @@ def maybe_cleanup_failed_native_bootstrap(
             return "skip", job
 
     owner_id = job["owner_id"]
-    exec_id = job.get("native_failure_cleanup_exec_id") or f"native-fail-clean-{job['id']}"
+    exec_id = job.get("native_failure_cleanup_exec_id")
+    cleanup_running = bool(job.get("native_failure_cleanup_state") == "running" and exec_id)
+    if not isinstance(exec_id, str) or not exec_id:
+        exec_id = str(uuid.uuid4())
+        job = scheduler._update("jobs", job["id"], {"native_failure_cleanup_exec_id": exec_id}, owner_id)
     executor = scheduler._executor(job)
     start_fn = getattr(executor, "start_teardown", None)
 
-    if not job.get("native_failure_cleanup_exec_id"):
+    if not cleanup_running:
         if callable(start_fn):
             payload = {
                 "from_pool": POOL_NATIVE,
                 "to_pool": POOL_NATIVE,
                 "clean_native_only": True,
-                "skip_native_stop": False,
+                "native_bootstrap_failed": False,
                 "expected_baseline_digest": (
                     (instance or {}).get("vm_baseline_digest") or lease.get("vm_baseline_digest")
                 ),
@@ -1749,7 +1761,7 @@ def maybe_cleanup_failed_native_bootstrap(
         return "pending", job
     report = result.get("teardown_report") if isinstance(result.get("teardown_report"), dict) else None
     if state == "aborted_unsynced" or (report and report.get("aborted_unsynced")):
-        detail = str(result.get("message") or "清理原生失败残留时发现未上传的 Drive 缓存，已保护隔离")
+        detail = str(result.get("error_message") or result.get("message") or "清理原生失败残留时发现未上传的 Drive 缓存，已保护隔离")
         job = _quarantine_instance(
             scheduler,
             job,
