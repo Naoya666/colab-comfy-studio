@@ -15,6 +15,13 @@ from PIL import Image
 from .common import APIError, current_user, get_store, ok, own
 from .config import settings
 from .gpu.repository import Repository
+from .image_metadata import (
+    ImageMetadataStripError,
+    clean_download_filename,
+    content_disposition_header,
+    is_strippable_image_mime,
+    strip_image_metadata,
+)
 from .presenters import public_asset
 from .storage import asset_path, delete_asset_file, save_asset
 
@@ -129,7 +136,13 @@ async def upload_asset(
 
 @assets_router.get("/api/assets/{asset_id}/download")
 @assets_router.get("/api/assets/{asset_id}/preview")
-def download_asset(asset_id: str, request: Request, user=Depends(current_user), st=Depends(get_store)):
+def download_asset(
+    asset_id: str,
+    request: Request,
+    strip_metadata: bool = False,
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
     asset = own(st, "assets", asset_id, user)
     is_preview = request.url.path.endswith("/preview")
     headers = {
@@ -137,6 +150,33 @@ def download_asset(asset_id: str, request: Request, user=Depends(current_user), 
         "Vary": "Cookie, Authorization",
     }
     sha = asset.get("sha256")
+    if strip_metadata:
+        mime = str(asset.get("mime") or "")
+        if not is_strippable_image_mime(mime):
+            raise APIError("STRIP_METADATA_UNSUPPORTED", "仅支持对图片去除元数据", 422)
+        if isinstance(sha, str) and sha:
+            etag = f'"{sha[:32]}-clean"'
+            headers["ETag"] = etag
+            if _etag_matches(request.headers.get("if-none-match"), etag):
+                return Response(status_code=304, headers=headers)
+        path = asset_path(asset)
+        try:
+            file_size = path.stat().st_size
+        except FileNotFoundError as exc:
+            raise APIError("NOT_FOUND", "素材文件不存在", 404) from exc
+        if file_size > settings.max_upload_bytes:
+            raise APIError("PAYLOAD_TOO_LARGE", "图片超过大小限制，无法去除元数据", 413)
+        try:
+            cleaned = strip_image_metadata(path.read_bytes(), mime)
+        except ImageMetadataStripError as exc:
+            raise APIError("IMAGE_METADATA_STRIP_FAILED", f"去除图片元数据失败：{exc}", 422) from exc
+        clean_name = clean_download_filename(asset.get("filename") or asset_id)
+        headers["Content-Disposition"] = content_disposition_header(
+            clean_name,
+            disposition="inline" if is_preview else "attachment",
+        )
+        return Response(cleaned, media_type=mime, headers=headers)
+
     if isinstance(sha, str) and sha:
         etag = f'"{sha[:32]}"'
         headers["ETag"] = etag

@@ -13,7 +13,15 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from .common import APIError, current_user, ok
+from .config import settings
 from .gpu import native_outputs
+from .image_metadata import (
+    ImageMetadataStripError,
+    clean_download_filename,
+    content_disposition_header,
+    is_strippable_image_mime,
+    strip_image_metadata,
+)
 
 router = APIRouter(prefix="/api/gpu/native/outputs")
 _ORIGINAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -45,10 +53,7 @@ def _etag_matches(header: str | None, etag: str) -> bool:
 
 
 def _content_disposition(filename: str) -> str:
-    safe_name = re.sub(r"[\x00-\x1f\x7f]+", "_", str(filename or "output"))
-    ascii_name = safe_name.encode("ascii", "replace").decode("ascii").replace("\\", "_").replace('"', "_")
-    utf8_name = quote(safe_name, safe="")
-    return f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'
+    return content_disposition_header(filename, disposition="inline")
 
 
 @router.get("")
@@ -134,12 +139,36 @@ async def output_content(
     file_id: str,
     request: Request,
     download: bool = False,
+    strip_metadata: bool = False,
     user=Depends(current_user),
 ):
     repo = request.app.state.repo
     item, storage, owns = await asyncio.to_thread(
         native_outputs.resolve_output_item, repo, user["id"], file_id,
     )
+    if strip_metadata:
+        mime = str(item.get("mime") or "")
+        if not is_strippable_image_mime(mime):
+            if owns and storage._owns_client:
+                storage.client.close()
+            raise APIError("STRIP_METADATA_UNSUPPORTED", "仅支持对图片去除元数据", 422)
+        declared_size = int(item.get("size") or 0)
+        if declared_size > settings.max_upload_bytes:
+            if owns and storage._owns_client:
+                storage.client.close()
+            raise APIError("PAYLOAD_TOO_LARGE", "图片超过大小限制，无法去除元数据", 413)
+        safe_rev = re.sub(r"[^A-Za-z0-9_-]+", "", str(item.get("revision") or "v0"))[:32] or "v0"
+        clean_etag = f'W/"native-clean-{file_id[:32]}-{safe_rev}"'
+        clean_headers: dict[str, str] = {
+            "Cache-Control": "private, max-age=3600",
+            "ETag": clean_etag,
+            "Vary": "Cookie, Authorization",
+        }
+        if _etag_matches(request.headers.get("if-none-match"), clean_etag):
+            if owns and storage._owns_client:
+                storage.client.close()
+            return Response(status_code=304, headers=clean_headers)
+
     try:
         token = await asyncio.to_thread(storage.google.access_token, "drive")
         base_url = storage.base_url
@@ -148,10 +177,10 @@ async def output_content(
             storage.client.close()
 
     headers = {"Authorization": "Bearer " + token, "Accept-Encoding": "identity"}
-    range_header = request.headers.get("range")
+    range_header = None if strip_metadata else request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
-    if_none_match = request.headers.get("if-none-match")
+    if_none_match = None if strip_metadata else request.headers.get("if-none-match")
     if if_none_match and not range_header:
         headers["If-None-Match"] = if_none_match
     url = f"{base_url}/files/{quote(file_id, safe='')}?alt=media"
@@ -164,6 +193,39 @@ async def output_content(
         if owns_client:
             await client.aclose()
         raise APIError("DRIVE_STREAM_FAILED", "连接 Google Drive 流式读取失败", 502, True) from exc
+
+    if strip_metadata:
+        try:
+            if upstream.status_code != 200:
+                status = upstream.status_code
+                raise APIError(
+                    "DRIVE_STREAM_FAILED",
+                    f"读取 Drive 原生作品失败（HTTP {status}）",
+                    502 if status >= 500 else status,
+                )
+            buf = bytearray()
+            async for chunk in upstream.aiter_bytes(65536):
+                buf.extend(chunk)
+                if len(buf) > settings.max_upload_bytes:
+                    raise APIError("PAYLOAD_TOO_LARGE", "图片超过大小限制，无法去除元数据", 413)
+        except httpx.HTTPError as exc:
+            raise APIError("DRIVE_STREAM_FAILED", "读取 Google Drive 图片流失败", 502, True) from exc
+        finally:
+            await upstream.aclose()
+            if owns_client:
+                await client.aclose()
+
+        try:
+            cleaned = await asyncio.to_thread(strip_image_metadata, bytes(buf), item["mime"])
+        except ImageMetadataStripError as exc:
+            raise APIError("IMAGE_METADATA_STRIP_FAILED", f"去除图片元数据失败：{exc}", 422) from exc
+
+        clean_name = clean_download_filename(item["filename"])
+        clean_headers["Content-Disposition"] = content_disposition_header(
+            clean_name,
+            disposition="attachment" if download else "inline",
+        )
+        return Response(cleaned, media_type=item["mime"], headers=clean_headers)
 
     if upstream.status_code == 304:
         not_modified_headers: dict[str, str] = {

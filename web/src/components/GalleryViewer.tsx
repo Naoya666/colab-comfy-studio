@@ -1,17 +1,23 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowUpRight, ChevronLeft, ChevronRight, Copy, Download, FileCode2, FolderInput, ImagePlus, Maximize2, Minimize2, RotateCcw, Star, Trash2, ZoomIn, ZoomOut,
+  ArrowUpRight, ChevronLeft, ChevronRight, Copy, FileCode2, FolderInput, ImagePlus, Maximize2, Minimize2, RotateCcw, Star, Trash2, ZoomIn, ZoomOut,
 } from 'lucide-react';
 import {
   apiMessage, assetUrl, fetchNativeOutputBytes,
   type GalleryAsset, type GpuJob, type GpuWorkflow, type NativeOutputAsset,
 } from '../lib/gpu-api';
 import { extractPromptText } from '../lib/create-runtime-prefs';
+import {
+  loadImageDownloadMode,
+  saveImageDownloadMode,
+  type ImageDownloadMode,
+} from '../lib/download-prefs';
 import { formatInstanceTime } from '../lib/instance-time';
 import { paramRows, promptCompositionRows } from '../lib/job-detail-copy';
 import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import { bytesLabel } from '../lib/model-library';
 import { extractPng, MAX_IMAGE, type ExtractedWorkflow } from '../lib/png-workflow';
+import { GalleryDownloadButton } from './GalleryDownloadButton';
 import {
   computeNativeScale,
   IDENTITY_TRANSFORM,
@@ -87,6 +93,7 @@ export function GalleryViewer({
   const [extractError, setExtractError] = useState('');
   const [selectedJson, setSelectedJson] = useState<'workflow' | 'prompt'>('workflow');
   const [importingDraft, setImportingDraft] = useState(false);
+  const [downloadMode, setDownloadMode] = useState<ImageDownloadMode>(() => loadImageDownloadMode());
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [lightbox, setLightbox] = useState(false);
   const [view, setView] = useState<ViewTransform>(IDENTITY_TRANSFORM);
@@ -445,9 +452,11 @@ export function GalleryViewer({
 
   const title = item.asset.filename || item.asset.id;
   const mediaSrc = item.kind === 'studio' ? assetUrl(item.asset) : item.asset.content_url;
-  const downloadHref = item.kind === 'studio'
-    ? assetUrl(item.asset)
-    : `${item.asset.content_url}${item.asset.content_url.includes('?') ? '&' : '?'}download=true`;
+
+  const handleDownloadModeChange = useCallback((next: ImageDownloadMode) => {
+    setDownloadMode(next);
+    saveImageDownloadMode(next);
+  }, []);
 
   const viewerJobId = item.kind === 'studio' ? (item.asset.source_job_id || item.asset.gpu_job_id) : undefined;
   const matchedViewerJob = item.kind === 'studio' && viewerJob && viewerJob.id === viewerJobId ? viewerJob : null;
@@ -595,9 +604,12 @@ export function GalleryViewer({
                   {item.asset.favorite ? '已收藏' : '收藏'}
                 </button>
               ) : null}
-              <a className="button secondary small" href={downloadHref} download={title} target="_blank" rel="noreferrer">
-                <Download size={14} strokeWidth={1.6} aria-hidden />下载
-              </a>
+              <GalleryDownloadButton
+                item={item}
+                mode={downloadMode}
+                onModeChange={handleDownloadModeChange}
+                placement="down"
+              />
             </>
           )}
           <button
@@ -798,9 +810,11 @@ export function GalleryViewer({
                 <FolderInput size={14} strokeWidth={1.6} aria-hidden />移动到项目
               </button>
             )}
-            <a className="button secondary small" href={downloadHref} download={title} target="_blank" rel="noreferrer">
-              <Download size={14} strokeWidth={1.6} aria-hidden />下载
-            </a>
+            <GalleryDownloadButton
+              item={item}
+              mode={downloadMode}
+              onModeChange={handleDownloadModeChange}
+            />
             <button className="button danger small" type="button" onClick={() => onDeleteStudio(item.asset)}>
               <Trash2 size={14} strokeWidth={1.6} aria-hidden />删除
             </button>
@@ -835,9 +849,11 @@ export function GalleryViewer({
                 {extracting ? '解析中…' : '提取 PNG 工作流'}
               </button>
             )}
-            <a className="button secondary small" href={downloadHref} download={title} target="_blank" rel="noreferrer">
-              <Download size={14} strokeWidth={1.6} aria-hidden />下载
-            </a>
+            <GalleryDownloadButton
+              item={item}
+              mode={downloadMode}
+              onModeChange={handleDownloadModeChange}
+            />
             {onDeleteNative && (
               <button className="button danger small" type="button" onClick={() => onDeleteNative(item.asset)}>
                 <Trash2 size={14} strokeWidth={1.6} aria-hidden />移至回收站
