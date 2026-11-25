@@ -618,6 +618,57 @@ def test_plugin_backup_captures_committed_wal_data_without_archiving_sidecars(se
             assert reader.execute('SELECT name FROM tags').fetchall() == [('committed',)]
 
 
+def test_sqlite_wal_readonly_snapshot_sidecar_touch_preserves_durable(setup, monkeypatch):
+    """Opening a WAL DB in sqlite_snapshot() may create a 0-byte -wal or bump its ctime.
+
+    Neither read-only metadata touch alters database state, so status(use_cache=False)
+    must remain durable=True while real WAL data writes still flip durable=False.
+    """
+    new, _ = setup
+    instance = new('sqlite-wal-ctime')
+    node = add(instance, 'weilin-demo')
+    data_dir = node / 'user_data'
+    data_dir.mkdir()
+    db = data_dir / 'tags.db'
+    with closing(sqlite3.connect(db)) as writer:
+        writer.execute('PRAGMA journal_mode=WAL')
+        writer.execute('CREATE TABLE tags (name TEXT)')
+        writer.execute("INSERT INTO tags VALUES ('initial')")
+        writer.commit()
+    # Closed WAL DB: initial sync + fresh scan may create a 0-byte -wal sidecar.
+    sync(instance)
+    assert instance.status(use_cache=False)['durable'] is True
+
+    # Simulate Colab overlayfs/SQLite bumping -wal st_ctime_ns during sqlite_snapshot().
+    wal = data_dir / 'tags.db-wal'
+    wal.write_bytes(b'')
+    orig_snapshot = p.sqlite_snapshot
+
+    @p.contextmanager
+    def touching_snapshot(path, limit):
+        with orig_snapshot(path, limit) as snap:
+            w = path.with_name(path.name + '-wal')
+            if w.exists():
+                mode = w.stat().st_mode & 0o777
+                p.os.chmod(w, mode)
+            yield snap
+
+    monkeypatch.setattr(p, 'sqlite_snapshot', touching_snapshot)
+    assert instance.status(use_cache=False)['durable'] is True
+    assert instance.status(use_cache=True)['durable'] is True
+
+    # Real committed WAL write (non-empty -wal) must still invalidate cache and mark durable=False.
+    with closing(sqlite3.connect(db)) as writer:
+        writer.execute("INSERT INTO tags VALUES ('updated')")
+        writer.commit()
+        assert wal.stat().st_size > 0
+        assert instance.status(use_cache=True)['durable'] is False
+        assert instance.status(use_cache=False)['durable'] is False
+        # Once backed up, even with non-empty -wal whose ctime is bumped by snapshot, durable=True.
+        sync(instance)
+        assert instance.status(use_cache=False)['durable'] is True
+
+
 def test_binary_magic_skips_regex_while_spoofed_png_secret_is_blocked(tmp_path):
     node = tmp_path / 'media-node'
     node.mkdir()

@@ -491,6 +491,15 @@ def _full_tree_stat_fingerprint(nodes: Path) -> str:
                 st = (base_path / name).lstat()
             except OSError:
                 return f'err:{time.monotonic_ns()}'
+            if name.endswith(('-wal', '-journal')):
+                # Read-only sqlite_snapshot() connections on WAL-mode plugin DBs can create
+                # a 0-byte -wal file or bump st_ctime_ns via fchmod/overlayfs metadata touches
+                # without altering database content. Empty sidecars carry no frames, while real
+                # WAL/journal writes update st_size and/or st_mtime_ns.
+                if st.st_size == 0:
+                    continue
+                entries.append((f'{rel_base}/{name}', st.st_ino, st.st_size, st.st_mtime_ns))
+                continue
             entries.append((f'{rel_base}/{name}', st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
     return digest(entries)
 
