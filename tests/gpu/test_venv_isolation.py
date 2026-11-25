@@ -292,8 +292,13 @@ def test_workflow_smoke_disables_warm_and_cleans_between_runs(tmp_path, monkeypa
             self._code = 0
             return 0
 
-    def fake_popen(cmd, **kwargs):
-        popen_cmds.append(list(cmd))
+    real_popen = runtime_worker.subprocess.Popen
+
+    def fake_popen(cmd, *args, **kwargs):
+        cmd_list = [str(c) for c in cmd] if isinstance(cmd, (list, tuple)) else [str(cmd)]
+        if "main.py" not in cmd_list:
+            return real_popen(cmd, *args, **kwargs)
+        popen_cmds.append(cmd_list)
         popen_envs.append(dict(kwargs.get("env") or {}))
         return _DummyProc()
 
