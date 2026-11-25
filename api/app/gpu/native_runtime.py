@@ -620,10 +620,12 @@ def heal_cycle(
                         comfy_log.parent.mkdir(parents=True, exist_ok=True)
                         comfy_env = dict(os.environ)
                         comfy_env["PYTHONNOUSERSITE"] = "1"
+                        comfy_env["UV_SYSTEM_PYTHON"] = "false"
                         comfy_env.pop("PYTHONPATH", None)
                         venv_dir = state.get("venv_dir")
                         if isinstance(venv_dir, str) and venv_dir:
                             comfy_env["VIRTUAL_ENV"] = venv_dir
+                            comfy_env["PIP_REQUIRE_VIRTUALENV"] = "true"
                             vbin = str(Path(venv_dir) / "bin")
                             parts = [p for p in comfy_env.get("PATH", "").split(os.pathsep) if p and p != vbin]
                             comfy_env["PATH"] = os.pathsep.join([vbin, *parts])
@@ -1074,7 +1076,7 @@ def _install_base_python(worker, root: Path, comfy: Path, manager: Path, *, loca
         run_kwargs["env"] = venv_env
     if uv_bin:
         cmd = [
-            uv_bin, "pip", "install", "--python", str(venv_python),
+            uv_bin, "pip", "install", "--no-system", "--python", str(venv_python),
             "--constraint", str(constraints), "-q", *packages, *req_args,
         ]
         try:

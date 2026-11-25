@@ -20,6 +20,7 @@ import math
 import os
 import random
 import re
+import shlex
 import shutil
 import signal
 import site
@@ -203,11 +204,32 @@ def _venv_has_system_site_packages(venv_dir: Path) -> bool:
     return False
 
 
+def _ensure_venv_pip_shims(venv_dir: Path, py_bin: Path) -> None:
+    """Install pip/pip3 shims in venv/bin so bare `pip` invocations stay inside the domain venv."""
+    vbin = Path(venv_dir) / "bin"
+    if not vbin.is_dir():
+        return
+    quoted_py = shlex.quote(str(py_bin))
+    script = f"#!/bin/sh\nexec {quoted_py} -m pip \"$@\"\n"
+    for name in ("pip", "pip3", f"pip{sys.version_info.major}.{sys.version_info.minor}"):
+        shim = vbin / name
+        if shim.is_symlink():
+            continue
+        try:
+            if shim.is_file() and shim.read_text(encoding="utf-8", errors="replace") == script:
+                continue
+            shim.write_text(script, encoding="utf-8")
+            shim.chmod(0o755)
+        except OSError:
+            pass
+
+
 def ensure_domain_venv(venv_dir: Path, *, timeout: float = 120.0) -> Path:
     """Create or reuse a domain-isolated venv inheriting Colab's system site-packages."""
     vdir = Path(venv_dir)
     py_bin = venv_python_path(vdir)
     if py_bin.is_file() and _venv_has_system_site_packages(vdir):
+        _ensure_venv_pip_shims(vdir, py_bin)
         return py_bin
     if vdir.exists():
         shutil.rmtree(vdir, ignore_errors=True)
@@ -215,13 +237,17 @@ def ensure_domain_venv(venv_dir: Path, *, timeout: float = 120.0) -> Path:
     uv_bin = shutil.which("uv")
     if uv_bin and Path(uv_bin).is_file():
         try:
+            uv_env = dict(os.environ)
+            uv_env["UV_SYSTEM_PYTHON"] = "false"
             res = subprocess.run(
                 [uv_bin, "venv", "--system-site-packages", "--python", sys.executable, str(vdir)],
+                env=uv_env,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
             )
             if res.returncode == 0 and py_bin.is_file() and _venv_has_system_site_packages(vdir):
+                _ensure_venv_pip_shims(vdir, py_bin)
                 return py_bin
         except (OSError, TypeError, subprocess.SubprocessError):
             pass
@@ -234,6 +260,7 @@ def ensure_domain_venv(venv_dir: Path, *, timeout: float = 120.0) -> Path:
         raise WorkerError(f"创建域隔离 venv 失败：{_safe_error(exc)}") from exc
     if not py_bin.is_file():
         raise WorkerError("创建域隔离 venv 失败：未生成 venv python 可执行文件")
+    _ensure_venv_pip_shims(vdir, py_bin)
     return py_bin
 
 
@@ -246,10 +273,15 @@ def domain_python_env(
     """Construct a clean subprocess environment pinned to a domain venv with PYTHONNOUSERSITE=1."""
     env = dict(os.environ if base_env is None else base_env)
     env["PYTHONNOUSERSITE"] = "1"
+    # Colab sets UV_SYSTEM_PYTHON=true in the default container environment, which causes
+    # `uv pip install` (e.g. from ComfyUI-Manager or plugins) to bypass VIRTUAL_ENV and pollute
+    # global dist-packages. Force uv and pip to stay strictly inside the domain venv.
+    env["UV_SYSTEM_PYTHON"] = "false"
     env.pop("PYTHONPATH", None)
     if venv_dir is not None:
         vdir = Path(venv_dir)
         env["VIRTUAL_ENV"] = str(vdir)
+        env["PIP_REQUIRE_VIRTUALENV"] = "true"
         vbin = str(vdir / "bin")
         old_path = env.get("PATH", "")
         parts = [p for p in old_path.split(os.pathsep) if p and p != vbin]
@@ -428,9 +460,47 @@ def ensure_vm_baseline(studio_root: Path | None = None, *, site_dirs: list[Path]
             "captured_at": time.time(),
             "protected": snap.get("protected") or {},
             "roots": sorted((snap.get("roots") or {}).keys()),
+            "snapshot": snap,
         }
         _atomic_json(baseline_path, record)
         return record
+
+
+def _diff_site_snapshots(expected_snap: dict[str, Any] | None, actual_snap: dict[str, Any] | None, *, limit: int = 20) -> dict[str, list[str]]:
+    """Compute a compact diff between two global_site_snapshot() dicts for diagnostics."""
+    if not isinstance(expected_snap, dict) or not isinstance(actual_snap, dict):
+        return {}
+    exp_roots = expected_snap.get("roots") if isinstance(expected_snap.get("roots"), dict) else {}
+    act_roots = actual_snap.get("roots") if isinstance(actual_snap.get("roots"), dict) else {}
+    added: list[str] = []
+    removed: list[str] = []
+    changed: list[str] = []
+    for root_str in sorted(set(exp_roots) | set(act_roots)):
+        e_doc = exp_roots.get(root_str) if isinstance(exp_roots.get(root_str), dict) else {}
+        a_doc = act_roots.get(root_str) if isinstance(act_roots.get(root_str), dict) else {}
+        e_entries = e_doc.get("entries") if isinstance(e_doc.get("entries"), dict) else {}
+        a_entries = a_doc.get("entries") if isinstance(a_doc.get("entries"), dict) else {}
+        e_dists = e_doc.get("dists") if isinstance(e_doc.get("dists"), dict) else {}
+        a_dists = a_doc.get("dists") if isinstance(a_doc.get("dists"), dict) else {}
+        for name in sorted(set(e_entries) | set(a_entries)):
+            label = f"{root_str}/{name}"
+            if name not in e_entries:
+                if len(added) < limit:
+                    added.append(label)
+            elif name not in a_entries:
+                if len(removed) < limit:
+                    removed.append(label)
+            elif e_entries[name] != a_entries[name] or e_dists.get(name) != a_dists.get(name):
+                if len(changed) < limit:
+                    changed.append(label)
+    out: dict[str, list[str]] = {}
+    if added:
+        out["added"] = added
+    if removed:
+        out["removed"] = removed
+    if changed:
+        out["changed"] = changed
+    return out
 
 
 def _probe_gpu() -> dict | None:
@@ -1318,7 +1388,7 @@ def _pip_install(
     installed_via_uv = False
     if uv_bin:
         cmd = [
-            uv_bin, "pip", "install", "--python", str(venv_python),
+            uv_bin, "pip", "install", "--no-system", "--python", str(venv_python),
             "--constraint", str(constraints), "-q", "huggingface_hub", *req_args,
         ]
         try:
@@ -3509,7 +3579,7 @@ def verify_vm_purity(
             report["errors"].append("gpu_hardware_unavailable")
         else:
             report["gpu_diagnostics"] = diag
-    actual_digest, _ = global_site_digest()
+    actual_digest, actual_snap = global_site_digest()
     report["actual_baseline_digest"] = actual_digest
     report["expected_baseline_digest"] = expected_baseline_digest
     if (
@@ -3520,7 +3590,19 @@ def verify_vm_purity(
         report["site_snapshot_ok"] = True
     else:
         report["site_snapshot_ok"] = False
-        report["errors"].append("global_site_snapshot_mismatch")
+        base_file = base_root / ".vm-baseline.json"
+        site_diff: dict[str, list[str]] = {}
+        if base_file.is_file():
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                bdoc = json.loads(base_file.read_text(encoding="utf-8"))
+                if isinstance(bdoc, dict) and isinstance(bdoc.get("snapshot"), dict):
+                    site_diff = _diff_site_snapshots(bdoc.get("snapshot"), actual_snap)
+        if site_diff:
+            report["site_diff"] = site_diff
+            sample = [Path(p).name for vals in site_diff.values() for p in vals][:5]
+            report["errors"].append("global_site_snapshot_mismatch:" + ",".join(sample))
+        else:
+            report["errors"].append("global_site_snapshot_mismatch")
     dirty_user = _user_site_packages_dirty(home_dir=home_dir)
     if dirty_user:
         report["user_site_ok"] = False

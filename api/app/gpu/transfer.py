@@ -872,6 +872,7 @@ def _fail_transfer_to_releasing(
     error_code: str,
     message: str,
     final_state: str = "failed",
+    teardown_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fail-closed: abort transfer and route VM through normal confirmed deletion."""
     owner_id = job["owner_id"]
@@ -899,6 +900,9 @@ def _fail_transfer_to_releasing(
                 svc._set(inst, idata, state="releasing", expected_version=inst.version, session=session)
                 svc._emit(session, owner_id, inst.project_id, inst.id, job["id"], "releasing", message)
 
+    extra_fields: dict[str, Any] = {}
+    if teardown_report is not None:
+        extra_fields["teardown_report"] = teardown_report
     return scheduler._set_state(
         job,
         "cleaning_up",
@@ -907,6 +911,7 @@ def _fail_transfer_to_releasing(
         cleanup_final_state=final_state,
         error_code=error_code if final_state == "failed" else None,
         error_message=message if final_state == "failed" else None,
+        **extra_fields,
     )
 
 
@@ -1414,6 +1419,7 @@ def _handle_teardown_result(
         error_code=err_code,
         message=err_msg,
         final_state="failed",
+        teardown_report=report,
     )
 
 

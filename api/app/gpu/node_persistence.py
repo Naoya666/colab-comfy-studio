@@ -765,6 +765,10 @@ def _detected_cuda_arch_list() -> str | None:
 def prestartup(root):
     """Manager exec-restarts keep their PID; verify every startup, including those."""
     root = Path(root)
+    os.environ['PYTHONNOUSERSITE'] = '1'
+    os.environ['UV_SYSTEM_PYTHON'] = 'false'
+    if sys.prefix != sys.base_prefix:
+        os.environ['PIP_REQUIRE_VIRTUALENV'] = 'true'
     config = read(root / 'plugins-config.json')
     if not config:
         return
@@ -889,10 +893,12 @@ class Persistence:
         env = dict(os.environ)
         env['COMFYUI_PATH'] = str(self.comfy)
         env['PYTHONNOUSERSITE'] = '1'
+        env['UV_SYSTEM_PYTHON'] = 'false'
         env.pop('PYTHONPATH', None)
         vdir = self._resolved_venv_dir()
         if vdir is not None:
             env['VIRTUAL_ENV'] = str(vdir)
+            env['PIP_REQUIRE_VIRTUALENV'] = 'true'
             vbin = str(vdir / 'bin')
             parts = [p for p in env.get('PATH', '').split(os.pathsep) if p and p != vbin]
             env['PATH'] = os.pathsep.join([vbin, *parts])
@@ -1069,7 +1075,7 @@ class Persistence:
                 req_args = [arg for req in req_files for arg in ('-r', str(req))]
                 uv_bin = shutil.which('uv') if env_flag('NATIVE_USE_UV', True) else None
                 if uv_bin:
-                    uv_flags = ['--python', py_bin] if vdir is not None else ['--system', '--python', py_bin]
+                    uv_flags = ['--no-system', '--python', py_bin] if vdir is not None else ['--system', '--python', py_bin]
                     batch_cmd = [uv_bin, 'pip', 'install', *uv_flags, '--constraint', str(constraints), '-q', *req_args]
                 else:
                     batch_cmd = [py_bin, '-m', 'pip', 'install', '--disable-pip-version-check', '-q', '-c', str(constraints), *req_args]
@@ -1777,12 +1783,13 @@ def try_restore_env_cache(
         if after_protected != baseline_protected:
             raise RuntimeError('env-cache altered protected PyTorch/CUDA packages')
         py_bin = sys.executable
-        check_env = dict(os.environ, PYTHONNOUSERSITE='1')
+        check_env = dict(os.environ, PYTHONNOUSERSITE='1', UV_SYSTEM_PYTHON='false')
         check_env.pop('PYTHONPATH', None)
         resolved_venv = Path(venv_dir) if venv_dir is not None else (Path(root) / 'venv')
         if (resolved_venv / 'bin' / 'python').is_file():
             py_bin = str(resolved_venv / 'bin' / 'python')
             check_env['VIRTUAL_ENV'] = str(resolved_venv)
+            check_env['PIP_REQUIRE_VIRTUALENV'] = 'true'
             vbin = str(resolved_venv / 'bin')
             parts = [p for p in check_env.get('PATH', '').split(os.pathsep) if p and p != vbin]
             check_env['PATH'] = os.pathsep.join([vbin, *parts])

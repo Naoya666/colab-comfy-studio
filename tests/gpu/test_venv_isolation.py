@@ -6,7 +6,6 @@ import io
 import json
 import os
 import shutil
-import site
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -435,3 +434,61 @@ def test_teardown_native_order_aborts_on_unsynced_and_blocks_rmtree_on_active_mo
     assert res2["cleaned"] is False
     assert res2["error_code"] == "mount_still_active"
     assert native_dir.exists()
+
+
+def test_domain_venv_installs_pip_shims_and_disables_colab_uv_system_python(tmp_path, monkeypatch):
+    """Colab sets UV_SYSTEM_PYTHON=true by default; domain venvs must block global installs."""
+    monkeypatch.setenv("UV_SYSTEM_PYTHON", "true")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/rogue")
+
+    vdir = tmp_path / "native" / "venv"
+    py_bin = runtime_worker.ensure_domain_venv(vdir)
+    assert py_bin.is_file()
+    for shim_name in ("pip", "pip3"):
+        shim = vdir / "bin" / shim_name
+        assert shim.is_file()
+        assert os.access(shim, os.X_OK)
+        text = shim.read_text(encoding="utf-8")
+        assert "-m pip" in text and str(py_bin) in text
+
+    env = runtime_worker.domain_python_env(vdir)
+    assert env["UV_SYSTEM_PYTHON"] == "false"
+    assert env["PIP_REQUIRE_VIRTUALENV"] == "true"
+    assert env["PYTHONNOUSERSITE"] == "1"
+    assert "PYTHONPATH" not in env
+    assert env["VIRTUAL_ENV"] == str(vdir)
+    assert env["PATH"].split(os.pathsep)[0] == str(vdir / "bin")
+
+    # Persistence._python_env() must enforce the same venv guards for Manager/cm-cli.
+    native_root = tmp_path / "native"
+    comfy = native_root / "ComfyUI"
+    (comfy / "custom_nodes").mkdir(parents=True)
+    user_dir = native_root / "user"
+    user_dir.mkdir(parents=True)
+    pers = node_persistence.Persistence(native_root, comfy, user_dir, venv_dir=vdir)
+    penv = pers._python_env()
+    assert penv["UV_SYSTEM_PYTHON"] == "false"
+    assert penv["PIP_REQUIRE_VIRTUALENV"] == "true"
+    assert penv["PYTHONNOUSERSITE"] == "1"
+    assert penv["VIRTUAL_ENV"] == str(vdir)
+
+    # verify_vm_purity() reports exact site_diff when global site-packages is mutated.
+    fake_site = tmp_path / "global_site"
+    fake_site.mkdir()
+    (fake_site / "torch").mkdir()
+    monkeypatch.setattr(runtime_worker, "_global_site_dirs", lambda: [fake_site])
+    studio_root = tmp_path / "studio"
+    base = runtime_worker.ensure_vm_baseline(studio_root=studio_root)
+    (fake_site / "comfyui_frontend_package").mkdir()
+    purity = runtime_worker.verify_vm_purity(
+        base["digest"],
+        studio_root=studio_root,
+        check_ports=False,
+        check_gpu=False,
+        check_mounts=False,
+        allow_mock_gpu=True,
+        home_dir=tmp_path / "home",
+    )
+    assert purity["site_snapshot_ok"] is False
+    assert any("comfyui_frontend_package" in p for p in (purity.get("site_diff") or {}).get("added", []))
+    assert any("comfyui_frontend_package" in e for e in purity["errors"])
