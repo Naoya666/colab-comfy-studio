@@ -13,11 +13,10 @@ from app import review_routes
 from app.common import APIError
 from app.config import settings
 from app.db import Store
-from app.gpu import native, transfer
+from app.gpu import native
 from app.gpu.compute import GpuConfig
 from app.gpu.instances import POOL_CREATION, POOL_EPHEMERAL, InstanceService
 from app.gpu.repository import Repository
-from app.gpu.scheduler import Scheduler
 from app.storage import save_asset
 
 OWNER = {"id": "owner-smoke", "role": "admin"}
@@ -304,10 +303,8 @@ def test_ephemeral_standby_claimed_at_minute_9_recomputes_lease_deadline(tmp_pat
     assert updated_lease["deadline_epoch"] > t0 + 600.0
     assert updated_lease["idle_deadline_at"] is None
 
-    # Scheduler reuse path also recomputes deadline_epoch cleanly.
-    scheduler = Scheduler(store, config=cfg, clock=clock)
-    repo.create("jobs", OWNER["id"], {**smoke_job, "instance_id": inst["id"], "lease_id": lease["id"]}, record_id="job-min9")
     # At t0 + 650 (50s past the old standby deadline), lease deadline is still 190s in the future!
+    repo.create("jobs", OWNER["id"], {**smoke_job, "instance_id": inst["id"], "lease_id": lease["id"]}, record_id="job-min9")
     clock.advance(110.0)
     assert clock() > t0 + 600.0
     assert clock() < updated_lease["deadline_epoch"]

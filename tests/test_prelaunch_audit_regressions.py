@@ -1900,9 +1900,9 @@ def test_audit5_fix1_upgrade_reconciles_95fc412_legacy_default_drive_pending_com
 
 
 def test_audit5_fix2_runtime_secrets_and_scheduler_pin_actual_mounted_drive_after_prelaunch_rebind(tmp_path, monkeypatch):
-    from cryptography.fernet import Fernet
     from app.gpu import drive as drive_mod
     from app.gpu.scheduler import GpuConfig, Scheduler
+    from cryptography.fernet import Fernet
 
     monkeypatch.setattr(settings, "encryption_key", Fernet.generate_key().decode())
     store = Store(f"sqlite:///{tmp_path / 'audit5_fix2.db'}")

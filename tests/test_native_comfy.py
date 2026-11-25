@@ -1517,7 +1517,6 @@ def test_utf8_content_disposition_header_forwarded_without_latin1_error(proxy, m
 
 
 def test_native_base_python_uv_fallback_and_env_toggle(monkeypatch, tmp_path):
-    import sys
     from types import SimpleNamespace
 
     from app.gpu import native_runtime as runtime

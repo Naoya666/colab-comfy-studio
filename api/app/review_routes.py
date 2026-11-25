@@ -1037,7 +1037,7 @@ def _activation_instance_hints(repo: Repository, owner_id: str, manifest: Mappin
     """Compute exact-spec-matching standby ephemeral card and transferable other-domain cards (Spec §5.2)."""
     from .gpu.instances import POOL_CREATION, POOL_EPHEMERAL, POOL_NATIVE, instance_pool_of
     from .gpu.specs import spec_key as _norm_spec_key
-    from .gpu.transfer import _has_active_job_for_instance_in_tx, _is_gpu_instance, _vm_allocated_at
+    from .gpu.transfer import _is_gpu_instance, _vm_allocated_at
 
     raw_spec = (manifest or {}).get("compute_spec") if isinstance(manifest, Mapping) else None
     if not isinstance(raw_spec, Mapping):
