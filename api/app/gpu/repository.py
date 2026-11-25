@@ -1081,6 +1081,8 @@ class Repository:
                 if lease is None or lease.state == 'deleted' or lease_instance_id != instance_id:
                     return None
                 lease_data = lease.data or {}
+                if lease.state == 'quarantined' and not lease_data.get('force_stop'):
+                    return None
                 if lease_data.get('cleanup_claim_token') not in {None, token} and self._claim_is_live(lease_data, now):
                     return None
                 others = session.scalars(select(GpuLeaseRow).where(GpuLeaseRow.owner_id == owner_id)).all()
@@ -1108,7 +1110,7 @@ class Repository:
                         or lease_account_json != instance_account_json):
                     return None
                 current_job = instance_data.get('current_job_id') or instance.current_job_id
-                if current_job or instance.state in {'allocating', 'ready', 'busy', 'deleted', 'unknown'}:
+                if current_job or instance.state in {'allocating', 'ready', 'busy', 'deleted', 'unknown', 'transferring', 'quarantined'}:
                     return None
                 if idle_cleanup:
                     if (

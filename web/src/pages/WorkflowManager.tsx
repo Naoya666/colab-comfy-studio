@@ -4,6 +4,7 @@ import { ImageDraftConfiguration } from '../components/ImageDraftConfiguration';
 import { Fragment, Suspense, lazy, useCallback, useMemo, useState } from 'react';
 import { ChevronDown, Download, Search, Trash2, Upload, X } from 'lucide-react';
 import type { GpuWorkflow, WorkflowExportResponse } from '../lib/gpu-api';
+import type { TransferFocusTarget } from '../lib/domain-transfer';
 import { Pager } from '../components/ui';
 import { WorkflowActivationPanel } from '../components/WorkflowActivation';
 import type { WorkflowGraphPreviewData } from '../components/WorkflowGraphPreview';
@@ -34,7 +35,7 @@ async function fetchWorkflowGraphPreview(workflow: Pick<GpuWorkflow, 'workflow_k
 }
 
 export function WorkflowsPanel({
-  workflows, projectId = '', projectTitle = '', onImport, onExport, onValidate, onPublish, onRollback, onDeactivate, onDelete, deleting = false, onActivated, onOpenJob, onUseProject, onOpenModelLibrary,
+  workflows, projectId = '', projectTitle = '', onImport, onExport, onValidate, onPublish, onRollback, onDeactivate, onDelete, deleting = false, onActivated, onOpenJob, onUseProject, onOpenModelLibrary, onFocusTransfer,
 }: {
   workflows: GpuWorkflow[];
   projectId?: string;
@@ -51,6 +52,7 @@ export function WorkflowsPanel({
   onOpenJob?: (jobId: string, projectId?: string) => void;
   onUseProject?: (projectId: string) => void;
   onOpenModelLibrary?: () => void;
+  onFocusTransfer?: (target: TransferFocusTarget) => void;
 }) {
   const [importOpen, setImportOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -256,6 +258,7 @@ export function WorkflowsPanel({
                               onOpenJob={onOpenJob}
                               onUseProject={onUseProject}
                               onWatch={(next) => rememberWatch(wf.id, next)}
+                              onTransferToEphemeral={onFocusTransfer ? (instanceId) => onFocusTransfer({ instanceId, targetPool: 'ephemeral' }) : undefined}
                             />
                           </div>
                         )}

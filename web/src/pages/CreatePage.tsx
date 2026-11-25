@@ -4,9 +4,15 @@ import {
   ChevronRight, ChevronDown, Minus, Plus, X, Check, Trash2, Save, ArrowLeftRight,
 } from 'lucide-react';
 import type {
-  GalleryAsset, GpuManifest, GpuModel, GpuPreset, GpuSettings, GpuUsage, GpuWorkflow, Project, Provider,
+  GalleryAsset, GpuManifest, GpuModel, GpuPreset, GpuSettings, GpuSpecKey, GpuUsage, GpuWorkflow, Project, Provider,
 } from '../lib/gpu-api';
 import { getGpuWorkflowSchema } from '../lib/gpu-api';
+import {
+  domainBadgeLabel,
+  findTransferableInstancesForCreation,
+  instanceIdOfCard,
+  type TransferFocusTarget,
+} from '../lib/domain-transfer';
 import { GpuParamForm, splitParams } from '../components/GpuParamForm';
 import { ReferencePicker, supportsReferences } from '../components/ReferencePicker';
 import { RuntimeSelection } from '../components/RuntimeSelection';
@@ -64,13 +70,15 @@ export function CreatePanel({
   models, workflows, presets, settings, usage, computeSpec, specBelowDefaultError, onEditGuard, manifest, params, setParams, gallery,
   selectedAssets, setSelectedAssets, uploadProgress, onUpload, setModelId, workflowId, setWorkflowId,
   runtime, setRuntime, maxRuntime, setMaxRuntime, batchCount, setBatchCount, batchMode,
-  runtimeChoice, accounts, instances, onRuntimeChoiceChange,
+  runtimeChoice, accounts, instances, onRuntimeChoiceChange, gpuOrder, onFocusTransfer,
   gpuSelection, loading, error, onSubmit, onApplyPreset, onSavePreset, onUpdatePreset, onDeletePreset, children, desktop, draftReady,
 }: {
   gpuSelection?: ReactNode;
   children?: ReactNode;
   desktop: boolean;
   draftReady: boolean;
+  gpuOrder?: GpuSpecKey[];
+  onFocusTransfer?: (target: TransferFocusTarget) => void;
   projectId: string;
   projectTitle?: string;
   projects?: Project[];
@@ -216,6 +224,10 @@ export function CreatePanel({
   const selectedAccountAlias = accounts.find((a) => a.account_id === runtimeChoice.accountId)?.alias || runtimeChoice.accountId;
   const selectedInstanceObj = instances.find((item) => (item.id || item.instance_id) === runtimeChoice.instanceId);
   const effectiveComputeSpec = computeSpec || (manifest?.compute_spec as Record<string, unknown> | undefined);
+  const transferableForCreation = useMemo(
+    () => (runtime === 'colab' ? findTransferableInstancesForCreation(instances, effectiveComputeSpec, gpuOrder) : []),
+    [runtime, instances, effectiveComputeSpec, gpuOrder],
+  );
   const runtimeSummary = [
     runtime === 'mock' ? '离线模拟' : 'Colab GPU',
     selectedAccountAlias ? `账号 ${selectedAccountAlias}` : '自动账号',
@@ -305,6 +317,22 @@ export function CreatePanel({
               </button>
             </div>
           </div>
+
+          {transferableForCreation.length > 0 && onFocusTransfer && (
+            <div className="status" role="status" aria-label="其他域空闲 GPU 转移提示" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+              <span className="small">
+                当前「{domainBadgeLabel(transferableForCreation[0])}」有空闲 {transferableForCreation[0].gpu_reported || 'GPU'} 满足本工作流规格，可免重新抢卡直接转移至创作池。
+              </span>
+              <button
+                type="button"
+                className="button secondary small"
+                onClick={() => onFocusTransfer({ instanceId: instanceIdOfCard(transferableForCreation[0]), targetPool: 'creation' })}
+              >
+                <ArrowLeftRight size={14} aria-hidden />
+                去实例中心转移至创作池
+              </button>
+            </div>
+          )}
 
           {runtimeExpanded && (
             <div className={styles.stack}>

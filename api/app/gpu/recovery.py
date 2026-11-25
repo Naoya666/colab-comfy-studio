@@ -635,6 +635,8 @@ def evaluate_recovery_eligibility_in_tx(
     force_stop: bool = False,
     fuse_forced_stop: bool = False,
     native_draining: bool = False,
+    was_transferring: bool = False,
+    native_bootstrap_failed: bool = False,
     last_successful_probe_at: float | None = None,
     process_started_at: float | None = None,
     check_vps_outage: bool = False,
@@ -661,6 +663,10 @@ def evaluate_recovery_eligibility_in_tx(
         return False, "disabled", "自动恢复或真实 GPU 未启用"
 
     # 4. Pool & policy filter
+    if was_transferring:
+        return False, "non_candidate", "实例正在执行域转移，不触发跨机自动恢复"
+    if native_bootstrap_failed:
+        return False, "non_candidate", "原生启动失败待命态不触发跨机自动恢复"
     if pool == POOL_EPHEMERAL:
         return False, "non_candidate", "一次性任务不触发跨机自动恢复"
     if pool == POOL_CREATION and retention_mode not in {"smart", "retain"}:
@@ -744,6 +750,12 @@ def evaluate_recovery_eligibility_in_tx(
                 ldata = lease_row.data or {}
                 if ldata.get("native_comfy") and lease_row.state not in {"deleted", "quarantined", "releasing", "deleting"}:
                     return False, "concurrent_active", "检测到已存在活跃原生实例，停止重复恢复"
+            for inst_row in session.scalars(select(GpuInstanceRow).where(GpuInstanceRow.owner_id == owner_id)).all():
+                if inst_row.id == ignore_instance_id:
+                    continue
+                idata = inst_row.data or {}
+                if inst_row.state == "transferring" and (idata.get("transfer_state") or {}).get("to_pool") == POOL_NATIVE:
+                    return False, "concurrent_active", "检测到已有 GPU 实例正在转入原生域，停止重复恢复"
             reclaimed_ids = {i for i in (ignore_instance_id, source_instance_id) if i}
             for job_row in session.scalars(select(GpuJobRow).where(GpuJobRow.owner_id == owner_id)).all():
                 if job_row.id == ignore_job_id:
@@ -938,6 +950,8 @@ def on_runtime_reclaimed_in_tx(
         force_stop=bool(snapshot.get("force_stop")),
         fuse_forced_stop=bool(snapshot.get("fuse_forced_stop")),
         native_draining=bool(snapshot.get("native_draining")),
+        was_transferring=bool(snapshot.get("was_transferring")),
+        native_bootstrap_failed=bool(snapshot.get("native_bootstrap_failed")),
         last_successful_probe_at=snapshot.get("last_successful_probe_at"),
         process_started_at=process_started_at,
         check_vps_outage=True,

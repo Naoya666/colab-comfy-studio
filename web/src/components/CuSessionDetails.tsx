@@ -16,7 +16,7 @@ import { Card, Segmented } from './ui';
 import styles from '../gpu.module.css';
 
 const labels: Record<CuSessionKind, string> = {
-  single_job: '单次任务', smart_reuse: '智能复用', native_comfy: '原生 ComfyUI', prep: '缓存准备', smoke: '冒烟测试',
+  single_job: '单次任务', smart_reuse: '智能复用', multi_domain: '跨域复用', native_comfy: '原生 ComfyUI', prep: '缓存准备', smoke: '冒烟测试',
 };
 const PAGE_SIZE = 10;
 
@@ -291,7 +291,7 @@ function SessionLine({
   accountAlias?: string;
   active?: boolean;
 }) {
-  const expandable = session.session_kind === 'smart_reuse';
+  const expandable = session.session_kind === 'smart_reuse' || session.session_kind === 'multi_domain';
   const rowContent = (
     <div className={styles.cuSessionRow} data-expandable={expandable}>
       <div className={styles.cuSessionMain}>

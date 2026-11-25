@@ -618,10 +618,19 @@ def heal_cycle(
                     else:
                         comfy_log = Path(state.get("comfy_log") or str(root / "comfy.log"))
                         comfy_log.parent.mkdir(parents=True, exist_ok=True)
+                        comfy_env = dict(os.environ)
+                        comfy_env["PYTHONNOUSERSITE"] = "1"
+                        comfy_env.pop("PYTHONPATH", None)
+                        venv_dir = state.get("venv_dir")
+                        if isinstance(venv_dir, str) and venv_dir:
+                            comfy_env["VIRTUAL_ENV"] = venv_dir
+                            vbin = str(Path(venv_dir) / "bin")
+                            parts = [p for p in comfy_env.get("PATH", "").split(os.pathsep) if p and p != vbin]
+                            comfy_env["PATH"] = os.pathsep.join([vbin, *parts])
                         with comfy_log.open("ab") as log:
                             log_offset = log.tell()
                             proc = popen_fn(
-                                comfy_args, cwd=comfy_cwd, stdout=log,
+                                comfy_args, cwd=comfy_cwd, env=comfy_env, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True,
                             )
                         deadline = time.monotonic() + 300.0
@@ -1033,25 +1042,49 @@ def _base_python_packages(*, local: bool) -> tuple[str, ...]:
     return ("jedi>=0.16,<0.20", "httpx>=0.27,<1") if local else ("jedi>=0.16,<0.20",)
 
 
-def _install_base_python(worker, root: Path, comfy: Path, manager: Path, *, local: bool) -> None:
-    print(f"[studio-native] Installing Manager requirements: {manager}; Python: {sys.executable}", flush=True)
+def _install_base_python(worker, root: Path, comfy: Path, manager: Path, *, local: bool, venv_dir: Path | None = None) -> None:
+    target_venv = Path(venv_dir) if venv_dir is not None else (root / "venv")
+    ensure_venv_fn = getattr(worker, "ensure_domain_venv", None)
+    env_fn = getattr(worker, "domain_python_env", None)
+    if ensure_venv_fn is None or env_fn is None:
+        try:
+            import runtime_worker as _rw
+        except ImportError:
+            from . import runtime_worker as _rw
+        ensure_venv_fn = ensure_venv_fn or _rw.ensure_domain_venv
+        env_fn = env_fn or _rw.domain_python_env
+    venv_python = ensure_venv_fn(target_venv)
+    print(f"[studio-native] Installing Manager requirements: {manager}; Python: {venv_python}", flush=True)
     constraints = root / "gpu-constraints.txt"
     packages = _base_python_packages(local=local)
     req_args = ["-r", str(comfy / "requirements.txt"), "-r", str(manager)]
+    venv_env = env_fn(
+        target_venv,
+        extra={"PIP_CONSTRAINT": str(constraints), "UV_CONSTRAINT": str(constraints)},
+    )
     uv_bin = shutil.which("uv") if _flag("NATIVE_USE_UV", True) else None
+    run_kwargs: dict[str, object] = {"timeout": 900}
+    try:
+        import inspect
+
+        sig = inspect.signature(worker._run)
+        if "env" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            run_kwargs["env"] = venv_env
+    except (TypeError, ValueError):
+        run_kwargs["env"] = venv_env
     if uv_bin:
         cmd = [
-            uv_bin, "pip", "install", "--system", "--python", sys.executable,
+            uv_bin, "pip", "install", "--python", str(venv_python),
             "--constraint", str(constraints), "-q", *packages, *req_args,
         ]
         try:
-            worker._run(cmd, timeout=900)
+            worker._run(cmd, **run_kwargs)
             return
         except worker.WorkerError as exc:
             print(f"[studio-native] uv pip install failed ({exc}); falling back to pip", flush=True)
     worker._run(
-        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", "-c", str(constraints), *packages, *req_args],
-        timeout=900,
+        [str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", "-q", "-c", str(constraints), *packages, *req_args],
+        **run_kwargs,
     )
 
 
@@ -1199,9 +1232,18 @@ def run(root, payload, stages):
                         extra.write_text(json.dumps(model_paths(mount)))
 
                 shutil.copyfile(Path(__file__).with_name("node_persistence.py"), ROOT / "node_persistence.py")
-                persistence = Persistence(ROOT, comfy, (data / "user") if data is not None else (ROOT / "drive" / "native-comfy" / "user"))
+                venv_dir = ROOT / "venv"
+                venv_python = worker.ensure_domain_venv(venv_dir)
+                venv_env = worker.domain_python_env(venv_dir)
+                vm_baseline = worker.ensure_vm_baseline(studio_root=ROOT.parent)
+                persistence = Persistence(
+                    ROOT,
+                    comfy,
+                    (data / "user") if data is not None else (ROOT / "drive" / "native-comfy" / "user"),
+                    venv_dir=venv_dir,
+                )
                 baseline_protected = protect_environment(ROOT)
-                site = worker._site_dir()
+                site = worker.venv_site_dir(venv_dir)
                 use_env_cache = _flag("NATIVE_ENV_CACHE", True) and site.is_dir() and persistence.remote.available()
 
                 stages.start("native_plugins_restore")
@@ -1209,7 +1251,7 @@ def run(root, payload, stages):
                 if boot_pool is not None:
                     def _run_base_python() -> float:
                         t_py = time.monotonic()
-                        _install_base_python(worker, ROOT, comfy, manager, local=local)
+                        _install_base_python(worker, ROOT, comfy, manager, local=local, venv_dir=venv_dir)
                         return time.monotonic() - t_py
                     base_python_future = boot_pool.submit(_run_base_python)
                 restored_plugins = persistence.restore(payload.get("native_plugin_generation"))
@@ -1223,7 +1265,7 @@ def run(root, payload, stages):
                     )
                 else:
                     stages.start("native_python")
-                    _install_base_python(worker, ROOT, comfy, manager, local=local)
+                    _install_base_python(worker, ROOT, comfy, manager, local=local, venv_dir=venv_dir)
                 importlib.invalidate_caches()
                 after_base = protect_environment(ROOT)
                 if after_base != baseline_protected:
@@ -1239,9 +1281,12 @@ def run(root, payload, stages):
                     key_info = compute_env_cache_key(
                         comfy, commit, worker._gpu_cache_tag(), comfy / "custom_nodes", current_plugins,
                         base_packages=_base_python_packages(local=local),
+                        base_pkg_sha=vm_baseline.get("digest"),
                     )
                     stages.start("native_env_cache")
-                    env_cache_hit = try_restore_env_cache(ROOT, site, key_info, baseline_protected, persistence.remote)
+                    env_cache_hit = try_restore_env_cache(
+                        ROOT, site, key_info, baseline_protected, persistence.remote, venv_dir=venv_dir,
+                    )
                     if env_cache_hit:
                         dep_key = persistence.stamp_cached_dependencies(current_plugins)
                         if dep_key:
@@ -1278,7 +1323,7 @@ def run(root, payload, stages):
                 probe = EXTENSION[EXTENSION.index("def open_writes():"):EXTENSION.index("def index_status(")]
                 (ROOT / "probe.py").write_text("import os, json\nfrom pathlib import Path\nfrom urllib.request import Request, urlopen\n" + probe)
                 stages.start("comfy_start")
-                args = [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188", "--enable-manager",
+                args = [str(venv_python), "main.py", "--listen", "127.0.0.1", "--port", "8188", "--enable-manager",
                         "--user-directory", str(data / "user"), "--input-directory", str(data / "input"),
                         "--output-directory", str(data / "output"), "--temp-directory", str(ROOT / "temp"),
                         "--max-upload-size", str(secret["max_upload_mb"]),
@@ -1286,13 +1331,17 @@ def run(root, payload, stages):
                 if local:
                     del args[args.index("--extra-model-paths-config"):args.index("--extra-model-paths-config") + 2]
                 comfy_log = root / "comfy.log"
+                uploader_pid = None
                 with ExitStack() as startup:
                     with comfy_log.open("ab") as log:
                         log_offset = log.tell()
                         worker._atomic_json(ROOT / "plugins-config.json", {"comfy": str(comfy), "user": str(data / "user"),
                                                                           "log": str(comfy_log), "log_offset": log_offset,
+                                                                          "venv_dir": str(venv_dir),
                                                                           "flags": applied_flags})
-                        process = subprocess.Popen(args, cwd=comfy, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                        process = subprocess.Popen(
+                            args, cwd=comfy, env=venv_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                        )
                         startup.callback(_stop_startup_process, process)
                     wait_for_comfy(worker, process)
                     verify_manager(worker, comfy_log, log_offset)
@@ -1325,9 +1374,10 @@ def run(root, payload, stages):
                     if env_cache_plan is not None and persistence.remote.available():
                         with (ROOT / "env-cache.log").open("ab") as log:
                             uploader = subprocess.Popen(
-                                [sys.executable, str(ROOT / "node_persistence.py"), "upload-env-cache", str(env_cache_plan)],
-                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                                [str(venv_python), str(ROOT / "node_persistence.py"), "upload-env-cache", str(env_cache_plan)],
+                                env=venv_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                             )
+                            uploader_pid = uploader.pid
                             startup.callback(_stop_startup_process, uploader)
                     rclone_meta = {}
                     rclone_state_file = ROOT / "rclone-state.json"
@@ -1344,15 +1394,24 @@ def run(root, payload, stages):
                             pass
                     tunnel_start_id = worker._process_metadata(tunnel.pid)["start_id"]
                     comfy_start_id = worker._process_metadata(process.pid)["start_id"]
+                    try:
+                        watchdog_start_id = worker._process_metadata(watchdog.pid)["start_id"]
+                    except Exception:
+                        watchdog_start_id = None
                     worker._atomic_json(marker, {
                         "commit": commit,
                         "pid": process.pid,
                         "comfy_start_id": comfy_start_id,
                         "comfy_args": args,
                         "comfy_cwd": str(comfy),
+                        "venv_dir": str(venv_dir),
+                        "venv_isolated": True,
                         "tunnel_pid": tunnel.pid,
                         "tunnel_start_id": tunnel_start_id,
                         "tunnel_binary": binary,
+                        "watchdog_pid": watchdog.pid,
+                        "watchdog_start_id": watchdog_start_id,
+                        "env_cache_uploader_pid": uploader_pid,
                         "comfy": str(comfy),
                         "comfy_log": str(comfy_log),
                         "model_storage_mode": mode,

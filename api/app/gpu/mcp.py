@@ -216,6 +216,74 @@ print(_json.dumps(_result, separators=(",", ":")))
 """
 
 
+def build_teardown_code(execution_id: str, payload: dict, worker_source: str | None = None) -> str:
+    """Return fixed trusted teardown code using the same O_EXCL lock + status.json protocol."""
+    execution_id = _uuid4(execution_id)
+    if not isinstance(payload, dict):
+        raise MCPError("teardown payload必须是对象")
+    if worker_source is None:
+        worker_source = Path(__file__).with_name("runtime_worker.py").read_text(encoding="utf-8")
+    if not isinstance(worker_source, str) or not worker_source:
+        raise MCPError("trusted worker source is unavailable")
+    allowed_fields = (
+        "execution_id",
+        "execution_dir",
+        "from_pool",
+        "to_pool",
+        "native_bootstrap_failed",
+        "clean_native_only",
+        "expected_baseline_digest",
+        "service_instance_id",
+        "allow_mock_gpu",
+    )
+    clean_payload = {k: payload[k] for k in allowed_fields if k in payload}
+    clean_payload["execution_id"] = execution_id
+    clean_payload["execution_dir"] = f"/content/ai-studio/{execution_id}"
+    source_b64 = base64.b64encode(worker_source.encode("utf-8")).decode("ascii")
+    payload_b64 = _b64_json(clean_payload)
+    execution_literal = repr(execution_id)
+    return f"""# Colab GPU Studio fixed trusted teardown; no caller Python is executed.
+import base64 as _base64
+import json as _json
+from pathlib import Path as _Path
+import subprocess as _subprocess
+import sys as _sys
+
+_execution_id = {execution_literal}
+_root = _Path("/content/ai-studio")
+_dir = _root / _execution_id
+_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+_lock = _dir / ".worker.lock"
+_marker = _dir / "marker.json"
+_status = _dir / "status.json"
+_worker = _dir / "runtime_worker.py"
+_payload = _dir / "payload.json"
+_log = _dir / "worker.log"
+_result = {{"execution_id": _execution_id, "directory": str(_dir), "started": False, "existing": False}}
+if _marker.exists() or _status.exists() or _lock.exists():
+    _result["existing"] = True
+else:
+    try:
+        _lock.open("x").close()
+    except FileExistsError:
+        _result["existing"] = True
+    else:
+        _worker.write_bytes(_base64.b64decode({source_b64!r}))
+        _payload.touch(mode=0o600)
+        _payload.chmod(0o600)
+        _payload.write_bytes(_base64.b64decode({payload_b64!r}))
+        _marker.write_text(_json.dumps({{"execution_id": _execution_id, "state": "reserved", "kind": "teardown"}}, sort_keys=True), encoding="utf-8")
+        _log_handle = _log.open("ab")
+        _proc = _subprocess.Popen([_sys.executable, str(_worker), "teardown", str(_payload)], cwd=str(_dir),
+                                  stdin=_subprocess.DEVNULL, stdout=_log_handle, stderr=_subprocess.STDOUT,
+                                  shell=False, start_new_session=True)
+        _log_handle.close()
+        _marker.write_text(_json.dumps({{"execution_id": _execution_id, "state": "launched", "kind": "teardown", "pid": _proc.pid}}, sort_keys=True), encoding="utf-8")
+        _result.update({{"started": True, "pid": _proc.pid}})
+print(_json.dumps(_result, separators=(",", ":")))
+"""
+
+
 def build_poll_code(execution_id: str, *, inline_small_artifacts: bool = False) -> str:
     """Return a read-only status reader with a hard 100MB output bound."""
     execution_id = _uuid4(execution_id)
@@ -240,7 +308,7 @@ if not _status_path.exists():
 else:
     _status = _json.loads(_status_path.read_text(encoding="utf-8"))
     if isinstance(_status, dict):
-        _result.update({{key: _status.get(key) for key in ("state", "error_code", "error_message", "stage", "timings", "stage_started", "updated_at", "gpu_diagnostics", "creation_runtime") if key in _status}})
+        _result.update({{key: _status.get(key) for key in ("state", "error_code", "error_message", "stage", "timings", "stage_started", "updated_at", "gpu_diagnostics", "creation_runtime", "venv_isolated", "vm_baseline_digest", "clean_after_smoke", "cleaned", "teardown_report") if key in _status}})
     if _result.get("state") == "completed" and _meta_path.exists():
         _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
         _artifacts = _meta.get("artifacts") if isinstance(_meta, dict) else None
@@ -848,6 +916,8 @@ class MCPGPUExecutor:
             payload["use_resident_service"] = True
             if job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
                 payload["snapshot"] = {**snapshot, "runtime_compute_spec": None}
+        if job.get("expected_baseline_digest"):
+            payload["expected_baseline_digest"] = job["expected_baseline_digest"]
         if "lora_drive_cache" in job:
             loras = job["lora_drive_cache"]
             payload["lora_drive_cache"] = (
@@ -878,7 +948,9 @@ class MCPGPUExecutor:
             return False
         pid, start = ident.split(":")
         name = _instance_service_name(job["instance_id"])
+        service_root = str(COMFY_SERVICE_ROOT / name)
         service = str(COMFY_SERVICE_ROOT / name / "ComfyUI")
+        venv_bin = str(COMFY_SERVICE_ROOT / name / "venv" / "bin")
         loopback = _service_api_url("/system_stats")
         session = self._session(handle, job["id"])
         code = f"""import json, os, urllib.request
@@ -887,7 +959,14 @@ proc = Path("/proc") / {pid!r}
 healthy = False
 try:
     stat = (proc / "stat").read_text().rsplit(")", 1)[1].split()
-    if stat[19] == {start!r} and os.readlink(proc / "cwd") == {service!r}:
+    raw_cmd = (proc / "cmdline").read_bytes()
+    cmdline = [item.decode("utf-8", "replace") for item in raw_cmd.split(b"\\0") if item]
+    venv_dir = Path({service_root!r}) / "venv"
+    cmd_ok = bool(cmdline)
+    if cmd_ok and venv_dir.is_dir():
+        c0 = Path(cmdline[0])
+        cmd_ok = c0.parent.resolve() == Path({venv_bin!r}).resolve() and c0.name.startswith("python")
+    if stat[19] == {start!r} and os.readlink(proc / "cwd") == {service!r} and cmd_ok:
         with urllib.request.urlopen({loopback!r}, timeout=3) as response:
             healthy = response.status == 200
 except (OSError, IndexError):
@@ -896,6 +975,43 @@ print(json.dumps({{"healthy": healthy}}))
 """
         result = self._exec_code_on_handle(handle, session, str(uuid.uuid4()), code)
         return result.get("healthy") if isinstance(result, dict) else None
+
+    def start_teardown(self, handle: dict, job: dict, execution_id: str, teardown_payload: dict) -> dict:
+        execution_id = _uuid4(execution_id)
+        if not isinstance(job, dict) or not isinstance(job.get("id"), str):
+            raise MCPError("job无效")
+        session = self._session(handle, job["id"])
+        code = build_teardown_code(execution_id, teardown_payload)
+        result = self._exec_code_on_handle(handle, session, execution_id, code)
+        return {
+            "execution_id": execution_id,
+            "session": session,
+            "idempotent": bool(isinstance(result, dict) and result.get("existing")),
+            "remote": result if isinstance(result, dict) else {},
+        }
+
+    def restart_kernel(self, handle: dict) -> bool:
+        """Optionally restart the Colab Jupyter Kernel after clean teardown to free Kernel RAM."""
+        tunnel_lease = self._tunnel_lease(handle)
+        if tunnel_lease is None or not tunnel_lease.get("kernel_id"):
+            return False
+        try:
+            proxy_url, proxy_token = self._refresh_tunnel_proxy(tunnel_lease)
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Colab-Client-Agent": "colab-cli",
+                "X-Colab-Runtime-Proxy-Token": proxy_token,
+            }
+            resp = self.client.post(
+                f"{proxy_url}/api/kernels/{tunnel_lease['kernel_id']}/restart",
+                headers=headers,
+                params={"colab-runtime-proxy-token": proxy_token, "authuser": "0"},
+                timeout=10.0,
+            )
+            return 200 <= resp.status_code < 300
+        except Exception:
+            return False
 
     def interrupt_creation_service(self, handle: dict, job: dict) -> bool:
         """Interrupt a resident prompt and confirm the worker can no longer submit work."""
@@ -1134,6 +1250,9 @@ print(json.dumps({{"interrupted": interrupted}}))
             "gpu_diagnostics": result.get("gpu_diagnostics"),
             "status_updated_at": result.get("updated_at"),
         }
+        for extra_key in ("venv_isolated", "vm_baseline_digest", "clean_after_smoke", "cleaned", "teardown_report"):
+            if extra_key in result:
+                evidence[extra_key] = result.get(extra_key)
         if state in {"reserved", "starting", "running", None}:
             stage = result.get("stage")
             stage_started = result.get("stage_started")
@@ -1149,6 +1268,15 @@ print(json.dumps({{"interrupted": interrupted}}))
                     if isinstance(stage_started, (int, float)) and not isinstance(stage_started, bool)
                     else None
                 ),
+                "timings": result.get("timings") if isinstance(result.get("timings"), dict) else {},
+            }
+        if state == "aborted_unsynced":
+            return {
+                **evidence,
+                "state": "aborted_unsynced",
+                "outputs": [],
+                "error_code": result.get("error_code", "native_unsynced_data"),
+                "message": str(result.get("error_message", "检测到未同步数据，已中止转移并保护实例"))[:1400],
                 "timings": result.get("timings") if isinstance(result.get("timings"), dict) else {},
             }
         if state == "failed":
@@ -1268,4 +1396,4 @@ print(json.dumps({{"interrupted": interrupted}}))
             self.client.close()
 
 
-__all__ = ["MCP_ENDPOINT", "MCPError", "MCPGPUExecutor", "build_bootstrap_code", "build_poll_code"]
+__all__ = ["MCP_ENDPOINT", "MCPError", "MCPGPUExecutor", "build_bootstrap_code", "build_poll_code", "build_teardown_code"]

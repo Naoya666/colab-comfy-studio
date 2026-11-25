@@ -267,6 +267,28 @@ def workspace_offline_status(repo, owner: str = "owner", now: float | None = Non
     if running:
         return False, "当前原生 ComfyUI 正在启动或收尾中，请等待任务结束并停止实例后再执行修改"
     from . import recovery
+    from .instances import POOL_NATIVE, instance_pool_of
+
+    all_instances = (
+        repo.list_by_states("instances", ("deleted",), owner, exclude=True)
+        if hasattr(repo, "list_by_states")
+        else repo.list("instances", owner)
+    )
+    for inst in all_instances:
+        if inst.get("state") == "deleted":
+            continue
+        if inst.get("state") == "transferring":
+            ts = inst.get("transfer_state") or {}
+            if ts.get("from_pool") == POOL_NATIVE or ts.get("to_pool") == POOL_NATIVE:
+                return False, "当前有 GPU 实例正在转入或转出原生域，请等待域转移完成后再执行离线修改"
+        if instance_pool_of(inst) == POOL_NATIVE and inst.get("state") in {
+            "allocating", "ready", "busy", "retained_idle", "quarantined", "releasing", "cleanup_pending"
+        }:
+            if inst.get("state") == "quarantined":
+                return False, "当前原生 ComfyUI 实例处于数据保护隔离状态，请先在实例中心处理后再执行离线修改"
+            if inst.get("native_bootstrap_failed"):
+                return False, "原生域存在启动失败待命实例，请先在实例中心停止或转出后再执行离线修改"
+            return False, "当前原生 ComfyUI 实例正在运行或释放中，请等待实例完全停止后再执行修改"
 
     plan = recovery.active_plan(repo, owner, pool="native")
     if plan:
@@ -420,7 +442,7 @@ def guard_generation(repo, owner, policy):
         CuGuardService(repo).check(owner, "colab", policy.get("account_id"), policy.get("instance_id"))
 
 
-def busy_state(client=None, *, repo=None, owner="owner", state_payload=None) -> tuple[str, str | None]:
+def busy_state(client=None, *, repo=None, owner="owner", state_payload=None, fresh: bool = False) -> tuple[str, str | None]:
     """Distinguish confirmed busy, confirmed idle, and unreachable/unknown upstream state.
 
     Returns ``(status, reason)`` where ``status`` is ``"busy"``, ``"idle"``, or ``"unknown"``.
@@ -436,11 +458,21 @@ def busy_state(client=None, *, repo=None, owner="owner", state_payload=None) -> 
             if data["queue_running"] or data["queue_pending"]:
                 return "busy", "queue"
             if state_payload is None:
-                state = c.get(url + "/studio_native/state", headers=headers)
+                state_path = "/studio_native/state?fresh=1" if fresh else "/studio_native/state"
+                state = c.get(url + state_path, headers=headers)
                 state.raise_for_status()
                 state_payload = state.json()
             if not isinstance(state_payload, dict):
                 return "unknown", "state_malformed"
+            if fresh:
+                plugins = state_payload.get("plugins")
+                if isinstance(plugins, dict):
+                    if plugins.get("durable") is False or plugins.get("error"):
+                        return "busy", "plugins_unsynced"
+                rclone = state_payload.get("rclone")
+                if isinstance(rclone, dict):
+                    if any(int(rclone.get(k) or 0) > 0 for k in ("uploadsQueued", "uploadsInProgress", "transferring", "open_writes")):
+                        return "busy", "rclone_uploading"
             flag = state_payload.get("busy")
             if flag is False:
                 return "idle", None
@@ -461,11 +493,11 @@ def busy(client=None, *, repo=None, owner="owner", state_payload=None):
 _default_busy = busy
 
 
-def busy_state_for(repo=None, owner="owner", client=None, *, state_payload=None) -> tuple[str, str | None]:
+def busy_state_for(repo=None, owner="owner", client=None, *, state_payload=None, fresh: bool = False) -> tuple[str, str | None]:
     if busy is not _default_busy:
         val = busy() if client is None else busy(client)
         return ("busy", None) if val else ("idle", None)
-    return busy_state(client=client, repo=repo, owner=owner, state_payload=state_payload)
+    return busy_state(client=client, repo=repo, owner=owner, state_payload=state_payload, fresh=fresh)
 
 
 def busy_for(repo=None, owner="owner", client=None, *, state_payload=None):
@@ -552,7 +584,66 @@ def _admit_locked(
     )
     running = next((j for j in active_jobs
                     if (j.get("snapshot") or {}).get("native_comfy") and j["state"] not in TERMINAL), None)
+    # Block starting a new native session while another instance is transferring into native or quarantined in native.
+    from .instances import POOL_NATIVE, instance_pool_of
+
+    all_instances = (
+        repo.list_by_states("instances", ("deleted",), owner, exclude=True)
+        if hasattr(repo, "list_by_states")
+        else repo.list("instances", owner)
+    )
+    for inst in all_instances:
+        if inst.get("state") == "deleted":
+            continue
+        if inst.get("state") == "transferring" and (inst.get("transfer_state") or {}).get("to_pool") == POOL_NATIVE:
+            raise APIError("NATIVE_ACTIVE", "已有 GPU 实例正在转移至原生域，请等待转移完成", 409)
+        if inst.get("state") == "quarantined" and instance_pool_of(inst) == POOL_NATIVE:
+            raise APIError("NATIVE_ACTIVE", "原生域存在保护隔离中的实例，请先在实例中心处理后再启动", 409)
+
     live = active_lease(repo, owner)
+    standby_retry_instance: dict | None = None
+    if not running and live:
+        live_inst = repo.get("instances", live.get("instance_id"), owner) if live.get("instance_id") else None
+        now_check = time.time()
+        deadlines = [
+            float(v)
+            for v in (
+                (live_inst or {}).get("idle_deadline_at"),
+                live.get("idle_deadline_at"),
+                live.get("deadline_epoch"),
+            )
+            if v is not None
+        ]
+        if (
+            live_inst
+            and live_inst.get("native_bootstrap_failed") is True
+            and not live.get("native_ready")
+            and live.get("state") == "idle"
+            and live_inst.get("state") == "retained_idle"
+            and not live_inst.get("manual_stop_requested")
+            and not live_inst.get("force_stop")
+            and (not deadlines or now_check < min(deadlines))
+        ):
+            from .specs import spec_id, spec_key
+
+            inst_spec = live_inst.get("runtime_spec_reported") or live_inst.get("runtime_spec_requested")
+            try:
+                same_spec = bool(inst_spec and spec_key(inst_spec) == spec_key(body["spec"]))
+                spec_label = spec_id(spec_key(inst_spec)) if inst_spec else (live_inst.get("gpu_reported") or "GPU")
+            except ValueError:
+                same_spec = False
+                spec_label = str(live_inst.get("gpu_reported") or "GPU")
+            same_account = (account is None) or (live_inst.get("account_id") == account)
+            if not same_account or not same_spec:
+                raise APIError(
+                    "NATIVE_ACTIVE",
+                    f"原生域已有失败待命实例（规格 {spec_label}），请先在实例中心停止或转移后再切换规格",
+                    409,
+                )
+            standby_retry_instance = live_inst
+            account = live_inst.get("account_id")
+            live = None  # Fall through to create an in-place retry bootstrap job claiming this standby card.
+
     if running or live:
         source = running or repo.get("jobs", live.get("native_bootstrap_job_id") or live.get("owner_job_id"), owner)
         if api_key_id and source:
@@ -576,7 +667,7 @@ def _admit_locked(
         if any(field in body and storage[field] != model_storage(policy)[field] for field in storage):
             raise APIError("NATIVE_ACTIVE", "已有原生会话；请停止实例并重新启动以修改模型存储配置", 409)
         return source
-    if body.get("instance_id"):
+    if body.get("instance_id") and (standby_retry_instance is None or body.get("instance_id") != standby_retry_instance["id"]):
         raise APIError("INSTANCE_CONFLICT", "原生 ComfyUI 仅使用独立原生实例，不复用其他域实例", 409)
     # Prevent double native VM allocation while an old native lease is still releasing/deleting
     # or while an L3 native recovery plan is actively dispatching/cancelling.
@@ -585,7 +676,16 @@ def _admit_locked(
         if hasattr(repo, "list_by_states")
         else repo.list("leases", owner)
     )
-    lingering_lease = next((x for x in all_leases if x.get("native_comfy") and x.get("state") not in {"deleted", "quarantined"}), None)
+    lingering_lease = next(
+        (
+            x
+            for x in all_leases
+            if x.get("native_comfy")
+            and x.get("state") not in {"deleted", "quarantined"}
+            and (standby_retry_instance is None or x.get("instance_id") != standby_retry_instance["id"])
+        ),
+        None,
+    )
     if lingering_lease:
         raise APIError("NATIVE_ACTIVE", "旧原生实例正在释放或核对中，请等待释放完成后再启动", 409)
     from . import recovery
@@ -618,6 +718,8 @@ def _admit_locked(
         repo.store.create("projects", owner, {"title": "原生 ComfyUI", "system": True}, record_id=project)
     raw = {"kind": "native-comfy", **body}
     job, _ = repo.create_job(owner, raw, key)
+    now_admit = time.time()
+    new_hard_deadline = now_admit + timeouts["max_runtime_minutes"] * 60
     policy = {"provider": "colab", "lifecycle": "retain", "account_id": account,
               **timeouts, **storage}
     patch = {
@@ -626,12 +728,16 @@ def _admit_locked(
         "native_request_hash": digest(body), "project_id": project, "provider": "colab",
         "account_id": account, "requested_account_id": account,
         "auto_select_account": account is None,
-        "requested_instance_id": None, "requested_spec": body["spec"],
+        "requested_instance_id": standby_retry_instance["id"] if standby_retry_instance else None,
+        "native_standby_retry": bool(standby_retry_instance),
+        "requested_spec": body["spec"],
         "initial_requested_spec": body["spec"],
         "lifecycle": "retain", "execution_policy": policy,
         "model_id": "native-comfy", "workflow_key": "system/native-comfy", "workflow_version": 1,
         "max_runtime_minutes": timeouts["max_runtime_minutes"], "unit_rate": rate,
-        "native_session_deadline_epoch": time.time() + timeouts["max_runtime_minutes"] * 60,
+        "hard_deadline_at": new_hard_deadline,
+        "deadline_epoch": new_hard_deadline,
+        "native_session_deadline_epoch": new_hard_deadline,
         "estimated_units": None,
         "snapshot": {"native_comfy": True, "native_plugin_generation": body.get("plugin_generation"), "bound_graph": {},
                      "manifest": {"reviewed": True, "state": "published", "comfy_commit": commit,
@@ -801,27 +907,36 @@ def _lease_identity(lease):
 
 
 def _smart_keepalive_allowed(repo, lease, now):
-    from .instances import POOL_CREATION, instance_pool_of
+    from .instances import POOL_CREATION, POOL_EPHEMERAL, POOL_NATIVE, instance_pool_of
 
     instance_id = lease.get("instance_id")
     instance = repo.get("instances", instance_id, lease["owner_id"]) if instance_id else None
     if (
         not instance
-        or lease.get("native_comfy")
         or lease.get("native_ready")
         or lease.get("native_draining")
         or lease.get("cleanup_claim_token")
-        or instance.get("native_comfy")
-        or instance_pool_of(instance) != POOL_CREATION
         or instance.get("runtime_deleted")
         or instance.get("state") != "retained_idle"
-        or instance.get("retention_mode") not in {"smart", "retain"}
         or instance.get("lease_id") != lease["id"]
         or instance.get("account_id") != lease.get("account_id")
         or instance.get("current_job_id")
         or instance.get("manual_stop_requested")
         or instance.get("cleanup_claim_token")
     ):
+        return False
+    pool = instance_pool_of(instance)
+    mode = instance.get("retention_mode")
+    if pool == POOL_CREATION:
+        if lease.get("native_comfy") or instance.get("native_comfy") or mode not in {"smart", "retain"}:
+            return False
+    elif pool == POOL_EPHEMERAL:
+        if lease.get("native_comfy") or instance.get("native_comfy") or mode != "retain":
+            return False
+    elif pool == POOL_NATIVE:
+        if not (instance.get("native_bootstrap_failed") is True and not instance.get("native_ready") and mode == "retain"):
+            return False
+    else:
         return False
     hard_deadline = instance.get("hard_deadline_at")
     if hard_deadline is None and lease.get("generation_timeouts"):

@@ -22,6 +22,7 @@ import random
 import re
 import shutil
 import signal
+import site
 import socket
 import subprocess
 import sys
@@ -150,13 +151,286 @@ def _atomic_json(path: Path, value: Any) -> None:
 
 
 def _status(root: Path, state: str, **fields: Any) -> None:
-    # Later stage updates keep the measured GPU so the coordinator can still poll it.
+    # Later stage updates keep the measured GPU and VM baseline metadata so the coordinator can still poll them.
     path = root / "status.json"
-    if "gpu_diagnostics" not in fields and path.exists():
-        previous = json.loads(path.read_text(encoding="utf-8")).get("gpu_diagnostics")
-        if previous:
-            fields["gpu_diagnostics"] = previous
+    if path.exists():
+        try:
+            previous_doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous_doc = {}
+        if isinstance(previous_doc, dict):
+            for sticky in ("gpu_diagnostics", "venv_isolated", "vm_baseline_digest", "clean_after_smoke"):
+                if sticky not in fields and sticky in previous_doc and previous_doc[sticky] is not None:
+                    fields[sticky] = previous_doc[sticky]
     _atomic_json(root / "status.json", {"state": state, "updated_at": time.time(), **fields})
+
+
+def venv_python_path(venv_dir: Path) -> Path:
+    """Return the Python binary path inside a domain virtual environment."""
+    return Path(venv_dir) / "bin" / "python"
+
+
+def venv_site_dir(venv_dir: Path) -> Path:
+    """Return the site-packages directory inside a domain virtual environment."""
+    vdir = Path(venv_dir)
+    py_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    preferred = vdir / "lib" / py_tag / "site-packages"
+    if preferred.is_dir():
+        return preferred
+    lib_dir = vdir / "lib"
+    if lib_dir.is_dir():
+        for cand in sorted(lib_dir.glob("python*/site-packages")):
+            if cand.is_dir():
+                return cand
+        for cand in sorted(lib_dir.glob("python*/dist-packages")):
+            if cand.is_dir():
+                return cand
+    preferred.mkdir(mode=0o755, parents=True, exist_ok=True)
+    return preferred
+
+
+def _venv_has_system_site_packages(venv_dir: Path) -> bool:
+    cfg = Path(venv_dir) / "pyvenv.cfg"
+    if not cfg.is_file():
+        return False
+    try:
+        for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, _, val = line.partition("=")
+            if key.strip().lower() == "include-system-site-packages":
+                return val.strip().lower() == "true"
+    except OSError:
+        return False
+    return False
+
+
+def ensure_domain_venv(venv_dir: Path, *, timeout: float = 120.0) -> Path:
+    """Create or reuse a domain-isolated venv inheriting Colab's system site-packages."""
+    vdir = Path(venv_dir)
+    py_bin = venv_python_path(vdir)
+    if py_bin.is_file() and _venv_has_system_site_packages(vdir):
+        return py_bin
+    if vdir.exists():
+        shutil.rmtree(vdir, ignore_errors=True)
+    vdir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    uv_bin = shutil.which("uv")
+    if uv_bin and Path(uv_bin).is_file():
+        try:
+            res = subprocess.run(
+                [uv_bin, "venv", "--system-site-packages", "--python", sys.executable, str(vdir)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if res.returncode == 0 and py_bin.is_file() and _venv_has_system_site_packages(vdir):
+                return py_bin
+        except (OSError, TypeError, subprocess.SubprocessError):
+            pass
+        shutil.rmtree(vdir, ignore_errors=True)
+    try:
+        import venv as _venv
+
+        _venv.EnvBuilder(system_site_packages=True, symlinks=True, with_pip=False).create(str(vdir))
+    except Exception as exc:  # noqa: BLE001
+        raise WorkerError(f"创建域隔离 venv 失败：{_safe_error(exc)}") from exc
+    if not py_bin.is_file():
+        raise WorkerError("创建域隔离 venv 失败：未生成 venv python 可执行文件")
+    return py_bin
+
+
+def domain_python_env(
+    venv_dir: Path | None,
+    *,
+    base_env: dict[str, str] | None = None,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Construct a clean subprocess environment pinned to a domain venv with PYTHONNOUSERSITE=1."""
+    env = dict(os.environ if base_env is None else base_env)
+    env["PYTHONNOUSERSITE"] = "1"
+    env.pop("PYTHONPATH", None)
+    if venv_dir is not None:
+        vdir = Path(venv_dir)
+        env["VIRTUAL_ENV"] = str(vdir)
+        vbin = str(vdir / "bin")
+        old_path = env.get("PATH", "")
+        parts = [p for p in old_path.split(os.pathsep) if p and p != vbin]
+        env["PATH"] = os.pathsep.join([vbin, *parts])
+    if extra:
+        for k, v in extra.items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = str(v)
+    return env
+
+
+def _global_site_dirs() -> list[Path]:
+    """Return global system site/dist-packages directories monitored by VM baseline snapshots."""
+    default_purelib = Path(sysconfig.get_paths()["purelib"])
+    configured = _site_dir()
+    if configured != default_purelib:
+        return [configured] if configured.is_dir() else []
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    raw_dirs: list[str] = [
+        sysconfig.get_paths().get("purelib", ""),
+        sysconfig.get_paths().get("platlib", ""),
+    ]
+    try:
+        raw_dirs.extend(site.getsitepackages())
+    except Exception:
+        pass
+    for raw in raw_dirs:
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_dir():
+            continue
+        key = str(p.resolve())
+        if key not in seen:
+            seen.add(key)
+            candidates.append(p.resolve())
+    return sorted(candidates, key=lambda item: str(item))
+
+
+def _user_site_packages_dirty(home_dir: Path | None = None) -> list[str]:
+    """Detect any packages installed under ~/.local/lib/python*/site-packages (or dist-packages)."""
+    home = Path(home_dir) if home_dir is not None else Path.home()
+    local_lib = home / ".local" / "lib"
+    dirty: list[str] = []
+    if not local_lib.is_dir():
+        return dirty
+    for py_dir in sorted(local_lib.glob("python*")):
+        if not py_dir.is_dir() or py_dir.is_symlink():
+            continue
+        for sub_name in ("site-packages", "dist-packages"):
+            sub = py_dir / sub_name
+            if not sub.is_dir() or sub.is_symlink():
+                continue
+            for entry in sorted(sub.iterdir(), key=lambda p: p.name):
+                if entry.name == "__pycache__":
+                    continue
+                dirty.append(str(entry.relative_to(home)))
+    return dirty
+
+
+def _hash_small_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def global_site_snapshot(site_dirs: list[Path] | None = None) -> dict[str, Any]:
+    """Capture a fast (<50ms) metadata snapshot of global site-packages immune to __pycache__ churn."""
+    dirs = _global_site_dirs() if site_dirs is None else [Path(d) for d in site_dirs if Path(d).is_dir()]
+    roots_data: dict[str, Any] = {}
+    protected: dict[str, str] = {}
+    for root_dir in sorted(dirs, key=lambda p: str(p)):
+        entries: dict[str, Any] = {}
+        dists: dict[str, Any] = {}
+        try:
+            children = sorted(root_dir.iterdir(), key=lambda p: p.name)
+        except OSError:
+            children = []
+        for entry in children:
+            name = entry.name
+            if name == "__pycache__" or name.startswith((".studio-creation-", ".studio-native-")):
+                continue
+            try:
+                st = entry.lstat()
+            except OSError:
+                continue
+            if entry.is_symlink():
+                try:
+                    target = os.readlink(entry)
+                except OSError:
+                    target = ""
+                entries[name] = ["l", target]
+            elif entry.is_dir():
+                # Record directory name/kind only; importing system packages creates __pycache__
+                # inside directories and mutates directory mtime/size without altering packages.
+                entries[name] = ["d"]
+                if name.endswith((".dist-info", ".egg-info")):
+                    meta_hashes: dict[str, Any] = {}
+                    dist_name = None
+                    dist_ver = None
+                    for mf in ("METADATA", "PKG-INFO", "direct_url.json"):
+                        mp = entry / mf
+                        if mp.is_file() and not mp.is_symlink():
+                            raw_bytes = mp.read_bytes()
+                            meta_hashes[mf] = hashlib.sha256(raw_bytes).hexdigest()
+                            if mf in {"METADATA", "PKG-INFO"} and dist_name is None:
+                                for line in raw_bytes.decode("utf-8", errors="replace").splitlines():
+                                    low = line.lower()
+                                    if low.startswith("name:"):
+                                        dist_name = _norm_dist_name(line.split(":", 1)[1])
+                                    elif low.startswith("version:"):
+                                        dist_ver = line.split(":", 1)[1].strip()
+                                    elif not line.strip():
+                                        break
+                    rec = entry / "RECORD"
+                    if rec.is_file() and not rec.is_symlink():
+                        try:
+                            rst = rec.lstat()
+                            meta_hashes["RECORD"] = [rst.st_size, rst.st_mtime_ns]
+                        except OSError:
+                            pass
+                    dists[name] = meta_hashes
+                    if dist_name and dist_ver and _is_protected_dist(dist_name):
+                        protected[dist_name] = dist_ver
+            else:
+                if name.endswith((".pth", ".egg-link")):
+                    entries[name] = ["pth", _hash_small_file(entry)]
+                else:
+                    entries[name] = ["f", st.st_size, st.st_mtime_ns]
+        roots_data[str(root_dir)] = {"entries": entries, "dists": dists}
+    return {"schema": 1, "roots": roots_data, "protected": protected}
+
+
+def global_site_digest(site_dirs: list[Path] | None = None) -> tuple[str, dict[str, Any]]:
+    snap = global_site_snapshot(site_dirs)
+    raw = json.dumps(snap, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest(), snap
+
+
+def _default_studio_root(exec_root: Path | None = None) -> Path:
+    default_service_root = Path("/content/ai-studio/comfy-services")
+    if COMFY_SERVICE_ROOT != default_service_root:
+        return COMFY_SERVICE_ROOT.parent
+    if exec_root is not None:
+        return Path(exec_root).resolve().parent
+    return Path("/content/ai-studio")
+
+
+def ensure_vm_baseline(studio_root: Path | None = None, *, site_dirs: list[Path] | None = None) -> dict[str, Any]:
+    """Capture once and persist .vm-baseline.json before any pip/uv install occurs on this VM."""
+    base_root = Path(studio_root) if studio_root is not None else _default_studio_root()
+    base_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    baseline_path = base_root / ".vm-baseline.json"
+    lock_path = base_root / ".vm-baseline.lock"
+    with _file_lock(lock_path):
+        if baseline_path.is_file():
+            try:
+                existing = json.loads(baseline_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("schema") == 1
+                    and isinstance(existing.get("digest"), str)
+                    and SHA256.fullmatch(existing["digest"])
+                ):
+                    return existing
+            except (OSError, ValueError, TypeError):
+                pass
+        digest_hex, snap = global_site_digest(site_dirs=site_dirs)
+        record = {
+            "schema": 1,
+            "digest": digest_hex,
+            "captured_at": time.time(),
+            "protected": snap.get("protected") or {},
+            "roots": sorted((snap.get("roots") or {}).keys()),
+        }
+        _atomic_json(baseline_path, record)
+        return record
 
 
 def _probe_gpu() -> dict | None:
@@ -280,7 +554,16 @@ def _trusted_process_metadata(service_dir: Path, state: dict) -> dict:
     command = metadata.get("cmdline")
     if not isinstance(command, list) or len(command) != 6:
         raise WorkerError("Comfy process ownership check failed")
-    if Path(command[0]).name != Path(sys.executable).name or command[1] != "main.py":
+    cmd0 = Path(command[0])
+    venv_dir = service_dir / "venv"
+    venv_bin = (venv_dir / "bin").resolve()
+    if venv_dir.is_dir() or state.get("venv_isolated") is True:
+        cmd0_ok = cmd0.parent.resolve() == venv_bin and cmd0.name.startswith("python")
+    else:
+        cmd0_ok = cmd0.name == Path(sys.executable).name or (
+            cmd0.parent.resolve() == venv_bin and cmd0.name.startswith("python")
+        )
+    if not cmd0_ok or command[1] != "main.py":
         raise WorkerError("Comfy process ownership check failed")
     if command[2:] != ["--listen", COMFY_SERVICE_HOST, "--port", str(COMFY_SERVICE_PORT)]:
         raise WorkerError("Comfy process ownership check failed")
@@ -335,13 +618,19 @@ def _start_comfy_service(service_dir: Path, fingerprint: str, cache_reason: str,
     comfy = service_dir / "ComfyUI"
     if not comfy.is_dir() or comfy.is_symlink():
         raise WorkerError("Comfy service checkout is unavailable")
+    venv_dir = service_dir / "venv"
+    venv_py = venv_python_path(venv_dir)
+    use_venv = venv_py.is_file()
+    python_bin = str(venv_py) if use_venv else sys.executable
+    proc_env = domain_python_env(venv_dir if use_venv else None)
     log_path = service_dir / "comfy.log"
     log_handle = log_path.open("ab", buffering=0)
-    args = [sys.executable, "main.py", "--listen", COMFY_SERVICE_HOST, "--port", str(COMFY_SERVICE_PORT)]
+    args = [python_bin, "main.py", "--listen", COMFY_SERVICE_HOST, "--port", str(COMFY_SERVICE_PORT)]
     try:
         process = subprocess.Popen(
             args,
             cwd=comfy,
+            env=proc_env,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             shell=False,
@@ -356,6 +645,7 @@ def _start_comfy_service(service_dir: Path, fingerprint: str, cache_reason: str,
             "cache_reason": cache_reason,
             "cwd": str(comfy.resolve()),
             "argv": args,
+            "venv_isolated": use_venv,
             "host": COMFY_SERVICE_HOST,
             "port": COMFY_SERVICE_PORT,
             "updated_at": time.time(),
@@ -1003,12 +1293,15 @@ def _pip_install(
     *,
     root: Path | None = None,
     custom_nodes: list[dict] | None = None,
+    venv_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Install ComfyUI base requirements + huggingface_hub (+ optional custom node deps) via uv with pip fallback."""
+    """Install ComfyUI base requirements + huggingface_hub (+ optional custom node deps) inside a domain venv."""
     t0 = time.monotonic()
     constraint_root = root or comfy.parent
+    target_venv = Path(venv_dir) if venv_dir is not None else (constraint_root / "venv")
+    venv_python = ensure_domain_venv(target_venv, timeout=min(120.0, timeout))
     before_protected, constraints = _protect_creation_environment(constraint_root)
-    build_env = _cuda_build_env(constraints, comfy)
+    build_env = domain_python_env(target_venv, base_env=_cuda_build_env(constraints, comfy))
     req_args = ["-r", str(comfy / "requirements.txt")]
     node_install_scripts: list[Path] = []
     for item in custom_nodes or ():
@@ -1025,7 +1318,7 @@ def _pip_install(
     installed_via_uv = False
     if uv_bin:
         cmd = [
-            uv_bin, "pip", "install", "--system", "--python", sys.executable,
+            uv_bin, "pip", "install", "--python", str(venv_python),
             "--constraint", str(constraints), "-q", "huggingface_hub", *req_args,
         ]
         try:
@@ -1036,21 +1329,26 @@ def _pip_install(
             print(f"[studio-creation] uv pip install failed ({exc}); falling back to pip", flush=True)
     if not installed_via_uv:
         base = [
-            sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q",
+            str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", "-q",
             "-c", str(constraints),
         ]
         _run([*base, "huggingface_hub", *req_args], cwd=comfy, timeout=timeout, env=build_env)
 
     for script in node_install_scripts:
-        _run([sys.executable, str(script)], cwd=script.parent, timeout=timeout, env=build_env)
+        _run([str(venv_python), str(script)], cwd=script.parent, timeout=timeout, env=build_env)
 
     importlib.invalidate_caches()
     after_protected, _ = _protect_creation_environment(constraint_root)
     if before_protected and after_protected != before_protected:
         raise WorkerError("Python 依赖安装修改了受保护的 PyTorch/CUDA 基础包，已中止运行")
+    vsite = venv_site_dir(target_venv)
+    if vsite.is_dir():
+        for entry in vsite.iterdir():
+            if _is_protected_site_entry(entry.name, vsite):
+                raise WorkerError(f"Python 依赖安装在域 venv 中覆写了受保护的 PyTorch/CUDA 包：{entry.name}")
     elapsed = round(time.monotonic() - t0, 2)
-    print(f"[studio-creation] Python deps ready via {installer} in {elapsed:.1f}s", flush=True)
-    return {"installer": installer, "python_seconds": elapsed}
+    print(f"[studio-creation] Python deps ready in venv via {installer} in {elapsed:.1f}s", flush=True)
+    return {"installer": installer, "python_seconds": elapsed, "venv_dir": str(target_venv)}
 
 
 def _env_tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
@@ -1304,9 +1602,11 @@ def _warm_put(root: Path, fingerprint: str) -> None:
 def _restore_env(
     root: Path, commit: str, timeout: float, cache: "DriveCache | None", build: bool, custom_nodes: list[dict] | None = None
 ) -> dict:
-    """ComfyUI + Python deps: fast uv direct install by default; fixed v2 Drive env-cache when explicitly needed."""
+    """ComfyUI + Python deps inside a domain venv; fixed v3 Drive env-cache when explicitly needed."""
     comfy = root / "ComfyUI"
-    site = _site_dir()
+    venv_dir = root / "venv"
+    ensure_domain_venv(venv_dir, timeout=min(120.0, timeout))
+    site = venv_site_dir(venv_dir)
     started = time.time()
     record: dict[str, Any] = {}
     key = target = None
@@ -1323,7 +1623,7 @@ def _restore_env(
     )
     if try_env_cache:
         try:
-            key = "v2-" + _env_key(commit, timeout, custom_nodes)
+            key = "v3-" + _env_key(commit, timeout, custom_nodes)
             target = f"env/{key}.tar.gz"
             record["key"] = key
             entry = cache.lookup(target, None, None)
@@ -1349,7 +1649,7 @@ def _restore_env(
     t_nodes = time.monotonic()
     _install_custom_nodes(comfy, custom_nodes or [], timeout)
     record["nodes_seconds"] = round(time.monotonic() - t_nodes, 2)
-    pip_info = _pip_install(comfy, timeout, root=root, custom_nodes=custom_nodes)
+    pip_info = _pip_install(comfy, timeout, root=root, custom_nodes=custom_nodes, venv_dir=venv_dir)
     record.update(pip_info)
     record.update(source="install", seconds=round(time.time() - started, 1))
     should_build_cache = (
@@ -2181,7 +2481,12 @@ def _read_env_state(service_dir: Path) -> dict | None:
 def _write_env_state(service_dir: Path, code_fp: str, commit: str) -> None:
     _atomic_json(
         service_dir / _ENV_STATE_FILE,
-        {"code_env_fingerprint": code_fp, "commit": commit, "updated_at": time.time()},
+        {
+            "code_env_fingerprint": code_fp,
+            "commit": commit,
+            "venv_isolated": venv_python_path(service_dir / "venv").is_file(),
+            "updated_at": time.time(),
+        },
     )
 
 
@@ -2268,6 +2573,8 @@ def _evict_unused_weights_if_needed(
 def _can_reuse_in_place_env(service_dir: Path, code_fp: str, commit: str, nodes: list[dict]) -> bool:
     env_state = _read_env_state(service_dir)
     if not isinstance(env_state, dict) or env_state.get("code_env_fingerprint") != code_fp:
+        return False
+    if env_state.get("venv_isolated") is True and not venv_python_path(service_dir / "venv").is_file():
         return False
     comfy = service_dir / "ComfyUI"
     if not (comfy / "main.py").is_file():
@@ -2468,6 +2775,55 @@ def _remove_warm_outputs(comfy, item):
                     path.unlink()
 
 
+def _clean_ephemeral_history(root: Path) -> None:
+    """Remove leftover .warm and sibling ephemeral execution directories before a clean smoke run."""
+    parent = root.parent
+    if not parent.is_dir():
+        return
+    shutil.rmtree(parent / ".warm", ignore_errors=True)
+    for entry in list(parent.iterdir()):
+        if entry.name in {root.name, ".vm-baseline.json", ".vm-baseline.lock", "native", "comfy-services"}:
+            continue
+        try:
+            uuid.UUID(entry.name)
+        except ValueError:
+            continue
+        _remove(entry)
+
+
+def _terminate_process_group(process: subprocess.Popen | None, *, grace_seconds: float = 10.0) -> bool:
+    if process is None:
+        return True
+    if process.poll() is not None:
+        return True
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            with contextlib.suppress(OSError):
+                process.terminate()
+    else:
+        with contextlib.suppress(OSError):
+            process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+        return True
+    except subprocess.TimeoutExpired:
+        if isinstance(pid, int) and pid > 0:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                with contextlib.suppress(OSError):
+                    process.kill()
+        else:
+            with contextlib.suppress(OSError):
+                process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+        return process.poll() is not None
+
+
 def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _Stages, *, service_dir=None) -> list[dict]:
     commit = manifest.get("comfy_commit", manifest.get("comfy_version"))
     if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
@@ -2478,8 +2834,18 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
     for node in graph.values():
         if not isinstance(node, dict) or node.get("class_type") not in allowlist:
             raise WorkerError("bound graph contains an unreviewed node")
+    snapshot = payload.get("snapshot") or {}
+    is_workflow_smoke = bool(snapshot.get("workflow_smoke")) and service_dir is None
+    studio_root = _default_studio_root(root)
+    expected_baseline = payload.get("expected_baseline_digest")
+    if is_workflow_smoke:
+        _clean_ephemeral_history(root)
+        if isinstance(expected_baseline, str) and SHA256.fullmatch(expected_baseline):
+            actual_digest, _ = global_site_digest()
+            if actual_digest != expected_baseline or _user_site_packages_dirty():
+                raise WorkerError("冒烟前全局 Python 环境基线校验未通过，已中止运行")
     comfy = (service_dir or root) / "ComfyUI"
-    user_loras = (payload.get("snapshot") or {}).get("lora_files") or []
+    user_loras = snapshot.get("lora_files") or []
     _check_loras(graph, manifest, user_loras)
     timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
     nodes = _reviewed_custom_nodes(manifest.get("custom_nodes"))
@@ -2489,12 +2855,13 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
     if not payload.get("generation_timeouts"):
         runtime_seconds = min(runtime_seconds, 600 * 60)
     deadline = min(time.time() + runtime_seconds, float(payload.get("deadline_epoch") or float("inf")))
-    warmup = bool((payload.get("snapshot") or {}).get("creation_warmup"))
+    warmup = bool(snapshot.get("creation_warmup"))
     service = None
+    process = None
     if service_dir:
         service, env, weights = _creation_service(
             service_dir, payload, manifest, commit, nodes, checked, user_loras, stages, deadline)
-    elif _warm_take(root, fingerprint, nodes, checked, user_loras=user_loras):
+    elif not is_workflow_smoke and _warm_take(root, fingerprint, nodes, checked, user_loras=user_loras):
         # Same runtime, same environment: the previous job left it restored. Nothing to download.
         stages.start("warm_reuse")
         env = {"source": "warm"}
@@ -2504,8 +2871,10 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
         env_cache = _drive_cache(payload, "runtime_folder_id") if payload.get("use_drive_cache", True) else None
         env = _restore_env(root, commit, timeout, env_cache, build=False, custom_nodes=nodes)
         stages.start("restore_weights")
-        parked = root.parent / ".warm" / "ComfyUI"
-        warm_models = _local_models(parked) if parked.is_dir() else None
+        warm_models = None
+        if not is_workflow_smoke:
+            parked = root.parent / ".warm" / "ComfyUI"
+            warm_models = _local_models(parked) if parked.is_dir() else None
         weights = _restore_weights(comfy, manifest, timeout, _drive_cache(payload), prep=False,
                                    warm_models=warm_models, use_drive_cache=payload.get("use_drive_cache", True))
     try:
@@ -2514,26 +2883,34 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
             _restore_user_loras(comfy, user_loras, _lora_drive_cache(payload))
         _local_models(comfy)
         _check_local_tree(comfy / "output")  # ComfyUI also registers model folders under its output directory.
-        _write_input_files(comfy, payload.get("snapshot") or {})
+        _write_input_files(comfy, snapshot)
         if not service:
             stages.start("comfy_start")
         log_path = root / "comfy.log"
         log = log_path.open("ab", buffering=0)
-        process = None
         try:
             port = COMFY_SERVICE_PORT
             if not service:
                 with socket.socket() as listener:
                     listener.bind((COMFY_SERVICE_HOST, 0))
                     port = listener.getsockname()[1]
-            process = None if service else subprocess.Popen(
-                [sys.executable, "main.py", "--listen", COMFY_SERVICE_HOST, "--port", str(port)],
-                cwd=comfy,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                shell=False,
-                start_new_session=True,
-            )
+                run_venv = root / "venv"
+                run_py = venv_python_path(run_venv)
+                if not run_py.is_file() and is_workflow_smoke:
+                    run_py = ensure_domain_venv(run_venv, timeout=min(120.0, timeout))
+                comfy_python = str(run_py) if run_py.is_file() else sys.executable
+                comfy_env = domain_python_env(run_venv if run_py.is_file() else None)
+                process = subprocess.Popen(
+                    [comfy_python, "main.py", "--listen", COMFY_SERVICE_HOST, "--port", str(port)],
+                    cwd=comfy,
+                    env=comfy_env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    shell=False,
+                    start_new_session=True,
+                )
+            else:
+                process = None
             if not service and not payload.get("generation_timeouts"):
                 deadline = time.time() + runtime_seconds
             api = f"http://{COMFY_SERVICE_HOST}:{port}"
@@ -2634,15 +3011,31 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                 return outputs
             raise WorkerError("Comfy execution timed out")
         finally:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            _terminate_process_group(process, grace_seconds=10.0)
             log.close()
     finally:
-        if not service_dir:
+        if is_workflow_smoke:
+            proc_dead = _terminate_process_group(process, grace_seconds=5.0)
+            shutil.rmtree(root / "ComfyUI", ignore_errors=True)
+            shutil.rmtree(root / "venv", ignore_errors=True)
+            shutil.rmtree(root.parent / ".warm", ignore_errors=True)
+            clean_ok = False
+            try:
+                base_expected = expected_baseline
+                if not (isinstance(base_expected, str) and SHA256.fullmatch(base_expected)):
+                    base_expected = ensure_vm_baseline(studio_root=studio_root)["digest"]
+                actual_digest, _ = global_site_digest()
+                clean_ok = bool(
+                    proc_dead
+                    and not (root / "ComfyUI").exists()
+                    and not (root / "venv").exists()
+                    and actual_digest == base_expected
+                    and not _user_site_packages_dirty()
+                )
+            except Exception:
+                clean_ok = False
+            _status(root, "running", clean_after_smoke=clean_ok)
+        elif not service_dir:
             _warm_put(root, fingerprint)  # restore succeeded above, so the tree is reusable even if this job failed later
 
 
@@ -2707,9 +3100,15 @@ def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
         _status(root, "running")
         snapshot, manifest, graph = _snapshot(payload)
         if snapshot.get("prep") is not True:
+            baseline = ensure_vm_baseline(studio_root=_default_studio_root(root))
             diagnostics = _probe_gpu()
+            status_fields: dict[str, Any] = {
+                "venv_isolated": True,
+                "vm_baseline_digest": baseline["digest"],
+            }
             if diagnostics:
-                _status(root, "running", gpu_diagnostics=diagnostics)
+                status_fields["gpu_diagnostics"] = diagnostics
+            _status(root, "running", **status_fields)
             _check_compute_hardware(manifest, diagnostics, snapshot.get("runtime_compute_spec"))
         if snapshot.get("native_comfy") is True:
             from native_runtime import run as run_native
@@ -2783,10 +3182,661 @@ class _MCPManifestStore:
             'mime': mime, 'size_bytes': size, 'sha256': digest.hexdigest()}
 
 
+_MOUNTINFO_PATH = Path("/proc/self/mountinfo")
+_PROC_ROOT = Path("/proc")
+
+
+def _unescape_mount_path(raw: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), raw)
+
+
+def _active_mounts_under(target_root: Path, *, mountinfo_path: Path | None = None) -> list[str]:
+    """Return any mount points mounted at or beneath target_root from /proc/self/mountinfo."""
+    mi = mountinfo_path or _MOUNTINFO_PATH
+    resolved_root = Path(target_root).resolve()
+    if not mi.is_file():
+        return []
+    found: list[str] = []
+    try:
+        lines = mi.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise WorkerError(f"无法读取挂载表：{exc}") from exc
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        mount_point = Path(_unescape_mount_path(parts[4]))
+        try:
+            mp_resolved = mount_point.resolve()
+        except OSError:
+            mp_resolved = mount_point
+        if mp_resolved == resolved_root or resolved_root in mp_resolved.parents:
+            found.append(str(mount_point))
+    return sorted(set(found))
+
+
+def _proc_pid_alive(pid: int, expected_start_id: str | None = None) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    stat_path = _PROC_ROOT / str(pid) / "stat"
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        rest = raw.rsplit(")", 1)[1].split()
+        if rest[0] == "Z":
+            return False
+        if expected_start_id and rest[19] != str(expected_start_id):
+            return False
+        return True
+    except (OSError, IndexError, ValueError):
+        return False
+
+
+def _stop_pid_verified(
+    pid: int | None,
+    expected_start_id: str | None = None,
+    *,
+    grace_seconds: float = 10.0,
+    kill_group: bool = True,
+    allow_sigkill: bool = True,
+) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return True
+    if not _proc_pid_alive(pid, expected_start_id):
+        return True
+    try:
+        if kill_group:
+            try:
+                pgid = os.getpgid(pid)
+                if pgid == os.getpgid(os.getpid()):
+                    os.kill(pid, signal.SIGTERM)
+                else:
+                    os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                os.kill(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return not _proc_pid_alive(pid, expected_start_id)
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not _proc_pid_alive(pid, expected_start_id):
+            return True
+        time.sleep(0.2)
+    if allow_sigkill and _proc_pid_alive(pid, expected_start_id):
+        try:
+            if kill_group:
+                try:
+                    pgid = os.getpgid(pid)
+                    if pgid == os.getpgid(os.getpid()):
+                        os.kill(pid, signal.SIGKILL)
+                    else:
+                        os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    os.kill(pid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass
+        kill_deadline = time.monotonic() + 3.0
+        while time.monotonic() < kill_deadline:
+            if not _proc_pid_alive(pid, expected_start_id):
+                return True
+            time.sleep(0.1)
+    return not _proc_pid_alive(pid, expected_start_id)
+
+
+def _my_ancestor_pids() -> set[int]:
+    pids = {os.getpid(), os.getppid()}
+    cur = os.getppid()
+    for _ in range(16):
+        if cur <= 1:
+            break
+        try:
+            raw = (_PROC_ROOT / str(cur) / "stat").read_text(encoding="utf-8")
+            ppid = int(raw.rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+        if ppid in pids or ppid <= 1:
+            break
+        pids.add(ppid)
+        cur = ppid
+    return pids
+
+
+def _scan_matching_pids(predicate) -> list[tuple[int, str]]:
+    """Scan /proc for live processes matching predicate(pid, cmdline, cwd)."""
+    skip = _my_ancestor_pids()
+    matches: list[tuple[int, str]] = []
+    if not _PROC_ROOT.is_dir():
+        return matches
+    for entry in _PROC_ROOT.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in skip:
+            continue
+        try:
+            raw_stat = (entry / "stat").read_text(encoding="utf-8")
+            rest = raw_stat.rsplit(")", 1)[1].split()
+            if rest[0] == "Z":
+                continue
+            start_id = rest[19]
+            raw_cmd = (entry / "cmdline").read_bytes()
+            cmdline = [item.decode("utf-8", "replace") for item in raw_cmd.split(b"\0") if item]
+            try:
+                cwd = os.readlink(entry / "cwd")
+            except OSError:
+                cwd = ""
+            if predicate(pid, cmdline, cwd):
+                matches.append((pid, start_id))
+        except (OSError, IndexError, ValueError):
+            continue
+    return matches
+
+
+def _native_open_writes(mount_dir: Path) -> bool:
+    prefix = str(mount_dir).rstrip("/") + "/"
+    ignored = {
+        prefix + "native-comfy/user/comfyui.log",
+        prefix + "native-comfy/user/comfyui_8188.log",
+    }
+    if not _PROC_ROOT.is_dir():
+        return False
+    for proc in _PROC_ROOT.glob("[0-9]*"):
+        try:
+            for fd in (proc / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                    if not target.startswith(prefix) or target in ignored:
+                        continue
+                    info = (proc / "fdinfo" / fd.name).read_text(encoding="utf-8")
+                    flags = next(line.split()[1] for line in info.splitlines() if line.startswith("flags:"))
+                    if int(flags, 8) & 3:
+                        return True
+                except (OSError, StopIteration, ValueError):
+                    continue
+        except OSError:
+            continue
+    return False
+
+
+def _local_rclone_unsynced_reason() -> str | None:
+    """Return a non-empty reason if local rclone RC (127.0.0.1:5572) reports pending uploads/writes or errors."""
+    def _rpc(path: str) -> dict:
+        req = Request(
+            f"http://127.0.0.1:5572/{path}",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    v = _rpc("vfs/stats")
+    d = v.get("diskCache") if isinstance(v, dict) else None
+    d = d if isinstance(d, dict) else {}
+    io_stats = _rpc("core/stats")
+    io_stats = io_stats if isinstance(io_stats, dict) else {}
+    if d.get("uploadsQueued", 0):
+        return f"rclone_uploads_queued:{d.get('uploadsQueued')}"
+    if d.get("uploadsInProgress", 0):
+        return f"rclone_uploads_in_progress:{d.get('uploadsInProgress')}"
+    if d.get("erroredFiles", 0):
+        return f"rclone_errored_files:{d.get('erroredFiles')}"
+    if d.get("outOfSpace"):
+        return "rclone_out_of_space"
+    if io_stats.get("transferring"):
+        return "rclone_transferring"
+    return None
+
+
+def _local_native_sync_check(native_root: Path) -> tuple[bool, str | None]:
+    """Local loopback verification after stopping cloudflared & watchdog, before touching ComfyUI/rclone."""
+    mount_dir = native_root / "drive"
+    if _native_open_writes(mount_dir):
+        return False, "open_writes_on_drive"
+    try:
+        queue = _http_json("http://127.0.0.1:8188/queue", timeout=5)
+        if not isinstance(queue, dict):
+            return False, "queue_malformed"
+        if queue.get("queue_running") or queue.get("queue_pending"):
+            return False, "comfy_queue_busy"
+    except Exception as exc:
+        return False, f"queue_probe_failed:{type(exc).__name__}"
+    try:
+        state = _http_json("http://127.0.0.1:8188/studio_native/state?fresh=1", timeout=8)
+        if not isinstance(state, dict):
+            return False, "native_state_malformed"
+        if state.get("busy") is not False:
+            return False, f"native_state_busy:{state.get('busy_reason') or 'unknown'}"
+        plugins = state.get("plugins")
+        if isinstance(plugins, dict):
+            if plugins.get("durable") is not True or plugins.get("error"):
+                return False, f"plugins_not_durable:{plugins.get('error') or 'pending'}"
+    except Exception as exc:
+        return False, f"native_state_probe_failed:{type(exc).__name__}"
+    try:
+        rc_reason = _local_rclone_unsynced_reason()
+        if rc_reason:
+            return False, rc_reason
+    except Exception as exc:
+        return False, f"rclone_rc_probe_failed:{type(exc).__name__}"
+    return True, None
+
+
+def _check_port_free(port: int, host: str = "127.0.0.1") -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _gpu_compute_pids() -> list[int] | None:
+    """Return active CUDA compute PIDs from nvidia-smi, or None if nvidia-smi fails."""
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pids: list[int] = []
+    for line in res.stdout.splitlines():
+        token = line.strip()
+        if token.isdigit():
+            pids.append(int(token))
+    return pids
+
+
+def verify_vm_purity(
+    expected_baseline_digest: str,
+    *,
+    studio_root: Path | None = None,
+    check_ports: bool = True,
+    check_gpu: bool = True,
+    check_mounts: bool = True,
+    allow_mock_gpu: bool = False,
+    home_dir: Path | None = None,
+    mountinfo_path: Path | None = None,
+) -> dict[str, Any]:
+    """Fail-closed purity verification required before switching instance_pool."""
+    base_root = Path(studio_root) if studio_root is not None else _default_studio_root()
+    report: dict[str, Any] = {
+        "mounts_ok": True,
+        "ports_ok": True,
+        "gpu_compute_ok": True,
+        "gpu_alive_ok": True,
+        "site_snapshot_ok": False,
+        "user_site_ok": True,
+        "errors": [],
+    }
+    if check_mounts:
+        mounts = _active_mounts_under(base_root, mountinfo_path=mountinfo_path)
+        if mounts:
+            report["mounts_ok"] = False
+            report["active_mounts"] = mounts
+            report["errors"].append("mount_still_active:" + ",".join(mounts))
+    if check_ports:
+        busy_ports = [p for p in (8188, 5572) if not _check_port_free(p)]
+        if busy_ports:
+            report["ports_ok"] = False
+            report["busy_ports"] = busy_ports
+            report["errors"].append("ports_in_use:" + ",".join(str(p) for p in busy_ports))
+    if check_gpu and not allow_mock_gpu:
+        pids = _gpu_compute_pids()
+        if pids is None:
+            report["gpu_compute_ok"] = False
+            report["errors"].append("nvidia_smi_compute_probe_failed")
+        elif pids:
+            report["gpu_compute_ok"] = False
+            report["gpu_compute_pids"] = pids
+            report["errors"].append("gpu_compute_processes_alive:" + ",".join(str(p) for p in pids))
+        diag = _probe_gpu()
+        if not diag or not diag.get("devices"):
+            report["gpu_alive_ok"] = False
+            report["errors"].append("gpu_hardware_unavailable")
+        else:
+            report["gpu_diagnostics"] = diag
+    actual_digest, _ = global_site_digest()
+    report["actual_baseline_digest"] = actual_digest
+    report["expected_baseline_digest"] = expected_baseline_digest
+    if (
+        isinstance(expected_baseline_digest, str)
+        and SHA256.fullmatch(expected_baseline_digest)
+        and actual_digest == expected_baseline_digest
+    ):
+        report["site_snapshot_ok"] = True
+    else:
+        report["site_snapshot_ok"] = False
+        report["errors"].append("global_site_snapshot_mismatch")
+    dirty_user = _user_site_packages_dirty(home_dir=home_dir)
+    if dirty_user:
+        report["user_site_ok"] = False
+        report["dirty_user_site"] = dirty_user[:20]
+        report["errors"].append("user_site_packages_present")
+    report["ok"] = (
+        report["mounts_ok"]
+        and report["ports_ok"]
+        and report["gpu_compute_ok"]
+        and report["gpu_alive_ok"]
+        and report["site_snapshot_ok"]
+        and report["user_site_ok"]
+    )
+    return report
+
+
+def _unmount_native_drive(mount_dir: Path, *, timeout: float = 10.0, mountinfo_path: Path | None = None) -> bool:
+    if not _active_mounts_under(mount_dir, mountinfo_path=mountinfo_path):
+        return True
+    unmounter = shutil.which("fusermount3") or shutil.which("fusermount")
+    if unmounter:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run([unmounter, "-u", str(mount_dir)], capture_output=True, text=True, timeout=10)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _active_mounts_under(mount_dir, mountinfo_path=mountinfo_path):
+            return True
+        if unmounter:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run([unmounter, "-u", str(mount_dir)], capture_output=True, text=True, timeout=5)
+        time.sleep(0.4)
+    return not _active_mounts_under(mount_dir, mountinfo_path=mountinfo_path)
+
+
+def run_teardown(payload: dict, root: Path, *, home_dir: Path | None = None, mountinfo_path: Path | None = None) -> dict[str, Any]:
+    """Execute controlled, fail-closed domain teardown & purity check inside the Colab VM."""
+    root = Path(root).resolve()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    studio_root = _default_studio_root(root)
+    native_root = studio_root / "native"
+    from_pool = str(payload.get("from_pool") or "creation")
+    native_bootstrap_failed = bool(payload.get("native_bootstrap_failed"))
+    clean_native_only = bool(payload.get("clean_native_only"))
+    expected_digest = str(payload.get("expected_baseline_digest") or "")
+    allow_mock_gpu = bool(payload.get("allow_mock_gpu") or os.getenv("STUDIO_OFFLINE_TEST") == "1")
+    steps_log: list[str] = []
+
+    def _fail(code: str, msg: str, *, state: str = "failed", report: dict | None = None) -> dict[str, Any]:
+        out = {
+            "state": state,
+            "cleaned": False,
+            "error_code": code,
+            "error_message": msg[:1400],
+            "teardown_report": {"steps": steps_log, **(report or {})},
+        }
+        _status(root, state, **{k: v for k, v in out.items() if k != "state"})
+        return out
+
+    _status(root, "running", stage="teardown_stop_processes")
+    try:
+        # Step 1: Domain-specific ordered shutdown & data-protection re-verification
+        if (from_pool == "native" and not native_bootstrap_failed) or clean_native_only:
+            state_doc: dict[str, Any] = {}
+            state_file = native_root / "state.json"
+            if state_file.is_file():
+                with contextlib.suppress(OSError, ValueError):
+                    parsed = json.loads(state_file.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        state_doc = parsed
+            rclone_doc: dict[str, Any] = {}
+            rclone_file = native_root / "rclone-state.json"
+            if rclone_file.is_file():
+                with contextlib.suppress(OSError, ValueError):
+                    parsed_rc = json.loads(rclone_file.read_text(encoding="utf-8"))
+                    if isinstance(parsed_rc, dict):
+                        rclone_doc = parsed_rc
+
+            # 1a) Stop watchdog.py FIRST so it cannot restart cloudflared/ComfyUI/rclone or unassign VM
+            if state_doc.get("watchdog_pid"):
+                _stop_pid_verified(state_doc.get("watchdog_pid"), state_doc.get("watchdog_start_id"), grace_seconds=5.0)
+            for pid, sid in _scan_matching_pids(
+                lambda _p, cmd, _c: any("watchdog.py" in arg and "native" in arg for arg in cmd)
+            ):
+                _stop_pid_verified(pid, sid, grace_seconds=5.0)
+            steps_log.append("stopped_watchdog")
+
+            # 1b) Immediately stop cloudflared to sever ALL existing external WS & HTTP sessions at the edge
+            if state_doc.get("tunnel_pid"):
+                _stop_pid_verified(state_doc.get("tunnel_pid"), state_doc.get("tunnel_start_id"), grace_seconds=5.0)
+            for pid, sid in _scan_matching_pids(
+                lambda _p, cmd, _c: any("cloudflared" in arg for arg in cmd)
+                and any("tunnel.token" in arg for arg in cmd)
+            ):
+                _stop_pid_verified(pid, sid, grace_seconds=5.0)
+            steps_log.append("stopped_cloudflared")
+
+            # 1c) Local loopback sync & queue re-check BEFORE stopping ComfyUI or rclone!
+            if clean_native_only:
+                mount_dir = native_root / "drive"
+                if _native_open_writes(mount_dir):
+                    return _fail(
+                        "native_unsynced_data",
+                        "原生启动失败清理前检测到 Drive 仍有活跃写入，已中止清理以保护数据",
+                        state="aborted_unsynced",
+                        report={"reason": "open_writes_on_drive"},
+                    )
+                if not _check_port_free(5572):
+                    try:
+                        rc_reason = _local_rclone_unsynced_reason()
+                    except Exception as exc:
+                        rc_reason = f"rclone_rc_probe_failed:{type(exc).__name__}"
+                    if rc_reason:
+                        return _fail(
+                            "native_unsynced_data",
+                            f"原生启动失败清理前检测到 rclone 仍有未同步数据（{rc_reason}），已中止清理以保护数据",
+                            state="aborted_unsynced",
+                            report={"reason": rc_reason},
+                        )
+            else:
+                sync_ok, sync_reason = _local_native_sync_check(native_root)
+                if not sync_ok:
+                    return _fail(
+                        "native_unsynced_data",
+                        f"断流后本机复核发现原生 ComfyUI 或 rclone 仍有未完成任务/未上传缓存（{sync_reason}），已中止转移并保护实例数据",
+                        state="aborted_unsynced",
+                        report={"reason": sync_reason},
+                    )
+            steps_log.append("verified_local_sync")
+
+            # 1d) Stop background env-cache uploader
+            if state_doc.get("env_cache_uploader_pid"):
+                _stop_pid_verified(state_doc.get("env_cache_uploader_pid"), grace_seconds=5.0)
+            for pid, sid in _scan_matching_pids(
+                lambda _p, cmd, _c: any("node_persistence.py" in arg for arg in cmd) and "upload-env-cache" in cmd
+            ):
+                _stop_pid_verified(pid, sid, grace_seconds=5.0)
+            steps_log.append("stopped_env_uploader")
+
+            # 1e) Stop native ComfyUI (check comfy-runtime.json for Manager reboot PID as well as state.json)
+            comfy_rt = native_root / "comfy-runtime.json"
+            if comfy_rt.is_file():
+                with contextlib.suppress(OSError, ValueError):
+                    rt_doc = json.loads(comfy_rt.read_text(encoding="utf-8"))
+                    if isinstance(rt_doc, dict) and rt_doc.get("pid"):
+                        _stop_pid_verified(rt_doc.get("pid"), rt_doc.get("comfy_start_id"), grace_seconds=10.0)
+            if state_doc.get("pid"):
+                _stop_pid_verified(state_doc.get("pid"), state_doc.get("comfy_start_id"), grace_seconds=10.0)
+            native_comfy_str = str((native_root / "ComfyUI").resolve())
+            for pid, sid in _scan_matching_pids(
+                lambda _p, cmd, cwd: cwd == native_comfy_str or any(native_comfy_str in arg for arg in cmd)
+            ):
+                _stop_pid_verified(pid, sid, grace_seconds=10.0)
+            steps_log.append("stopped_native_comfy")
+
+            # 1f) Re-check rclone upload queue right before stopping rclone
+            if not _check_port_free(5572):
+                try:
+                    rc_reason = _local_rclone_unsynced_reason()
+                except Exception as exc:
+                    rc_reason = f"rclone_rc_probe_failed:{type(exc).__name__}"
+                if rc_reason:
+                    return _fail(
+                        "native_unsynced_data",
+                        f"停机后复核发现 rclone 仍有待上传缓存（{rc_reason}），已中止清理以保护数据",
+                        state="aborted_unsynced",
+                        report={"reason": rc_reason},
+                    )
+            rclone_pid = state_doc.get("rclone_pid") or rclone_doc.get("rclone_pid")
+            rclone_sid = state_doc.get("rclone_start_id") or rclone_doc.get("rclone_start_id")
+            if rclone_pid:
+                _stop_pid_verified(rclone_pid, rclone_sid, grace_seconds=10.0, allow_sigkill=False)
+            for pid, sid in _scan_matching_pids(
+                lambda _p, cmd, _c: any("rclone" in arg for arg in cmd) and str(native_root / "drive") in cmd
+            ):
+                _stop_pid_verified(pid, sid, grace_seconds=10.0, allow_sigkill=False)
+            steps_log.append("stopped_rclone")
+
+            # 1g) Unmount FUSE drive and confirm unmounted
+            mount_dir = native_root / "drive"
+            if not _unmount_native_drive(mount_dir, timeout=10.0, mountinfo_path=mountinfo_path):
+                return _fail(
+                    "mount_still_active",
+                    "无法安全卸载 Google Drive FUSE 挂载点，已严禁删除目录并中止转移",
+                )
+            steps_log.append("unmounted_fuse")
+
+        elif from_pool == "creation":
+            svc_root = studio_root / "comfy-services"
+            if svc_root.is_dir():
+                for child in sorted(svc_root.iterdir()):
+                    if not child.is_dir() or child.is_symlink():
+                        continue
+                    sdoc = _read_service_state(child)
+                    if sdoc and sdoc.get("pid"):
+                        try:
+                            _trusted_process_metadata(child, sdoc)
+                            _stop_pid_verified(sdoc.get("pid"), sdoc.get("process_start_id"), grace_seconds=10.0)
+                        except WorkerError:
+                            pass
+            svc_prefix = str(svc_root.resolve())
+            warm_prefix = str((studio_root / ".warm").resolve())
+            for pid, sid in _scan_matching_pids(
+                lambda _p, cmd, cwd: (
+                    cwd.startswith(svc_prefix)
+                    or cwd.startswith(warm_prefix)
+                    or any(svc_prefix in arg or warm_prefix in arg for arg in cmd)
+                )
+            ):
+                _stop_pid_verified(pid, sid, grace_seconds=10.0)
+            steps_log.append("stopped_creation_services")
+
+        elif from_pool == "ephemeral":
+            studio_prefix = str(studio_root.resolve())
+            cur_dir_str = str(root)
+            for pid, sid in _scan_matching_pids(
+                lambda _p, cmd, cwd: (
+                    (cwd.startswith(studio_prefix) and not cwd.startswith(cur_dir_str))
+                    or any(studio_prefix in arg and cur_dir_str not in arg for arg in cmd)
+                )
+            ):
+                _stop_pid_verified(pid, sid, grace_seconds=10.0)
+            steps_log.append("stopped_ephemeral_processes")
+
+        # Step 2: Full-tree mount check (REDLINE: NEVER rmtree if ANY mount exists under studio_root!)
+        _status(root, "running", stage="teardown_clean_files")
+        active_mounts = _active_mounts_under(studio_root, mountinfo_path=mountinfo_path)
+        if active_mounts:
+            return _fail(
+                "mount_still_active",
+                f"检测到 {studio_root} 目录树下仍存在活跃挂载点（{', '.join(active_mounts)}），严禁执行删除",
+                report={"active_mounts": active_mounts},
+            )
+        steps_log.append("verified_no_mounts")
+
+        # Strict removal of old domain directories, weights, credentials, venvs, and ~/.local user packages
+        if native_root.exists() or native_root.is_symlink():
+            _remove(native_root)
+        if not clean_native_only:
+            for target_name in ("comfy-services", ".warm"):
+                target_path = studio_root / target_name
+                if target_path.exists() or target_path.is_symlink():
+                    _remove(target_path)
+            if studio_root.is_dir():
+                for entry in list(studio_root.iterdir()):
+                    if entry.name in {root.name, ".vm-baseline.json", ".vm-baseline.lock"}:
+                        continue
+                    _remove(entry)
+        home = Path(home_dir) if home_dir is not None else Path.home()
+        local_lib = home / ".local" / "lib"
+        if local_lib.is_dir():
+            for py_dir in list(local_lib.glob("python*")):
+                if py_dir.is_dir() and not py_dir.is_symlink():
+                    shutil.rmtree(py_dir, ignore_errors=True)
+        steps_log.append("removed_old_domain_trees")
+
+        # Step 3: Fail-closed purity verification
+        _status(root, "running", stage="teardown_verify_purity")
+        purity = verify_vm_purity(
+            expected_digest,
+            studio_root=studio_root,
+            check_ports=True,
+            check_gpu=True,
+            check_mounts=True,
+            allow_mock_gpu=allow_mock_gpu,
+            home_dir=home,
+            mountinfo_path=mountinfo_path,
+        )
+        if not purity.get("ok"):
+            err_code = "mount_still_active" if not purity.get("mounts_ok") else (
+                "global_site_polluted" if not purity.get("site_snapshot_ok") or not purity.get("user_site_ok") else "teardown_purity_failed"
+            )
+            return _fail(
+                err_code,
+                "域清理纯净度校验未通过：" + "; ".join(purity.get("errors") or ["unknown"]),
+                report=purity,
+            )
+        steps_log.append("purity_verified")
+        result: dict[str, Any] = {
+            "state": "completed",
+            "cleaned": True,
+            "venv_isolated": True,
+            "vm_baseline_digest": purity.get("actual_baseline_digest"),
+            "teardown_report": {"steps": steps_log, **purity},
+        }
+        if purity.get("gpu_diagnostics"):
+            result["gpu_diagnostics"] = purity["gpu_diagnostics"]
+        _atomic_json(root / "meta.json", {"execution_id": payload.get("execution_id"), "outputs": []})
+        _status(root, "completed", **{k: v for k, v in result.items() if k != "state"})
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return _fail("teardown_exception", _safe_error(exc))
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) == 2 and argv[0] == "workbench":
         return _main_workbench_action(argv[1])
+    if len(argv) == 2 and argv[0] == "teardown":
+        payload_path = Path(argv[1]).resolve()
+        payload: Any = None
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise WorkerError("teardown payload must be an object")
+            root = Path(payload["execution_dir"]).resolve()
+            res = run_teardown(payload, root)
+            return 0 if res.get("cleaned") is True else 1
+        except Exception as exc:  # noqa: BLE001
+            with contextlib.suppress(Exception):
+                root = (
+                    Path(payload.get("execution_dir", payload_path.parent)).resolve()
+                    if isinstance(payload, dict)
+                    else payload_path.parent
+                )
+                _status(root, "failed", cleaned=False, error_code="teardown_bootstrap_failed", error_message=_safe_error(exc))
+            return 1
     if len(argv) != 1:
         return 2
     payload_path = Path(argv[0]).resolve()

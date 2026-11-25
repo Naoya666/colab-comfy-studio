@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUpRight, FolderKanban, Loader2 } from 'lucide-react';
+import { ArrowLeftRight, ArrowUpRight, FolderKanban, Loader2 } from 'lucide-react';
 import {
   apiFetch,
   apiMessage,
@@ -14,6 +14,12 @@ import {
   formatAllocationRetryHeadline,
   formatRetrySpec,
 } from '../lib/allocation-retry-copy';
+import {
+  domainBadgeLabel,
+  findTransferableInstancesForNative,
+  instanceIdOfCard,
+  type TransferFocusTarget,
+} from '../lib/domain-transfer';
 import { WorkflowGpuSelection } from '../components/WorkflowGpuSelection';
 import { NativeModelSettings, type ModelStorage } from '../components/NativeModelSettings';
 import { NativeModelPreparation } from '../components/NativeModelPreparation';
@@ -120,6 +126,24 @@ type NativeStatus = {
   allocation_retry?: AllocationRetryState | null;
   auto_select_account?: boolean;
   self_heal?: Record<string, unknown> | null;
+  transferred_out?: { instance_id: string; to_pool: string; state?: string } | null;
+  standby_instance?: {
+    instance_id: string;
+    account_id?: string | null;
+    account_alias?: string | null;
+    spec?: Record<string, unknown> | null;
+    gpu_reported?: string | null;
+    idle_deadline_at?: number | null;
+    remaining_seconds?: number | null;
+    error?: string | null;
+  } | null;
+  transferring_in?: {
+    instance_id: string;
+    from_pool?: string | null;
+    phase?: string | null;
+    transfer_job_id?: string | null;
+    started_at?: number | null;
+  } | null;
   events: NativeEvent[];
 };
 const restartMessages: Record<RestartPhase, string> = {
@@ -231,8 +255,14 @@ const NativeStageTimelines = memo(function NativeStageTimelines({
     : null;
 });
 
-export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, desktop, onOpenSettings }: {
-  usage: GpuUsage | null; accounts: GpuAccount[]; accountsLoaded: boolean; instances: GpuInstance[]; desktop: boolean; onOpenSettings?: () => void;
+export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, desktop, onOpenSettings, onFocusTransfer }: {
+  usage: GpuUsage | null;
+  accounts: GpuAccount[];
+  accountsLoaded: boolean;
+  instances: GpuInstance[];
+  desktop: boolean;
+  onOpenSettings?: () => void;
+  onFocusTransfer?: (target: TransferFocusTarget) => void;
 }) {
   const initialPrefs = useMemo(() => loadNativePrefs(), []);
   const eligibleAccounts = useMemo(
@@ -365,16 +395,44 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
     allocationRetry?.active && status && !status.ready && !terminalStates.has(status.state),
   );
   const allocationRetryWaiting = Boolean(allocationRetryActive && allocationRetry?.phase === 'waiting' && allocationRetry?.next_retry_at);
+  const standbyInstance = status?.standby_instance ?? null;
+  const transferringIn = status?.transferring_in ?? null;
+  const transferredOut = status?.transferred_out ?? null;
+  const alignedStandbyRef = useRef<string>('');
 
   useEffect(() => {
-    if ((!recoveryInProgress || !recoveryPlan?.next_retry_at) && !allocationRetryWaiting) return;
+    if (!standbyInstance?.instance_id) {
+      alignedStandbyRef.current = '';
+      return;
+    }
+    if (alignedStandbyRef.current === standbyInstance.instance_id) return;
+    alignedStandbyRef.current = standbyInstance.instance_id;
+    if (standbyInstance.account_id && eligibleAccounts.some(a => a.account_id === standbyInstance.account_id)) {
+      setAccount(standbyInstance.account_id);
+    }
+    if (standbyInstance.spec && typeof standbyInstance.spec === 'object') {
+      setSpec(standbyInstance.spec);
+    }
+  }, [standbyInstance, eligibleAccounts]);
+
+  const standbyRemainingSec = standbyInstance?.idle_deadline_at != null
+    ? Math.max(0, Math.ceil(standbyInstance.idle_deadline_at - recoveryClockSec))
+    : (standbyInstance?.remaining_seconds ?? 0);
+
+  useEffect(() => {
+    if ((!recoveryInProgress || !recoveryPlan?.next_retry_at) && !allocationRetryWaiting && !standbyInstance?.idle_deadline_at) return;
     setRecoveryClockSec(Math.floor(Date.now() / 1000));
     const timer = window.setInterval(() => setRecoveryClockSec(Math.floor(Date.now() / 1000)), 1000);
     return () => window.clearInterval(timer);
-  }, [recoveryInProgress, recoveryPlan?.next_retry_at, allocationRetryWaiting]);
+  }, [recoveryInProgress, recoveryPlan?.next_retry_at, allocationRetryWaiting, standbyInstance?.idle_deadline_at]);
+
+  const transferableCandidates = useMemo(
+    () => findTransferableInstancesForNative(instances),
+    [instances],
+  );
 
   const nativeTransitioning = Boolean(
-    pendingStart || pendingRestart || recoveryInProgress || recoveryRestoringModels || allocationRetryActive
+    pendingStart || pendingRestart || recoveryInProgress || recoveryRestoringModels || allocationRetryActive || transferringIn
     || (status && status.state !== 'stopped' && !terminalStates.has(status.state))
     || status?.restart?.phase === 'checking' || status?.restart?.phase === 'syncing'
     || status?.restart?.phase === 'rebooting' || status?.restart?.phase === 'recovering',
@@ -529,6 +587,77 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
           </p>
         </div>
         <button type="button" className="button" onClick={() => openSetupWizard(1)}>打开配置向导</button>
+      </div>
+    )}
+    {transferringIn && (
+      <div className={styles.recoveryBanner} role="status" aria-label="域转移进入原生状态">
+        <div className={styles.recoveryBannerBody}>
+          <div className={styles.recoveryBannerTitle}>
+            <Loader2 size={15} className={styles.spin} aria-hidden />
+            <strong>正在从其他域转移 GPU 至原生 ComfyUI…</strong>
+          </div>
+          <p className="muted small">
+            当前阶段：
+            {transferringIn.phase === 'cleaning'
+              ? '清理旧域环境'
+              : transferringIn.phase === 'verifying'
+                ? '校验环境纯净度'
+                : '拉起原生 ComfyUI'}
+            ，完成后将自动就绪，无需重复启动。
+          </p>
+        </div>
+      </div>
+    )}
+    {standbyInstance && !status?.ready && !transferringIn && (
+      <div className={styles.recoveryBanner} role="alert" aria-label="原生启动失败待命提示">
+        <div className={styles.recoveryBannerBody}>
+          <div className={styles.recoveryBannerTitle}>
+            <strong>上次原生 ComfyUI 启动失败，底层 GPU 处于 10 分钟安全待命（剩余约 {Math.floor(standbyRemainingSec / 60)} 分 {standbyRemainingSec % 60} 秒）</strong>
+          </div>
+          <p className="muted small">
+            {standbyInstance.gpu_reported ? `当前待命显卡：${standbyInstance.gpu_reported} · ` : ''}
+            失败原因：{standbyInstance.error || '原生 ComfyUI 启动失败'}
+          </p>
+          <p className="muted small">
+            你可以直接调整下方存储或超时参数后点击「原地重试启动（复用原卡）」，或前往实例中心将该卡转移回其他域。超时未操作将自动释放。
+          </p>
+        </div>
+        {onFocusTransfer && (
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => onFocusTransfer({ instanceId: standbyInstance.instance_id, targetPool: 'creation' })}
+          >
+            <ArrowLeftRight size={14} aria-hidden />
+            去实例中心转移域
+          </button>
+        )}
+      </div>
+    )}
+    {transferredOut && !status?.ready && !standbyInstance && !transferringIn && (
+      <div className={styles.recoveryBannerMuted} role="status">
+        <strong>原原生 ComfyUI 实例已转移至{transferredOut.to_pool === 'ephemeral' ? '冒烟域' : '创作池'}</strong>
+        <p className="muted small">当前没有原生会话；如需继续使用原生 ComfyUI，可重新启动或从实例中心将空闲 GPU 转移回来。</p>
+      </div>
+    )}
+    {!status?.ready && !startupPending && !restartInProgress && !recoveryInProgress && !recoveryRestoringModels && !allocationRetryActive && !standbyInstance && !transferringIn && transferableCandidates.length > 0 && onFocusTransfer && (
+      <div className={styles.recoveryBannerMuted} role="status" aria-label="其他域可转移 GPU 提示">
+        <div className={styles.recoveryBannerBody}>
+          <strong>
+            当前「{domainBadgeLabel(transferableCandidates[0])}」有空闲 {transferableCandidates[0].gpu_reported || 'GPU'} 实例可复用
+          </strong>
+          <p className="muted small">
+            如需避免重新申请 Colab GPU，可前往实例中心显式转移至原生 ComfyUI（将清理旧域环境并保留底层物理卡）。
+          </p>
+        </div>
+        <button
+          type="button"
+          className="button secondary"
+          onClick={() => onFocusTransfer({ instanceId: instanceIdOfCard(transferableCandidates[0]), targetPool: 'native' })}
+        >
+          <ArrowLeftRight size={14} aria-hidden />
+          去实例中心转移至原生 ComfyUI
+        </button>
       </div>
     )}
     {scheduledSession && <div className={styles.inlinePanel} role="status">
@@ -723,8 +852,8 @@ export function NativeComfyPage({ usage, accounts, accountsLoaded, instances, de
             </label>
           </div>
           <p className="muted small">参数在本次启动时生效。到期后停止接收新任务，等待生成和同步完成后释放 GPU。调整已有原生会话的参数需先停止旧实例。</p>
-          <button className="button" disabled={!!blocked || starting || startupPending || !accountsLoaded || !accountEligible || !spec || !status?.configured || !validTimeouts || !validStorage} onClick={() => void start()}>
-            {starting ? '正在提交…' : startupPending ? '正在启动…' : desktop || !webUiReady ? '启动 / 复用 GPU' : '启动 / 复用 GPU 并进入'}
+          <button className="button" disabled={!!blocked || starting || startupPending || Boolean(transferringIn) || !accountsLoaded || !accountEligible || !spec || !status?.configured || !validTimeouts || !validStorage} onClick={() => void start()}>
+            {starting ? '正在提交…' : startupPending ? '正在启动…' : transferringIn ? '正在转入原生域…' : standbyInstance ? '原地重试启动（复用原卡）' : desktop || !webUiReady ? '启动 / 复用 GPU' : '启动 / 复用 GPU 并进入'}
           </button>
           {status && !status.configured && <p className="status">尚未完成 Cloudflare 隧道与凭据配置，请点击上方「打开配置向导」。</p>}
         </>}

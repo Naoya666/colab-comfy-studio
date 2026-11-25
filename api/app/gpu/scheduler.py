@@ -70,6 +70,8 @@ _STAGE_TEXT = {
     "sampling": "采样中",
     "prep_env": "正在构建环境缓存",
     "prep_weights": "正在补齐模型缓存",
+    "transfer_cleaning": "正在清理旧域进程与环境",
+    "transfer_verifying": "正在校验物理卡环境纯净度",
 }
 
 
@@ -659,7 +661,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         return diag
 
     def _allocation(self, job: dict) -> dict:
-        if job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
+        if job.get("selection_reason") in {"reuse_idle", "requested_instance", "requested_ephemeral_standby"}:
             existing_lease = self._lease(job)
             if not existing_lease or not existing_lease.get("handle"):
                 return self._begin_failure(job, "creation_lease_unavailable", "复用实例租约已不可用，已中止执行（未新开机器）")
@@ -923,6 +925,12 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             "last_create_diagnostics": None,
             "last_seen": now_alloc,
         }
+        if lease.get("vm_allocated_at") is None:
+            lease_ready_patch["vm_allocated_at"] = now_alloc
+        if job.get("instance_id"):
+            inst_row = self._get("instances", job["instance_id"], job.get("owner_id"))
+            if inst_row is not None and inst_row.get("vm_allocated_at") is None:
+                self._update("instances", job["instance_id"], {"vm_allocated_at": now_alloc}, job.get("owner_id"))
         job_deadline_patch: dict[str, Any] = {}
         if job.get("recovery_source") != "auto_recovery":
             if (job.get("snapshot") or {}).get("native_comfy"):
@@ -1067,8 +1075,19 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     lease_patch["operation_done"] = True
                 if lease.get("last_create_error"):
                     lease_patch["last_create_error"] = None
+                if lease.get("vm_allocated_at") is None:
+                    lease_patch["vm_allocated_at"] = lease.get("create_started") or self.clock()
                 if lease_patch:
                     self._update("leases", lease["id"], lease_patch, job["owner_id"])
+            if job.get("instance_id"):
+                inst_alloc = self._get("instances", job["instance_id"], job.get("owner_id"))
+                if inst_alloc is not None and inst_alloc.get("vm_allocated_at") is None:
+                    self._update(
+                        "instances",
+                        job["instance_id"],
+                        {"vm_allocated_at": lease.get("vm_allocated_at") or lease.get("create_started") or self.clock()},
+                        job.get("owner_id"),
+                    )
             latest_job = self._get("jobs", job["id"], job.get("owner_id")) or job
             if (
                 latest_job.get("cancel_requested")
@@ -1173,6 +1192,13 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 if job.get("deadline_epoch") is not None
                 else lease.get("deadline_epoch"),
             }
+            if (job.get("snapshot") or {}).get("workflow_smoke") or job.get("workflow_smoke"):
+                expected_baseline = lease.get("vm_baseline_digest")
+                if not expected_baseline and job.get("instance_id"):
+                    inst_for_base = self._get("instances", job["instance_id"], job.get("owner_id"))
+                    expected_baseline = (inst_for_base or {}).get("vm_baseline_digest")
+                if expected_baseline:
+                    executor_job["expected_baseline_digest"] = expected_baseline
             if self._provider_name(job) == "colab" and (job.get("snapshot") or {}).get("lora_files"):
                 executor_job["lora_drive_cache"] = self._lora_cache(job, cache)
             result = self._executor(job).start(
@@ -1270,9 +1296,30 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             job = self._set_state(job, 'running', 'GPU connection recovered', poll_retry_count=0, poll_retry_at=0)
         if result.get('execution_id') not in {None,job.get('execution_id')}:
             return self._begin_failure(job,'gpu_execution_id_mismatch','poll execution identity mismatch')
-        if result.get("gpu_diagnostics") and (not job.get("gpu_reported")
-                or (job.get("creation_fingerprint") and not job.get("gpu_diagnostics"))):
+        if result.get("gpu_diagnostics") and (not job.get("gpu_reported") or not job.get("gpu_diagnostics")):
             job = self.store.record_gpu_diagnostics(job, result["gpu_diagnostics"]) or job
+        # Persist immutable VM venv isolation & baseline digest onto lease and instance (Spec §3.3).
+        if result.get("venv_isolated") is True or result.get("vm_baseline_digest"):
+            baseline_digest = result.get("vm_baseline_digest")
+            lease_iso_patch: dict[str, Any] = {}
+            if result.get("venv_isolated") is True and lease.get("venv_isolated") is not True:
+                lease_iso_patch["venv_isolated"] = True
+            if isinstance(baseline_digest, str) and baseline_digest and not lease.get("vm_baseline_digest"):
+                lease_iso_patch["vm_baseline_digest"] = baseline_digest
+            if lease_iso_patch:
+                lease = self._update("leases", lease["id"], lease_iso_patch, job.get("owner_id"))
+            if job.get("instance_id"):
+                inst_iso = self._get("instances", job["instance_id"], job.get("owner_id"))
+                if inst_iso is not None:
+                    inst_iso_patch: dict[str, Any] = {}
+                    if result.get("venv_isolated") is True and inst_iso.get("venv_isolated") is not True:
+                        inst_iso_patch["venv_isolated"] = True
+                    if isinstance(baseline_digest, str) and baseline_digest and not inst_iso.get("vm_baseline_digest"):
+                        inst_iso_patch["vm_baseline_digest"] = baseline_digest
+                    if inst_iso_patch:
+                        self._update("instances", job["instance_id"], inst_iso_patch, job.get("owner_id"))
+        if result.get("clean_after_smoke") is not None and job.get("clean_after_smoke") != bool(result["clean_after_smoke"]):
+            job = self._update("jobs", job["id"], {"clean_after_smoke": bool(result["clean_after_smoke"])}, job.get("owner_id"))
         state = result.get("state")
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else None
         status_updated_at = result.get("status_updated_at")
@@ -1362,6 +1409,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 lease_ready_patch = {
                     "native_ready": True, "native_last_busy": native_last_busy,
                     "native_bootstrap_job_id": job["id"],
+                    "native_bootstrap_failed": False,
                     "native_model_storage": model_storage(job.get("execution_policy")),
                     "deadline_epoch": deadline,
                     "native_idle_minutes": idle_minutes,
@@ -1382,9 +1430,26 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 if inherited_idle is not None:
                     lease_ready_patch["idle_deadline_at"] = inherited_idle
                 lease = self._update("leases", lease["id"], lease_ready_patch, job["owner_id"])
-                inst_ready_patch = {"native_comfy": True, "hard_deadline_at": deadline}
+                inst_ready_patch: dict[str, Any] = {
+                    "native_comfy": True,
+                    "native_ready": True,
+                    "native_bootstrap_failed": False,
+                    "native_bootstrap_error": None,
+                    "hard_deadline_at": deadline,
+                }
                 if inherited_idle is not None:
                     inst_ready_patch["idle_deadline_at"] = inherited_idle
+                if job.get("instance_id"):
+                    inst_cur = self._get("instances", job["instance_id"], job["owner_id"])
+                    if inst_cur and isinstance(inst_cur.get("transfer_state"), dict):
+                        if inst_cur["transfer_state"].get("phase") == "native_bootstrapping":
+                            inst_ready_patch["transfer_state"] = {
+                                **inst_cur["transfer_state"],
+                                "phase": "succeeded",
+                                "completed_at": now_ready,
+                                "error_code": None,
+                                "error_message": None,
+                            }
                 self._update("instances", job["instance_id"], inst_ready_patch, job["owner_id"])
                 job = self._update("jobs", job["id"], {
                     "deadline_epoch": deadline, "hard_deadline_at": deadline,
@@ -1825,6 +1890,8 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             )
             is_l3_candidate = (
                 cfg.enabled
+                and instance.get("state") != "transferring"
+                and not instance.get("native_bootstrap_failed")
                 and (
                     pool == POOL_NATIVE
                     or (pool == POOL_CREATION and instance.get("retention_mode") in {"smart", "retain"})
@@ -1945,6 +2012,22 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             or instance.get("current_job_id") in {None, job["id"]}
             or job.get("lease_id") is not None
         )
+        if (
+            final_state != "completed"
+            and (job.get("transferred_native_bootstrap") or job.get("native_standby_retry"))
+            and lease
+            and lease.get("handle")
+            and not lease.get("native_ready")
+            and owns_instance
+        ):
+            from . import transfer
+
+            clean_status, job = transfer.maybe_cleanup_failed_native_bootstrap(
+                self, job, lease, instance, observation=observation
+            )
+            if clean_status in {"pending", "quarantined"}:
+                return job
+            instance = self._service_instance_for_job(job)
         if self._is_v020_job(job) and job.get("instance_id") and owns_instance:
             try:
                 job, instance = self._complete_instance(job, final_state == "completed")
@@ -1962,10 +2045,27 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                         return job
                     instance = self._service_instance_for_job(job)
                     if lease and instance and instance.get("state") == "retained_idle":
+                        from .instances import POOL_EPHEMERAL
+
                         lease_patch = {"state": "idle", "current_job_id": None, "last_seen": self.clock()}
                         if instance.get("idle_deadline_at") is not None:
                             lease_patch["idle_deadline_at"] = instance["idle_deadline_at"]
-                        if instance.get("hard_deadline_at") is not None:
+                        if instance.get("native_bootstrap_failed") is True:
+                            lease_patch.update(
+                                native_ready=False,
+                                native_draining=False,
+                                native_bootstrap_failed=True,
+                                generation_timeouts=True,
+                                deadline_epoch=instance.get("idle_deadline_at"),
+                            )
+                        elif instance.get("instance_pool") == POOL_EPHEMERAL or instance.get("ephemeral_standby") is True:
+                            lease_patch.update(
+                                generation_timeouts=True,
+                                hard_deadline_at=None,
+                                ephemeral_standby=True,
+                                deadline_epoch=instance.get("idle_deadline_at"),
+                            )
+                        elif instance.get("hard_deadline_at") is not None:
                             lease_patch["deadline_epoch"] = instance["hard_deadline_at"]
                         elif lease.get("generation_timeouts") and instance.get("idle_deadline_at") is not None:
                             lease_patch["deadline_epoch"] = instance["idle_deadline_at"]
@@ -2175,6 +2275,13 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
         state = job.get("state")
         if state in TERMINAL_STATES:
             return job
+        if (
+            (job.get("domain_transfer") or (job.get("snapshot") or {}).get("domain_transfer"))
+            and state not in {"cleaning_up", "cleanup_pending"}
+        ):
+            from . import transfer
+
+            return transfer.advance_transfer_job(self, job)
         if job.get("cancel_requested") and state not in {"cleaning_up", "cleanup_pending"}:
             if self._lease(job) or job.get("instance_id"):
                 job = self._set_state(
@@ -2227,7 +2334,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                         job = self._reuse_instance_lease(job, inst)
                 if not job.get("instance_id"):
                     return job
-                if job.get("selection_reason") in {"reuse_idle", "requested_instance"}:
+                if job.get("selection_reason") in {"reuse_idle", "requested_instance", "requested_ephemeral_standby"}:
                     if not self._lease(job):
                         return self._begin_failure(job, "creation_lease_unavailable", "实例租约已不可复用，请重试")
             elif job.get('compatibility_signature'):
@@ -2240,14 +2347,18 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                             break
             if not self._is_v020_job(job) and self._has_capacity_blocker(job):
                 return job
+            use_gen_timeouts = bool(
+                job.get("generation_timeouts")
+                or job.get("selection_reason") == "requested_ephemeral_standby"
+            )
             task_deadline = ({"task_deadline_epoch": self.clock() + self._effective_runtime(job) * 60}
-                             if job.get("generation_timeouts") or job.get("creation_fingerprint") else {})
+                             if use_gen_timeouts or job.get("creation_fingerprint") else {})
             if job.get("hard_deadline_at") is not None:
                 hard_cap = float(job["hard_deadline_at"])
                 if "task_deadline_epoch" in task_deadline:
                     task_deadline["task_deadline_epoch"] = min(float(task_deadline["task_deadline_epoch"]), hard_cap)
                 task_deadline["deadline_epoch"] = hard_cap
-            if job.get("generation_timeouts"):
+            if use_gen_timeouts:
                 lease = self._lease(job)
                 if lease and lease.get("generation_timeouts") and lease.get("hard_deadline_at") is None:
                     deadline = task_deadline["task_deadline_epoch"]

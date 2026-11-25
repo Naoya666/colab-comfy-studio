@@ -132,7 +132,78 @@ export interface AccountRuntime {
 
 export type GpuInstanceState =
   | 'requested' | 'allocating' | 'ready' | 'busy' | 'retained_idle'
-  | 'releasing' | 'deleted' | 'unknown' | 'cleanup_pending' | 'quarantined' | string;
+  | 'transferring' | 'releasing' | 'deleted' | 'unknown' | 'cleanup_pending' | 'quarantined' | string;
+
+export interface InstanceTransferState {
+  transfer_id?: string;
+  from_pool?: GpuInstancePool;
+  to_pool?: GpuInstancePool;
+  phase?: string;
+  transfer_job_id?: string;
+  native_bootstrap_job_id?: string;
+  started_at?: number | null;
+  completed_at?: number | null;
+  error_code?: string | null;
+  error_message?: string | null;
+}
+
+export interface InstanceTransferHistoryItem {
+  transfer_id: string;
+  from_pool: GpuInstancePool;
+  to_pool: GpuInstancePool;
+  started_at?: number | null;
+  completed_at?: number | null;
+  transfer_job_id?: string;
+  domain_generation?: number;
+}
+
+export interface TransferTargetPreview {
+  allowed: boolean;
+  reason?: string | null;
+  defaults?: Record<string, unknown>;
+}
+
+export interface TransferPreviewResponse {
+  instance_id: string;
+  version: number;
+  current_pool: GpuInstancePool;
+  venv_isolated: boolean;
+  native_bootstrap_failed?: boolean;
+  vm_allocated_at?: number | null;
+  vm_elapsed_seconds?: number | null;
+  account_id?: string | null;
+  account_alias?: string | null;
+  spec?: Record<string, unknown> | null;
+  gpu_reported?: string | null;
+  transferable: boolean;
+  blocked_code?: string | null;
+  blocked_reason?: string | null;
+  targets: Partial<Record<'creation' | 'native' | 'ephemeral', TransferTargetPreview>>;
+}
+
+export interface TransferInstanceRequest {
+  target_pool: 'creation' | 'native' | 'ephemeral';
+  confirmed: true;
+  expected_version?: number;
+  key?: string;
+  creation_options?: {
+    retain_idle_minutes?: number;
+  };
+  native_options?: {
+    model_storage_mode?: 'local' | 'drive_mount';
+    cache_gb?: number;
+    cache_max_age_minutes?: number;
+    retain_idle_minutes?: number;
+    max_runtime_minutes?: number;
+    plugin_generation?: string | null;
+  };
+}
+
+export interface TransferInstanceResponse {
+  instance: GpuInstance;
+  transfer_job_id: string;
+  transfer_id: string;
+}
 
 export interface GpuInstance {
   instance_id: string;
@@ -148,8 +219,8 @@ export interface GpuInstance {
   version?: number;
   idle_minutes?: number | null;
   retain_requested_at?: string | null;
-  idle_deadline_at?: string | null;
-  hard_deadline_at?: string | null;
+  idle_deadline_at?: string | number | null;
+  hard_deadline_at?: string | number | null;
   manual_stop_requested?: boolean;
   current_job_id?: string | null;
   gpu_reported?: string | null;
@@ -169,6 +240,15 @@ export interface GpuInstance {
   replaced_by_instance_id?: string | null;
   recovery_plan_id?: string | null;
   recovery_source?: string | null;
+  venv_isolated?: boolean;
+  vm_allocated_at?: number | null;
+  domain_generation?: number;
+  transfer_state?: InstanceTransferState | null;
+  transfer_history?: InstanceTransferHistoryItem[];
+  native_bootstrap_failed?: boolean;
+  native_bootstrap_error?: string | null;
+  ephemeral_standby?: boolean;
+  quarantine_reason?: string | null;
 }
 
 export interface InstanceRetentionRequest {

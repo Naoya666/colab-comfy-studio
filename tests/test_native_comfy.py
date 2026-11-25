@@ -965,11 +965,13 @@ def test_native_bootstrap_installs_and_verifies_manager_once(monkeypatch, tmp_pa
         assert (comfy / 'models' / 'checkpoints').is_dir()
         assert not (drive / 'models').exists()
         assert (service / 'local-model-config.json').stat().st_mode & 0o777 == 0o600
-    assert args == [sys.executable, 'main.py', '--listen', '127.0.0.1', '--port', '8188', '--enable-manager',
+    assert args == [str(service / 'venv' / 'bin' / 'python'), 'main.py', '--listen', '127.0.0.1', '--port', '8188', '--enable-manager',
                     '--user-directory', str(data / 'user'), '--input-directory', str(data / 'input'),
                     '--output-directory', str(data / 'output'), '--temp-directory', str(service / 'temp'),
                     '--max-upload-size', '2048', *model_args,
                     '--preview-method', 'auto', '--disable-auto-launch']
+    assert kwargs['env']['PYTHONNOUSERSITE'] == '1'
+    assert kwargs['env']['VIRTUAL_ENV'] == str(service / 'venv')
     assert kwargs['cwd'] == comfy
     marker = json.loads((service / 'state.json').read_text())
     assert marker['comfy_log'] == str(job / 'comfy.log')
@@ -1537,14 +1539,17 @@ def test_native_base_python_uv_fallback_and_env_toggle(monkeypatch, tmp_path):
     worker = SimpleNamespace(_run=run_ok, WorkerError=FakeWorkerError)
     monkeypatch.setattr(runtime.shutil, "which", lambda name: "/usr/local/bin/uv" if name == "uv" else None)
 
+    expected_venv_py = str(tmp_path / "venv" / "bin" / "python")
     monkeypatch.setenv("NATIVE_USE_UV", "1")
     runtime._install_base_python(worker, tmp_path, comfy, manager, local=True)
     assert calls[-1][:3] == ["/usr/local/bin/uv", "pip", "install"]
+    assert "--system" not in calls[-1]
+    assert "--python" in calls[-1] and expected_venv_py in calls[-1]
     assert "httpx>=0.27,<1" in calls[-1]
 
     monkeypatch.setenv("NATIVE_USE_UV", "0")
     runtime._install_base_python(worker, tmp_path, comfy, manager, local=False)
-    assert calls[-1][:3] == [sys.executable, "-m", "pip"]
+    assert calls[-1][:3] == [expected_venv_py, "-m", "pip"]
     assert "httpx>=0.27,<1" not in calls[-1]
 
     # Automatic fallback to pip when uv raises WorkerError
@@ -1560,7 +1565,7 @@ def test_native_base_python_uv_fallback_and_env_toggle(monkeypatch, tmp_path):
     runtime._install_base_python(worker, tmp_path, comfy, manager, local=False)
     assert len(calls) == 2
     assert calls[0][0].endswith("uv")
-    assert calls[1][:3] == [sys.executable, "-m", "pip"]
+    assert calls[1][:3] == [expected_venv_py, "-m", "pip"]
 
 
 def test_native_env_cache_key_roundtrip_and_corrupt_rollback(monkeypatch, tmp_path):
@@ -1823,8 +1828,8 @@ def test_native_env_cache_v2_namespace_overlay_pycache_filter_and_v1_prune(monke
 
     cache_key = partial(np.compute_env_cache_key, base_packages=runtime._base_python_packages(local=False))
     key_info = cache_key(comfy, "a" * 40, "gpu_l4_89", nodes, np.inventory(nodes))
-    assert key_info["key"].startswith("native-env-v3-")
-    assert key_info["spec"]["schema"] == 3
+    assert key_info["key"].startswith("native-env-v4-")
+    assert key_info["spec"]["schema"] == 4
 
     def seed_base(site):
         # Preinstalled protected torch
@@ -1999,7 +2004,7 @@ def test_native_env_cache_v2_namespace_overlay_pycache_filter_and_v1_prune(monke
     (site_norec / "mystery-1.0.dist-info" / "METADATA").write_text("Name: mystery\nVersion: 1.0\n")
     assert np.prepare_env_cache_plan(root, site_norec, before_norec, key_info) is None
 
-    # prune_env_cache deletes all native-env-v1-* and native-env-v2-* files and keeps latest keep v3 entries
+    # prune_env_cache deletes all native-env-v1-*/v2-*/v3-* files and keeps latest keep v4 entries
     deleted = []
     remote_real = np.Remote(tmp_path / "rclone_root")
     (tmp_path / "rclone_root").mkdir()
@@ -2014,10 +2019,12 @@ def test_native_env_cache_v2_namespace_overlay_pycache_filter_and_v1_prune(monke
                     "2026-11-22 09:00:00\tnative-env-v1-old1.tar.gz\n"
                     "2026-11-22 10:00:00\tnative-env-v2-old2.meta.json\n"
                     "2026-11-22 10:00:00\tnative-env-v2-old2.tar.gz\n"
-                    "2026-11-22 11:00:00\tnative-env-v3-a.meta.json\n"
-                    "2026-11-22 12:00:00\tnative-env-v3-b.meta.json\n"
-                    "2026-11-22 13:00:00\tnative-env-v3-c.meta.json\n"
-                    "2026-11-22 14:00:00\tnative-env-v3-d.meta.json\n"
+                    "2026-11-22 10:30:00\tnative-env-v3-old3.meta.json\n"
+                    "2026-11-22 10:30:00\tnative-env-v3-old3.tar.gz\n"
+                    "2026-11-22 11:00:00\tnative-env-v4-a.meta.json\n"
+                    "2026-11-22 12:00:00\tnative-env-v4-b.meta.json\n"
+                    "2026-11-22 13:00:00\tnative-env-v4-c.meta.json\n"
+                    "2026-11-22 14:00:00\tnative-env-v4-d.meta.json\n"
                 )
             )
         if args[0] == "deletefile":
@@ -2031,9 +2038,11 @@ def test_native_env_cache_v2_namespace_overlay_pycache_filter_and_v1_prune(monke
     assert "native-env-v1-old1.tar.gz" in deleted
     assert "native-env-v2-old2.meta.json" in deleted
     assert "native-env-v2-old2.tar.gz" in deleted
-    assert "native-env-v3-a.meta.json" in deleted
-    assert "native-env-v3-a.tar.gz" in deleted
-    assert "native-env-v3-b.meta.json" not in deleted
+    assert "native-env-v3-old3.meta.json" in deleted
+    assert "native-env-v3-old3.tar.gz" in deleted
+    assert "native-env-v4-a.meta.json" in deleted
+    assert "native-env-v4-a.tar.gz" in deleted
+    assert "native-env-v4-b.meta.json" not in deleted
 
 
 def test_scheduler_native_wait_event_emitted_even_when_stage_already_native_tunnel(monkeypatch, tmp_path):

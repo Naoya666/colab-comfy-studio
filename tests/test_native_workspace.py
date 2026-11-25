@@ -268,12 +268,12 @@ def _seed_workspace(backend: FakeDriveBackend, owner: str = "owner") -> dict:
     # 3. Oversized workflow file (>20 MiB) should not OOM or crash overview
     backend.put_file("huge.json", wfs, b"{}", size_override=25 * 1024 * 1024)
 
-    # Env caches: one normal v3, one legacy oversized v2
-    backend.put_file("native-env-v3-good.tar.gz", env_cache_dir, b"z" * 10, mime="application/gzip", size_override=35 * 1024 * 1024)
+    # Env caches: one normal v4, one legacy oversized v2
+    backend.put_file("native-env-v4-good.tar.gz", env_cache_dir, b"z" * 10, mime="application/gzip", size_override=35 * 1024 * 1024)
     backend.put_json(
-        "native-env-v3-good.meta.json",
+        "native-env-v4-good.meta.json",
         env_cache_dir,
-        {"schema": 3, "key": "native-env-v3-good", "size": 35 * 1024 * 1024, "created_at": 1700000200.0, "added_count": 40, "spec": {"comfy_commit": "423cbd20511b", "python": "3.13", "gpu": "gpu123"}},
+        {"schema": 4, "key": "native-env-v4-good", "size": 35 * 1024 * 1024, "created_at": 1700000200.0, "added_count": 40, "spec": {"comfy_commit": "423cbd20511b", "python": "3.13", "gpu": "gpu123"}},
     )
     backend.put_file("native-env-v2-bloated.tar.gz", env_cache_dir, b"z" * 10, mime="application/gzip", size_override=1580 * 1024 * 1024)
     backend.put_json(
@@ -460,7 +460,7 @@ def test_workspace_overview_linked_cleanup_disable_enable_rollback_and_cache(tmp
 
     # Env cache flags
     ec_by_key = {c["key"]: c for c in overview["env_caches"]["items"]}
-    assert ec_by_key["native-env-v3-good"]["flags"] == []
+    assert ec_by_key["native-env-v4-good"]["flags"] == []
     assert set(ec_by_key["native-env-v2-bloated"]["flags"]) == {"legacy_schema", "oversized"}
 
     # Trying to disable in_use LanPaint without force_in_use is rejected!
@@ -519,7 +519,7 @@ def test_workspace_overview_linked_cleanup_disable_enable_rollback_and_cache(tmp
     assert del1["deleted_keys"] == ["native-env-v2-bloated"]
     assert del1["deleted_files"] == 2
     del2 = native_workspace.delete_env_caches(repo, "owner", delete_all=True, drive=drive)
-    assert del2["deleted_keys"] == ["native-env-v3-good"]
+    assert del2["deleted_keys"] == ["native-env-v4-good"]
 
     # Orphan object cleanup with keep_history=1 removes sha_orphan and makes old snapshot non-restorable
     dry = native_workspace.cleanup_orphan_objects(repo, "owner", keep_history=1, dry_run=True, drive=drive)

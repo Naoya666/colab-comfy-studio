@@ -355,6 +355,9 @@ async def telemetry(request: Request, refresh: bool = False, user=Depends(curren
 
 
 def _load_status_snapshot(repo, owner_id: str):
+    from .gpu.instances import POOL_NATIVE, instance_pool_of
+    from .gpu.transfer import _instance_spec_key
+
     lease = native.active_lease(repo, owner_id)
     restart_lease = lease or max(
         (row for row in repo.list("leases", owner_id) if row.get("native_restart")),
@@ -365,7 +368,58 @@ def _load_status_snapshot(repo, owner_id: str):
     native_jobs = [j for j in repo.list("jobs", owner_id) if (j.get("snapshot") or {}).get("native_comfy")]
     job = max(native_jobs, key=lambda j: j.get("created_at") or "", default=None)
     last_instance_id = (job or {}).get("instance_id")
-    instance = repo.get("instances", last_instance_id, owner_id) if not lease and last_instance_id else None
+    lease_instance = repo.get("instances", lease.get("instance_id"), owner_id) if lease and lease.get("instance_id") else None
+    instance = lease_instance or (repo.get("instances", last_instance_id, owner_id) if last_instance_id else None)
+
+    transferred_out = None
+    if lease is None and instance is not None and instance.get("state") != "deleted" and instance_pool_of(instance) != POOL_NATIVE:
+        transferred_out = {
+            "instance_id": instance["id"],
+            "to_pool": instance_pool_of(instance),
+            "state": instance.get("state"),
+        }
+
+    standby_instance = None
+    if (
+        lease is not None
+        and lease_instance is not None
+        and lease_instance.get("native_bootstrap_failed") is True
+        and not lease.get("native_ready")
+        and lease.get("state") == "idle"
+        and lease_instance.get("state") == "retained_idle"
+    ):
+        idle_deadline = lease_instance.get("idle_deadline_at") or lease.get("idle_deadline_at")
+        if idle_deadline is None or now < float(idle_deadline):
+            standby_instance = {
+                "instance_id": lease_instance["id"],
+                "account_id": lease_instance.get("account_id"),
+                "account_alias": lease_instance.get("account_alias_snapshot"),
+                "spec": _instance_spec_key(lease_instance),
+                "gpu_reported": lease_instance.get("gpu_reported"),
+                "idle_deadline_at": idle_deadline,
+                "remaining_seconds": max(0, int(round(float(idle_deadline) - now))) if idle_deadline is not None else None,
+                "error": lease_instance.get("native_bootstrap_error") or (job or {}).get("error_message"),
+            }
+
+    transferring_in = None
+    all_instances = (
+        repo.list_by_states("instances", ("transferring",), owner_id)
+        if hasattr(repo, "list_by_states")
+        else repo.list("instances", owner_id)
+    )
+    for inst_row in all_instances:
+        if inst_row.get("state") == "transferring":
+            ts = inst_row.get("transfer_state") or {}
+            if ts.get("to_pool") == POOL_NATIVE:
+                transferring_in = {
+                    "instance_id": inst_row["id"],
+                    "from_pool": ts.get("from_pool"),
+                    "phase": ts.get("phase"),
+                    "transfer_job_id": ts.get("transfer_job_id"),
+                    "started_at": ts.get("started_at"),
+                }
+                break
+
     job_events = (
         repo.list_events_for_job(owner_id, job["id"], asc=False)
         if job and hasattr(repo, "list_events_for_job")
@@ -375,18 +429,33 @@ def _load_status_snapshot(repo, owner_id: str):
     ncfg = native_config.resolve(repo, owner_id, use_cache=True, file_reader=reader, strict_decrypt=False)
     model_storage = (
         native.lease_storage(repo, lease)
-        if lease
+        if lease and standby_instance is None
         else (native.model_storage(job.get("execution_policy")) if job and job["state"] not in native.TERMINAL else None)
     )
-    can_restart_base = bool(lease) and native_restart.can_restart(repo, lease)
+    can_restart_base = bool(lease and standby_instance is None) and native_restart.can_restart(repo, lease)
     backend_info = None
-    if lease and lease.get("native_ready") and not native.restart_active(lease):
+    if lease and standby_instance is None and lease.get("native_ready") and not native.restart_active(lease):
         try:
             backend_info = native.backend_for(repo, owner_id)
         except APIError:
             backend_info = None
     rec_plan = recovery.public_plan(recovery.latest_plan_for_pool(repo, owner_id, "native"))
-    return lease, restart, job, instance, job_events, ncfg, model_storage, can_restart_base, backend_info, rec_plan, now
+    return (
+        lease,
+        restart,
+        job,
+        instance,
+        job_events,
+        ncfg,
+        model_storage,
+        can_restart_base,
+        backend_info,
+        rec_plan,
+        now,
+        transferred_out,
+        standby_instance,
+        transferring_in,
+    )
 
 
 @router.get("/status")
@@ -404,6 +473,9 @@ async def status(request: Request, user=Depends(current_user)):
         backend_info,
         rec_plan,
         now,
+        transferred_out,
+        standby_instance,
+        transferring_in,
     ) = await asyncio.to_thread(_load_status_snapshot, repo, user["id"])
     reclaimed = bool(instance and instance.get("state") == "deleted"
                      and instance.get("remote_delete_source") == RUNTIME_MISSING)
@@ -453,6 +525,8 @@ async def status(request: Request, user=Depends(current_user)):
         and offline_pending.get("generation")
         and offline_pending.get("generation") != (saved_plugins.get("manifest") or {}).get("generation")
     )
+    resolved_state = "stopped" if transferred_out else (job["state"] if job else "stopped")
+    resolved_ready = False if (transferred_out or standby_instance is not None) else ready
     return ok({"configured": bool(ncfg.tunnel_configured or (not ncfg.has_db_override and ncfg.any_configured)),
                "tunnel_configured": ncfg.tunnel_configured,
                "web_ui_configured": ncfg.web_ui_configured,
@@ -460,8 +534,8 @@ async def status(request: Request, user=Depends(current_user)):
                "timeouts": native.timeout_options(), "model_storage_defaults": native.model_storage_defaults(),
                "model_storage_known": not lease or bool(lease.get("native_model_storage")),
                "model_storage": model_storage, "disk": disk,
-               "ready": ready, "instance_id": lease.get("instance_id") if lease else None,
-               "job_id": job["id"] if job else None, "state": job["state"] if job else "stopped",
+               "ready": resolved_ready, "instance_id": lease.get("instance_id") if lease else None,
+               "job_id": job["id"] if job else None, "state": resolved_state,
                "stage": (job or {}).get("stage"), "gpu_reported": gpu_reported,
                "timings": timings, "timing_details": timing_details,
                "restart": restart, "can_restart": can_restart,
@@ -470,6 +544,9 @@ async def status(request: Request, user=Depends(current_user)):
                "allocation_retry": allocation_retry.public_allocation_retry((job or {}).get("allocation_retry")),
                "auto_select_account": bool((job or {}).get("auto_select_account")),
                "self_heal": (lease or {}).get("native_self_heal"),
+               "transferred_out": transferred_out,
+               "standby_instance": standby_instance,
+               "transferring_in": transferring_in,
                "reason": RUNTIME_MISSING if reclaimed else None,
                "error": RUNTIME_MISSING_MESSAGE if reclaimed else (job or {}).get("error_message"),
                "events": [{"message": e.get("message"), "state": e.get("state"), "created_at": e.get("created_at")}

@@ -31,6 +31,8 @@ class SchedulerWatchdogMixin:
         lease = self._get("leases", lease["id"], lease.get("owner_id")) or lease
         if lease.get("state") == "deleted":
             return False
+        if lease.get("state") == "quarantined" and not lease.get("force_stop"):
+            return False
         observation = None if lease.get("force_stop") else self._inspect_runtime(lease)
         if observation in {"missing", "stale", "unknown"}:
             return observation == "missing"
@@ -72,9 +74,17 @@ class SchedulerWatchdogMixin:
 
         token = uuid.uuid4().hex
         durable_instance = self._get("instances", instance_id, owner_id) if instance_id else None
+        if durable_instance and durable_instance.get("state") in {"quarantined", "transferring"} and not lease.get("force_stop"):
+            return False
         idle_cleanup = bool(
             lease.get("state") == "idle"
-            and (not lease.get("native_comfy") or lease.get("native_draining") or lease.get("force_stop"))
+            and (
+                not lease.get("native_comfy")
+                or lease.get("native_draining")
+                or lease.get("force_stop")
+                or lease.get("native_bootstrap_failed")
+                or (durable_instance and durable_instance.get("native_bootstrap_failed"))
+            )
             and durable_instance
             and durable_instance.get("lease_id") == lease["id"]
         )
@@ -553,6 +563,14 @@ class SchedulerWatchdogMixin:
                 continue
             instance_id = lease.get("instance_id")
             instance = self._get("instances", instance_id, lease["owner_id"]) if instance_id else None
+            if (
+                (lease.get("state") == "quarantined" or (instance and instance.get("state") == "quarantined"))
+                and not lease.get("force_stop")
+                and not (instance and instance.get("force_stop"))
+            ):
+                continue
+            if instance and instance.get("state") == "transferring" and not lease.get("force_stop"):
+                continue
             if lease.get("native_ready") and not lease.get("force_stop"):
                 from .native import protect_lease
                 if protect_lease(
@@ -567,9 +585,10 @@ class SchedulerWatchdogMixin:
                         or (lease.get("native_comfy") and lease.get("cu_fuse") == "soft_daily_limit"))
             if lease.get('state')=='idle' and not stopping and self.clock()<min(
                     float(lease.get('idle_deadline_at') or 0),float(lease.get('deadline_epoch') or 0)):
-                from .instances import POOL_CREATION, instance_pool_of
+                from .instances import POOL_CREATION, POOL_EPHEMERAL, POOL_NATIVE, instance_pool_of
 
-                is_creation_pool = bool(instance and instance_pool_of(instance) == POOL_CREATION)
+                pool = instance_pool_of(instance) if instance else None
+                is_creation_pool = pool == POOL_CREATION
                 if is_creation_pool and instance.get("creation_runtime"):
                     probe_job = associated or {
                         "id": lease.get("owner_job_id") or f"probe:{instance['id']}",
@@ -579,14 +598,18 @@ class SchedulerWatchdogMixin:
                         "instance_id": instance["id"],
                     }
                     self._probe_creation_process(probe_job, instance, lease, observation=observation)
-                if (
+                standby_keepalive_eligible = bool(
                     lease.get("provider") == "colab"
-                    and not lease.get("native_comfy")
                     and not lease.get("native_ready")
-                    and is_creation_pool
+                    and instance
                     and instance.get("state") == "retained_idle"
-                    and instance.get("retention_mode") in {"smart", "retain"}
-                ):
+                    and (
+                        (pool == POOL_CREATION and not lease.get("native_comfy") and instance.get("retention_mode") in {"smart", "retain"})
+                        or (pool == POOL_EPHEMERAL and not lease.get("native_comfy") and instance.get("retention_mode") == "retain")
+                        or (pool == POOL_NATIVE and instance.get("native_bootstrap_failed") is True and instance.get("retention_mode") == "retain")
+                    )
+                )
+                if standby_keepalive_eligible:
                     from .native import keepalive_lease
 
                     keepalive_lease(self.store, lease, self.clock, provider_factory=self._provider, smart=True)

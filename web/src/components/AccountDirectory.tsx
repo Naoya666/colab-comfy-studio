@@ -87,7 +87,8 @@ export interface GpuInstance {
   retention_mode?: string;
   retain_idle_minutes?: number | null;
   gpu_reported?: string;
-  runtime_spec_reported?: string | Record<string, unknown>;
+  runtime_spec_requested?: { accelerator?: string; variant?: string; [key: string]: unknown } | null;
+  runtime_spec_reported?: string | Record<string, unknown> | null;
   creation_runtime?: Record<string, unknown> | null;
   current_job_id?: string | null;
   current_job_title?: string;
@@ -111,6 +112,34 @@ export interface GpuInstance {
   replaced_by_instance_id?: string | null;
   recovery_plan_id?: string | null;
   recovery_source?: string | null;
+  venv_isolated?: boolean;
+  vm_allocated_at?: number | null;
+  domain_generation?: number;
+  transfer_state?: {
+    transfer_id?: string;
+    from_pool?: string;
+    to_pool?: string;
+    phase?: string;
+    transfer_job_id?: string;
+    native_bootstrap_job_id?: string;
+    started_at?: number | null;
+    completed_at?: number | null;
+    error_code?: string | null;
+    error_message?: string | null;
+  } | null;
+  transfer_history?: Array<{
+    transfer_id: string;
+    from_pool: string;
+    to_pool: string;
+    started_at?: number | null;
+    completed_at?: number | null;
+    transfer_job_id?: string;
+    domain_generation?: number;
+  }>;
+  native_bootstrap_failed?: boolean;
+  native_bootstrap_error?: string | null;
+  ephemeral_standby?: boolean;
+  quarantine_reason?: string | null;
   [key: string]: unknown;
 }
 

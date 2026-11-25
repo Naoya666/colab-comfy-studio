@@ -51,6 +51,7 @@ import {
   buildConfirmActions, formatReuseDecisionTitle, isCreationPoolInstance,
   resolveInstanceSubmission, shouldBypassSkipConfirm, type ConfirmActionOption,
 } from './lib/instance-submission';
+import type { TransferFocusTarget } from './lib/domain-transfer';
 import { isSystemJob, pickInitialProjectId, projectOptionLabel, projectTitleById } from './lib/project-label';
 import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
 import { readStoredWorkflowInspect, writeStoredWorkflowInspect } from './lib/model-library';
@@ -78,7 +79,7 @@ const tabIcons: Record<MainTab, typeof Sparkles> = {
 };
 const mobileLabels: Partial<Record<MainTab, string>> = { '原生 ComfyUI': '原生' };
 const terminalStates = new Set(['completed', 'succeeded', 'failed', 'failed_final', 'cancelled', 'cancelled_local', 'blocked']);
-const activeInstanceStates = new Set(['requested', 'allocating', 'preparing', 'ready', 'busy', 'retained_idle', 'releasing']);
+const activeInstanceStates = new Set(['requested', 'allocating', 'preparing', 'ready', 'busy', 'retained_idle', 'transferring', 'releasing']);
 
 export default function App() {
   const desktop = useDesktopLayout();
@@ -92,6 +93,7 @@ export default function App() {
   const [assetsSubTab, setAssetsSubTab] = useState<AssetsSubTab>(initialRoute.assetsSubTab);
   const [creationApiOpen, setCreationApiOpen] = useState(initialRoute.creationApiOpen);
   const [settingsFocusSection, setSettingsFocusSection] = useState<'model-storage' | null>(null);
+  const [focusTransferTarget, setFocusTransferTarget] = useState<TransferFocusTarget | null>(null);
   const [adminRole, setAdminRole] = useState(false);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
@@ -228,7 +230,7 @@ export default function App() {
   const activeInstance = instances.find((instance) => instance.provider === 'colab' && !instance.runtime_deleted
     && instanceIdOf(instance) === runtimeChoice.instanceId)
     || instances.find((instance) => instance.provider === 'colab' && !instance.runtime_deleted
-      && ['ready', 'busy', 'retained_idle', 'allocating', 'preparing'].includes(instance.state || ''));
+      && ['ready', 'busy', 'retained_idle', 'allocating', 'preparing', 'transferring'].includes(instance.state || ''));
   const detailRevision = jobs.find((job) => job.id === detailId)?.updated_at;
 
   const activeJobsCount = useMemo(
@@ -1132,6 +1134,11 @@ export default function App() {
     window.scrollTo(0, 0);
   }
 
+  function jumpToTransfer(target: TransferFocusTarget) {
+    setFocusTransferTarget(target);
+    navigate('算力');
+  }
+
   function openJobFromViewer(jobId: string) {
     gs.closeViewers();
     gs.setPendingRouteAssetId('');
@@ -1369,6 +1376,8 @@ export default function App() {
                   accounts={accounts}
                   instances={instances}
                   onRuntimeChoiceChange={changeRuntimeChoice}
+                  gpuOrder={gpuOrder}
+                  onFocusTransfer={jumpToTransfer}
                   loading={loading}
                   error={error}
                   onSubmit={requestSubmit}
@@ -1541,7 +1550,10 @@ export default function App() {
             instances={instances}
             onContinue={continueInstance}
             onOpenWorkbench={openInstanceWorkbench}
+            onOpenNative={() => navigate('原生 ComfyUI')}
             onRefreshInstances={() => resourceRefresh.current?.()}
+            focusTransferTarget={focusTransferTarget}
+            onFocusTransferHandled={() => setFocusTransferTarget(null)}
             onStop={() => setConfirm('stop')}
             onCheck={() => void checkGpu()}
             loadingStop={loading === 'stop'}
@@ -1614,6 +1626,7 @@ export default function App() {
                   }}
                   onUseProject={(id) => { setJobsProjectFilter(id); setTab('任务'); }}
                   onActivated={() => { void getGpuWorkflows().then(setWorkflows); void getGpuModels().then(setModels).catch(() => undefined); }}
+                  onFocusTransfer={jumpToTransfer}
                 />
               </>
             ) : (
@@ -1630,6 +1643,7 @@ export default function App() {
             instances={instances}
             desktop={desktop}
             onOpenSettings={() => navigate('设置')}
+            onFocusTransfer={jumpToTransfer}
           />
         )}
 

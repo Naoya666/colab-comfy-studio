@@ -659,9 +659,9 @@ class Remote:
             if len(parts) != 2:
                 continue
             ts, fname = parts[0], parts[1].strip()
-            if fname.startswith(('native-env-v1-', 'native-env-v2-')) and fname.endswith(('.meta.json', '.tar.gz')):
+            if fname.startswith(('native-env-v1-', 'native-env-v2-', 'native-env-v3-')) and fname.endswith(('.meta.json', '.tar.gz')):
                 legacy_files.append(fname)
-            elif fname.startswith('native-env-v3-') and fname.endswith('.meta.json'):
+            elif fname.startswith('native-env-v4-') and fname.endswith('.meta.json'):
                 metas.append((ts, fname[:-len('.meta.json')]))
         for fname in sorted(set(legacy_files)):
             try:
@@ -677,11 +677,33 @@ class Remote:
                     pass
 
 
-def manager_cli(comfy):
+def _venv_site_candidates(venv_dir: Path | None) -> list[Path]:
+    if venv_dir is None:
+        return []
+    vdir = Path(venv_dir)
+    out: list[Path] = []
+    lib_dir = vdir / 'lib'
+    if lib_dir.is_dir():
+        for pattern in ('python*/site-packages', 'python*/dist-packages'):
+            for cand in sorted(lib_dir.glob(pattern)):
+                if cand.is_dir():
+                    out.append(cand)
+    return out
+
+
+def manager_cli(comfy, *, venv_dir: Path | None = None):
+    for site_dir in _venv_site_candidates(venv_dir):
+        cm_main = site_dir / 'cm_cli' / '__main__.py'
+        if cm_main.is_file():
+            return cm_main
     packaged = importlib.util.find_spec('cm_cli')
     if packaged and packaged.origin:
         return Path(packaged.origin).with_name('__main__.py')
     candidates = list((comfy / 'custom_nodes').glob('*/cm-cli.py'))
+    for site_dir in _venv_site_candidates(venv_dir):
+        mgr_dir = site_dir / 'comfyui_manager'
+        if mgr_dir.is_dir():
+            candidates.extend(mgr_dir.rglob('cm-cli.py'))
     spec = importlib.util.find_spec('comfyui_manager')
     if spec and spec.submodule_search_locations:
         for folder in spec.submodule_search_locations:
@@ -689,6 +711,15 @@ def manager_cli(comfy):
     if not candidates:
         raise RuntimeError('Installed Manager has no cm-cli.py; install a compatible pinned Manager release')
     return sorted(candidates)[0]
+
+
+_DEFAULT_MANAGER_CLI = manager_cli
+
+
+def _resolve_manager_cli(comfy, venv_dir: Path | None = None):
+    if manager_cli is _DEFAULT_MANAGER_CLI:
+        return manager_cli(comfy, venv_dir=venv_dir)
+    return manager_cli(comfy)
 
 
 def protect_environment(root):
@@ -814,10 +845,11 @@ def _restore_git_bundle(node: Path, item: dict) -> None:
 
 
 class Persistence:
-    def __init__(self, root, comfy, user, remote=None):
+    def __init__(self, root, comfy, user, remote=None, *, venv_dir: Path | None = None):
         self.root, self.comfy, self.user = Path(root), Path(comfy), Path(user)
         self.nodes = self.comfy / 'custom_nodes'
         self.remote = remote or Remote(root)
+        self.venv_dir = Path(venv_dir) if venv_dir is not None else None
         self.cache = self.root / 'plugin-cache'
         self.cache.mkdir(parents=True, exist_ok=True)
         self.previous = None
@@ -829,6 +861,33 @@ class Persistence:
         self.error = None
         self._inv_lock = threading.Lock()
         self._inv_cache: tuple[str, str, float] | None = None
+
+    def _resolved_venv_dir(self) -> Path | None:
+        if self.venv_dir is not None and (self.venv_dir / 'bin' / 'python').is_file():
+            return self.venv_dir
+        default_venv = self.root / 'venv'
+        if (default_venv / 'bin' / 'python').is_file():
+            return default_venv
+        return None
+
+    def _python_bin(self) -> str:
+        vdir = self._resolved_venv_dir()
+        if vdir is not None:
+            return str(vdir / 'bin' / 'python')
+        return sys.executable
+
+    def _python_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env['COMFYUI_PATH'] = str(self.comfy)
+        env['PYTHONNOUSERSITE'] = '1'
+        env.pop('PYTHONPATH', None)
+        vdir = self._resolved_venv_dir()
+        if vdir is not None:
+            env['VIRTUAL_ENV'] = str(vdir)
+            vbin = str(vdir / 'bin')
+            parts = [p for p in env.get('PATH', '').split(os.pathsep) if p and p != vbin]
+            env['PATH'] = os.pathsep.join([vbin, *parts])
+        return env
 
     def download_json(self, key):
         path = self.cache / 'download.json'
@@ -980,7 +1039,9 @@ class Persistence:
         key = self._dependency_key(plugins, protected)
         if read(self.root / 'plugin-dependencies.json', {}).get('key') == key:
             return key
-        env = dict(os.environ, COMFYUI_PATH=str(self.comfy))
+        env = self._python_env()
+        py_bin = self._python_bin()
+        vdir = self._resolved_venv_dir()
         if env_flag('NATIVE_BATCH_PLUGIN_PIP', True):
             arch_list = _detected_cuda_arch_list()
             if arch_list:
@@ -998,11 +1059,11 @@ class Persistence:
                 constraints = self.root / 'gpu-constraints.txt'
                 req_args = [arg for req in req_files for arg in ('-r', str(req))]
                 uv_bin = shutil.which('uv') if env_flag('NATIVE_USE_UV', True) else None
-                batch_cmd = (
-                    [uv_bin, 'pip', 'install', '--system', '--python', sys.executable, '--constraint', str(constraints), '-q', *req_args]
-                    if uv_bin
-                    else [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '-q', '-c', str(constraints), *req_args]
-                )
+                if uv_bin:
+                    uv_flags = ['--python', py_bin] if vdir is not None else ['--system', '--python', py_bin]
+                    batch_cmd = [uv_bin, 'pip', 'install', *uv_flags, '--constraint', str(constraints), '-q', *req_args]
+                else:
+                    batch_cmd = [py_bin, '-m', 'pip', 'install', '--disable-pip-version-check', '-q', '-c', str(constraints), *req_args]
                 try:
                     t_batch = time.monotonic()
                     batch_res = subprocess.run(batch_cmd, cwd=self.comfy, env=env, capture_output=True, text=True, timeout=1500)
@@ -1030,7 +1091,7 @@ class Persistence:
                 t_script = time.monotonic()
                 try:
                     script_res = subprocess.run(
-                        [sys.executable, str(script)],
+                        [py_bin, str(script)],
                         cwd=script.parent,
                         env=env,
                         capture_output=True,
@@ -1057,7 +1118,7 @@ class Persistence:
                     flush=True,
                 )
         else:
-            command = [sys.executable, '-c', DEPENDENCY_LAUNCHER, str(manager_cli(self.comfy)),
+            command = [py_bin, '-c', DEPENDENCY_LAUNCHER, str(_resolve_manager_cli(self.comfy, venv_dir=vdir)),
                        'restore-dependencies', '--user-directory', str(self.user)]
             try:
                 result = subprocess.run(command, cwd=self.comfy, env=env, capture_output=True, text=True, timeout=1800)
@@ -1077,7 +1138,11 @@ class Persistence:
         after = protect_environment(self.root)
         if protected != after:
             raise RuntimeError('Plugin installer changed protected PyTorch/CUDA packages; recreate runtime')
-        check = subprocess.run([sys.executable, '-m', 'pip', 'check'], capture_output=True, text=True)
+        for vsite in _venv_site_candidates(vdir):
+            for entry in vsite.iterdir():
+                if _is_protected_site_top_name(entry.name, vsite):
+                    raise RuntimeError(f'Plugin installer overrode protected package in venv: {entry.name}')
+        check = subprocess.run([py_bin, '-m', 'pip', 'check'], env=env, capture_output=True, text=True)
         if check.returncode:
             error = {'plugins': [p['path'] for p in plugins], 'error': 'Python dependency compatibility check failed',
                      'detail': SECRET.sub(b'[redacted]', (check.stdout + check.stderr).encode()).decode(errors='replace')[-3000:]}
@@ -1090,9 +1155,10 @@ class Persistence:
     def snapshot(self):
         path = self.cache / 'manager-snapshot.json'
         path.unlink(missing_ok=True)
-        result = subprocess.run([sys.executable, str(manager_cli(self.comfy)), 'save-snapshot', '--output', str(path),
+        vdir = self._resolved_venv_dir()
+        result = subprocess.run([self._python_bin(), str(_resolve_manager_cli(self.comfy, venv_dir=vdir)), 'save-snapshot', '--output', str(path),
                                  '--user-directory', str(self.user)], cwd=self.comfy,
-                                env=dict(os.environ, COMFYUI_PATH=str(self.comfy)), capture_output=True, text=True, timeout=180)
+                                env=self._python_env(), capture_output=True, text=True, timeout=180)
         if result.returncode or not path.exists():
             raise RuntimeError('Manager save-snapshot failed')
         # Snapshot pip records can contain authenticated URLs; persist only node state.
@@ -1248,9 +1314,9 @@ class Persistence:
                 'error': error}
 
 
-# --- Phase 2: Incremental Native Environment Cache (plugin site-packages delta v3) ---
+# --- Phase 2: Incremental Native Environment Cache (venv site-packages delta v4) ---
 
-_ENV_CACHE_SCHEMA = 3
+_ENV_CACHE_SCHEMA = 4
 _PROTECTED_TOP_DIRS = frozenset({'torch', 'torchvision', 'torchaudio', 'triton', 'torchgen', 'functorch', 'nvidia'})
 _MAX_ENV_ARCHIVE_BYTES = 8 * 1024**3
 
@@ -1424,14 +1490,22 @@ def plugin_dep_fingerprint(nodes: Path, plugins: list[dict]) -> str:
 
 
 def compute_env_cache_key(
-    comfy: Path, commit: str, gpu_tag: str, nodes: Path, plugins: list[dict], *, base_packages: tuple[str, ...],
+    comfy: Path,
+    commit: str,
+    gpu_tag: str,
+    nodes: Path,
+    plugins: list[dict],
+    *,
+    base_packages: tuple[str, ...],
+    base_pkg_sha: str | None = None,
 ) -> dict:
-    dists = sorted(
-        f"{(d.metadata.get('Name') or '').lower().replace('_', '-')}=={d.version}"
-        for d in importlib.metadata.distributions()
-        if d.metadata.get('Name')
-    )
-    base_pkg_sha = hashlib.sha256('\n'.join(dists).encode()).hexdigest()
+    if not base_pkg_sha:
+        dists = sorted(
+            f"{(d.metadata.get('Name') or '').lower().replace('_', '-')}=={d.version}"
+            for d in importlib.metadata.distributions()
+            if d.metadata.get('Name')
+        )
+        base_pkg_sha = hashlib.sha256('\n'.join(dists).encode()).hexdigest()
     comfy_req_sha = file_hash(comfy / 'requirements.txt')
     manager_req_sha = file_hash(comfy / 'manager_requirements.txt')
     plugin_deps_sha = plugin_dep_fingerprint(nodes, plugins)
@@ -1450,7 +1524,7 @@ def compute_env_cache_key(
     }
     spec_sha = digest(spec)
     py_tag = f'py{sys.version_info.major}{sys.version_info.minor}'
-    key = f'native-env-v3-{commit[:12]}-{py_tag}-img{base_pkg_sha[:12]}-gpu{gpu_tag[:12]}-deps{spec_sha[:16]}'
+    key = f'native-env-v{_ENV_CACHE_SCHEMA}-{commit[:12]}-{py_tag}-img{base_pkg_sha[:12]}-gpu{gpu_tag[:12]}-deps{spec_sha[:16]}'
     return {'key': key, 'spec': spec}
 
 
@@ -1572,7 +1646,15 @@ def _prune_empty_dirs(dirs: list[Path], stop_at: Path) -> None:
             pass
 
 
-def try_restore_env_cache(root: Path, site: Path, key_info: dict, baseline_protected: dict, remote: Remote) -> bool:
+def try_restore_env_cache(
+    root: Path,
+    site: Path,
+    key_info: dict,
+    baseline_protected: dict,
+    remote: Remote,
+    *,
+    venv_dir: Path | None = None,
+) -> bool:
     """Restore incremental site-packages cache atomically (top-level + file-level overlay); return False cleanly on miss or failure."""
     if not env_flag('NATIVE_ENV_CACHE', True) or not site.is_dir():
         return False
@@ -1685,7 +1767,17 @@ def try_restore_env_cache(root: Path, site: Path, key_info: dict, baseline_prote
         after_protected = protect_environment(Path(root))
         if after_protected != baseline_protected:
             raise RuntimeError('env-cache altered protected PyTorch/CUDA packages')
-        check = subprocess.run([sys.executable, '-m', 'pip', 'check'], capture_output=True, text=True, timeout=60)
+        py_bin = sys.executable
+        check_env = dict(os.environ, PYTHONNOUSERSITE='1')
+        check_env.pop('PYTHONPATH', None)
+        resolved_venv = Path(venv_dir) if venv_dir is not None else (Path(root) / 'venv')
+        if (resolved_venv / 'bin' / 'python').is_file():
+            py_bin = str(resolved_venv / 'bin' / 'python')
+            check_env['VIRTUAL_ENV'] = str(resolved_venv)
+            vbin = str(resolved_venv / 'bin')
+            parts = [p for p in check_env.get('PATH', '').split(os.pathsep) if p and p != vbin]
+            check_env['PATH'] = os.pathsep.join([vbin, *parts])
+        check = subprocess.run([py_bin, '-m', 'pip', 'check'], env=check_env, capture_output=True, text=True, timeout=60)
         if check.returncode != 0:
             raise RuntimeError('env-cache failed pip check')
         print(

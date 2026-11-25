@@ -681,6 +681,16 @@ def real_smoke(
         or any(not isinstance(value, str) for value in asset_ids)
     ):
         raise APIError("VALIDATION_ERROR", "asset_ids格式无效")
+    retain_after_smoke = body.get("retain_after_smoke", False)
+    if not isinstance(retain_after_smoke, bool):
+        raise APIError("VALIDATION_ERROR", "retain_after_smoke必须为布尔值")
+    raw_req_inst = body.get("requested_instance_id")
+    if raw_req_inst is None or raw_req_inst == "":
+        requested_instance_id = None
+    elif isinstance(raw_req_inst, str) and raw_req_inst.strip():
+        requested_instance_id = raw_req_inst.strip()
+    else:
+        raise APIError("VALIDATION_ERROR", "requested_instance_id格式无效")
     requested_key = _spec_key(body.get("spec"))
     if requested_key is None:
         raise APIError("GPU_SPEC_REQUIRED", "必须提供来自当前账户的spec.key")
@@ -725,10 +735,14 @@ def real_smoke(
         "asset_ids": copy.deepcopy(asset_ids),
         "loras": copy.deepcopy(body.get("loras") or []),
         "spec": copy.deepcopy(body["spec"]),
+        "retain_after_smoke": retain_after_smoke,
+        "requested_instance_id": requested_instance_id,
         "execution_policy": {
             "provider": "colab",
             "account_id": account_id,
-            "shutdown_after_job": True,
+            "lifecycle": "retain" if retain_after_smoke else "save",
+            "shutdown_after_job": not retain_after_smoke,
+            "retain_idle_minutes": 10 if retain_after_smoke else 0,
             "max_runtime_minutes": runtime,
             "idle_grace_minutes": 0,
         },
@@ -803,6 +817,18 @@ def real_smoke(
         reusable = _reusable_smoke_job(repo, user["id"], workflow_id, row, model, compatibility)
         if reusable:
             return _smoke_response(reusable, request, resumed=True)
+        if requested_instance_id:
+            with st.admission_lock(timeout=1.0) as adm_ok:
+                if not adm_ok:
+                    raise APIError("SCHEDULER_BUSY", "资源分配正在进行，请稍后使用相同幂等键重试", 503, True)
+                _validate_requested_ephemeral_standby(
+                    repo,
+                    user["id"],
+                    requested_instance_id,
+                    account_id=account_id,
+                    expected_spec_key=requested_key,
+                    now=time.time(),
+                )
         from .gpu.native import guard_generation
 
         guard_generation(repo, user["id"], raw["execution_policy"])
@@ -817,6 +843,9 @@ def real_smoke(
                     "instance_pool": "ephemeral",
                     "account_id": account_id,
                     "requested_account_id": account_id,
+                    "requested_instance_id": requested_instance_id,
+                    "retain_after_smoke": retain_after_smoke,
+                    "generation_timeouts": bool(requested_instance_id or retain_after_smoke),
                     "execution_policy": raw["execution_policy"],
                     "model_id": row["model_id"],
                     "workflow_key": row["workflow_key"],
@@ -836,11 +865,16 @@ def real_smoke(
                 },
                 user["id"],
             )
+            smoke_msg = (
+                f"已进入队列，最长 {runtime} 分钟，完成后保留 GPU 10 分钟"
+                if retain_after_smoke
+                else f"已进入队列，最长 {runtime} 分钟，完成后立即释放 GPU"
+            )
             repo.event(
                 job["id"],
                 user["id"],
                 "queued",
-                f"已进入队列，最长 {runtime} 分钟，完成后立即释放 GPU",
+                smoke_msg,
             )
     return _smoke_response(job, request, resumed=not created)
 
@@ -936,22 +970,199 @@ def prepare_loras(body: dict, request: Request, user=Depends(current_user), st=D
     return ok({"id": job["id"], "job_id": job["id"], "state": job["state"]}, request, 202)
 
 
+def _validate_requested_ephemeral_standby(
+    repo: Repository,
+    owner_id: str,
+    instance_id: str,
+    *,
+    account_id: str,
+    expected_spec_key: dict,
+    now: float,
+) -> dict:
+    """Fail-closed validation for explicit ephemeral standby binding (Spec §5.2)."""
+    from .gpu.instances import POOL_EPHEMERAL, instance_pool_of
+    from .gpu.specs import spec_key as _norm_spec_key
+
+    msg = "冒烟域待命实例已失效或被占用，未自动新开 GPU，请刷新后确认是否新开实例"
+    inst = repo.get("instances", instance_id, owner_id)
+    if inst is None or instance_pool_of(inst) != POOL_EPHEMERAL:
+        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", msg, 409)
+    if (
+        inst.get("state") not in {"ready", "retained_idle"}
+        or inst.get("current_job_id") is not None
+        or inst.get("manual_stop_requested")
+        or inst.get("force_stop")
+        or inst.get("runtime_deleted")
+        or inst.get("cleanup_claim_token")
+        or inst.get("account_id") != account_id
+        or inst.get("provider") != "colab"
+    ):
+        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", msg, 409)
+    deadlines = [float(inst[k]) for k in ("idle_deadline_at", "hard_deadline_at") if inst.get(k) is not None]
+    if deadlines and now >= min(deadlines):
+        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", msg, 409)
+    lease_id = inst.get("lease_id")
+    lease = repo.get("leases", lease_id, owner_id) if lease_id else None
+    if (
+        lease is None
+        or lease.get("state") != "idle"
+        or lease.get("current_job_id") is not None
+        or lease.get("cleanup_claim_token")
+        or lease.get("force_stop")
+        or not lease.get("handle")
+    ):
+        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", msg, 409)
+    lease_deadlines = [float(lease[k]) for k in ("idle_deadline_at", "deadline_epoch") if lease.get(k) is not None]
+    if lease_deadlines and now >= min(lease_deadlines):
+        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", msg, 409)
+    actual_spec = inst.get("runtime_spec_reported") or inst.get("runtime_spec_requested")
+    try:
+        if not isinstance(actual_spec, Mapping) or _norm_spec_key(dict(actual_spec)) != _norm_spec_key(dict(expected_spec_key)):
+            raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", msg, 409)
+    except ValueError as exc:
+        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", msg, 409) from exc
+    terminal = {"completed", "failed", "cancelled", "rejected"}
+    for existing_job in repo.list("jobs", owner_id):
+        if existing_job.get("state") in terminal:
+            continue
+        if (
+            existing_job.get("instance_id") == instance_id
+            or existing_job.get("requested_instance_id") == instance_id
+        ):
+            raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", msg, 409)
+    return inst
+
+
+def _activation_instance_hints(repo: Repository, owner_id: str, manifest: Mapping | None, *, now: float) -> tuple[dict | None, list[dict]]:
+    """Compute exact-spec-matching standby ephemeral card and transferable other-domain cards (Spec §5.2)."""
+    from .gpu.instances import POOL_CREATION, POOL_EPHEMERAL, POOL_NATIVE, instance_pool_of
+    from .gpu.specs import spec_key as _norm_spec_key
+    from .gpu.transfer import _has_active_job_for_instance_in_tx, _is_gpu_instance, _vm_allocated_at
+
+    raw_spec = (manifest or {}).get("compute_spec") if isinstance(manifest, Mapping) else None
+    if not isinstance(raw_spec, Mapping):
+        return None, []
+    try:
+        target_spec = _norm_spec_key(dict(raw_spec))
+    except ValueError:
+        return None, []
+
+    terminal = {"completed", "failed", "cancelled", "rejected"}
+    busy_inst_ids: set[str] = set()
+    for j in repo.list("jobs", owner_id):
+        if j.get("state") in terminal:
+            continue
+        for key in ("instance_id", "requested_instance_id"):
+            if j.get(key):
+                busy_inst_ids.add(str(j[key]))
+
+    standby_candidates: list[tuple[float, dict]] = []
+    transferable_others: list[dict] = []
+    leases_by_id = {ls["id"]: ls for ls in repo.list("leases", owner_id) if ls.get("id")}
+
+    for inst in repo.list("instances", owner_id):
+        if inst.get("state") not in {"ready", "retained_idle"}:
+            continue
+        if (
+            inst.get("current_job_id") is not None
+            or inst.get("id") in busy_inst_ids
+            or inst.get("manual_stop_requested")
+            or inst.get("force_stop")
+            or inst.get("runtime_deleted")
+            or inst.get("cleanup_claim_token")
+            or not _is_gpu_instance(inst)
+        ):
+            continue
+        actual_raw = inst.get("runtime_spec_reported") or inst.get("runtime_spec_requested")
+        if not isinstance(actual_raw, Mapping):
+            continue
+        try:
+            actual_spec = _norm_spec_key(dict(actual_raw))
+        except ValueError:
+            continue
+        if actual_spec != target_spec:
+            continue
+        pool = instance_pool_of(inst)
+        lease = leases_by_id.get(inst.get("lease_id")) if inst.get("lease_id") else None
+        if inst.get("provider") == "colab":
+            if (
+                lease is None
+                or lease.get("state") != "idle"
+                or lease.get("current_job_id") is not None
+                or lease.get("cleanup_claim_token")
+                or lease.get("force_stop")
+                or not lease.get("handle")
+            ):
+                continue
+        is_native_ready = pool == POOL_NATIVE and bool((lease or {}).get("native_ready")) and not inst.get("native_bootstrap_failed")
+        hard = inst.get("hard_deadline_at")
+        if hard is not None and now >= float(hard):
+            continue
+        idle_deadline = inst.get("idle_deadline_at") or (lease or {}).get("idle_deadline_at")
+        if not is_native_ready and idle_deadline is not None and now >= float(idle_deadline):
+            continue
+        if pool == POOL_EPHEMERAL:
+            rem = max(0, int(round(float(idle_deadline) - now))) if idle_deadline is not None else None
+            standby_candidates.append(
+                (
+                    float(idle_deadline or 0.0),
+                    {
+                        "instance_id": inst["id"],
+                        "account_id": inst.get("account_id"),
+                        "account_alias": inst.get("account_alias_snapshot"),
+                        "spec": actual_spec,
+                        "gpu_reported": inst.get("gpu_reported"),
+                        "idle_deadline_at": idle_deadline,
+                        "remaining_seconds": rem,
+                    },
+                )
+            )
+        elif pool in {POOL_CREATION, POOL_NATIVE}:
+            baseline = inst.get("vm_baseline_digest") or (lease or {}).get("vm_baseline_digest")
+            if inst.get("venv_isolated") is not True or not baseline:
+                continue
+            if pool == POOL_NATIVE and not inst.get("native_bootstrap_failed"):
+                if inst.get("native_draining") or (lease or {}).get("native_draining"):
+                    continue
+            transferable_others.append(
+                {
+                    "instance_id": inst["id"],
+                    "instance_pool": pool,
+                    "account_id": inst.get("account_id"),
+                    "account_alias": inst.get("account_alias_snapshot"),
+                    "spec": actual_spec,
+                    "gpu_reported": inst.get("gpu_reported"),
+                    "idle_deadline_at": idle_deadline,
+                    "vm_allocated_at": _vm_allocated_at(inst, lease),
+                    "native_bootstrap_failed": bool(inst.get("native_bootstrap_failed")),
+                }
+            )
+
+    standby_candidates.sort(key=lambda item: item[0], reverse=True)
+    best_standby = standby_candidates[0][1] if standby_candidates else None
+    return best_standby, transferable_others
+
+
 def _job_gpu_diagnostics(job: dict, leases: list[dict]) -> dict | None:
     # Only server-persisted scheduler/provider evidence is accepted.  Never use
     # a diagnostic value from the request body or the accept endpoint body.
+    # Strictly prefer diagnostics pinned onto the job itself over mutable lease fields (Spec §5.3(3)).
     candidates = [job.get(name) for name in ("gpu_diagnostics", "gpu_diagnostic", "runtime_diagnostics")]
     snapshot = job.get("snapshot") or {}
     candidates.extend(
         snapshot.get(name) for name in ("gpu_diagnostics", "gpu_diagnostic", "runtime_diagnostics")
     )
-    for lease in leases:
-        candidates.extend(
-            lease.get(name)
-            for name in ("gpu_diagnostics", "gpu_diagnostic", "runtime_diagnostics", "selected_spec")
-        )
     for value in candidates:
         if isinstance(value, Mapping) and value:
             return copy.deepcopy(dict(value))
+    # Legacy fallback only for untransferred leases still owned by this smoke job.
+    for lease in leases:
+        if lease.get("owner_job_id") != job.get("id") or int(lease.get("domain_generation") or 0) > 0:
+            continue
+        for name in ("gpu_diagnostics", "gpu_diagnostic", "runtime_diagnostics", "selected_spec"):
+            value = lease.get(name)
+            if isinstance(value, Mapping) and value:
+                return copy.deepcopy(dict(value))
     return None
 
 
@@ -998,8 +1209,35 @@ def accept_smoke(
             raise APIError("SMOKE_OUTPUT_INVALID", "冒烟输出文件不可读取") from exc
         if asset.get("size") != len(content) or asset.get("sha256") != hashlib.sha256(content).hexdigest():
             raise APIError("SMOKE_OUTPUT_INVALID", "冒烟输出SHA校验失败")
-    leases = [lease for lease in repo.list("leases", user["id"]) if lease.get("owner_job_id") == job["id"]]
-    if not leases or any(lease.get("state") != "deleted" for lease in leases):
+    job_lease_id = job.get("lease_id")
+    leases = []
+    if job_lease_id:
+        found_lease = repo.get("leases", job_lease_id, user["id"])
+        if found_lease is not None:
+            leases = [found_lease]
+    if not leases:
+        leases = [lease for lease in repo.list("leases", user["id"]) if lease.get("owner_job_id") == job["id"]]
+    exec_id = job.get("execution_id")
+    execution = repo.get("executions", exec_id, user["id"]) if exec_id else None
+    execution_completed = bool(execution and execution.get("state") == "completed")
+
+    def _lease_released_or_detached(lease: dict) -> bool:
+        if lease.get("state") == "deleted":
+            return True
+        if not execution_completed:
+            return False
+        if lease.get("current_job_id") == job["id"]:
+            return False
+        if lease.get("state") == "active" and lease.get("owner_job_id") == job["id"]:
+            return False
+        inst_id = lease.get("instance_id") or job.get("instance_id")
+        if inst_id:
+            inst = repo.get("instances", inst_id, user["id"])
+            if inst is not None and inst.get("current_job_id") == job["id"]:
+                return False
+        return True
+
+    if not leases or not all(_lease_released_or_detached(lease) for lease in leases):
         raise APIError("GPU_NOT_RELEASED", "GPU租约尚未由服务器确认释放")
     diagnostics = _job_gpu_diagnostics(job, leases)
     requested = job.get("requested_spec")
@@ -1171,6 +1409,9 @@ def workflow_activation(
         if not step["done"] and not step.get("running") and not step.get("failed"):
             step["next"] = True
             break
+    standby_ephemeral_instance, transferable_other_instances = _activation_instance_hints(
+        repo, user["id"], row.get("manifest"), now=time.time()
+    )
     return ok(
         {
             "workflow": {
@@ -1212,6 +1453,8 @@ def workflow_activation(
             "blockers": blockers,
             "done": published and bool(row.get("active")) and smoke_done,
             "account_id": account_id,
+            "standby_ephemeral_instance": standby_ephemeral_instance,
+            "transferable_other_instances": transferable_other_instances,
         },
         request,
     )

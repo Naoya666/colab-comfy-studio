@@ -125,7 +125,7 @@ class SchedulerInstancesMixin:
         if not self._is_v020_job(job):
             return job
         if job.get("instance_id"):
-            if job.get("selection_reason") in {"reuse_idle", "requested_instance"} and not self._lease(job):
+            if job.get("selection_reason") in {"reuse_idle", "requested_instance", "requested_ephemeral_standby"} and not self._lease(job):
                 return self._reuse_instance_lease(job, self._service_instance_for_job(job))
             return job
         try:
@@ -173,13 +173,19 @@ class SchedulerInstancesMixin:
         if deadline is not None and self.clock() >= float(deadline):
             return job
         handle = lease.get("handle")
+        now = self.clock()
         lease_patch = {
             "state": "active",
             "owner_job_id": job["id"],
             "current_job_id": job["id"],
             "idle_deadline_at": None,
-            "last_active_at": self.clock(),
+            "last_active_at": now,
         }
+        effective_deadline = deadline
+        if lease.get("generation_timeouts") and lease.get("hard_deadline_at") is None:
+            effective_deadline = now + self._effective_runtime(job) * 60
+            lease_patch["deadline_epoch"] = effective_deadline
+            lease_patch["ephemeral_standby"] = False
         if isinstance(handle, dict):
             lease_patch["handle"] = {
                 **handle,
@@ -188,8 +194,10 @@ class SchedulerInstancesMixin:
             }
         self._update("leases", lease_id, lease_patch, job.get("owner_id"))
         job_patch = {"lease_id": lease_id}
-        if deadline is not None:
-            job_patch["deadline_epoch"] = deadline
+        if effective_deadline is not None:
+            job_patch["deadline_epoch"] = effective_deadline
+            if lease.get("generation_timeouts") and lease.get("hard_deadline_at") is None:
+                job_patch["task_deadline_epoch"] = effective_deadline
         return self._update("jobs", job["id"], job_patch, job.get("owner_id"))
 
     def _bind_instance_lease(self, job: dict, lease: dict) -> tuple[dict, dict]:

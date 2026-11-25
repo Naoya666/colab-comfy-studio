@@ -40,6 +40,16 @@ class StopInput(BaseModel):
     confirmed: bool
 
 
+class TransferInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_pool: Literal["creation", "native", "ephemeral"]
+    confirmed: bool
+    expected_version: int | None = Field(default=None, ge=0)
+    key: str | None = Field(default=None, min_length=1, max_length=200)
+    creation_options: dict[str, Any] | None = None
+    native_options: dict[str, Any] | None = None
+
+
 class WorkbenchActionInput(BaseModel):
     model_config = ConfigDict(extra="allow")
     action: str = Field(min_length=1, max_length=64)
@@ -254,6 +264,48 @@ def stop_instance(instance_id: str, body: StopInput, request: Request, user=Depe
     except (InstanceServiceError, KeyError) as exc:
         raise _domain_error(exc) from exc
     return ok(_public(service, value), request, 202)
+
+
+@router.get("/instances/{instance_id}/transfer-preview")
+def transfer_preview(instance_id: str, request: Request, user=Depends(current_user)):
+    from .gpu import transfer
+
+    _instance(_service(request), instance_id, user["id"])
+    preview = transfer.preview_transfer(
+        _repo(request),
+        user["id"],
+        instance_id,
+        is_admin=(user.get("role") == "admin"),
+    )
+    return ok(_safe_public(preview), request)
+
+
+@router.post("/instances/{instance_id}/transfer", status_code=202)
+def transfer_instance(instance_id: str, body: TransferInput, request: Request, user=Depends(current_user)):
+    from .gpu import transfer
+
+    is_admin = user.get("role") == "admin"
+    if body.target_pool == "ephemeral" and not is_admin:
+        raise APIError("FORBIDDEN", "仅管理员可将实例转移至冒烟域", 403)
+    header_key = request.headers.get("Idempotency-Key")
+    if body.key and header_key and body.key != header_key:
+        raise APIError("IDEMPOTENCY_CONFLICT", "请求头与正文幂等键不一致", 409)
+    key = body.key or header_key
+    if not key:
+        raise APIError("IDEMPOTENCY_REQUIRED", "域转移必须提供固定幂等键", 422)
+    try:
+        result = transfer.start_transfer(
+            _repo(request),
+            _service(request),
+            user["id"],
+            instance_id,
+            body.model_dump(),
+            key,
+            is_admin=is_admin,
+        )
+    except (InstanceServiceError, KeyError) as exc:
+        raise _domain_error(exc) from exc
+    return ok(_safe_public(result), request, 202)
 
 
 def _workbench(request: Request):

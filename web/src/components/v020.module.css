@@ -972,3 +972,137 @@
   background: var(--warning-bg, rgba(255, 210, 125, 0.14));
   border-color: var(--warning-line, rgba(255, 210, 125, 0.45));
 }
+
+.domainBadge {
+  font-weight: 600;
+}
+
+.domainCreation {
+  color: #8cc5ff;
+  background: rgba(140, 197, 255, 0.12);
+  border-color: rgba(140, 197, 255, 0.42);
+}
+
+.domainNative {
+  color: #8ee5b8;
+  background: rgba(142, 229, 184, 0.12);
+  border-color: rgba(142, 229, 184, 0.42);
+}
+
+.domainEphemeral {
+  color: #f7c873;
+  background: rgba(247, 200, 115, 0.12);
+  border-color: rgba(247, 200, 115, 0.42);
+}
+
+.domainCpu {
+  color: var(--v-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--v-border);
+}
+
+.transferProgress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--v-border-strong);
+  border-radius: var(--r-sm, 8px);
+  background: var(--v-panel);
+  font-size: 0.76rem;
+}
+
+.transferStep {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--r-full, 999px);
+  border: 1px solid var(--v-border);
+  color: var(--v-muted);
+}
+
+.transferStepActive {
+  color: var(--v-text);
+  border-color: var(--v-text);
+  font-weight: 600;
+}
+
+.transferStepDone {
+  color: var(--v-good);
+  border-color: rgba(215, 255, 215, 0.4);
+}
+
+.transferStepFailed {
+  color: var(--v-danger);
+  border-color: var(--v-danger-line);
+}
+
+.transferTargetList {
+  display: grid;
+  gap: 8px;
+}
+
+.transferTargetOption {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--v-border);
+  border-radius: var(--r-md, 12px);
+  background: var(--v-bg);
+  text-align: left;
+  cursor: pointer;
+}
+
+.transferTargetOption[data-selected='true'] {
+  border-color: var(--v-text);
+  background: var(--v-panel-2);
+}
+
+.transferTargetOption[data-disabled='true'] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.transferWarnings {
+  margin: 0;
+  padding: 10px 12px 10px 26px;
+  border: 1px solid var(--warning-line, rgba(255, 210, 125, 0.38));
+  border-radius: var(--r-md, 12px);
+  background: var(--warning-bg, rgba(255, 210, 125, 0.08));
+  color: var(--warning, #ffd27d);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  display: grid;
+  gap: 4px;
+}
+
+.standbyAlert {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--warning-line, rgba(255, 210, 125, 0.45));
+  border-radius: var(--r-md, 12px);
+  background: var(--warning-bg, rgba(255, 210, 125, 0.1));
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.quarantineAlert {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--v-danger-line);
+  border-radius: var(--r-md, 12px);
+  background: rgba(255, 107, 107, 0.1);
+  color: var(--v-danger);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.transferFormGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}

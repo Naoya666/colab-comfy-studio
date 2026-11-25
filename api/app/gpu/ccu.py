@@ -322,6 +322,8 @@ def _refresh(session, row, now, **patch):
         GpuJobRow.owner_id == row.owner_id, GpuJobRow.instance_id == row.instance_id,
     ).order_by(GpuJobRow.created_at, GpuJobRow.id).with_for_update()):
         details = job.data or {}
+        if details.get("domain_transfer") or (details.get("snapshot") or {}).get("domain_transfer"):
+            continue
         start = details.get("execution_started_at")
         seconds = details.get("execution_seconds")
         if seconds is None and start is not None:
@@ -334,7 +336,7 @@ def _refresh(session, row, now, **patch):
     total = max(elapsed, sum(job["execution_seconds"] for job in jobs.values()))
     remainder = round(actual * 1_000_000)
     for item in jobs.values():
-        proportional = data["session_kind"] == "smart_reuse"
+        proportional = data["session_kind"] in {"smart_reuse", "multi_domain"}
         units = round(actual * item["execution_seconds"] / total * 1_000_000) if proportional and total else (
             remainder if not proportional and item["job_id"] == data.get("job_id") else 0
         )
@@ -408,6 +410,27 @@ def open_instance_session(repo, job, lease, now):
         row = _open_session(session, instance, job, lease, now)
         if row is not None and row in session.new:
             _seal(session, _segments(session, owner, account, ("reconciling",)), now, all_pending=True)
+
+
+def record_domain_transfer_in_tx(
+    session,
+    owner_id: str,
+    instance_id: str,
+    *,
+    from_pool: str,
+    to_pool: str,
+    at: float,
+) -> bool:
+    """Mark an open instance-lifetime CU segment as multi_domain and append transfer timeline."""
+    if not owner_id or not instance_id:
+        return False
+    row = session.get(GpuInstanceUsageSegmentRow, _session_id(owner_id, instance_id))
+    if row is None or row.owner_id != owner_id or row.state != "open" or not (row.data or {}).get("session_kind"):
+        return False
+    transfers = list((row.data or {}).get("domain_transfers") or [])
+    transfers.append({"at": float(at), "from_pool": from_pool, "to_pool": to_pool})
+    _refresh(session, row, float(at), session_kind="multi_domain", domain_transfers=transfers)
+    return True
 
 
 def gpu_label(spec):

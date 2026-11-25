@@ -245,7 +245,7 @@ class InstanceService:
     migration register the v0.2 tables without changing this domain service.
     """
 
-    _INSTANCE_STATES = {"requested", "allocating", "ready", "busy", "retained_idle", "releasing", "deleted", "unknown", "cleanup_pending", "quarantined"}
+    _INSTANCE_STATES = {"requested", "allocating", "ready", "busy", "retained_idle", "transferring", "releasing", "deleted", "unknown", "cleanup_pending", "quarantined"}
     _IDLE_STATES = {"ready", "retained_idle"}
     _ACTIVE_CREATION_STATES = {"retained_idle", "ready", "allocating", "busy"}
     _RUNTIME_CHECK_INTERVAL = 45
@@ -259,6 +259,8 @@ class InstanceService:
         "allocation_key", "budget_reserved", "retention_reserved", "allocation_requested_at", "deletion_confirmed_at",
         "remote_delete_source", "history_cleared_at",
         "recovery_group_id", "recovery_generation", "parent_instance_id", "replaced_by_instance_id", "recovery_plan_id", "recovery_source",
+        "venv_isolated", "vm_allocated_at", "domain_generation", "transfer_state", "transfer_history",
+        "native_bootstrap_failed", "native_bootstrap_error", "ephemeral_standby", "quarantine_reason",
     }
 
     def __init__(self, repo, clock=time.time, config=None):
@@ -1121,8 +1123,15 @@ class InstanceService:
         if data.get("current_job_id") not in {None, job.get("id")}:
             raise InstanceConflict("实例已被其他任务占用")
         now = self.clock()
+        policy = self._job_policy(job)
+        pool = self._instance_pool(session, instance)
+        is_native_standby_retry = bool(
+            pool == POOL_NATIVE and (data.get("native_bootstrap_failed") or job.get("native_standby_retry"))
+        )
+        is_ephemeral_standby = bool(pool == POOL_EPHEMERAL)
         lease_id = data.get("lease_id")
         claimed_deadline = None
+        claimed_task_deadline = None
         if lease_id:
             lease = self._find(session, "leases", lease_id, instance.owner_id)
             if lease is None or lease.state != "idle":
@@ -1148,6 +1157,41 @@ class InstanceService:
                 instance_id=instance.id,
                 account_id=self._account_id(account),
             )
+            if is_native_standby_retry:
+                from . import native as _native
+
+                new_hard = (
+                    float(job["hard_deadline_at"])
+                    if job.get("hard_deadline_at") is not None
+                    else now + float(job.get("max_runtime_minutes") or policy.get("max_runtime_minutes") or 720) * 60.0
+                )
+                lease_data.update(
+                    native_comfy=True,
+                    native_ready=False,
+                    native_draining=False,
+                    native_bootstrap_failed=False,
+                    native_bootstrap_job_id=job["id"],
+                    native_model_storage=_native.model_storage(policy),
+                    native_idle_minutes=policy.get("retain_idle_minutes"),
+                    generation_timeouts=False,
+                    hard_deadline_at=new_hard,
+                    deadline_epoch=new_hard,
+                )
+                if job.get("drive_account_id"):
+                    lease_data["drive_account_id"] = job["drive_account_id"]
+                    lease_data["native_drive_account_id"] = job["drive_account_id"]
+            elif is_ephemeral_standby or (
+                lease_data.get("generation_timeouts") and lease_data.get("hard_deadline_at") is None
+            ):
+                # Recompute single-job execution deadline from this job's max_runtime_minutes
+                # instead of inheriting a short standby countdown (Spec §4.4 & §5.2).
+                max_rt = job.get("max_runtime_minutes") or policy.get("max_runtime_minutes") or self._cfg("max_runtime_minutes", 30)
+                task_deadline = now + max(1.0, float(max_rt)) * 60.0
+                lease_data["generation_timeouts"] = True
+                lease_data["hard_deadline_at"] = None
+                lease_data["deadline_epoch"] = task_deadline
+                lease_data["ephemeral_standby"] = False
+                claimed_task_deadline = task_deadline
             if isinstance(handle, dict):
                 lease_data["allocation_confirmed"] = True
                 lease_data["handle"] = {
@@ -1194,12 +1238,40 @@ class InstanceService:
             runtime_deleted=False,
             idle_deadline_at=None,
         )
+        if is_native_standby_retry:
+            new_hard = (
+                float(job["hard_deadline_at"])
+                if job.get("hard_deadline_at") is not None
+                else (float(claimed_deadline) if claimed_deadline is not None else None)
+            )
+            data.update(
+                native_comfy=True,
+                native_ready=False,
+                native_draining=False,
+                native_bootstrap_failed=False,
+                native_bootstrap_error=None,
+                retention_mode="retain",
+                retain_idle_minutes=policy.get("retain_idle_minutes") or data.get("retain_idle_minutes"),
+                hard_deadline_at=new_hard,
+            )
+            if isinstance(data.get("transfer_state"), dict):
+                data["transfer_state"] = {
+                    **data["transfer_state"],
+                    "phase": "native_bootstrapping",
+                    "native_bootstrap_job_id": job["id"],
+                    "error_code": None,
+                    "error_message": None,
+                }
+        elif is_ephemeral_standby:
+            data.update(ephemeral_standby=False, hard_deadline_at=None)
         self._set(instance, data, state="allocating", expected_version=instance.version, session=session)
         job_for_bind = dict(job)
         if lease_id:
             job_for_bind["lease_id"] = lease_id
         if claimed_deadline is not None:
             job_for_bind["deadline_epoch"] = claimed_deadline
+        if claimed_task_deadline is not None:
+            job_for_bind["task_deadline_epoch"] = claimed_task_deadline
         self._bind_job_rows(session, job_for_bind, instance, account)
         self._emit(session, job["owner_id"], instance.project_id, instance.id, job["id"], "allocating", "instance allocated")
         return self._dict(instance)
@@ -1291,6 +1363,8 @@ class InstanceService:
                 data["lease_id"] = job["lease_id"]
             if job.get("deadline_epoch") is not None:
                 data["deadline_epoch"] = job["deadline_epoch"]
+            if job.get("task_deadline_epoch") is not None:
+                data["task_deadline_epoch"] = job["task_deadline_epoch"]
             self._set(job_row, data, state=job_row.state, session=session)
         execution_id = job.get("execution_id")
         if execution_id:
@@ -1529,10 +1603,54 @@ class InstanceService:
                 accounts = [account for account in accounts if self._account_id(account) in eligible]
             account_id = self._account_id(accounts[0]) if requested_account else None
 
-            # 1) Ephemeral pool (CUDA smoke, workflow smoke, CPU prep): NEVER reuse, NEVER block others.
+            # 1) Ephemeral pool (CUDA smoke, workflow smoke, CPU prep):
+            #    NEVER implicitly reuse; only explicit requested_instance_id for workflow_smoke may claim an ephemeral standby card.
             if pool == POOL_EPHEMERAL:
                 if requested_instance:
-                    raise AllocationError("一次性任务不支持复用实例")
+                    snapshot = job.get("snapshot") if isinstance(job.get("snapshot"), Mapping) else {}
+                    is_workflow_smoke = bool(job.get("workflow_smoke") or snapshot.get("workflow_smoke"))
+                    if not is_workflow_smoke:
+                        raise AllocationError("一次性任务不支持复用实例")
+                    instance = session.scalar(select(model).where(model.id == requested_instance, model.owner_id == owner_id))
+                    unavail_msg = "冒烟域待命实例已失效或被占用，未自动新开 GPU，请刷新后确认是否新开实例"
+                    if instance is None or self._instance_pool(session, instance) != POOL_EPHEMERAL:
+                        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", unavail_msg, 409)
+                    data = self._data(instance)
+                    now = self.clock()
+                    if (
+                        instance.state not in self._IDLE_STATES
+                        or data.get("current_job_id") is not None
+                        or data.get("manual_stop_requested")
+                        or data.get("force_stop")
+                        or data.get("runtime_deleted")
+                        or data.get("cleanup_claim_token")
+                        or data.get("provider", provider) != provider
+                    ):
+                        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", unavail_msg, 409)
+                    deadlines = [data[k] for k in ("idle_deadline_at", "hard_deadline_at") if data.get(k) is not None]
+                    if deadlines and now >= min(map(float, deadlines)):
+                        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", unavail_msg, 409)
+                    ok_lease, _ = self._lease_is_reusable_idle(session, instance, data, now)
+                    if not ok_lease:
+                        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", unavail_msg, 409)
+                    if requested_account and data.get("account_id") != account_id:
+                        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", unavail_msg, 409)
+                    account = next((a for a in accounts if self._account_id(a) == data.get("account_id")), None)
+                    if account is None:
+                        raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", unavail_msg, 409)
+                    actual = self._instance_spec(data)
+                    expected_spec = self._job_workflow_default_spec(job) or self._job_requested_spec(job)
+                    if provider == "colab" or (actual is not None and expected_spec is not None):
+                        from .specs import spec_key as _spec_key
+
+                        try:
+                            if actual is None or expected_spec is None or _spec_key(dict(actual)) != _spec_key(dict(expected_spec)):
+                                raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", unavail_msg, 409)
+                        except ValueError as exc:
+                            raise APIError("EPHEMERAL_INSTANCE_UNAVAILABLE", unavail_msg, 409) from exc
+                    return self._claim_existing(
+                        session, instance, job, account, key, stable_id, "requested_ephemeral_standby"
+                    )
                 account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
                 return self._create_instance(
                     session, job, account, key, stable_id, "requested_account" if requested_account else "round_robin"
@@ -1545,7 +1663,7 @@ class InstanceService:
                     if instance is None or self._instance_pool(session, instance) != POOL_NATIVE:
                         raise AllocationError("指定原生实例不存在或不属于原生域")
                     data = self._data(instance)
-                    if instance.state in {"unknown", "cleanup_pending", "deleted", "releasing", "quarantined"}:
+                    if instance.state in {"unknown", "cleanup_pending", "deleted", "releasing", "quarantined", "transferring"}:
                         raise AllocationError("指定实例当前不可用")
                     if requested_account and data.get("account_id") != account_id:
                         raise AllocationError("指定实例与账号冲突")
@@ -1603,7 +1721,7 @@ class InstanceService:
                 if self._instance_pool(session, instance) != POOL_CREATION:
                     raise AllocationError("指定实例不属于创作池，不能跨域复用")
                 data = self._data(instance)
-                if instance.state in {"unknown", "cleanup_pending", "deleted", "releasing", "quarantined"}:
+                if instance.state in {"unknown", "cleanup_pending", "deleted", "releasing", "quarantined", "transferring"}:
                     raise AllocationError("指定实例当前不可用")
                 if requested_account and data.get("account_id") != account_id:
                     raise AllocationError("指定实例与账号冲突")
@@ -1822,8 +1940,8 @@ class InstanceService:
             instance = self._instance_for_job(session, job)
             if instance is None:
                 raise AllocationError("job has no instance")
-            if instance.state in {"unknown", "deleted", "releasing", "cleanup_pending", "quarantined"}:
-                raise InstanceConflict("stopping, quarantined, unknown or deleted instance cannot be advanced")
+            if instance.state in {"unknown", "deleted", "releasing", "cleanup_pending", "quarantined", "transferring"}:
+                raise InstanceConflict("stopping, transferring, quarantined, unknown or deleted instance cannot be advanced")
             data = self._data(instance)
             if data.get("force_stop") or data.get("fuse_forced_stop") or data.get("cleanup_claim_token"):
                 raise InstanceConflict("stopping instance cannot be advanced")
@@ -1899,8 +2017,28 @@ class InstanceService:
                 or past_hard
             )
 
+            snapshot = job.get("snapshot") if isinstance(job.get("snapshot"), Mapping) else {}
+            is_workflow_smoke = bool(job.get("workflow_smoke") or snapshot.get("workflow_smoke"))
+            retain_after_smoke = bool(
+                pool == POOL_EPHEMERAL
+                and is_workflow_smoke
+                and (job.get("retain_after_smoke") is True or policy.get("lifecycle") == "retain")
+            )
+            smoke_clean_ok = (
+                job.get("clean_after_smoke") is True
+                if data.get("provider") == "colab"
+                else job.get("clean_after_smoke") is not False
+            )
+            is_transferred_native_fail = bool(
+                (pool == POOL_NATIVE or data.get("native_comfy"))
+                and not success
+                and (job.get("transferred_native_bootstrap") or job.get("native_standby_retry"))
+            )
+
             if pool == POOL_EPHEMERAL:
-                mode = "save"
+                mode = "retain" if (retain_after_smoke and not hard_terminate and smoke_clean_ok) else "save"
+            elif is_transferred_native_fail:
+                mode = "retain" if (job.get("native_failure_cleaned") is True and not hard_terminate) else "save"
             elif pool == POOL_NATIVE or data.get("native_comfy"):
                 mode = "save" if (manual_stop or force_stopped or remote_missing or unstarted_vm or unconfirmed_allocation) else "retain"
             elif hard_terminate:
@@ -1923,7 +2061,9 @@ class InstanceService:
             )
 
             if pool == POOL_EPHEMERAL:
-                retain = False
+                retain = retain_after_smoke and (not hard_terminate) and smoke_clean_ok
+            elif is_transferred_native_fail:
+                retain = (job.get("native_failure_cleaned") is True) and (not hard_terminate)
             elif pool == POOL_NATIVE or data.get("native_comfy"):
                 # Native VM is retained only once booted (success or already marked native_comfy) and no hard stop.
                 retain = (
@@ -1937,15 +2077,48 @@ class InstanceService:
             data.update(current_job_id=None, last_seen_at=self.clock(), retention_mode=mode, instance_pool=pool)
             if not (pool == POOL_NATIVE or data.get("native_comfy")):
                 data.update(idle_deadline_at=None, retention_reserved=0.0)
+            if pool == POOL_EPHEMERAL:
+                data["ephemeral_standby"] = bool(retain)
+                if retain:
+                    data["hard_deadline_at"] = None
+                    hard = None
+            if is_transferred_native_fail:
+                if retain:
+                    data.update(
+                        native_comfy=True,
+                        native_ready=False,
+                        native_draining=False,
+                        native_bootstrap_failed=True,
+                        native_bootstrap_error=job.get("error_message"),
+                    )
+                    if isinstance(data.get("transfer_state"), dict):
+                        data["transfer_state"] = {
+                            **data["transfer_state"],
+                            "phase": "native_bootstrap_failed",
+                            "error_code": job.get("error_code"),
+                            "error_message": job.get("error_message"),
+                        }
+                else:
+                    data.update(native_bootstrap_failed=False)
+                    if isinstance(data.get("transfer_state"), dict):
+                        data["transfer_state"] = {
+                            **data["transfer_state"],
+                            "phase": "failed",
+                            "error_code": job.get("error_code"),
+                            "error_message": job.get("error_message"),
+                        }
             if retain:
-                minutes = (
-                    policy.get("retain_idle_minutes")
-                    or data.get("retain_idle_minutes")
-                    or self._cfg("default_idle_minutes", self._cfg("max_idle_minutes", 15))
-                )
-                minutes = 1.0 if reuse_batch else max(1.0, float(minutes))
-                if not (pool == POOL_NATIVE or data.get("native_comfy")) and not job.get("generation_timeouts"):
-                    minutes = min(30.0, minutes)
+                if pool == POOL_EPHEMERAL or is_transferred_native_fail:
+                    minutes = 10.0
+                else:
+                    minutes = (
+                        policy.get("retain_idle_minutes")
+                        or data.get("retain_idle_minutes")
+                        or self._cfg("default_idle_minutes", self._cfg("max_idle_minutes", 15))
+                    )
+                    minutes = 1.0 if reuse_batch else max(1.0, float(minutes))
+                    if not (pool == POOL_NATIVE or data.get("native_comfy")) and not job.get("generation_timeouts"):
+                        minutes = min(30.0, minutes)
                 now = self.clock()
                 if (
                     job.get("recovery_source") == "auto_recovery"
@@ -1959,7 +2132,7 @@ class InstanceService:
                 data.update(retain_idle_minutes=minutes, idle_deadline_at=deadline)
             state = "retained_idle" if retain else "releasing"
             self._set(instance, data, state=state, session=session)
-            message = "job completed" if success else "job failed"
+            message = "job completed" if success else ("native bootstrap failed; retained 10m standby" if (is_transferred_native_fail and retain) else "job failed")
             self._emit(session, instance.owner_id, instance.project_id, instance.id, job.get("id"), state, message)
             return self._dict(instance)
 
@@ -1974,8 +2147,8 @@ class InstanceService:
             if instance is None:
                 raise AllocationError("job has no instance")
             data = self._data(instance)
-            if instance.state in {"deleted", "unknown", "releasing", "cleanup_pending", "quarantined"}:
-                raise InstanceConflict("实例正在清理，不能接管租约")
+            if instance.state in {"deleted", "unknown", "releasing", "cleanup_pending", "quarantined", "transferring"}:
+                raise InstanceConflict("实例正在清理或域转移，不能接管租约")
             if data.get("cleanup_claim_token"):
                 raise InstanceConflict("实例已被清理流程围栏")
             if data.get("current_job_id") not in {None, job.get("id")}:
@@ -2052,12 +2225,16 @@ class InstanceService:
                 raise KeyError(id)
             if expected_version is not None and int(instance.version) != int(expected_version):
                 raise InstanceConflict("instance version conflict")
+            if instance.state == "transferring":
+                raise InstanceConflict("实例正在执行域转移，暂不可修改保留策略")
             if instance.state in {"releasing", "deleted", "unknown", "cleanup_pending", "quarantined"}:
                 raise InstanceConflict("instance can no longer be retained")
             pool = self._instance_pool(session, instance)
             if pool == POOL_EPHEMERAL:
                 raise AllocationError("一次性实例不支持修改保留策略")
             data = self._data(instance)
+            if data.get("native_bootstrap_failed") and mode in {"retain", "smart"}:
+                raise InstanceConflict("原生启动失败待命实例仅保留 10 分钟，请前往原生页重试或转移至其他域")
             lease = self._find(session, "leases", data["lease_id"], owner) if data.get("lease_id") else None
             lease_data = self._data(lease) if lease is not None else {}
             if not lease_data.get("generation_timeouts") and minutes > float(self._cfg("max_idle_minutes", 30)):
@@ -2109,6 +2286,63 @@ class InstanceService:
                 result = self._dict(instance)
             elif instance.state == "unknown":
                 raise InstanceConflict("unknown instance requires reconciliation before stop")
+            elif instance.state == "transferring":
+                # Do NOT overwrite state="releasing" while transferring: coordinate via manual_stop_requested
+                # + cancel_requested so the transfer coordinator converges safely without losing unsynced VFS data.
+                data = self._data(instance)
+                data.update(
+                    manual_stop_requested=True,
+                    retention_mode="save",
+                    idle_deadline_at=None,
+                    retention_reserved=0.0,
+                    last_seen_at=self.clock(),
+                )
+                self._set(instance, data, state="transferring", session=session)
+                tjob_id = data.get("current_job_id") or (data.get("transfer_state") or {}).get("transfer_job_id")
+                if tjob_id:
+                    tjob = self._find(session, "jobs", tjob_id, owner)
+                    if tjob is not None and tjob.state not in {"completed", "failed", "cancelled"}:
+                        tdata = self._data(tjob)
+                        tdata["cancel_requested"] = True
+                        self._set(tjob, tdata, state=tjob.state, session=session)
+                from . import recovery
+
+                recovery.cancel_plans_for_instance_in_tx(session, owner, id, self.clock())
+                result = self._dict(instance)
+                self._emit(
+                    session,
+                    owner,
+                    instance.project_id,
+                    id,
+                    tjob_id,
+                    "transferring",
+                    "域转移期间收到手动停止请求，正在安全中止并准备释放实例",
+                )
+            elif instance.state == "quarantined":
+                # Explicit confirmed stop on a quarantined instance releases it by setting force_stop.
+                data = self._data(instance)
+                data.update(
+                    manual_stop_requested=True,
+                    force_stop=True,
+                    quarantine_reason=None,
+                    retention_mode="save",
+                    idle_deadline_at=None,
+                    retention_reserved=0.0,
+                    last_seen_at=self.clock(),
+                )
+                self._set(instance, data, state="releasing", session=session)
+                lease_id = data.get("lease_id")
+                if lease_id:
+                    lease_row = self._find(session, "leases", lease_id, owner)
+                    if lease_row is not None and lease_row.state != "deleted":
+                        ldata = self._data(lease_row)
+                        ldata.update(force_stop=True, quarantine_reason=None, state="releasing", last_seen=self.clock())
+                        self._set(lease_row, ldata, state="releasing", session=session)
+                from . import recovery
+
+                recovery.cancel_plans_for_instance_in_tx(session, owner, id, self.clock())
+                result = self._dict(instance)
+                self._emit(session, owner, instance.project_id, id, data.get("current_job_id"), "releasing", "quarantined instance manually force-stopped")
             else:
                 data = self._data(instance)
                 data.update(
@@ -2422,6 +2656,8 @@ class InstanceService:
             "force_stop": bool(inst_data_before.get("force_stop") or lease_data_before.get("force_stop")),
             "fuse_forced_stop": bool(inst_data_before.get("fuse_forced_stop")),
             "native_draining": effective_native_draining,
+            "was_transferring": instance.state == "transferring" or inst_data_before.get("state") == "transferring",
+            "native_bootstrap_failed": bool(inst_data_before.get("native_bootstrap_failed")),
             "last_successful_probe_at": last_successful_probe_at,
             "recovery_group_id": inst_data_before.get("recovery_group_id"),
             "recovery_generation": inst_data_before.get("recovery_generation"),
@@ -2690,6 +2926,10 @@ class InstanceService:
         result = {k: self._redact(source[k]) for k in self._PUBLIC if k in source}
         if "instance_pool" not in result:
             result["instance_pool"] = instance_pool_of(source)
+        result["venv_isolated"] = bool(source.get("venv_isolated") is True)
+        result.setdefault("domain_generation", int(source.get("domain_generation") or 0))
+        result.setdefault("transfer_history", list(source.get("transfer_history") or []))
+        result.setdefault("native_bootstrap_failed", bool(source.get("native_bootstrap_failed")))
         return result
 
     def _dict_fast(self, row) -> dict:

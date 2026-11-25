@@ -7,6 +7,7 @@ import { ComputeSpecs } from '../components/ComputeSpecs';
 import { InstanceCenter } from '../components/InstanceCenter';
 import { RuntimeTelemetryCard } from '../components/RuntimeTelemetryCard';
 import type { GpuInstance } from '../components/AccountDirectory';
+import type { TransferFocusTarget } from '../lib/domain-transfer';
 import { Card } from '../components/ui';
 import styles from '../gpu.module.css';
 import { cuNumber, formatDateTime, shown } from '../lib/ui-helpers';
@@ -78,7 +79,7 @@ function CcuAccountBalanceList({ usage, error }: { usage: GpuUsage | null; error
 }
 
 export function ComputePage({
-  settings, usage, canEditGuard, onRefreshUsage, instances = [], onStop, onCheck, onContinue, onOpenWorkbench, onRefreshInstances, loadingStop, loadingCheck, specs = [], specsNote = '', error = '',
+  settings, usage, canEditGuard, onRefreshUsage, instances = [], onStop, onCheck, onContinue, onOpenWorkbench, onOpenNative, onRefreshInstances, loadingStop, loadingCheck, specs = [], specsNote = '', error = '', focusTransferTarget = null, onFocusTransferHandled,
 }: {
   settings: GpuSettings | null;
   usage: GpuUsage | null;
@@ -89,12 +90,15 @@ export function ComputePage({
   onCheck?: () => void;
   onContinue?: (instance: GpuInstance) => void;
   onOpenWorkbench?: (instance: GpuInstance) => void;
+  onOpenNative?: () => void;
   onRefreshInstances?: () => void;
   loadingStop?: boolean;
   loadingCheck?: boolean;
   specs?: ComputeSpec[];
   specsNote?: string;
   error?: string;
+  focusTransferTarget?: TransferFocusTarget | null;
+  onFocusTransferHandled?: () => void;
 }) {
   const [queryingBalance, setQueryingBalance] = useState(false);
   const [balanceError, setBalanceError] = useState('');
@@ -171,7 +175,15 @@ export function ComputePage({
       <div className={styles.workspaceWide}><CuSessionDetails usage={usage} /></div>
 
       <div className={styles.workspaceWide}>
-        <InstanceCenter instances={instances} onContinue={onContinue} onOpenWorkbench={onOpenWorkbench} onRefresh={onRefreshInstances} />
+        <InstanceCenter
+          instances={instances}
+          onContinue={onContinue}
+          onOpenWorkbench={onOpenWorkbench}
+          onOpenNative={onOpenNative}
+          onRefresh={onRefreshInstances}
+          focusTransferTarget={focusTransferTarget}
+          onFocusTransferHandled={onFocusTransferHandled}
+        />
       </div>
 
       <div className={`${styles.computeFooter} ${styles.workspaceWide}`}>

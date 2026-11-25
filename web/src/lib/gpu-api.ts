@@ -16,7 +16,13 @@ import type {
   GpuJobRequestV020,
   GpuReuseAction,
   InstanceRetentionRequest,
+  InstanceTransferHistoryItem,
+  InstanceTransferState,
   RetentionMode,
+  TransferInstanceRequest,
+  TransferInstanceResponse,
+  TransferPreviewResponse,
+  TransferTargetPreview,
   Workbench,
   WorkbenchAction,
   WorkbenchActionRequest,
@@ -39,7 +45,13 @@ export type {
   GpuInstancePool,
   GpuReuseAction,
   InstanceRetentionRequest,
+  InstanceTransferHistoryItem,
+  InstanceTransferState,
   RetentionMode,
+  TransferInstanceRequest,
+  TransferInstanceResponse,
+  TransferPreviewResponse,
+  TransferTargetPreview,
   Workbench,
   WorkbenchAction,
   WorkbenchActionRequest,
@@ -235,7 +247,7 @@ export interface CuGuard {
   message: string | null;
   daily_message: string | null;
 }
-export type CuSessionKind = 'single_job' | 'smart_reuse' | 'native_comfy' | 'prep' | 'smoke';
+export type CuSessionKind = 'single_job' | 'smart_reuse' | 'multi_domain' | 'native_comfy' | 'prep' | 'smoke';
 export interface CuSession {
   instance_id: string;
   account_id: string;
@@ -249,6 +261,7 @@ export interface CuSession {
   estimated_cu: number | null;
   idle_cu: number;
   draining: boolean;
+  domain_transfers?: Array<{ at: number; from_pool: string; to_pool: string }>;
   jobs: { job_id: string; workflow_key?: string | null; state: string; execution_seconds: number; actual_cu: number }[];
 }
 export interface CuDailyEntry {
@@ -400,6 +413,26 @@ export const deactivateGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api
 
 export type ActivationStep = { key: string; label: string; done: boolean; next?: boolean; running?: boolean; failed?: boolean };
 export type ActivationInput = { key: string; label: string; description?: string; type: string; required: boolean };
+export type StandbyEphemeralInstance = {
+  instance_id: string;
+  account_id?: string | null;
+  account_alias?: string | null;
+  spec?: Record<string, unknown> | null;
+  gpu_reported?: string | null;
+  idle_deadline_at?: number | null;
+  remaining_seconds?: number | null;
+};
+export type TransferableOtherInstance = {
+  instance_id: string;
+  instance_pool: 'creation' | 'native' | string;
+  account_id?: string | null;
+  account_alias?: string | null;
+  spec?: Record<string, unknown> | null;
+  gpu_reported?: string | null;
+  idle_deadline_at?: number | null;
+  vm_allocated_at?: number | null;
+  native_bootstrap_failed?: boolean;
+};
 export type WorkflowActivation = {
   workflow: { id: string; workflow_key: string; version: string; state: string; active: boolean };
   model: null | { model_id: string; review_approved: boolean; license_accepted: boolean; enabled: boolean; license?: string; source?: string };
@@ -412,6 +445,8 @@ export type WorkflowActivation = {
   max_runtime_minutes?: number;
   blockers: string[];
   done: boolean;
+  standby_ephemeral_instance?: StandbyEphemeralInstance | null;
+  transferable_other_instances?: TransferableOtherInstance[];
 };
 export const getWorkflowActivation = (id: string) => apiFetch<WorkflowActivation>(`/api/gpu/workflows/${encodeURIComponent(id)}/activation`);
 export const reviewGpuModel = (modelId: string) => apiFetch<unknown>(`/api/gpu/models/${encodeURIComponent(modelId)}/review`, post({ confirmed: true, license_accepted: true }));
@@ -423,6 +458,8 @@ export interface RealSmokeGpuWorkflowRequest {
   asset_ids: string[];
   account_id: string;
   spec: ComputeSpec;
+  retain_after_smoke?: boolean;
+  requested_instance_id?: string | null;
 }
 export const realSmokeGpuWorkflow = (
   id: string,
@@ -585,6 +622,17 @@ export const setInstanceRetention = (instanceId: string, body: InstanceRetention
   apiFetch<GpuInstance>(`/api/gpu/instances/${encodeURIComponent(instanceId)}/retention`, write('PATCH', body, idempotencyKey));
 export const stopInstance = (instanceId: string, idempotencyKey: string) =>
   apiFetch<GpuInstance>(`/api/gpu/instances/${encodeURIComponent(instanceId)}/stop`, write('POST', { confirmed: true }, idempotencyKey));
+export const getInstanceTransferPreview = (instanceId: string) =>
+  apiFetch<TransferPreviewResponse>(`/api/gpu/instances/${encodeURIComponent(instanceId)}/transfer-preview`, { cache: 'no-store' });
+export const transferGpuInstance = (
+  instanceId: string,
+  body: TransferInstanceRequest,
+  idempotencyKey: string,
+) =>
+  apiFetch<TransferInstanceResponse>(
+    `/api/gpu/instances/${encodeURIComponent(instanceId)}/transfer`,
+    write('POST', body, idempotencyKey),
+  );
 export const getWorkbench = (instanceId: string) =>
   apiFetch<Workbench>(`/api/gpu/instances/${encodeURIComponent(instanceId)}/workbench`);
 export const workbenchAction = (instanceId: string, action: WorkbenchAction, params: Record<string, unknown> = {}, idempotencyKey: string) =>

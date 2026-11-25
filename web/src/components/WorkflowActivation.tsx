@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  acceptGpuWorkflowSmoke, apiMessage, getGpuComputeSpecs, getGoogleAccounts, getReferenceAssets, getWorkflowActivation,
+  acceptGpuWorkflowSmoke, ApiError, apiMessage, getGpuComputeSpecs, getGoogleAccounts, getReferenceAssets, getWorkflowActivation,
   publishGpuWorkflow, realSmokeGpuWorkflow, reviewGpuModel, reviewGpuWorkflow, uploadAsset, validateGpuWorkflow, getGpuJob,
   type ActivationInput, type ComputeSpec, type GalleryAsset, type GpuWorkflow, type WorkflowActivation,
 } from '../lib/gpu-api';
@@ -32,7 +32,7 @@ function smokeStateText(state: string, minutes: number | null): string {
 }
 
 export function WorkflowActivationPanel({
-  workflow, projectId, projectTitle, onClose, onDone, onPreview, onOpenJob, onUseProject, onWatch,
+  workflow, projectId, projectTitle, onClose, onDone, onPreview, onOpenJob, onUseProject, onWatch, onTransferToEphemeral,
 }: {
   workflow: GpuWorkflow;
   projectId: string;
@@ -43,6 +43,7 @@ export function WorkflowActivationPanel({
   onOpenJob?: (jobId: string, projectId?: string) => void;
   onUseProject?: (projectId: string) => void;
   onWatch?: (watch: ActivationWatch | null) => void;
+  onTransferToEphemeral?: (instanceId: string) => void;
 }) {
   const [data, setData] = useState<WorkflowActivation | null>(null);
   const [history, setHistory] = useState<JobHistoryDetailRecord | null>(null);
@@ -50,8 +51,10 @@ export function WorkflowActivationPanel({
   const [historyBusy, setHistoryBusy] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState('');
+  const [standbyStaleError, setStandbyStaleError] = useState('');
   const [busy, setBusy] = useState(false);
   const [consent, setConsent] = useState(false);
+  const [retainAfterSmoke, setRetainAfterSmoke] = useState(false);
   const [accountId, setAccountId] = useState('');
   const [spec, setSpec] = useState<ComputeSpec | null>(null);
   const [specsLoaded, setSpecsLoaded] = useState(false);
@@ -153,22 +156,42 @@ export function WorkflowActivationPanel({
           if (missing.length) throw new Error(`请先上传：${missing.join('、')}`);
           if (!consent) throw new Error('请先确认会真实开 GPU 并产生费用');
           if (!projectId) throw new Error('请先在顶栏选择项目。冒烟只会记在当前项目里，不会自动改用别的项目。');
-          if (!accountId || !spec) throw new Error('当前账号没有可用的 GPU 规格，请先授权 Colab');
+          const standby = data?.standby_ephemeral_instance || snapshot.standby_ephemeral_instance || null;
+          const boundInstanceId = standby?.instance_id || null;
+          const effectiveAccountId = standby?.account_id || accountId;
+          if (!effectiveAccountId || !spec) throw new Error('当前账号没有可用的 GPU 规格，请先授权 Colab');
           const minutes = getSmokeRuntimeMinutes(snapshot);
           say(minutes === null ? '正在提交真实 GPU 冒烟…' : `正在提交真实 GPU 冒烟，最长 ${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)} 分钟`, token);
           const smokeBody = activationSmokeParams(required, inputs);
-          await realSmokeGpuWorkflow(
-            workflow.id,
-            {
-              confirmed: true,
-              project_id: projectId,
-              params: smokeBody.params,
-              asset_ids: smokeBody.assetIds,
-              account_id: accountId,
-              spec,
-            },
-            smokeIdempotencyKey(workflow.id, projectId, smokeBody.assetIds, terminalSmokeJobId(snapshot)),
-          );
+          try {
+            await realSmokeGpuWorkflow(
+              workflow.id,
+              {
+                confirmed: true,
+                project_id: projectId,
+                params: smokeBody.params,
+                asset_ids: smokeBody.assetIds,
+                account_id: effectiveAccountId,
+                spec,
+                retain_after_smoke: retainAfterSmoke,
+                ...(boundInstanceId ? { requested_instance_id: boundInstanceId } : {}),
+              },
+              smokeIdempotencyKey(workflow.id, projectId, smokeBody.assetIds, terminalSmokeJobId(snapshot), {
+                retainAfterSmoke,
+                requestedInstanceId: boundInstanceId,
+              }),
+            );
+          } catch (submitErr) {
+            if (submitErr instanceof ApiError && submitErr.code === 'EPHEMERAL_INSTANCE_UNAVAILABLE') {
+              if (isCurrent(token)) {
+                setStandbyStaleError(submitErr.message || '冒烟域待命实例已失效或被占用，未自动新开 GPU，请刷新后确认是否新开实例');
+                void refresh(token).catch(() => undefined);
+              }
+              return;
+            }
+            throw submitErr;
+          }
+          setStandbyStaleError('');
           if (!isCurrent(token)) return;
           snapshot = await refresh(token);
           if (!isCurrent(token)) return;
@@ -203,7 +226,7 @@ export function WorkflowActivationPanel({
       runningRef.current = false;
       if (isCurrent(token)) setBusy(false);
     }
-  }, [accountId, busy, consent, inputs, isCurrent, onDone, projectId, refresh, say, spec, waitForSmoke, workflow.id]);
+  }, [accountId, busy, consent, data?.standby_ephemeral_instance, inputs, isCurrent, onDone, projectId, refresh, retainAfterSmoke, say, spec, waitForSmoke, workflow.id]);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -227,20 +250,22 @@ export function WorkflowActivationPanel({
         }
         const accounts = await getGoogleAccounts();
         if (!isCurrent(token)) return;
+        const standbyAccountId = snapshot.standby_ephemeral_instance?.account_id || null;
         const request = resolveGpuCheckRequest(
           { real_enabled: snapshot.real_enabled, offline_mode: false },
           accounts,
-          null,
+          standbyAccountId,
         );
         if (request.provider !== 'colab') {
           throw new Error('没有已启用且已连接 Colab 的账号，无法读取真实 GPU 规格');
         }
         const requiredSpec = workflow.manifest?.compute_spec;
         if (!requiredSpec || typeof requiredSpec !== 'object') throw new Error('工作流未声明 GPU 规格，请先补齐工作流配置');
-        const eligible = selectEligibleColabGpuSpec(await getGpuComputeSpecs('colab', request.accountId), requiredSpec);
+        const resolvedAccountId = standbyAccountId || request.accountId;
+        const eligible = selectEligibleColabGpuSpec(await getGpuComputeSpecs('colab', resolvedAccountId), requiredSpec);
         if (!isCurrent(token)) return;
         if (!eligible) throw new Error('当前账号没有工作流要求的 GPU 规格；不会自动改用其他显卡');
-        setAccountId(request.accountId);
+        setAccountId(resolvedAccountId);
         setSpec(eligible);
       } catch (err) {
         if (isCurrent(token)) setError(apiMessage(err));
@@ -375,6 +400,48 @@ export function WorkflowActivationPanel({
           </li>
         ))}
       </ol>
+      {needsNewSmoke && data?.standby_ephemeral_instance ? (
+        <div className={styles.notice} role="status" aria-label="冒烟域待命实例绑定提示">
+          <p className="small">
+            <strong>将使用冒烟域待命实例 #{data.standby_ephemeral_instance.instance_id.slice(0, 8)}</strong>
+            （{data.standby_ephemeral_instance.account_alias || data.standby_ephemeral_instance.account_id || '当前账号'} · {data.standby_ephemeral_instance.gpu_reported || 'GPU'}
+            {data.standby_ephemeral_instance.remaining_seconds != null ? `，剩余约 ${Math.max(1, Math.ceil(data.standby_ephemeral_instance.remaining_seconds / 60))} 分钟` : ''}），无需重新抢卡。
+          </p>
+        </div>
+      ) : null}
+      {needsNewSmoke && !data?.standby_ephemeral_instance && (data?.transferable_other_instances?.length ?? 0) > 0 && onTransferToEphemeral ? (() => {
+        const candidate = data!.transferable_other_instances![0];
+        const fromLabel = candidate.instance_pool === 'native' ? '原生 ComfyUI' : '创作池';
+        return (
+          <div className={styles.notice} role="status" aria-label="其他域可转移实例提示">
+            <p className="small">
+              {fromLabel}有空闲可转移的同规格实例 #{candidate.instance_id.slice(0, 8)}（{candidate.gpu_reported || 'GPU'}），可前往实例中心显式转移到冒烟域，免重新抢卡。
+            </p>
+            <button
+              className="button secondary small"
+              type="button"
+              onClick={() => onTransferToEphemeral(candidate.instance_id)}
+            >
+              去实例中心转移到冒烟域
+            </button>
+          </div>
+        );
+      })() : null}
+      {standbyStaleError ? (
+        <div className={styles.notice} role="alert">
+          <p className={styles.errorText}>{standbyStaleError}</p>
+          <button
+            className="button secondary small"
+            type="button"
+            onClick={() => {
+              setStandbyStaleError('');
+              void refresh(executionRef.current);
+            }}
+          >
+            刷新待命状态
+          </button>
+        </div>
+      ) : null}
       {error ? <p className={styles.errorText}>{error}</p> : null}
       {log.length ? (
         <details className="foldable" open>
@@ -385,10 +452,16 @@ export function WorkflowActivationPanel({
         </details>
       ) : null}
       {needsNewSmoke ? (
-        <label className={styles.checkline}>
-          <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} />
-          <span>我知道会真实开 GPU{spec && typeof spec.key === 'object' ? `（${String(spec.key.accelerator || '')} / ${String(spec.key.shape || '')}）` : ''} 并产生费用</span>
-        </label>
+        <>
+          <label className={styles.checkline}>
+            <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} />
+            <span>我知道会真实开 GPU{spec && typeof spec.key === 'object' ? `（${String(spec.key.accelerator || '')} / ${String(spec.key.shape || '')}）` : ''} 并产生费用</span>
+          </label>
+          <label className={styles.checkline}>
+            <input type="checkbox" checked={retainAfterSmoke} onChange={(event) => setRetainAfterSmoke(event.target.checked)} />
+            <span>冒烟结束后保留此 GPU 10 分钟（失败时也保留，便于继续冒烟或前往实例中心转移域）</span>
+          </label>
+        </>
       ) : null}
       {historyError ? <p role="alert" className={styles.errorText}>{historyError}</p> : null}
       {history ? <section aria-label="持久任务详情"><JobHistoryDetails job={history} /></section> : null}
