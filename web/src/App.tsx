@@ -27,10 +27,10 @@ import {
   apiMessage, cancelGpuJob, clearGpuJobHistory, createGpuJob, createGpuBatch,
   createProject, deleteGpuPreset, deleteGpuWorkflow, deleteProject,
   apiFetch, exportGpuWorkflow,
-  getGpuComputeSpecs, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
+  getGpuComputeSpecs, getGpuFixedPrompts, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
   getGpuPresets, getReferenceAssets, getGpuSettings, getGpuSpecOrder, getGpuUsage, getGpuWorkflowSchema, getGpuWorkflows, getProjects,
   importGpuWorkflow,
-  isLoggedIn, previewGpuJobReuse, publishGpuWorkflow, renameProject, retryGpuJob, retryGpuAttempt, setDefaultProject, stopGpuCompute,
+  isLoggedIn, previewGpuJobReuse, publishGpuWorkflow, renameProject, retryGpuJob, retryGpuAttempt, saveGpuFixedPrompts, setDefaultProject, stopGpuCompute,
   updateGpuPreset, uploadAsset,
   validateGpuWorkflow, rollbackGpuWorkflow, deactivateGpuWorkflow, saveGpuPreset, ApiError,
   type ComputeSpec, type GalleryAsset, type GpuJob, type GpuPreset,
@@ -54,7 +54,26 @@ import {
 import type { TransferFocusTarget } from './lib/domain-transfer';
 import { isSystemJob, pickInitialProjectId, projectOptionLabel, projectTitleById } from './lib/project-label';
 import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
-import { readStoredWorkflowInspect, writeStoredWorkflowInspect } from './lib/model-library';
+import {
+  applyFixedPromptsToParams,
+  collectActiveLoraTriggerWords,
+  defaultFixedPromptConfig,
+  normalizeFixedPromptConfig,
+  readCachedFixedPrompts,
+  restoreFromHistoricalJob,
+  writeCachedFixedPrompts,
+  type FixedPromptConfig,
+  type PromptComposition,
+} from './lib/fixed-prompts';
+import {
+  dependencyApi,
+  libraryApi,
+  readStoredWorkflowInspect,
+  writeStoredWorkflowInspect,
+  type Catalog,
+  type DependencyRecord,
+  type LibraryModel,
+} from './lib/model-library';
 import { useDesktopLayout } from './lib/desktop-layout';
 import { useBodyScrollLock } from './lib/modal-scroll-lock';
 import { parameterKey, parameterList, readableState } from './lib/ui-helpers';
@@ -208,7 +227,90 @@ export default function App() {
   const workflowIdRef = useRef(workflowId);
   workflowIdRef.current = workflowId;
   const incomingDraft = useRef<Record<string, unknown> | null>(null);
+  const pendingReuseRef = useRef<{
+    workflowId: string;
+    resolvedParams: Record<string, unknown>;
+    promptComposition?: PromptComposition | null;
+  } | null>(null);
   const draftLocation = useRef({ projectId: '', workflowId: '' });
+  const [fixedPrompts, setFixedPrompts] = useState<FixedPromptConfig>(() => defaultFixedPromptConfig());
+  const [fixedPromptsSyncing, setFixedPromptsSyncing] = useState(false);
+  const fixedPromptsRef = useRef(fixedPrompts);
+  fixedPromptsRef.current = fixedPrompts;
+  const fixedPromptDirtyRef = useRef<{ projectId: string; workflowId: string; config: FixedPromptConfig } | null>(null);
+  const fixedPromptTimerRef = useRef<number | null>(null);
+  const fixedPromptRevisionRef = useRef(0);
+  const [workflowDependencyState, setWorkflowDependencyState] = useState<{ workflowId: string; record: DependencyRecord } | null>(null);
+  const [libraryModelsCatalog, setLibraryModelsCatalog] = useState<LibraryModel[] | null>(null);
+
+  const promptKeysOf = useCallback((targetManifest: GpuManifest | null | undefined) => {
+    const plist = parameterList(targetManifest || null);
+    const keys = plist.map((p, i) => parameterKey(p, i));
+    const promptKey = keys.find((k) => k === 'prompt')
+      || keys.find((k) => /prompt|caption/i.test(k) && !/negative/i.test(k))
+      || null;
+    const negativePromptKey = keys.find((k) => /(^|_)negative(_prompt)?$/i.test(k)) || null;
+    return { promptKey, negativePromptKey };
+  }, []);
+
+  const flushFixedPrompts = useCallback(async (
+    override?: { projectId: string; workflowId: string; config: FixedPromptConfig },
+  ) => {
+    if (fixedPromptTimerRef.current !== null) {
+      window.clearTimeout(fixedPromptTimerRef.current);
+      fixedPromptTimerRef.current = null;
+    }
+    const target = override ?? fixedPromptDirtyRef.current;
+    if (!target || !target.projectId || !target.workflowId) return;
+    if (fixedPromptDirtyRef.current === target) fixedPromptDirtyRef.current = null;
+    setFixedPromptsSyncing(true);
+    try {
+      await saveGpuFixedPrompts(target.projectId, target.workflowId, target.config);
+    } catch {
+      /* Local cache keeps edits; next save retries sync. */
+    } finally {
+      setFixedPromptsSyncing(false);
+    }
+  }, []);
+
+  const updateFixedPrompts = useCallback((
+    next: FixedPromptConfig,
+    opts: { immediate?: boolean; projectId?: string; workflowId?: string } = {},
+  ) => {
+    const pid = opts.projectId ?? currentProjectId.current;
+    const wid = opts.workflowId ?? workflowIdRef.current;
+    const normalized = normalizeFixedPromptConfig(next);
+    fixedPromptRevisionRef.current += 1;
+    if (pid === currentProjectId.current && wid === workflowIdRef.current) {
+      setFixedPrompts(normalized);
+      fixedPromptsRef.current = normalized;
+    }
+    if (!pid || !wid) return;
+    writeCachedFixedPrompts(pid, wid, normalized);
+    const dirty = { projectId: pid, workflowId: wid, config: normalized };
+    fixedPromptDirtyRef.current = dirty;
+    if (fixedPromptTimerRef.current !== null) {
+      window.clearTimeout(fixedPromptTimerRef.current);
+      fixedPromptTimerRef.current = null;
+    }
+    if (opts.immediate) {
+      void flushFixedPrompts(dirty);
+    } else {
+      fixedPromptTimerRef.current = window.setTimeout(() => {
+        fixedPromptTimerRef.current = null;
+        void flushFixedPrompts();
+      }, 400);
+    }
+  }, [flushFixedPrompts]);
+
+  const activeLoraTriggerWords = useMemo(
+    () => collectActiveLoraTriggerWords(
+      workflowDependencyState?.workflowId === workflowId ? workflowDependencyState.record.dependencies : undefined,
+      libraryModelsCatalog,
+      modelOverrides[workflowId],
+    ),
+    [workflowDependencyState, libraryModelsCatalog, modelOverrides, workflowId],
+  );
 
   const activeProject = projects.find((p) => p.id === projectId);
   const activeWorkflow = workflows.find((item) => item.id === workflowId);
@@ -450,23 +552,96 @@ export default function App() {
     if (previous.workflowId && previous.projectId && draftReady.current === `${previous.projectId}:${previous.workflowId}`) {
       writeWorkflowDraft(previous.projectId, previous.workflowId, paramsRef.current);
     }
+    if (
+      fixedPromptDirtyRef.current
+      && (fixedPromptDirtyRef.current.projectId !== projectId || fixedPromptDirtyRef.current.workflowId !== workflowId)
+    ) {
+      void flushFixedPrompts(fixedPromptDirtyRef.current);
+    }
     const carried = sameProject && previous.workflowId && previous.workflowId !== workflowId ? carriedDraft(paramsRef.current) : null;
     draftLocation.current = { projectId, workflowId };
     let alive = true;
     const requestWorkflow = workflowId;
     const requestProject = projectId;
+    const cachedFixed = readCachedFixedPrompts(requestProject, requestWorkflow);
+    const optimisticFixed = cachedFixed ?? defaultFixedPromptConfig();
+    setFixedPrompts(optimisticFixed);
+    fixedPromptsRef.current = optimisticFixed;
+    const loadRevision = fixedPromptRevisionRef.current;
     setLoading('schema');
-    getGpuWorkflowSchema(workflowId).then((next) => {
+    Promise.all([
+      getGpuWorkflowSchema(requestWorkflow),
+      getGpuFixedPrompts(requestProject, requestWorkflow).catch(() => null),
+    ]).then(([next, remoteFixed]) => {
       if (!alive) return;
+      const loadedFixed = remoteFixed
+        ? normalizeFixedPromptConfig(remoteFixed)
+        : (cachedFixed ?? defaultFixedPromptConfig());
+      const pendingReuse = pendingReuseRef.current;
+      if (pendingReuse && pendingReuse.workflowId === requestWorkflow) {
+        pendingReuseRef.current = null;
+        incomingDraft.current = null;
+        const { promptKey, negativePromptKey } = promptKeysOf(next);
+        const restored = restoreFromHistoricalJob(
+          pendingReuse.resolvedParams,
+          pendingReuse.promptComposition,
+          loadedFixed,
+          promptKey,
+          negativePromptKey,
+        );
+        setManifest(next);
+        draftReady.current = `${requestProject}:${requestWorkflow}`;
+        setParams(mergeWorkflowDraft(next, restored.params, null));
+        updateFixedPrompts(restored.fixedPrompts, {
+          immediate: true,
+          projectId: requestProject,
+          workflowId: requestWorkflow,
+        });
+        pushToast(
+          restored.pausedLegacy
+            ? '已载入历史参数；为避免重复拼接，已暂停当前固定提示词'
+            : '已载入历史参数到创作工作区',
+          'success',
+        );
+        return;
+      }
       const forced = incomingDraft.current;
       incomingDraft.current = null;
       const saved = forced ?? readWorkflowDraft(requestProject, requestWorkflow);
       setManifest(next);
       draftReady.current = `${requestProject}:${requestWorkflow}`;
       setParams(mergeWorkflowDraft(next, saved, forced ? null : carried));
+      if (fixedPromptRevisionRef.current === loadRevision) {
+        setFixedPrompts(loadedFixed);
+        fixedPromptsRef.current = loadedFixed;
+        writeCachedFixedPrompts(requestProject, requestWorkflow, loadedFixed);
+      }
     }).catch((cause) => alive && setError(`参数 schema：${apiMessage(cause)}`)).finally(() => alive && setLoading(''));
     return () => { alive = false; };
-  }, [workflowId, projectId]);
+  }, [workflowId, projectId, flushFixedPrompts, promptKeysOf, pushToast, updateFixedPrompts]);
+
+  useEffect(() => {
+    const flushOnLeave = () => {
+      if (fixedPromptDirtyRef.current) void flushFixedPrompts(fixedPromptDirtyRef.current);
+    };
+    window.addEventListener('pagehide', flushOnLeave);
+    return () => window.removeEventListener('pagehide', flushOnLeave);
+  }, [flushFixedPrompts]);
+
+  useEffect(() => {
+    if (!loggedIn || !workflowId || tab !== '创作') return;
+    let alive = true;
+    const targetWorkflowId = workflowId;
+    void Promise.all([
+      dependencyApi<DependencyRecord>(targetWorkflowId).catch(() => null),
+      libraryApi<Catalog>().catch(() => null),
+    ]).then(([deps, catalog]) => {
+      if (!alive || workflowIdRef.current !== targetWorkflowId) return;
+      if (deps) setWorkflowDependencyState({ workflowId: targetWorkflowId, record: deps });
+      if (catalog?.items) setLibraryModelsCatalog(catalog.items);
+    });
+    return () => { alive = false; };
+  }, [loggedIn, workflowId, tab]);
 
   useEffect(() => {
     if (draftReady.current !== `${projectId}:${workflowId}` || !workflowId || !projectId) return;
@@ -547,14 +722,42 @@ export default function App() {
       const restored = { ...(againJob.resolved_params || againJob.params) };
       setModelId(String(againJob.model_id || ''));
       const workflow = workflows.find((item) => item.workflow_key === againJob.workflow_key && String(item.workflow_version) === String(againJob.workflow_version));
-      if (workflow && workflow.id !== workflowIdRef.current) incomingDraft.current = restored;
-      if (workflow) setWorkflowId(workflow.id);
-      setParams(restored);
+      if (workflow) {
+        const sameLoaded = workflow.id === workflowIdRef.current
+          && draftReady.current === `${currentProjectId.current}:${workflow.id}`;
+        if (sameLoaded) {
+          const { promptKey, negativePromptKey } = promptKeysOf(manifest);
+          const result = restoreFromHistoricalJob(
+            restored,
+            againJob.prompt_composition,
+            fixedPromptsRef.current,
+            promptKey,
+            negativePromptKey,
+          );
+          setParams(mergeWorkflowDraft(manifest, result.params, null));
+          updateFixedPrompts(result.fixedPrompts, { immediate: true });
+          pushToast(
+            result.pausedLegacy
+              ? '已载入历史参数；为避免重复拼接，已暂停当前固定提示词'
+              : '已载入历史参数到创作工作区',
+            'success',
+          );
+        } else {
+          pendingReuseRef.current = {
+            workflowId: workflow.id,
+            resolvedParams: restored,
+            promptComposition: againJob.prompt_composition,
+          };
+          setWorkflowId(workflow.id);
+        }
+      } else {
+        setParams(restored);
+        pushToast('已载入历史参数到创作工作区', 'success');
+      }
       setAgainJob(null);
       setTab('创作');
-      pushToast('已载入历史参数到创作工作区', 'success');
     }
-  }, [againJob, workflows, pushToast]);
+  }, [againJob, workflows, manifest, promptKeysOf, pushToast, updateFixedPrompts]);
 
   function chooseProject(id: string, opts: { syncView?: boolean } = {}) {
     setProjectId(id);
@@ -781,16 +984,22 @@ export default function App() {
         resolvedAccountId = decision.accountId;
         resolvedInstanceId = decision.instanceId;
       }
+      if (fixedPromptDirtyRef.current) {
+        void flushFixedPrompts(fixedPromptDirtyRef.current);
+      }
+      const { promptKey, negativePromptKey } = promptKeysOf(manifest);
+      const composed = applyFixedPromptsToParams(params, fixedPromptsRef.current, promptKey, negativePromptKey);
       const validAssetIds = new Set(referenceAssets(availableReferenceImages).map((a) => a.id));
       const body = {
         project_id: projectId,
         model_id: modelId,
         workflow_key: activeWorkflow.workflow_key,
         workflow_version: activeWorkflow.workflow_version,
-        params,
+        params: composed.params,
+        ...(composed.promptComposition ? { prompt_composition: composed.promptComposition } : {}),
         ...(modelOverrides[workflowId]?.length ? { model_overrides: modelOverrides[workflowId] } : {}),
         asset_ids: supportsReferences(manifest)
-          ? [...new Set([...selectedAssets.filter((id) => validAssetIds.has(id)), ...assetIdsFromParams(params, validAssetIds)])]
+          ? [...new Set([...selectedAssets.filter((id) => validAssetIds.has(id)), ...assetIdsFromParams(composed.params, validAssetIds)])]
           : [],
         execution_policy: {
           provider: runtime,
@@ -947,18 +1156,35 @@ export default function App() {
     });
   }
 
-  async function savePreset(name: string) {
+  function buildPresetOverrides(includeMainPrompt: boolean): Record<string, unknown> {
+    const nextOverrides: Record<string, unknown> = { ...params };
+    if (!includeMainPrompt) {
+      const { promptKey } = promptKeysOf(manifest);
+      if (promptKey) delete nextOverrides[promptKey];
+    }
+    return nextOverrides;
+  }
+
+  async function savePreset(name: string, includeMainPrompt: boolean) {
     if (!workflowId) return;
     await action('preset', async () => {
-      const next = await saveGpuPreset({ name, workflow_version_id: workflowId, overrides: params });
+      const next = await saveGpuPreset({
+        name,
+        workflow_version_id: workflowId,
+        overrides: buildPresetOverrides(includeMainPrompt),
+        fixed_prompts: normalizeFixedPromptConfig(fixedPromptsRef.current),
+      });
       setPresets((curr) => [next, ...curr]);
       pushToast(`已保存预设「${next.name}」`, 'success');
     });
   }
 
-  async function updatePreset(preset: GpuPreset) {
+  async function updatePreset(preset: GpuPreset, includeMainPrompt: boolean) {
     await action('preset', async () => {
-      const next = await updateGpuPreset(preset.id, { overrides: params });
+      const next = await updateGpuPreset(preset.id, {
+        overrides: buildPresetOverrides(includeMainPrompt),
+        fixed_prompts: normalizeFixedPromptConfig(fixedPromptsRef.current),
+      });
       setPresets((curr) => curr.map((item) => (item.id === next.id ? next : item)));
       pushToast(`已更新预设「${next.name}」`, 'success');
     });
@@ -977,7 +1203,10 @@ export default function App() {
       setError('预设版本不兼容。');
       return;
     }
-    setParams({ ...params, ...preset.overrides });
+    setParams((curr) => ({ ...curr, ...preset.overrides }));
+    if (preset.fixed_prompts) {
+      updateFixedPrompts(normalizeFixedPromptConfig(preset.fixed_prompts), { immediate: true });
+    }
     pushToast(`已套用预设「${preset.name}」`, 'info');
   }
 
@@ -1355,6 +1584,10 @@ export default function App() {
                   manifest={workflowParamsReady ? manifest : null}
                   params={workflowParamsReady ? params : {}}
                   setParams={setParams}
+                  fixedPrompts={fixedPrompts}
+                  onFixedPromptsChange={(next) => updateFixedPrompts(next)}
+                  fixedPromptsSyncing={fixedPromptsSyncing}
+                  triggerWords={activeLoraTriggerWords}
                   gallery={availableReferenceImages}
                   selectedAssets={selectedAssets}
                   setSelectedAssets={setSelectedAssets}
@@ -1382,8 +1615,8 @@ export default function App() {
                   error={error}
                   onSubmit={requestSubmit}
                   onApplyPreset={applyPreset}
-                  onSavePreset={(name) => void savePreset(name)}
-                  onUpdatePreset={(preset) => void updatePreset(preset)}
+                  onSavePreset={(name, includeMainPrompt) => void savePreset(name, includeMainPrompt)}
+                  onUpdatePreset={(preset, includeMainPrompt) => void updatePreset(preset, includeMainPrompt)}
                   onDeletePreset={(preset) => void removePreset(preset)}
                 >
                   {workflowId && (
@@ -1391,6 +1624,8 @@ export default function App() {
                       workflowId={workflowId}
                       value={modelOverrides[workflowId] || []}
                       onChange={(value) => setModelOverrides((current) => ({ ...current, [workflowId]: value }))}
+                      dependencyRecord={workflowDependencyState?.workflowId === workflowId ? workflowDependencyState.record : null}
+                      libraryModels={libraryModelsCatalog}
                     />
                   )}
                 </CreatePanel>

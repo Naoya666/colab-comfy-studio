@@ -261,36 +261,46 @@ export function ModelRunOverrides({
   workflowId,
   value,
   onChange,
+  dependencyRecord,
+  libraryModels,
 }: {
   workflowId: string;
   value: ModelOverride[];
   onChange: (v: ModelOverride[]) => void;
+  dependencyRecord?: DependencyRecord | null;
+  libraryModels?: LibraryModel[] | null;
 }) {
   const [open, setOpen] = useState(false);
-  const [record, setRecord] = useState<DependencyRecord | null>(null);
-  const [models, setModels] = useState<LibraryModel[]>([]);
+  const [fetchedRecord, setFetchedRecord] = useState<DependencyRecord | null>(null);
+  const [fetchedModels, setFetchedModels] = useState<LibraryModel[]>([]);
   const [error, setError] = useState('');
 
+  const hasExternalData = Boolean(dependencyRecord && libraryModels);
+
   useEffect(() => {
-    setRecord(null);
+    setFetchedRecord(null);
     setError('');
   }, [workflowId]);
 
   useEffect(() => {
+    if (hasExternalData) return;
     if (!open && !value.length) return;
     let alive = true;
     setError('');
     void Promise.all([dependencyApi<DependencyRecord>(workflowId), libraryApi<Catalog>()])
       .then(([r, c]) => {
         if (!alive) return;
-        setRecord(r);
-        setModels(c.items);
+        setFetchedRecord(r);
+        setFetchedModels(c.items);
       })
       .catch((e) => {
         if (alive) setError(apiMessage(e));
       });
     return () => { alive = false; };
-  }, [workflowId, open, value.length > 0]);
+  }, [workflowId, open, value.length > 0, hasExternalData]);
+
+  const record = dependencyRecord ?? fetchedRecord;
+  const models = libraryModels ?? fetchedModels;
 
   const overridable = record?.dependencies.filter((d) => ['checkpoints', 'loras'].includes(d.model_type)) || [];
 

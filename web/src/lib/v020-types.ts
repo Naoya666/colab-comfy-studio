@@ -31,6 +31,24 @@ export interface GpuJobRequestV020 {
   params: Record<string, unknown>;
   asset_ids: string[];
   preset_id?: string;
+  prompt_composition?: {
+    positive?: {
+      param_key: string;
+      main: string;
+      fixed: string;
+      enabled: boolean;
+      position: 'prefix' | 'suffix';
+      separator: 'comma' | 'space' | 'newline';
+    } | null;
+    negative?: {
+      param_key: string;
+      main: string;
+      fixed: string;
+      enabled: boolean;
+      position: 'prefix' | 'suffix';
+      separator: 'comma' | 'space' | 'newline';
+    } | null;
+  } | null;
   execution_policy: GpuExecutionPolicyV020;
 }
 

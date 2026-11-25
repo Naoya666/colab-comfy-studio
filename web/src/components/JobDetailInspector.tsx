@@ -2,7 +2,7 @@ import { Fragment } from 'react';
 import { ArrowUpRight, X } from 'lucide-react';
 import type { GpuJob, GpuWorkflow } from '../lib/gpu-api';
 import { formatInstanceTime } from '../lib/instance-time';
-import { jobDetailTimings, paramRows, stageSecondsTotal, taskStatusNote } from '../lib/job-detail-copy';
+import { jobDetailTimings, paramRows, promptCompositionRows, stageSecondsTotal, taskStatusNote } from '../lib/job-detail-copy';
 import { jobErrorMessage, jobErrorRows } from '../lib/job-error-copy';
 import { formatAllocationRetryHeadline, formatRetrySpec } from '../lib/allocation-retry-copy';
 import { jobStateLabel } from '../lib/job-stage-rows';
@@ -169,6 +169,9 @@ export function JobDetailInspector({
               <summary>本次使用的参数</summary>
               <div className="foldContent">
                 <dl className={styles.kv}>
+                  {promptCompositionRows(inspectedJob.prompt_composition).map((row) => (
+                    <Fragment key={row.key}><dt>{row.label}</dt><dd>{row.value}</dd></Fragment>
+                  ))}
                   {paramRows(inspectedJob.resolved_params).map((row) => (
                     <Fragment key={row.key}><dt>{row.label}</dt><dd>{row.value}</dd></Fragment>
                   ))}

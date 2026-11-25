@@ -8,7 +8,7 @@ import {
 } from '../lib/gpu-api';
 import { extractPromptText } from '../lib/create-runtime-prefs';
 import { formatInstanceTime } from '../lib/instance-time';
-import { paramRows } from '../lib/job-detail-copy';
+import { paramRows, promptCompositionRows } from '../lib/job-detail-copy';
 import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import { bytesLabel } from '../lib/model-library';
 import { extractPng, MAX_IMAGE, type ExtractedWorkflow } from '../lib/png-workflow';
@@ -749,6 +749,9 @@ export function GalleryViewer({
                 </button>
               )}
               <dl className={styles.kv}>
+                {promptCompositionRows(matchedViewerJob.prompt_composition).map((row) => (
+                  <Fragment key={row.key}><dt>{row.label}</dt><dd>{row.value}</dd></Fragment>
+                ))}
                 {paramRows(matchedViewerJob.resolved_params || matchedViewerJob.params || {}).map((row) => (
                   <Fragment key={row.key}><dt>{row.label}</dt><dd>{row.value}</dd></Fragment>
                 ))}

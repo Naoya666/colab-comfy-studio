@@ -38,8 +38,15 @@ from .creation_api import admin_router as creation_api_router
 from .db import Store
 from .gpu import loras as lora_registry
 from .gpu.compute import GpuConfig, MockColabProvider
+from .gpu.fixed_prompts import get_fixed_prompts, normalize_fixed_prompts, save_fixed_prompts
 from .gpu.google import GoogleError
-from .gpu.manifest import bind_parameters, digest, resolve_parameters, validate_manifest
+from .gpu.manifest import (
+    bind_parameters,
+    digest,
+    resolve_parameters,
+    validate_manifest,
+    validate_partial_parameters,
+)
 from .gpu.rates import estimate as estimate_units
 from .gpu.rates import mode_param
 from .gpu.registry import Registry
@@ -752,6 +759,37 @@ def delete_workflow(workflow_id: str, request: Request, user=Depends(current_use
     return ok({"id": workflow_id}, request)
 
 
+@router.get("/projects/{project_id}/workflows/{workflow_id}/fixed-prompts")
+def read_fixed_prompts(
+    project_id: str,
+    workflow_id: str,
+    request: Request,
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
+    own(st, "projects", project_id, user)
+    own(Repository(st), "workflows", workflow_id, user)
+    return ok(get_fixed_prompts(st, user["id"], project_id, workflow_id), request)
+
+
+@router.put("/projects/{project_id}/workflows/{workflow_id}/fixed-prompts")
+def write_fixed_prompts(
+    project_id: str,
+    workflow_id: str,
+    body: dict,
+    request: Request,
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
+    own(st, "projects", project_id, user)
+    own(Repository(st), "workflows", workflow_id, user)
+    try:
+        saved = save_fixed_prompts(st, user["id"], project_id, workflow_id, body)
+    except ValueError as exc:
+        raise APIError("VALIDATION_ERROR", str(exc)) from exc
+    return ok(saved, request)
+
+
 @router.get("/presets")
 def presets(
     request: Request,
@@ -770,17 +808,24 @@ def presets(
 def save_preset(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
     repo = Repository(st)
     workflow = own(repo, "workflows", body.get("workflow_version_id"), user)
-    overrides = body.get("overrides", {})
-    resolve_parameters(workflow["manifest"], overrides)
-    row = repo.create(
-        "presets",
-        user["id"],
-        {
-            "name": str(body.get("name", "未命名预设"))[:100],
-            "workflow_version_id": workflow["id"],
-            "overrides": overrides,
-        },
-    )
+    raw_overrides = body.get("overrides", {})
+    try:
+        overrides = validate_partial_parameters(workflow["manifest"], raw_overrides)
+        fixed_prompts = (
+            normalize_fixed_prompts(body["fixed_prompts"])
+            if "fixed_prompts" in body and body["fixed_prompts"] is not None
+            else None
+        )
+    except ValueError as exc:
+        raise APIError("VALIDATION_ERROR", str(exc)) from exc
+    payload = {
+        "name": str(body.get("name", "未命名预设"))[:100],
+        "workflow_version_id": workflow["id"],
+        "overrides": overrides,
+    }
+    if fixed_prompts is not None:
+        payload["fixed_prompts"] = fixed_prompts
+    row = repo.create("presets", user["id"], payload)
     return ok(row, request, 201)
 
 
@@ -796,9 +841,18 @@ def update_preset(preset_id: str, body: dict, request: Request, user=Depends(cur
         patch["name"] = name
     if "overrides" in body:
         workflow = own(repo, "workflows", preset.get("workflow_version_id"), user)
-        overrides = body.get("overrides", {})
-        resolve_parameters(workflow["manifest"], overrides)
-        patch["overrides"] = overrides
+        try:
+            patch["overrides"] = validate_partial_parameters(workflow["manifest"], body.get("overrides", {}))
+        except ValueError as exc:
+            raise APIError("VALIDATION_ERROR", str(exc)) from exc
+    if "fixed_prompts" in body:
+        if body["fixed_prompts"] is None:
+            patch["fixed_prompts"] = None
+        else:
+            try:
+                patch["fixed_prompts"] = normalize_fixed_prompts(body["fixed_prompts"])
+            except ValueError as exc:
+                raise APIError("VALIDATION_ERROR", str(exc)) from exc
     if not patch:
         raise APIError("VALIDATION_ERROR", "未提供需要更新的字段")
     return ok(repo.update("presets", preset_id, patch, user["id"]), request)

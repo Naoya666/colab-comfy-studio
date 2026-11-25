@@ -150,6 +150,19 @@ def update(model_id: str, body: dict, user=Depends(current_user), st=Depends(get
             if not isinstance(body["tags"], list):
                 raise ModelError("标签需为数组")
             patch["tags"] = [str(t)[:100] for t in body["tags"][:100]]
+        if "trigger_words" in body:
+            if not isinstance(body["trigger_words"], list):
+                raise ModelError("触发词需为数组")
+            seen: set[str] = set()
+            cleaned_words: list[str] = []
+            for item in body["trigger_words"]:
+                word = str(item).strip()[:200]
+                if word and word not in seen:
+                    seen.add(word)
+                    cleaned_words.append(word)
+                    if len(cleaned_words) >= 100:
+                        break
+            patch["trigger_words"] = cleaned_words
         if "external_source_url" in body:
             patch["external_source"] = lib.bind_external_source(model, body["external_source_url"])
         return ok(lib.update(model_id, **patch))

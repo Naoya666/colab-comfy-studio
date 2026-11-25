@@ -55,6 +55,7 @@ export function ModelDetailDrawer({
   const [displayName, setDisplayName] = useState('');
   const [architecture, setArchitecture] = useState('');
   const [tagsText, setTagsText] = useState('');
+  const [triggerWordsText, setTriggerWordsText] = useState('');
   const [externalSource, setExternalSource] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -86,6 +87,7 @@ export function ModelDetailDrawer({
       setDisplayName(loaded.display_name || '');
       setArchitecture(loaded.architecture || 'unknown');
       setTagsText((loaded.tags || []).join(', '));
+      setTriggerWordsText((loaded.trigger_words || []).join(', '));
       setExternalSource(loaded.external_source?.url || '');
     }).catch((cause) => {
       if (active) setError(apiMessage(cause));
@@ -161,6 +163,7 @@ export function ModelDetailDrawer({
           setDisplayName(refreshed.display_name || '');
           setArchitecture(refreshed.architecture || 'unknown');
           setTagsText((refreshed.tags || []).join(', '));
+          setTriggerWordsText((refreshed.trigger_words || []).join(', '));
           setExternalSource(refreshed.external_source?.url || '');
         }
       }
@@ -175,11 +178,16 @@ export function ModelDetailDrawer({
   async function saveMetadata() {
     if (!detail) return;
     const tags = tagsText.split(',').map((s) => s.trim()).filter(Boolean);
+    const trigger_words = triggerWordsText
+      .split(/[,\n，]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
     await runAction(
       () => libraryApi('/' + detail.id, {
         display_name: displayName.trim() || detail.filename,
         architecture: architecture.trim() || 'unknown',
         tags,
+        trigger_words,
       }, 'PATCH'),
       '模型信息已保存',
     );
@@ -493,6 +501,16 @@ export function ModelDetailDrawer({
                     <input value={tagsText} disabled={busy} onChange={(e) => setTagsText(e.target.value)} placeholder="anime, style" />
                   </label>
                 </div>
+                <label className="field">
+                  触发词（逗号或换行分隔）
+                  <textarea
+                    rows={2}
+                    value={triggerWordsText}
+                    disabled={busy}
+                    onChange={(e) => setTriggerWordsText(e.target.value)}
+                    placeholder="例如：camera motion, Anime-Motion"
+                  />
+                </label>
                 <div className="actions">
                   <button
                     type="button"

@@ -89,6 +89,8 @@ def public_job(job):
         "retry_not_before_epoch",
     }
     result = {k: v for k, v in job.items() if k in keys}
+    if job.get("prompt_composition") is not None:
+        result["prompt_composition"] = job["prompt_composition"]
     if job.get("allocation_retry") is not None:
         from .gpu.allocation_retry import public_allocation_retry
 

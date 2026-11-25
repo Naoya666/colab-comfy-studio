@@ -14,6 +14,7 @@ import {
   type TransferFocusTarget,
 } from '../lib/domain-transfer';
 import { GpuParamForm, splitParams } from '../components/GpuParamForm';
+import { FixedPromptPanel } from '../components/FixedPromptPanel';
 import { ReferencePicker, supportsReferences } from '../components/ReferencePicker';
 import { RuntimeSelection } from '../components/RuntimeSelection';
 import type { RuntimeSelectionValue } from '../components/RuntimeSelection';
@@ -21,6 +22,7 @@ import { computeLabel } from '../components/WorkflowGpuSelection';
 import type { GpuAccount, GpuInstance } from '../components/AccountDirectory';
 import { Card, InfoTip, Segmented } from '../components/ui';
 import { ConfirmDialog } from '../components/Feedback';
+import type { FixedPromptConfig, TriggerWordChip } from '../lib/fixed-prompts';
 import { RUNTIME_HELP } from '../lib/labels';
 import { useBodyScrollLock } from '../lib/modal-scroll-lock';
 import { workflowTitle, workflowUsage } from '../lib/workflow-copy';
@@ -67,7 +69,8 @@ function buildSizes(defW: number, defH: number, step: number, min: number, max: 
 
 export function CreatePanel({
   projectId, projectTitle, projects = [], referenceScope = 'project', onReferenceScopeChange,
-  models, workflows, presets, settings, usage, computeSpec, specBelowDefaultError, onEditGuard, manifest, params, setParams, gallery,
+  models, workflows, presets, settings, usage, computeSpec, specBelowDefaultError, onEditGuard, manifest, params, setParams,
+  fixedPrompts, onFixedPromptsChange, fixedPromptsSyncing = false, triggerWords = [], gallery,
   selectedAssets, setSelectedAssets, uploadProgress, onUpload, setModelId, workflowId, setWorkflowId,
   runtime, setRuntime, maxRuntime, setMaxRuntime, batchCount, setBatchCount, batchMode,
   runtimeChoice, accounts, instances, onRuntimeChoiceChange, gpuOrder, onFocusTransfer,
@@ -95,6 +98,10 @@ export function CreatePanel({
   manifest: GpuManifest | null;
   params: Record<string, unknown>;
   setParams: Dispatch<SetStateAction<Record<string, unknown>>>;
+  fixedPrompts: FixedPromptConfig;
+  onFixedPromptsChange: (next: FixedPromptConfig) => void;
+  fixedPromptsSyncing?: boolean;
+  triggerWords?: TriggerWordChip[];
   gallery: GalleryAsset[];
   selectedAssets: string[];
   setSelectedAssets: (value: string[]) => void;
@@ -120,13 +127,14 @@ export function CreatePanel({
   error: string;
   onSubmit: () => void;
   onApplyPreset: (preset: GpuPreset) => void;
-  onSavePreset: (name: string) => void;
-  onUpdatePreset?: (preset: GpuPreset) => void;
+  onSavePreset: (name: string, includeMainPrompt: boolean) => void;
+  onUpdatePreset?: (preset: GpuPreset, includeMainPrompt: boolean) => void;
   onDeletePreset?: (preset: GpuPreset) => void;
 }) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [customSize, setCustomSize] = useState(false);
   const [presetName, setPresetName] = useState('');
+  const [includeMainPromptInPreset, setIncludeMainPromptInPreset] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState('');
   const [deletingPreset, setDeletingPreset] = useState<GpuPreset | null>(null);
   const [runtimeExpanded, setRuntimeExpanded] = useState(false);
@@ -413,7 +421,7 @@ export function CreatePanel({
                       className="button secondary small"
                       disabled={!draftReady}
                       title="用当前参数覆盖此预设"
-                      onClick={() => onUpdatePreset(selectedPreset)}
+                      onClick={() => onUpdatePreset(selectedPreset, includeMainPromptInPreset)}
                     >
                       <Save size={14} aria-hidden />更新
                     </button>
@@ -432,13 +440,22 @@ export function CreatePanel({
               </div>
               <div className={styles.inlineForm}>
                 <input aria-label="新预设名称" placeholder="给当前参数起个名字" value={presetName} onChange={(e) => setPresetName(e.target.value)} />
-                <button className="button secondary" type="button" disabled={!presetName.trim() || !draftReady} onClick={() => { onSavePreset(presetName.trim()); setPresetName(''); }}>另存为</button>
+                <button className="button secondary" type="button" disabled={!presetName.trim() || !draftReady} onClick={() => { onSavePreset(presetName.trim(), includeMainPromptInPreset); setPresetName(''); }}>另存为</button>
               </div>
+              <label className={styles.checkRow}>
+                <input
+                  type="checkbox"
+                  checked={includeMainPromptInPreset}
+                  disabled={!draftReady}
+                  onChange={(e) => setIncludeMainPromptInPreset(e.target.checked)}
+                />
+                <span className="small muted">同时保存当前主提示词（默认仅保存固定提示词与尺寸/生成参数）</span>
+              </label>
             </div>
           </details>
         </Card>
 
-        {/* 3 提示词（含负面提示词） */}
+        {/* 3 提示词（含负面提示词与固定提示词） */}
         <Card
           icon={<Pencil size={17} strokeWidth={1.6} aria-hidden />}
           title="提示词"
@@ -478,6 +495,19 @@ export function CreatePanel({
               />
             </div>
           ) : null}
+          <FixedPromptPanel
+            config={fixedPrompts}
+            onChange={onFixedPromptsChange}
+            disabled={!draftReady}
+            syncing={fixedPromptsSyncing}
+            mainPrompt={promptValue}
+            negativePrompt={negativePromptValue}
+            hasNegative={Boolean(negativePromptKey)}
+            triggerWords={triggerWords}
+            onSubmitShortcut={() => {
+              if (draftReady && loading !== 'submit') onSubmit();
+            }}
+          />
         </Card>
 
         {/* 4 参考素材（有素材槽位时放在前面，方便图生图/图生视频） */}

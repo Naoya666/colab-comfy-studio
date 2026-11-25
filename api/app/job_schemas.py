@@ -135,6 +135,22 @@ class ModelOverrideInput(BaseModel):
         return value
 
 
+class PromptCompositionSlotInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    param_key: str = Field(min_length=1, max_length=100)
+    main: str = Field(default="", max_length=50_000)
+    fixed: str = Field(default="", max_length=20_000)
+    enabled: bool = True
+    position: Literal["prefix", "suffix"] = "prefix"
+    separator: Literal["comma", "space", "newline"] = "comma"
+
+
+class PromptCompositionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    positive: PromptCompositionSlotInput | None = None
+    negative: PromptCompositionSlotInput | None = None
+
+
 class JobInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     project_id: str
@@ -146,11 +162,14 @@ class JobInput(BaseModel):
     loras: list[dict] = Field(default_factory=list, max_length=lora_registry.MAX_LORAS)
     model_overrides: list[ModelOverrideInput] = Field(default_factory=list, max_length=100)
     preset_id: str | None = None
+    prompt_composition: PromptCompositionInput | None = None
     execution_policy: Policy = Field(default_factory=Policy)
 
     def model_dump(self, *args, **kwargs):  # noqa: ANN002, ANN003
         """Use Policy's compatibility serializer for nested HTTP payloads."""
         data = super().model_dump(*args, **kwargs)
+        if self.prompt_composition is None and "prompt_composition" not in self.model_fields_set:
+            data.pop("prompt_composition", None)
         policy_kwargs = {
             key: value
             for key, value in kwargs.items()

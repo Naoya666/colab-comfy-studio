@@ -1,4 +1,5 @@
 import type { GpuSpecKey } from './gpu-spec-order';
+import type { FixedPromptConfig, PromptComposition } from './fixed-prompts';
 import type {
   AccountRuntime,
   ColabCliAuthCompleteResponse,
@@ -125,7 +126,18 @@ export interface GpuWorkflow {
   import_weight_summary?: WorkflowImportWeightSummary;
   [key: string]: unknown;
 }
-export interface GpuPreset { id: string; name: string; workflow_version_id: string; overrides: Record<string, unknown>; [key: string]: unknown; }
+export interface GpuPreset {
+  id: string;
+  name: string;
+  workflow_version_id: string;
+  overrides: Record<string, unknown>;
+  fixed_prompts?: FixedPromptConfig | null;
+  [key: string]: unknown;
+}
+export interface FixedPromptsResponse extends FixedPromptConfig {
+  project_id: string;
+  workflow_id: string;
+}
 export type GpuExecutionPolicy = GpuExecutionPolicyV020;
 export interface GpuJobRequest extends GpuJobRequestV020 { }
 export interface GpuErrorDetails {
@@ -188,6 +200,7 @@ export interface GpuJob {
   provider?: Provider;
   params?: Record<string, unknown>;
   resolved_params?: Record<string, unknown>;
+  prompt_composition?: PromptComposition | null;
   asset_ids?: string[];
   output_asset_ids?: string[];
   error?: string;
@@ -469,9 +482,27 @@ export const realSmokeGpuWorkflow = (
   method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(body),
 });
 export const acceptGpuWorkflowSmoke = (id: string, jobId: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/accept-smoke`, post({ confirmed: true, job_id: jobId }));
+export const getGpuFixedPrompts = (projectId: string, workflowId: string, signal?: AbortSignal) =>
+  apiFetch<FixedPromptsResponse>(
+    `/api/gpu/projects/${encodeURIComponent(projectId)}/workflows/${encodeURIComponent(workflowId)}/fixed-prompts`,
+    { signal },
+  );
+export const saveGpuFixedPrompts = (projectId: string, workflowId: string, body: FixedPromptConfig) =>
+  apiFetch<FixedPromptsResponse>(
+    `/api/gpu/projects/${encodeURIComponent(projectId)}/workflows/${encodeURIComponent(workflowId)}/fixed-prompts`,
+    { method: 'PUT', body: JSON.stringify(body) },
+  );
 export const getGpuPresets = () => apiFetch<GpuPreset[]>('/api/gpu/presets');
-export const saveGpuPreset = (body: { name: string; workflow_version_id: string; overrides: Record<string, unknown> }) => apiFetch<GpuPreset>('/api/gpu/presets', post(body));
-export const updateGpuPreset = (id: string, body: { name?: string; overrides?: Record<string, unknown> }) =>
+export const saveGpuPreset = (body: {
+  name: string;
+  workflow_version_id: string;
+  overrides: Record<string, unknown>;
+  fixed_prompts?: FixedPromptConfig | null;
+}) => apiFetch<GpuPreset>('/api/gpu/presets', post(body));
+export const updateGpuPreset = (
+  id: string,
+  body: { name?: string; overrides?: Record<string, unknown>; fixed_prompts?: FixedPromptConfig | null },
+) =>
   apiFetch<GpuPreset>(`/api/gpu/presets/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) });
 export const deleteGpuPreset = (id: string) =>
   apiFetch<{ deleted: boolean; id: string }>(`/api/gpu/presets/${encodeURIComponent(id)}`, { method: 'DELETE' });

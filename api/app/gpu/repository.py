@@ -833,7 +833,7 @@ class Repository:
                 data = copy.deepcopy(job)
                 raw_jobs=(request_body or {}).get('jobs',[])
                 data['request_body']=copy.deepcopy(raw_jobs[index] if index<len(raw_jobs) else {
-                    k:v for k,v in job.items() if k in {'project_id','model_id','workflow_key','workflow_version','params','asset_ids','execution_policy','preset_id','loras'}})
+                    k:v for k,v in job.items() if k in {'project_id','model_id','workflow_key','workflow_version','params','asset_ids','execution_policy','preset_id','loras','prompt_composition'}})
                 data.update(batch_id=batch_id, queue_order=index, state="queued",
                             execution_policy={**data.get("execution_policy", {}), **policy},
                             provider=data.get("execution_policy", {}).get("provider", "mock"))

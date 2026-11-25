@@ -1,4 +1,5 @@
 import type { GpuJob } from './gpu-api';
+import type { PromptComposition } from './fixed-prompts';
 import { friendlyLabel } from './labels';
 import { formatDuration } from './job-history';
 
@@ -21,6 +22,44 @@ export function paramRows(params: Record<string, unknown> | null | undefined): A
     const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
     return [{ key, label: friendlyLabel(key, key), value: text }];
   });
+}
+
+export function promptCompositionRows(
+  composition: PromptComposition | null | undefined,
+): Array<{ key: string; label: string; value: string }> {
+  if (!composition) return [];
+  const rows: Array<{ key: string; label: string; value: string }> = [];
+  const pos = composition.positive;
+  if (pos && pos.enabled && pos.fixed.trim()) {
+    rows.push({
+      key: 'composition_fixed_positive',
+      label: `固定正面提示词（${pos.position === 'suffix' ? '后置' : '前置'}）`,
+      value: pos.fixed.trim(),
+    });
+    if (pos.main.trim()) {
+      rows.push({
+        key: 'composition_main_positive',
+        label: '本次正面提示词',
+        value: pos.main.trim(),
+      });
+    }
+  }
+  const neg = composition.negative;
+  if (neg && neg.enabled && neg.fixed.trim()) {
+    rows.push({
+      key: 'composition_fixed_negative',
+      label: `固定负面提示词（${neg.position === 'suffix' ? '后置' : '前置'}）`,
+      value: neg.fixed.trim(),
+    });
+    if (neg.main.trim()) {
+      rows.push({
+        key: 'composition_main_negative',
+        label: '本次负面提示词',
+        value: neg.main.trim(),
+      });
+    }
+  }
+  return rows;
 }
 
 export function stageSecondsTotal(timings: Record<string, number> | null | undefined): string {

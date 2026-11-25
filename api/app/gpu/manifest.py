@@ -438,6 +438,26 @@ def _optional_image(spec: Mapping) -> bool:
     return spec.get("type") == "image" and spec.get("required") is False
 
 
+def validate_partial_parameters(manifest: dict, params: dict) -> dict:
+    """Validate a partial parameter override dict (e.g. presets) against manifest definitions."""
+    definitions = _normalized_definitions(manifest) if isinstance(manifest, Mapping) else None
+    if not isinstance(definitions, dict) or not isinstance(params, Mapping):
+        _fail("manifest.parameters和params必须是对象")
+    unknown = set(params) - set(definitions)
+    if unknown:
+        _fail(f"未知参数: {sorted(unknown)!r}")
+    validated: dict[str, Any] = {}
+    for name, value in params.items():
+        spec = definitions[name]
+        if not isinstance(spec, Mapping):
+            _fail(f"参数 {name}定义无效")
+        if _optional_image(spec) and value in (None, ""):
+            continue
+        _check(name, spec, value)
+        validated[name] = copy.deepcopy(value)
+    return validated
+
+
 def resolve_parameters(manifest: dict, params: dict, preset: dict | None = None) -> dict:
     definitions = _normalized_definitions(manifest) if isinstance(manifest, Mapping) else None
     if not isinstance(definitions, dict) or not isinstance(params, Mapping):

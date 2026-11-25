@@ -387,6 +387,7 @@ def admit_job(
             **({"drive_account_id": model_drive_account or _resolve_drive_account_id(repo, user["id"], policy.get("account_id"))} if model_drive_account or policy.get("account_id") else {}),
             "snapshot": snapshot,
             "params": params,
+            **({"prompt_composition": copy.deepcopy(body["prompt_composition"])} if body.get("prompt_composition") is not None else {}),
             "resolved_seed": params.get("seed"),
             "atelier_project_id": project.get("atelier_project_id"),
             "max_runtime_minutes": policy["max_runtime_minutes"],
