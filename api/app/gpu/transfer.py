@@ -1611,12 +1611,33 @@ def advance_transfer_job(scheduler, job: dict[str, Any]) -> dict[str, Any]:
                 if instance and isinstance(instance.get("transfer_state"), dict):
                     phase = "verifying" if stage in {"transfer_verifying", "teardown_verify_purity"} else "cleaning"
                     if instance["transfer_state"].get("phase") != phase:
-                        scheduler._update(
-                            "instances",
-                            instance["id"],
-                            {"transfer_state": {**instance["transfer_state"], "phase": phase}},
-                            owner_id,
-                        )
+                        svc = scheduler.instance_service
+                        expected_ver = job.get("expected_instance_version")
+                        new_ver: int | None = None
+                        with scheduler.db_store.dispatch_lock() as d_ok:
+                            if d_ok:
+                                with svc._admission(), svc._tx() as session:
+                                    inst_row = svc._find(session, "instances", instance["id"], owner_id)
+                                    if inst_row is not None and inst_row.state == "transferring":
+                                        idata = svc._data(inst_row)
+                                        ts = dict(idata.get("transfer_state") or {})
+                                        if (
+                                            ts.get("transfer_id") == job.get("transfer_id")
+                                            and not idata.get("manual_stop_requested")
+                                            and not idata.get("force_stop")
+                                            and (expected_ver is None or int(inst_row.version) == int(expected_ver))
+                                        ):
+                                            ts["phase"] = phase
+                                            idata["transfer_state"] = ts
+                                            svc._set(inst_row, idata, state="transferring", expected_version=inst_row.version, session=session)
+                                            new_ver = int(inst_row.version)
+                        if new_ver is not None:
+                            job = scheduler._update(
+                                "jobs",
+                                job["id"],
+                                {"expected_instance_version": new_ver},
+                                owner_id,
+                            )
             return job
         return _handle_teardown_result(scheduler, job, lease, executor, result)
 

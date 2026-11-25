@@ -711,3 +711,48 @@ def test_transfer_http_auth_and_pre_upgrade_and_cpu_rejection(tmp_path, monkeypa
         )
         assert r_eph.status_code == 202
         assert r_eph.json()["data"]["instance"]["state"] == "transferring"
+
+
+def test_transfer_verifying_phase_bump_does_not_trigger_version_conflict(tmp_path, monkeypatch):
+    """Updating transfer_state.phase from cleaning->verifying must keep expected_instance_version in sync."""
+    clock, store, repo, owner, aid, svc, ex, sched = _make_env(tmp_path, monkeypatch)
+    inst, _lease, _ = _seed_instance(repo, owner, aid, clock, pool=POOL_NATIVE, native_ready=True)
+    monkeypatch.setattr(native, "busy_state_for", lambda *a, **kw: ("idle", None))
+
+    out = transfer.start_transfer(
+        repo,
+        svc,
+        owner,
+        inst["id"],
+        {"target_pool": POOL_EPHEMERAL, "confirmed": True, "expected_version": inst["version"]},
+        "tr-verifying-phase-sync",
+        is_admin=True,
+        clock=clock,
+    )
+    tr_job_id = out["transfer_job_id"]
+    # Poll 1: remote script enters teardown_verify_purity -> phase flips cleaning -> verifying (bumps inst.version!)
+    # Poll 2: remote script completes cleanly -> must commit WITHOUT transfer_version_conflict!
+    ex.poll_script = [
+        {"state": "running", "stage": "teardown_verify_purity"},
+        {"state": "completed", "cleaned": True, "teardown_report": {"cleaned": True, "steps": ["purity_verified"]}},
+    ]
+
+    # Tick 1: starts teardown (loading -> running)
+    j1 = transfer.advance_transfer_job(sched, repo.get("jobs", tr_job_id, owner))
+    assert j1["state"] == "running"
+    # Tick 2: polls running/teardown_verify_purity -> updates transfer_state.phase="verifying" AND advances expected_instance_version
+    j2 = transfer.advance_transfer_job(sched, repo.get("jobs", tr_job_id, owner))
+    assert j2["state"] == "running"
+    mid_inst = repo.get("instances", inst["id"], owner)
+    mid_job = repo.get("jobs", tr_job_id, owner)
+    assert mid_inst["state"] == "transferring"
+    assert mid_inst["transfer_state"]["phase"] == "verifying"
+    assert mid_job["expected_instance_version"] == mid_inst["version"]
+
+    # Tick 3: polls completed/cleaned -> commits cleanly into ephemeral standby!
+    done_job = transfer.advance_transfer_job(sched, repo.get("jobs", tr_job_id, owner))
+    done_inst = repo.get("instances", inst["id"], owner)
+    assert done_job["state"] == "completed", f"Unexpected failure: {done_job}"
+    assert done_inst["state"] == "retained_idle"
+    assert done_inst["instance_pool"] == POOL_EPHEMERAL
+    assert done_inst["domain_generation"] == 1
