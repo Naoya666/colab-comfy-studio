@@ -36,9 +36,9 @@ from .specs import (
 log = logging.getLogger("studio.allocation_retry")
 
 SETTINGS_PREFIX = "allocation-retry:"
-MIN_INTERVAL_SECONDS = 20
+MIN_INTERVAL_SECONDS = 10
 MAX_INTERVAL_SECONDS = 120
-DEFAULT_INTERVAL_SECONDS = 45
+DEFAULT_INTERVAL_SECONDS = 15
 JITTER_MAX_SECONDS = 5.0
 MIN_MAX_RETRIES = 1
 MAX_MAX_RETRIES = 60
@@ -550,6 +550,7 @@ def sync_attempt_state(
             "retries_used": 0,
             "max_retries": int(cfg["max_retries"]),
             "interval_seconds": int(cfg["retry_interval_seconds"]),
+            "attempt_started_at": float(now),
             "next_retry_at": None,
             "candidate_specs": candidates,
             "account_order": account_order,
@@ -572,12 +573,19 @@ def sync_attempt_state(
         }
     else:
         state = copy.deepcopy(dict(existing))
+        prev_started = state.get("attempt_started_at")
+        attempt_started_at = (
+            float(prev_started)
+            if existing.get("phase") == "allocating" and prev_started is not None
+            else float(now)
+        )
         state.update(
             enabled=bool(cfg["enabled"]),
             active=True,
             phase="allocating",
             max_retries=int(cfg["max_retries"]),
             interval_seconds=int(cfg["retry_interval_seconds"]),
+            attempt_started_at=attempt_started_at,
             next_retry_at=None,
             candidate_specs=candidates or state.get("candidate_specs") or [],
             current_spec=cur_spec,
@@ -757,6 +765,31 @@ def _emit_event_in_tx(
     )
 
 
+def _resolve_attempt_started_at(
+    session,
+    owner_id: str,
+    jdata: Mapping[str, Any],
+    lease: Mapping[str, Any] | None,
+    state: Mapping[str, Any],
+) -> float | None:
+    """Return the epoch timestamp when the just-failed allocation attempt started."""
+    raw = lease.get("create_started") if isinstance(lease, Mapping) else None
+    if raw is None:
+        lid = jdata.get("lease_id")
+        if isinstance(lid, str) and lid:
+            lrow = session.get(GpuLeaseRow, lid)
+            if lrow is not None and lrow.owner_id == owner_id:
+                raw = (lrow.data or {}).get("create_started")
+    if raw is None:
+        raw = state.get("attempt_started_at")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def maybe_defer_allocation_retry(
     repo,
     job: dict[str, Any],
@@ -932,8 +965,11 @@ def maybe_defer_allocation_retry(
         elif err_kind == "account_fatal":
             delay = 2.0
         else:
+            attempt_started_at = _resolve_attempt_started_at(session, owner_id, jdata, lease, state)
+            elapsed = max(0.0, float(now) - attempt_started_at) if attempt_started_at is not None else 0.0
+            remaining = max(0.0, float(interval_seconds) - elapsed)
             jitter = float(jitter_fn()) if jitter_fn is not None else random.uniform(0.0, JITTER_MAX_SECONDS)
-            delay = float(interval_seconds) + max(0.0, min(JITTER_MAX_SECONDS, jitter))
+            delay = remaining + max(0.0, min(JITTER_MAX_SECONDS, jitter))
         next_retry_at = float(now) + delay
 
         # Close any stale non-terminal execution row.
@@ -1021,6 +1057,7 @@ def maybe_defer_allocation_retry(
             retries_used=retries_used,
             max_retries=max_retries,
             interval_seconds=interval_seconds,
+            attempt_started_at=None,
             next_retry_at=next_retry_at,
             candidate_specs=candidates,
             account_order=accounts,
@@ -1068,9 +1105,10 @@ def maybe_defer_allocation_retry(
         elif err_kind == "account_fatal":
             msg = f"账号「{failed_alias}」异常（{err_code}）已移出本次轮换，即将切换至 {next_alias} · {next_spec_label}"
         else:
+            timing = "即将尝试" if delay < 0.5 else f"将在 {max(1, int(round(delay)))} 秒后尝试"
             msg = (
                 f"自动排队抢卡：第 {retries_used}/{max_retries} 次重试，"
-                f"将在 {max(1, int(round(delay)))} 秒后尝试 {next_alias} · {next_spec_label}"
+                f"{timing} {next_alias} · {next_spec_label}"
                 f"（上次 {format_spec_label(failed_spec)}：{err_code or '无可用卡'}）"
             )
         _emit_event_in_tx(session, owner_id, job_row.project_id, job_row.id, "waiting_for_capacity", msg)

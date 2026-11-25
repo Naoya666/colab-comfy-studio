@@ -75,16 +75,21 @@ class ScriptedColabProvider:
         acc = key["accelerator"]
         self.events.append((self.account_id, f"{acc}:{key['shape']}"))
         action = self.outcomes.pop(0) if self.outcomes else {"ok": True}
+        if action.get("elapsed"):
+            self.clock.advance(float(action["elapsed"]))
         if action.get("error"):
             exc = action["error"]
             if getattr(exc, "remote_state_unknown", False):
-                self._reconcile_until[runtime_id] = self.clock() + TUNNEL_RECONCILE_WINDOW_SECONDS + 0.5
-                if action.get("late_runtime"):
-                    self._late_runtime.add(runtime_id)
+                create_started = self.clock()
                 if self.repo is not None:
                     lease = next((row for row in self.repo.list("leases", "owner") if row.get("runtime_id") == runtime_id), None)
                     if lease:
+                        if lease.get("create_started") is not None:
+                            create_started = float(lease["create_started"])
                         self.repo.update("leases", lease["id"], {"tunnel_nbh": f"nbh-{request_id}"}, "owner")
+                self._reconcile_until[runtime_id] = create_started + TUNNEL_RECONCILE_WINDOW_SECONDS + 0.5
+                if action.get("late_runtime"):
+                    self._late_runtime.add(runtime_id)
             raise exc
         handle = {
             "runtime_name": f"runtimes/{runtime_id}",
@@ -310,15 +315,23 @@ def test_settings_api_defaults_and_validation(monkeypatch):
             data = res.json()["data"]
             assert data["enabled"] is False
             assert data["gpu_pool"] == []
-            assert data["retry_interval_seconds"] == 45
+            assert data["retry_interval_seconds"] == 15
             assert data["max_retries"] == 20
 
             bad = client.put(
                 "/api/gpu/settings/allocation-retry",
                 headers=ADMIN,
-                json={"enabled": True, "gpu_pool": [L4_STD], "retry_interval_seconds": 10, "max_retries": 20},
+                json={"enabled": True, "gpu_pool": [L4_STD], "retry_interval_seconds": 9, "max_retries": 20},
             )
             assert bad.status_code == 422
+
+            min_ok = client.put(
+                "/api/gpu/settings/allocation-retry",
+                headers=ADMIN,
+                json={"enabled": True, "gpu_pool": [L4_STD], "retry_interval_seconds": 10, "max_retries": 20},
+            )
+            assert min_ok.status_code == 200
+            assert min_ok.json()["data"]["retry_interval_seconds"] == 10
 
             bad_max = client.put(
                 "/api/gpu/settings/allocation-retry",
@@ -568,6 +581,7 @@ def test_unknown_503_waits_60s_reconciliation_and_deletes_late_runtime_before_re
         deleted: list[str] = []
         outcomes = [
             {
+                "elapsed": 30.0,
                 "error": ColabError(
                     "HTTP 503 upstream",
                     error_code="colab_upstream_unavailable",
@@ -603,8 +617,127 @@ def test_unknown_503_waits_60s_reconciliation_and_deletes_late_runtime_before_re
         # Late runtime from attempt 1 MUST have been deleted (never adopted) before attempt 2 started!
         assert len(deleted) == 1
         assert events == [("acc-a", "L4:SHAPE_STANDARD"), ("acc-a", "T4:SHAPE_STANDARD")]
-        # At least 60s reconciliation + 25s retry interval must have elapsed!
-        assert clock() - t0 >= TUNNEL_RECONCILE_WINDOW_SECONDS + 25.0
+        # 60s reconciliation window already exceeds 25s interval -> do NOT stack another 25s on top!
+        elapsed = clock() - t0
+        assert TUNNEL_RECONCILE_WINDOW_SECONDS <= elapsed < TUNNEL_RECONCILE_WINDOW_SECONDS + 5.0
+    finally:
+        store.engine.dispose()
+
+
+def test_retry_interval_start_to_start_deduction_across_503_and_fast_denial(monkeypatch):
+    """Verify start-to-start interval deduction:
+    1) 503 + 60s reconciliation with interval=90s only waits the remaining ~30s (total ~90s, not 150s).
+    2) Fast NO_RUNTIMES denial (~2s) with default interval=15s still waits the remaining ~13s (total ~15s) to prevent 429.
+    3) Pre-create failure (no lease.create_started) falls back to attempt_started_at for deduction.
+    """
+    store, repo = _make_store()
+    clock = FakeClock()
+    monkeypatch.setattr(allocation_retry.random, "uniform", lambda a, b: 0.0)
+    try:
+        _add_account(repo, "acc-a", "主号A")
+
+        # Case 1: 503 (30s) + 60s reconciliation with interval=90s -> total ~90s (not 60+90=150s)
+        allocation_retry.save_allocation_retry_settings(
+            store,
+            "owner",
+            {"enabled": True, "gpu_pool": [T4_STD], "retry_interval_seconds": 90, "max_retries": 5},
+        )
+        events_1: list[tuple[str, str]] = []
+        outcomes_1 = [
+            {
+                "elapsed": 30.0,
+                "error": ColabError(
+                    "HTTP 503 upstream",
+                    error_code="colab_upstream_unavailable",
+                    category="upstream",
+                    phase="assign_post",
+                    http_status=503,
+                    remote_state_unknown=True,
+                ),
+            },
+            {"ok": True},
+        ]
+        provider_1 = ScriptedColabProvider(
+            "acc-a",
+            eligible_by_account={"acc-a": [T4_STD, L4_STD]},
+            outcomes=outcomes_1,
+            events=events_1,
+            deleted_handles=[],
+            clock=clock,
+            repo=repo,
+        )
+        scheduler_1 = Scheduler(
+            repo,
+            provider_factory=lambda job: provider_1,
+            executor_factory=lambda job: MockGPUExecutor(),
+            config=GpuConfig(enabled=True, real_enabled=True),
+            clock=clock,
+        )
+        job1 = _make_native_job(repo, spec=L4_STD, account_id="acc-a")
+        t1 = clock()
+        res1 = _drive_scheduler(scheduler_1, repo, job1["id"], clock, stop_states={"loading", "failed"})
+        assert res1["state"] == "loading"
+        elapsed_1 = clock() - t1
+        assert 90.0 <= elapsed_1 < 95.0
+
+        # Case 2: Fast NO_RUNTIMES denial (2s) with default 15s interval -> waits remaining 13s (total ~15s)
+        allocation_retry.save_allocation_retry_settings(
+            store,
+            "owner",
+            {"enabled": True, "gpu_pool": [T4_STD], "retry_interval_seconds": 15, "max_retries": 5},
+        )
+        events_2: list[tuple[str, str]] = []
+        outcomes_2 = [
+            {
+                "elapsed": 2.0,
+                "error": ColabAllocationError("TUNNEL_DENIED", "NO_RUNTIMES", remote_state_unknown=False),
+            },
+            {"ok": True},
+        ]
+        provider_2 = ScriptedColabProvider(
+            "acc-a",
+            eligible_by_account={"acc-a": [T4_STD, L4_STD]},
+            outcomes=outcomes_2,
+            events=events_2,
+            deleted_handles=[],
+            clock=clock,
+            repo=repo,
+        )
+        scheduler_2 = Scheduler(
+            repo,
+            provider_factory=lambda job: provider_2,
+            executor_factory=lambda job: MockGPUExecutor(),
+            config=GpuConfig(enabled=True, real_enabled=True),
+            clock=clock,
+        )
+        job2 = _make_native_job(repo, spec=L4_STD, account_id="acc-a")
+        t2 = clock()
+        res2 = _drive_scheduler(scheduler_2, repo, job2["id"], clock, stop_states={"loading", "failed"})
+        assert res2["state"] == "loading"
+        elapsed_2 = clock() - t2
+        assert 15.0 <= elapsed_2 < 17.0
+
+        # Case 3: Direct unit check when lease is None (pre-create failure) -> uses attempt_started_at
+        job3 = _make_native_job(repo, spec=L4_STD, account_id="acc-a")
+        t3 = clock()
+        job3 = allocation_retry.sync_attempt_state(repo, job3, now=t3)
+        job3 = repo.update(
+            "jobs",
+            job3["id"],
+            {"error_code": "colab_network_error", "error_message": "list_specs timeout"},
+            "owner",
+        )
+        deferred = allocation_retry.maybe_defer_allocation_retry(
+            repo,
+            job3,
+            None,
+            t3 + 6.0,
+            jitter_fn=lambda: 0.0,
+        )
+        assert deferred is not None
+        # Interval 15s minus 6s elapsed = 9s remaining
+        assert deferred["retry_not_before_epoch"] == pytest.approx(t3 + 15.0)
+        assert deferred["allocation_retry"]["attempt_started_at"] is None
     finally:
         store.engine.dispose()
 

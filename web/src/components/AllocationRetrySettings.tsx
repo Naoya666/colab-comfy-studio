@@ -12,8 +12,9 @@ import { DEFAULT_GPU_SPEC_ORDER, formatGpuSpecName, gpuSpecId } from '../lib/gpu
 import { Card } from './ui';
 import styles from '../gpu.module.css';
 
-const MIN_INTERVAL = 20;
+const MIN_INTERVAL = 10;
 const MAX_INTERVAL = 120;
+const DEFAULT_INTERVAL = 15;
 const MIN_RETRIES = 1;
 const MAX_RETRIES = 60;
 
@@ -28,7 +29,7 @@ export function AllocationRetrySettings({
   const [fallbackOrder, setFallbackOrder] = useState<GpuSpecKey[]>(DEFAULT_GPU_SPEC_ORDER);
   const [enabled, setEnabled] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [intervalText, setIntervalText] = useState('45');
+  const [intervalText, setIntervalText] = useState(String(DEFAULT_INTERVAL));
   const [maxRetriesText, setMaxRetriesText] = useState('20');
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
@@ -38,7 +39,7 @@ export function AllocationRetrySettings({
     setSaved(cfg);
     setEnabled(Boolean(cfg.enabled));
     setSelectedIds((cfg.gpu_pool || []).map((item) => gpuSpecId(item)).filter((id): id is string => Boolean(id)));
-    setIntervalText(String(cfg.retry_interval_seconds ?? 45));
+    setIntervalText(String(cfg.retry_interval_seconds ?? DEFAULT_INTERVAL));
     setMaxRetriesText(String(cfg.max_retries ?? 20));
   }, []);
 
@@ -222,7 +223,7 @@ export function AllocationRetrySettings({
 
           <div className={styles.retryFieldsRow}>
             <label className="field">
-              重试间隔（{MIN_INTERVAL} ~ {MAX_INTERVAL} 秒，含 0~5s 随机抖动）
+              最小重试间隔（{MIN_INTERVAL} ~ {MAX_INTERVAL} 秒，含 0~5s 随机抖动）
               <input
                 type="number"
                 min={MIN_INTERVAL}
@@ -258,6 +259,9 @@ export function AllocationRetrySettings({
               )}
             </label>
           </div>
+          <p className="muted small">
+            重试间隔从上次发起申请起算，已消耗的请求与 60s 旧租约核验时间会自动抵扣，不重复叠加；遇到明确无卡秒拒时仍会补足冷却以防触发 429。
+          </p>
 
           {canEdit && (
             <div className="actions">

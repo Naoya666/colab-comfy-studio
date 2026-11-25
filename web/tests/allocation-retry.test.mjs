@@ -18,6 +18,9 @@ test('allocation retry copy helper and settings UI wiring', async () => {
   assert.match(retrySettings, /启用自动排队抢卡/);
   assert.match(retrySettings, /参与重试的显卡池/);
   assert.match(retrySettings, /429/);
+  assert.match(retrySettings, /const MIN_INTERVAL = 10;/);
+  assert.match(retrySettings, /const DEFAULT_INTERVAL = 15;/);
+  assert.match(retrySettings, /自动抵扣/);
 
   const nativePage = fs.readFileSync(path.join(root, 'src/pages/NativeComfyPage.tsx'), 'utf8');
   assert.match(nativePage, /自动选择账号（多账号轮换）/);
