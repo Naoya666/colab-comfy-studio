@@ -542,3 +542,96 @@ def test_suggest_next_version_skips_existing_versions():
     assert suggest_next_version("1.0.0", {"1.0.0", "1.0.1", "1.0.2"}) == "1.0.3"
     assert suggest_next_version("2.1.0-beta.1", {"2.1.0-beta.1"}) == "2.1.1"
     assert suggest_next_version("3", {"3", "4"}) == "5"
+
+
+def test_prepare_dependencies_civitai_requires_exact_file_id_when_sha256_missing(tmp_path):
+    """When a Civitai weight specifies file_id without SHA-256, never auto-bind a single mismatched file."""
+    store = Store(f"sqlite:///{tmp_path / 'civitai_fid.db'}")
+    repo = Repository(store)
+    wf = repo.create(
+        "workflows",
+        "owner",
+        {
+            "workflow_key": "wf-civitai-fid",
+            "workflow_version": 1,
+            "model_id": "m-fid",
+            "state": "draft",
+            "api_graph": {
+                "1": {
+                    "class_type": "LoraLoader",
+                    "inputs": {"lora_name": "style.safetensors"},
+                }
+            },
+            "manifest": {
+                "dependencies": {
+                    "weight_files": [
+                        {
+                            "source": "civitai",
+                            "target": "loras/style.safetensors",
+                            "filename": "style.safetensors",
+                            "source_url": "https://civitai.com/models/12345?modelVersionId=67890",
+                            "source_identity": {
+                                "model_id": 12345,
+                                "version_id": 67890,
+                                "file_id": 10,
+                            },
+                        }
+                    ]
+                }
+            },
+        },
+    )
+
+    returned_file_id = {"value": 20}
+
+    def civitai_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/model-versions/67890":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 67890,
+                    "modelId": 12345,
+                    "name": "v1.0",
+                    "baseModel": "SDXL 1.0",
+                    "model": {"name": "Style LoRA", "type": "LORA"},
+                    "files": [
+                        {
+                            "id": returned_file_id["value"],
+                            "name": "other_variant.safetensors",
+                            "sizeKB": 128,
+                            "hashes": {},
+                            "downloadUrl": "https://civitai.com/api/download/models/67890",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    mock_http = SourceHTTP(
+        {},
+        client=httpx.Client(transport=httpx.MockTransport(civitai_handler)),
+        resolver=lambda _h: ["93.184.216.34"],
+    )
+    lib = ModelLibrary(repo, "owner", http=mock_http)
+    try:
+        # 1. Single candidate has file_id=20 while dependency specifies file_id=10 -> MUST NOT auto-bind!
+        prep_mismatch = lib.prepare_dependencies(wf["id"])
+        assert prep_mismatch["tasks"] == []
+        deps_after = lib.dependency_record(wf["id"])["dependencies"]
+        assert len(deps_after) == 1
+        assert deps_after[0]["id"] in prep_mismatch["unresolved"]
+        assert deps_after[0].get("model_id") is None
+        assert "不匹配" in (deps_after[0].get("source_error") or "")
+        assert lib.models() == []
+
+        # 2. Exact file_id=10 match -> binds and enqueues cleanly.
+        returned_file_id["value"] = 10
+        prep_match = lib.prepare_dependencies(wf["id"])
+        assert len(prep_match["tasks"]) == 1
+        assert prep_match["unresolved"] == []
+        deps_matched = lib.dependency_record(wf["id"])["dependencies"]
+        assert deps_matched[0]["model_id"] is not None
+        assert deps_matched[0]["confirmed"] is True
+    finally:
+        lib.close()
+        store.engine.dispose()

@@ -756,3 +756,84 @@ def test_transfer_verifying_phase_bump_does_not_trigger_version_conflict(tmp_pat
     assert done_inst["state"] == "retained_idle"
     assert done_inst["instance_pool"] == POOL_EPHEMERAL
     assert done_inst["domain_generation"] == 1
+
+
+def test_transfer_verifying_phase_update_is_atomic_on_interruption(tmp_path, monkeypatch):
+    """Phase bump and expected_instance_version must commit atomically so interruption cannot cause version conflict."""
+    clock, store, repo, owner, aid, svc, ex, sched = _make_env(tmp_path, monkeypatch)
+    inst, _lease, _ = _seed_instance(repo, owner, aid, clock, pool=POOL_NATIVE, native_ready=True)
+    monkeypatch.setattr(native, "busy_state_for", lambda *a, **kw: ("idle", None))
+
+    out = transfer.start_transfer(
+        repo,
+        svc,
+        owner,
+        inst["id"],
+        {"target_pool": POOL_EPHEMERAL, "confirmed": True, "expected_version": inst["version"]},
+        "tr-verifying-atomic-tx",
+        is_admin=True,
+        clock=clock,
+    )
+    tr_job_id = out["transfer_job_id"]
+    ex.poll_script = [
+        {"state": "running", "stage": "teardown_verify_purity"},
+        {"state": "running", "stage": "teardown_verify_purity"},
+        {"state": "completed", "cleaned": True, "teardown_report": {"cleaned": True, "steps": ["purity_verified"]}},
+    ]
+
+    # Tick 1: loading -> running
+    j1 = transfer.advance_transfer_job(sched, repo.get("jobs", tr_job_id, owner))
+    assert j1["state"] == "running"
+    ver_before = repo.get("instances", inst["id"], owner)["version"]
+    assert repo.get("jobs", tr_job_id, owner)["expected_instance_version"] == ver_before
+
+    # Inject a crash right after svc._set inside the phase transition tx -> SQLite rolls back BOTH rows!
+    sched_svc = sched.instance_service
+    orig_set = sched_svc._set
+    crashed = {"done": False}
+
+    def crashing_set(*args, **kwargs):
+        res = orig_set(*args, **kwargs)
+        if not crashed["done"] and kwargs.get("state") == "transferring":
+            crashed["done"] = True
+            raise RuntimeError("simulated process crash mid-transaction")
+        return res
+
+    monkeypatch.setattr(sched_svc, "_set", crashing_set)
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        transfer.advance_transfer_job(sched, repo.get("jobs", tr_job_id, owner))
+
+    # After crash rollback: neither instance version/phase nor job stage/expected_instance_version diverged.
+    after_crash_inst = repo.get("instances", inst["id"], owner)
+    after_crash_job = repo.get("jobs", tr_job_id, owner)
+    assert after_crash_inst["version"] == ver_before
+    assert after_crash_inst["transfer_state"]["phase"] == "cleaning"
+    assert after_crash_job["expected_instance_version"] == ver_before
+    assert after_crash_job["stage"] == "transfer_cleaning"
+
+    # Recovery: ensure no separate scheduler._update("jobs", ...) is needed for the phase bump,
+    # and the transfer commits cleanly without transfer_version_conflict.
+    monkeypatch.setattr(sched_svc, "_set", orig_set)
+    separate_job_updates: list[dict] = []
+    orig_update = sched._update
+
+    def tracking_update(kind, ident, patch, *args, **kwargs):
+        if kind == "jobs" and ident == tr_job_id:
+            separate_job_updates.append(dict(patch))
+        return orig_update(kind, ident, patch, *args, **kwargs)
+
+    monkeypatch.setattr(sched, "_update", tracking_update)
+    j2 = transfer.advance_transfer_job(sched, repo.get("jobs", tr_job_id, owner))
+    assert j2["state"] == "running"
+    assert separate_job_updates == []
+    mid_inst = repo.get("instances", inst["id"], owner)
+    mid_job = repo.get("jobs", tr_job_id, owner)
+    assert mid_inst["transfer_state"]["phase"] == "verifying"
+    assert mid_inst["version"] == ver_before + 1
+    assert mid_job["expected_instance_version"] == mid_inst["version"]
+
+    done_job = transfer.advance_transfer_job(sched, repo.get("jobs", tr_job_id, owner))
+    done_inst = repo.get("instances", inst["id"], owner)
+    assert done_job["state"] == "completed", f"Unexpected failure: {done_job}"
+    assert done_inst["state"] == "retained_idle"
+    assert done_inst["instance_pool"] == POOL_EPHEMERAL

@@ -441,16 +441,26 @@ class ModelLibrary:
                 elif weight_source == "civitai":
                     civitai_url = deps.source_url_of(dep)
                     expected_sha = (dep.get("expected_sha256") or weight.get("sha256") or "").lower() or None
-                    expected_fid = (weight.get("source_identity") or {}).get("file_id")
+                    raw_fid = (weight.get("source_identity") or {}).get("file_id")
+                    expected_fid = (
+                        str(raw_fid)
+                        if raw_fid is not None and not isinstance(raw_fid, bool) and str(raw_fid) != ""
+                        else None
+                    )
                     if civitai_url or expected_sha:
                         try:
                             candidates = self.resolve({"url": civitai_url} if civitai_url else {"sha256": expected_sha})
                             exact = [
                                 f for f in candidates
                                 if (expected_sha and (f.get("expected_sha256") or "").lower() == expected_sha)
-                                or (not expected_sha and expected_fid is not None and (f.get("source_identity") or {}).get("file_id") == expected_fid)
+                                or (
+                                    not expected_sha
+                                    and expected_fid is not None
+                                    and (f.get("source_identity") or {}).get("file_id") is not None
+                                    and str((f.get("source_identity") or {}).get("file_id")) == expected_fid
+                                )
                             ]
-                            if not exact and not expected_sha and len(candidates) == 1:
+                            if not exact and not expected_sha and expected_fid is None and len(candidates) == 1:
                                 exact = candidates
                             if len(exact) == 1:
                                 selected = exact[0]

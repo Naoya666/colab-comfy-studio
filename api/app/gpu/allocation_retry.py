@@ -1075,3 +1075,164 @@ def maybe_defer_allocation_retry(
             )
         _emit_event_in_tx(session, owner_id, job_row.project_id, job_row.id, "waiting_for_capacity", msg)
         return repo._row(job_row)
+
+
+def revalidate_before_allocation(
+    repo,
+    job: dict[str, Any],
+    *,
+    now: float,
+) -> tuple[dict[str, Any], str | None, str | None]:
+    """Re-verify excluded accounts, live account usability, and (account, spec) eligibility
+    right before allocating a retry-queued job.
+
+    Returns ``(updated_job, abort_error_code, abort_reason)``.
+    """
+    existing = job.get("allocation_retry")
+    if not isinstance(existing, Mapping) or not existing.get("active"):
+        return job, None, None
+    owner_id = job.get("owner_id")
+    if not owner_id:
+        return job, None, None
+    store = _base_store(repo)
+    if not (hasattr(store, "db_lock") and hasattr(store, "Session")):
+        return job, None, None
+
+    cfg = allocation_retry_settings(store, owner_id)
+    with store.db_lock(), store.Session.begin() as session:
+        store.begin_immediate(session)
+        job_row = session.get(GpuJobRow, job["id"])
+        if job_row is None or job_row.owner_id != owner_id:
+            return job, None, None
+        jdata = copy.deepcopy(job_row.data or {})
+        state = jdata.get("allocation_retry")
+        if not isinstance(state, Mapping) or not state.get("active"):
+            return repo._row(job_row), None, None
+        if jdata.get("instance_id"):
+            return repo._row(job_row), None, None
+        state = copy.deepcopy(dict(state))
+
+        excluded_accounts: dict[str, dict[str, str]] = copy.deepcopy(state.get("excluded_accounts") or {})
+        ineligible_pairs: set[str] = set(state.get("ineligible_pairs") or [])
+        account_order: list[str] = list(state.get("account_order") or [])
+
+        accounts, alias_map, global_cu_stop, cu_excluded = _resolve_candidate_accounts_in_tx(
+            repo,
+            session,
+            owner_id,
+            jdata,
+            now=now,
+            excluded_ids=set(excluded_accounts.keys()),
+            preferred_order=account_order,
+        )
+        if cu_excluded:
+            excluded_accounts.update(cu_excluded)
+
+        def _abort(error_code: str, stop_reason: str) -> tuple[dict[str, Any], str, str]:
+            state.update(
+                active=False,
+                phase="aborted",
+                next_retry_at=None,
+                next_account_id=None,
+                next_account_alias=None,
+                next_spec=None,
+                account_order=accounts,
+                excluded_accounts=excluded_accounts,
+                ineligible_pairs=sorted(ineligible_pairs),
+                stop_reason=stop_reason,
+                updated_at=now,
+            )
+            jdata["allocation_retry"] = state
+            jdata.pop("retry_target_account_id", None)
+            job_row.data = jdata
+            job_row.version = int(job_row.version or 0) + 1
+            job_row.updated_at = utcnow()
+            _emit_event_in_tx(session, owner_id, job_row.project_id, job_row.id, job_row.state, stop_reason)
+            return repo._row(job_row), error_code, stop_reason
+
+        if global_cu_stop:
+            return _abort("CU_DAILY_LIMIT_REACHED", global_cu_stop)
+        if not accounts:
+            return _abort(
+                "ACCOUNT_UNAVAILABLE",
+                "当前所有可用 Google 账号均已受限、禁用或触及余额底线，已停止自动排队抢卡",
+            )
+
+        planned_acct = jdata.get("retry_target_account_id") or jdata.get("requested_account_id")
+        planned_spec = _normalize_spec_dict(jdata.get("requested_spec"))
+        planned_sid = spec_id(planned_spec) if planned_spec else None
+
+        planned_valid = (
+            isinstance(planned_acct, str)
+            and planned_acct in accounts
+            and (planned_sid is None or f"{planned_acct}|{planned_sid}" not in ineligible_pairs)
+        )
+        if planned_valid:
+            if cu_excluded:
+                state["excluded_accounts"] = excluded_accounts
+                state["account_order"] = accounts
+                state["updated_at"] = now
+                jdata["allocation_retry"] = state
+                job_row.data = jdata
+                job_row.version = int(job_row.version or 0) + 1
+                job_row.updated_at = utcnow()
+            return repo._row(job_row), None, None
+
+        candidates = build_candidate_specs(store, owner_id, jdata, cfg) or list(state.get("candidate_specs") or [])
+        if not candidates:
+            return _abort("gpu_spec_ineligible", "没有符合要求的候选 GPU 规格，已停止自动排队抢卡")
+
+        next_pair = _pick_next_pair(
+            accounts,
+            candidates,
+            last_account_id=None,
+            last_spec_id=planned_sid,
+            ineligible_pairs=ineligible_pairs,
+        )
+        if next_pair is None:
+            return _abort(
+                "gpu_spec_ineligible",
+                "所有候选账号均不支持重试显卡池中的任何规格，已停止自动排队抢卡",
+            )
+
+        next_acct, next_spec = next_pair
+        next_alias = alias_map.get(next_acct, next_acct)
+
+        snapshot = copy.deepcopy(jdata.get("snapshot") or {})
+        if job_pool(jdata) == POOL_NATIVE:
+            manifest = copy.deepcopy(snapshot.get("manifest") or {})
+            manifest["compute_spec"] = copy.deepcopy(next_spec)
+            snapshot["manifest"] = manifest
+        else:
+            snapshot["runtime_compute_spec"] = copy.deepcopy(next_spec)
+
+        cost_patch = _recalculate_cost_fields(repo, owner_id, jdata, next_spec)
+        state.update(
+            account_order=accounts,
+            candidate_specs=candidates,
+            excluded_accounts=excluded_accounts,
+            ineligible_pairs=sorted(ineligible_pairs),
+            next_account_id=next_acct,
+            next_account_alias=next_alias,
+            next_spec=next_spec,
+            updated_at=now,
+        )
+        jdata.update(
+            retry_target_account_id=next_acct,
+            requested_spec={"key": copy.deepcopy(next_spec)},
+            snapshot=snapshot,
+            allocation_retry=state,
+            **cost_patch,
+        )
+        job_row.data = jdata
+        job_row.version = int(job_row.version or 0) + 1
+        job_row.updated_at = utcnow()
+        _emit_event_in_tx(
+            session,
+            owner_id,
+            job_row.project_id,
+            job_row.id,
+            job_row.state,
+            f"原计划重试账号已不可用，自动切换尝试 {next_alias} · {format_spec_label(next_spec)}",
+        )
+        return repo._row(job_row), None, None

@@ -2324,6 +2324,18 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             if job.get("awaiting_prep"):
                 job = self._update("jobs", job["id"], {"awaiting_prep": False}, job.get("owner_id"))
             if self._is_v020_job(job):
+                if isinstance(job.get("allocation_retry"), dict) and job["allocation_retry"].get("active"):
+                    from . import allocation_retry
+
+                    job, retry_abort_code, retry_abort_msg = allocation_retry.revalidate_before_allocation(
+                        self.store, job, now=self.clock()
+                    )
+                    if retry_abort_code is not None:
+                        return self._begin_failure(
+                            job,
+                            retry_abort_code,
+                            retry_abort_msg or "没有可用候选账号，已停止自动排队抢卡",
+                        )
                 allocated = self._allocate_instance(job)
                 if allocated.get("state") in TERMINAL_STATES | {"cleaning_up", "cleanup_pending"}:
                     return allocated

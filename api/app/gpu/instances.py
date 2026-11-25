@@ -1585,6 +1585,21 @@ class InstanceService:
                 return self._dict(existing)
             accounts = self._legal_accounts(session, owner_id, project_id, provider, requested_account)
             retry_target_account = job.get("retry_target_account_id") if not requested_account else None
+            retry_state = job.get("allocation_retry") if isinstance(job.get("allocation_retry"), Mapping) else None
+            retry_excluded_raw = retry_state.get("excluded_accounts") if isinstance(retry_state, Mapping) else None
+            excluded_account_ids = (
+                {str(aid) for aid in retry_excluded_raw.keys() if aid}
+                if isinstance(retry_excluded_raw, Mapping)
+                else set()
+            )
+            if excluded_account_ids:
+                accounts = [account for account in accounts if self._account_id(account) not in excluded_account_ids]
+                if not accounts:
+                    raise APIError(
+                        "ACCOUNT_UNAVAILABLE",
+                        "当前所有可用 Google 账号均已被本次自动排队抢卡排除或不可用",
+                        409,
+                    )
             if provider == "colab":
                 if not requested_account:
                     accounts = self._filter_colab_connected_accounts(session, owner_id, accounts)
@@ -1601,6 +1616,34 @@ class InstanceService:
                     guard.state_in(session, owner_id, fail_closed_on_sample_error=True), keys
                 )
                 accounts = [account for account in accounts if self._account_id(account) in eligible]
+            retry_ineligible_pairs = (
+                {str(pair) for pair in (retry_state.get("ineligible_pairs") or ()) if pair}
+                if isinstance(retry_state, Mapping)
+                else set()
+            )
+            if retry_ineligible_pairs and not requested_instance:
+                cur_spec_raw = self._job_requested_spec(job) or self._job_workflow_default_spec(job)
+                cur_spec_id = None
+                if isinstance(cur_spec_raw, Mapping):
+                    from .specs import spec_id as _spec_id
+                    from .specs import spec_key as _spec_key
+
+                    try:
+                        cur_spec_id = _spec_id(_spec_key(dict(cur_spec_raw)))
+                    except ValueError:
+                        cur_spec_id = None
+                if cur_spec_id:
+                    accounts = [
+                        account
+                        for account in accounts
+                        if f"{self._account_id(account)}|{cur_spec_id}" not in retry_ineligible_pairs
+                    ]
+                    if not accounts:
+                        raise APIError(
+                            "gpu_spec_ineligible",
+                            f"当前可用账号均不支持所选 GPU 规格（{cur_spec_id}）",
+                            409,
+                        )
             account_id = self._account_id(accounts[0]) if requested_account else None
 
             # 1) Ephemeral pool (CUDA smoke, workflow smoke, CPU prep):

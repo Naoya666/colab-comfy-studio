@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from app import creation_api, native_api
 from app.common import APIError
 from app.compute_routes import router as compute_router
@@ -840,5 +841,130 @@ def test_cancel_during_reconciling_finishes_as_cancelled_without_stale_error(mon
         assert final["error_code"] is None
         assert final["error_message"] is None
         assert len(events) == 1
+    finally:
+        store.engine.dispose()
+
+
+def test_excluded_account_never_reused_when_retry_target_disabled(monkeypatch):
+    """When the scheduled retry target account becomes disabled during wait, excluded accounts must NEVER be selected."""
+    from app.common import APIError
+    from app.gpu.instances import InstanceService
+
+    store, repo = _make_store()
+    clock = FakeClock()
+    monkeypatch.setattr(allocation_retry.random, "uniform", lambda a, b: 0.0)
+    try:
+        _add_account(repo, "acc-a", "鉴权失败号A")
+        _add_account(repo, "acc-b", "被禁用目标号B")
+        allocation_retry.save_allocation_retry_settings(
+            store,
+            "owner",
+            {"enabled": True, "gpu_pool": [L4_STD], "retry_interval_seconds": 30, "max_retries": 5},
+        )
+        events: list[tuple[str, str]] = []
+        outcomes = [
+            {
+                "error": ColabError(
+                    "HTTP 401 unauthorized",
+                    error_code="colab_auth_failed",
+                    category="auth",
+                    phase="assign_get",
+                    http_status=401,
+                    remote_state_unknown=False,
+                )
+            },
+            {"ok": True},
+        ]
+        providers: dict[str, ScriptedColabProvider] = {}
+
+        def provider_factory(job):
+            aid = job.get("account_id") or "acc-a"
+            if aid not in providers:
+                providers[aid] = ScriptedColabProvider(
+                    aid,
+                    eligible_by_account={"acc-a": [L4_STD], "acc-b": [L4_STD], "acc-c": [L4_STD]},
+                    outcomes=outcomes,
+                    events=events,
+                    deleted_handles=[],
+                    clock=clock,
+                )
+            return providers[aid]
+
+        scheduler = Scheduler(
+            repo,
+            provider_factory=provider_factory,
+            executor_factory=lambda job: MockGPUExecutor(),
+            config=GpuConfig(enabled=True, real_enabled=True),
+            clock=clock,
+        )
+        job = _make_native_job(repo, spec=L4_STD, account_id=None)
+
+        # Drive until acc-a fails with 401 and job is deferred to waiting_for_capacity targeting acc-b.
+        waiting = None
+        for _ in range(30):
+            scheduler.tick()
+            cur = repo.get("jobs", job["id"], "owner")
+            if cur["state"] == "waiting_for_capacity" and cur.get("retry_target_account_id") == "acc-b":
+                waiting = cur
+                break
+        assert waiting is not None
+        assert "acc-a" in waiting["allocation_retry"]["excluded_accounts"]
+
+        # Disable acc-b while the job is waiting -> only excluded acc-a remains enabled in DB!
+        repo.update("accounts", "acc-b", {"enabled": False}, "owner")
+
+        # Defense-in-depth check: direct InstanceService.allocate() MUST refuse instead of falling back to acc-a.
+        svc = InstanceService(repo, clock=clock)
+        with pytest.raises(APIError) as exc_info:
+            svc.allocate(waiting)
+        assert exc_info.value.code == "ACCOUNT_UNAVAILABLE"
+
+        # Advance past retry wait -> scheduler re-validates and aborts cleanly WITHOUT retrying acc-a!
+        clock.now = float(waiting["retry_not_before_epoch"]) + 1.0
+        final = _drive_scheduler(scheduler, repo, job["id"], clock, stop_states={"failed", "loading"})
+        assert final["state"] == "failed"
+        assert final["error_code"] == "ACCOUNT_UNAVAILABLE"
+        assert final["allocation_retry"]["phase"] == "aborted"
+        assert final["allocation_retry"]["active"] is False
+        assert events == [("acc-a", "L4:SHAPE_STANDARD")]
+
+        # Case 2: If a third healthy account acc-c exists, scheduler skips disabled acc-b AND excluded acc-a and succeeds on acc-c.
+        _add_account(repo, "acc-c", "健康备用号C")
+        repo.update("accounts", "acc-b", {"enabled": True}, "owner")
+        events.clear()
+        outcomes[:] = [
+            {
+                "error": ColabError(
+                    "HTTP 401 unauthorized",
+                    error_code="colab_auth_failed",
+                    category="auth",
+                    phase="assign_get",
+                    http_status=401,
+                    remote_state_unknown=False,
+                )
+            },
+            {"ok": True},
+        ]
+        job2 = _make_native_job(repo, spec=L4_STD, account_id=None)
+        waiting2 = None
+        for _ in range(30):
+            scheduler.tick()
+            cur = repo.get("jobs", job2["id"], "owner")
+            if cur["state"] == "waiting_for_capacity" and cur.get("retry_target_account_id"):
+                waiting2 = cur
+                break
+        assert waiting2 is not None
+        first_failed = events[0][0]
+        planned_next = waiting2["retry_target_account_id"]
+        assert first_failed in waiting2["allocation_retry"]["excluded_accounts"]
+        assert planned_next != first_failed
+        remaining_healthy = ({"acc-a", "acc-b", "acc-c"} - {first_failed, planned_next}).pop()
+        repo.update("accounts", planned_next, {"enabled": False}, "owner")
+
+        clock.now = float(waiting2["retry_not_before_epoch"]) + 1.0
+        done2 = _drive_scheduler(scheduler, repo, job2["id"], clock, stop_states={"loading", "failed"})
+        assert done2["state"] == "loading"
+        assert done2["account_id"] == remaining_healthy
+        assert events == [(first_failed, "L4:SHAPE_STANDARD"), (remaining_healthy, "L4:SHAPE_STANDARD")]
     finally:
         store.engine.dispose()

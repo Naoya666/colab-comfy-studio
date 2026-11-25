@@ -201,6 +201,15 @@ def test_extract_png_workflow_parity_with_frontend_parser():
     with pytest.raises(ModelError, match="4 MiB"):
         extract_png_workflow(bomb_png)
 
+    # Valid Latin-1 bytes undefined in Python cp1252 (0x81, 0x8d, 0x8f, 0x90, 0x9d) in unrelated text chunks
+    # must NOT abort extraction of a valid ComfyUI prompt.
+    latin1_author = _png_chunk(b"tEXt", b"Author\x00A\x81\x8d\x8f\x90\x9dB")
+    latin1_png = _make_png(latin1_author, _png_text("prompt", SAMPLE_PROMPT))
+    out_latin1 = extract_png_workflow(latin1_png)
+    assert out_latin1["prompt"] == SAMPLE_PROMPT
+    author_entry = next(m for m in out_latin1["metadata"] if m["keyword"] == "Author")
+    assert author_entry["text"] == "A\x81\x8d\x8f\x90\x9dB"
+
 
 def test_fetch_workflow_source_handles_png_json_civitai_fallback_and_rejections():
     png_bytes = _make_png(_png_text("workflow", SAMPLE_VISUAL), _png_text("prompt", SAMPLE_PROMPT))
@@ -347,6 +356,10 @@ def test_http_model_library_inspect_workflow_from_url_json_and_png(http_client, 
 def test_http_workflows_fetch_url_conservative_policy_and_png_roundtrip(http_client, monkeypatch):
     c, _repo = http_client
     png_bytes = _make_png(_png_text("workflow", SAMPLE_VISUAL), _png_text("prompt", SAMPLE_PROMPT))
+    latin1_png_bytes = _make_png(
+        _png_chunk(b"tEXt", b"Author\x00A\x81\x8d\x8f\x90\x9dB"),
+        _png_text("prompt", SAMPLE_PROMPT),
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/bundle.json":
@@ -355,6 +368,8 @@ def test_http_workflows_fetch_url_conservative_policy_and_png_roundtrip(http_cli
             return httpx.Response(200, json=SAMPLE_VISUAL)
         if request.url.path == "/example.png":
             return httpx.Response(200, content=png_bytes, headers={"content-type": "image/png"})
+        if request.url.path == "/latin1.png":
+            return httpx.Response(200, content=latin1_png_bytes, headers={"content-type": "image/png"})
         return httpx.Response(404)
 
     monkeypatch.setattr(
@@ -401,6 +416,11 @@ def test_http_workflows_fetch_url_conservative_policy_and_png_roundtrip(http_cli
     )
     assert imported.status_code == 201, imported.text
     assert imported.json()["data"]["state"] == "draft"
+
+    # 3b. Remote PNG with non-CP1252 Latin-1 Author metadata still returns 200 and extracts prompt cleanly
+    r_latin1 = c.post("/api/gpu/workflows/fetch-url", json={"url": "https://files.example.com/latin1.png"})
+    assert r_latin1.status_code == 200, r_latin1.text
+    assert r_latin1.json()["data"]["extraction"]["prompt"] == SAMPLE_PROMPT
 
     # 4. Non-admin rejected with 403
     app.dependency_overrides[current_user] = lambda: {"id": "wf-url-owner", "role": "user"}

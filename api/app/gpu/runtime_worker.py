@@ -3651,6 +3651,17 @@ def verify_vm_purity(
     return report
 
 
+def _vfs_cache_has_files(native_root: Path) -> bool:
+    """Return True if rclone VFS cache contains any files (or cannot be inspected)."""
+    cache_dir = native_root / "vfs-cache"
+    if not cache_dir.is_dir():
+        return False
+    try:
+        return any(entry.is_file() for entry in cache_dir.rglob("*"))
+    except OSError:
+        return True
+
+
 def _unmount_native_drive(mount_dir: Path, *, timeout: float = 10.0, mountinfo_path: Path | None = None) -> bool:
     if not _active_mounts_under(mount_dir, mountinfo_path=mountinfo_path):
         return True
@@ -3732,8 +3743,9 @@ def run_teardown(payload: dict, root: Path, *, home_dir: Path | None = None, mou
             steps_log.append("stopped_cloudflared")
 
             # 1c) Local loopback sync & queue re-check BEFORE stopping ComfyUI or rclone!
+            mount_dir = native_root / "drive"
+            rclone_expected = not clean_native_only
             if clean_native_only:
-                mount_dir = native_root / "drive"
                 if _native_open_writes(mount_dir):
                     return _fail(
                         "native_unsynced_data",
@@ -3741,7 +3753,13 @@ def run_teardown(payload: dict, root: Path, *, home_dir: Path | None = None, mou
                         state="aborted_unsynced",
                         report={"reason": "open_writes_on_drive"},
                     )
+                rclone_artifacts_present = (
+                    rclone_file.is_file()
+                    or bool(_active_mounts_under(mount_dir, mountinfo_path=mountinfo_path))
+                    or _vfs_cache_has_files(native_root)
+                )
                 if not _check_port_free(5572):
+                    rclone_expected = True
                     rc_reason = _wait_rclone_drained(mount_dir, timeout=15.0)
                     if rc_reason:
                         return _fail(
@@ -3750,6 +3768,13 @@ def run_teardown(payload: dict, root: Path, *, home_dir: Path | None = None, mou
                             state="aborted_unsynced",
                             report={"reason": rc_reason},
                         )
+                elif rclone_artifacts_present:
+                    return _fail(
+                        "native_unsynced_data",
+                        "原生启动失败清理前检测到 rclone 挂载或缓存痕迹但 RC 端口不可用，无法确认写回完成，已中止清理并保留缓存",
+                        state="aborted_unsynced",
+                        report={"reason": "rclone_rc_unavailable_with_cache"},
+                    )
             else:
                 sync_ok, sync_reason = _local_native_sync_check(native_root)
                 if not sync_ok:
@@ -3787,9 +3812,15 @@ def run_teardown(payload: dict, root: Path, *, home_dir: Path | None = None, mou
             steps_log.append("stopped_native_comfy")
 
             # 1f) Wait for rclone --vfs-write-back (5s) flush of files closed when ComfyUI exits
-            # (e.g. comfyui_8188.log), failing closed if any upload/error remains before stopping rclone.
+            # (e.g. comfyui_8188.log), failing closed if rclone exited early or any upload/error remains.
+            post_stop_rclone_present = (
+                rclone_expected
+                or rclone_file.is_file()
+                or bool(_active_mounts_under(mount_dir, mountinfo_path=mountinfo_path))
+                or _vfs_cache_has_files(native_root)
+            )
             if not _check_port_free(5572):
-                rc_reason = _wait_rclone_drained(native_root / "drive")
+                rc_reason = _wait_rclone_drained(mount_dir)
                 if rc_reason:
                     return _fail(
                         "native_unsynced_data",
@@ -3797,18 +3828,34 @@ def run_teardown(payload: dict, root: Path, *, home_dir: Path | None = None, mou
                         state="aborted_unsynced",
                         report={"reason": rc_reason},
                     )
+            elif post_stop_rclone_present:
+                return _fail(
+                    "native_unsynced_data",
+                    "停机后检测到 rclone RC 端口已不可用，无法确认 VFS 缓存写回完成，已中止清理并保留缓存",
+                    state="aborted_unsynced",
+                    report={"reason": "rclone_exited_before_flush_check"},
+                )
             rclone_pid = state_doc.get("rclone_pid") or rclone_doc.get("rclone_pid")
             rclone_sid = state_doc.get("rclone_start_id") or rclone_doc.get("rclone_start_id")
+            rclone_stopped = True
             if rclone_pid:
-                _stop_pid_verified(rclone_pid, rclone_sid, grace_seconds=10.0, allow_sigkill=False)
+                if not _stop_pid_verified(rclone_pid, rclone_sid, grace_seconds=10.0, allow_sigkill=False):
+                    rclone_stopped = False
             for pid, sid in _scan_matching_pids(
-                lambda _p, cmd, _c: any("rclone" in arg for arg in cmd) and str(native_root / "drive") in cmd
+                lambda _p, cmd, _c: any("rclone" in arg for arg in cmd) and str(mount_dir) in cmd
             ):
-                _stop_pid_verified(pid, sid, grace_seconds=10.0, allow_sigkill=False)
+                if not _stop_pid_verified(pid, sid, grace_seconds=10.0, allow_sigkill=False):
+                    rclone_stopped = False
+            if not rclone_stopped:
+                return _fail(
+                    "native_unsynced_data",
+                    "rclone 停止超时，可能仍在执行写回刷新，已中止清理并保留缓存",
+                    state="aborted_unsynced",
+                    report={"reason": "rclone_stop_timeout"},
+                )
             steps_log.append("stopped_rclone")
 
             # 1g) Unmount FUSE drive and confirm unmounted
-            mount_dir = native_root / "drive"
             if not _unmount_native_drive(mount_dir, timeout=10.0, mountinfo_path=mountinfo_path):
                 return _fail(
                     "mount_still_active",

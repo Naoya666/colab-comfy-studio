@@ -396,6 +396,10 @@ export function fixedPromptStorageKey(projectId: string, workflowId: string): st
   return `studio-fixed-prompts:${projectId}:${workflowId}`;
 }
 
+export function fixedPromptPendingStorageKey(projectId: string, workflowId: string): string {
+  return `studio-fixed-prompts-pending:${projectId}:${workflowId}`;
+}
+
 export function readCachedFixedPrompts(projectId: string, workflowId: string): FixedPromptConfig | null {
   if (!projectId || !workflowId) return null;
   try {
@@ -414,4 +418,176 @@ export function writeCachedFixedPrompts(projectId: string, workflowId: string, c
   } catch {
     /* browser storage unavailable */
   }
+}
+
+export function readPendingFixedPrompts(projectId: string, workflowId: string): FixedPromptConfig | null {
+  if (!projectId || !workflowId) return null;
+  try {
+    const raw = localStorage.getItem(fixedPromptPendingStorageKey(projectId, workflowId));
+    if (!raw) return null;
+    return normalizeFixedPromptConfig(JSON.parse(raw) as Partial<FixedPromptConfig>);
+  } catch {
+    return null;
+  }
+}
+
+export function writePendingFixedPrompts(projectId: string, workflowId: string, config: FixedPromptConfig): void {
+  if (!projectId || !workflowId) return;
+  try {
+    localStorage.setItem(fixedPromptPendingStorageKey(projectId, workflowId), JSON.stringify(normalizeFixedPromptConfig(config)));
+  } catch {
+    /* browser storage unavailable */
+  }
+}
+
+export function clearPendingFixedPrompts(projectId: string, workflowId: string): void {
+  if (!projectId || !workflowId) return;
+  try {
+    localStorage.removeItem(fixedPromptPendingStorageKey(projectId, workflowId));
+  } catch {
+    /* browser storage unavailable */
+  }
+}
+
+export interface PendingFixedPromptEntry {
+  projectId: string;
+  workflowId: string;
+  config: FixedPromptConfig;
+  revision: number;
+}
+
+export interface FixedPromptSyncStorage {
+  readCached: (projectId: string, workflowId: string) => FixedPromptConfig | null;
+  writeCached: (projectId: string, workflowId: string, config: FixedPromptConfig) => void;
+  readPending: (projectId: string, workflowId: string) => FixedPromptConfig | null;
+  writePending: (projectId: string, workflowId: string, config: FixedPromptConfig) => void;
+  clearPending: (projectId: string, workflowId: string) => void;
+}
+
+export interface FixedPromptSyncer {
+  markDirty: (projectId: string, workflowId: string, config: FixedPromptConfig) => PendingFixedPromptEntry;
+  getPending: (projectId: string, workflowId: string) => PendingFixedPromptEntry | null;
+  keyVersion: (projectId: string, workflowId: string) => number;
+  flush: (projectId: string, workflowId: string) => Promise<boolean>;
+  flushAll: () => Promise<void>;
+  resolveLoaded: (
+    projectId: string,
+    workflowId: string,
+    remote: Partial<FixedPromptConfig> | null,
+  ) => { config: FixedPromptConfig; hasPending: boolean };
+}
+
+const defaultFixedPromptSyncStorage: FixedPromptSyncStorage = {
+  readCached: readCachedFixedPrompts,
+  writeCached: writeCachedFixedPrompts,
+  readPending: readPendingFixedPrompts,
+  writePending: writePendingFixedPrompts,
+  clearPending: clearPendingFixedPrompts,
+};
+
+export function createFixedPromptSyncer(opts: {
+  save: (projectId: string, workflowId: string, config: FixedPromptConfig) => Promise<unknown>;
+  storage?: FixedPromptSyncStorage;
+  onSyncingChange?: (syncing: boolean) => void;
+}): FixedPromptSyncer {
+  const storage = opts.storage ?? defaultFixedPromptSyncStorage;
+  const pending = new Map<string, PendingFixedPromptEntry>();
+  const versions = new Map<string, number>();
+  let nextRevision = 0;
+  let inFlightCount = 0;
+
+  const bumpVersion = (key: string) => {
+    versions.set(key, (versions.get(key) ?? 0) + 1);
+  };
+
+  const getPending = (projectId: string, workflowId: string): PendingFixedPromptEntry | null => {
+    if (!projectId || !workflowId) return null;
+    const key = fixedPromptStorageKey(projectId, workflowId);
+    const existing = pending.get(key);
+    if (existing) return existing;
+    const stored = storage.readPending(projectId, workflowId);
+    if (!stored) return null;
+    const hydrated: PendingFixedPromptEntry = {
+      projectId,
+      workflowId,
+      config: normalizeFixedPromptConfig(stored),
+      revision: ++nextRevision,
+    };
+    pending.set(key, hydrated);
+    return hydrated;
+  };
+
+  const markDirty = (projectId: string, workflowId: string, config: FixedPromptConfig): PendingFixedPromptEntry => {
+    const normalized = normalizeFixedPromptConfig(config);
+    const key = fixedPromptStorageKey(projectId, workflowId);
+    const entry: PendingFixedPromptEntry = {
+      projectId,
+      workflowId,
+      config: normalized,
+      revision: ++nextRevision,
+    };
+    pending.set(key, entry);
+    bumpVersion(key);
+    storage.writeCached(projectId, workflowId, normalized);
+    storage.writePending(projectId, workflowId, normalized);
+    return entry;
+  };
+
+  const flush = async (projectId: string, workflowId: string): Promise<boolean> => {
+    if (!projectId || !workflowId) return true;
+    const key = fixedPromptStorageKey(projectId, workflowId);
+    const target = getPending(projectId, workflowId);
+    if (!target) return true;
+    inFlightCount += 1;
+    if (inFlightCount === 1) opts.onSyncingChange?.(true);
+    try {
+      await opts.save(target.projectId, target.workflowId, target.config);
+      const latest = pending.get(key);
+      if (latest && latest.revision === target.revision) {
+        pending.delete(key);
+        storage.clearPending(target.projectId, target.workflowId);
+        bumpVersion(key);
+      }
+      return true;
+    } catch {
+      return false;
+    } finally {
+      inFlightCount = Math.max(0, inFlightCount - 1);
+      if (inFlightCount === 0) opts.onSyncingChange?.(false);
+    }
+  };
+
+  const flushAll = async (): Promise<void> => {
+    const targets = [...pending.values()].map((entry) => ({
+      projectId: entry.projectId,
+      workflowId: entry.workflowId,
+    }));
+    await Promise.all(targets.map((t) => flush(t.projectId, t.workflowId)));
+  };
+
+  const resolveLoaded = (
+    projectId: string,
+    workflowId: string,
+    remote: Partial<FixedPromptConfig> | null,
+  ): { config: FixedPromptConfig; hasPending: boolean } => {
+    const unsynced = getPending(projectId, workflowId);
+    if (unsynced) {
+      return { config: unsynced.config, hasPending: true };
+    }
+    const cached = storage.readCached(projectId, workflowId);
+    const resolved = remote
+      ? normalizeFixedPromptConfig(remote)
+      : (cached ?? defaultFixedPromptConfig());
+    storage.writeCached(projectId, workflowId, resolved);
+    return { config: resolved, hasPending: false };
+  };
+
+  return {
+    markDirty,
+    getPending,
+    keyVersion: (projectId, workflowId) => versions.get(fixedPromptStorageKey(projectId, workflowId)) ?? 0,
+    flush,
+    flushAll,
+    resolveLoaded,
+  };
 }

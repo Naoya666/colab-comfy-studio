@@ -413,10 +413,11 @@ def test_teardown_native_order_aborts_on_unsynced_and_blocks_rmtree_on_active_mo
     assert order == ["stop:9001", "stop:9002", "probe_sync"]
     assert native_dir.exists()
 
-    # Case 2: Synced, but /proc/self/mountinfo still reports an active mount under studio_root -> rmtree FORBIDDEN.
+    # Case 2: Synced and rclone drained cleanly, but /proc/self/mountinfo still reports an active mount -> rmtree FORBIDDEN.
     order.clear()
     monkeypatch.setattr(runtime_worker, "_local_native_sync_check", lambda _nr: (True, None))
-    monkeypatch.setattr(runtime_worker, "_check_port_free", lambda _p: True)
+    monkeypatch.setattr(runtime_worker, "_check_port_free", lambda _p: False)
+    monkeypatch.setattr(runtime_worker, "_wait_rclone_drained", lambda *a, **kw: None)
     monkeypatch.setattr(runtime_worker, "_unmount_native_drive", lambda *a, **kw: True)
     monkeypatch.setattr(
         runtime_worker,
@@ -526,3 +527,122 @@ def test_wait_rclone_drained_allows_transient_writeback_and_fails_closed_on_stuc
     # 3. Persistent upload queue past budget fails closed.
     monkeypatch.setattr(runtime_worker, "_local_rclone_unsynced_reason", lambda: "rclone_uploads_queued:3")
     assert runtime_worker._wait_rclone_drained(mount_dir, timeout=0.05) == "rclone_uploads_queued:3"
+
+
+def test_teardown_aborts_unsynced_and_preserves_vfs_cache_when_rclone_exits_during_stop(tmp_path, monkeypatch):
+    """If rclone exits before post-stop write-back confirmation, teardown must fail closed and keep vfs-cache."""
+    studio_root = tmp_path / "ai-studio"
+    native_dir = studio_root / "native"
+    cache_file = native_dir / "vfs-cache" / "vfs" / "studio" / "output" / "pending.png"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_bytes(b"unsynced-image-bytes")
+    (native_dir / "state.json").write_text(
+        json.dumps({"watchdog_pid": 9101, "tunnel_pid": 9102, "pid": 9103, "rclone_pid": 9104}),
+        encoding="utf-8",
+    )
+    (native_dir / "rclone-state.json").write_text(
+        json.dumps({"rclone_pid": 9104, "rc_port": 5572}),
+        encoding="utf-8",
+    )
+
+    global_site = tmp_path / "global_site"
+    global_site.mkdir()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(runtime_worker, "_global_site_dirs", lambda: [global_site])
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setattr(runtime_worker, "_scan_matching_pids", lambda pred: [])
+    monkeypatch.setattr(runtime_worker, "_stop_pid_verified", lambda *a, **kw: True)
+    monkeypatch.setattr(runtime_worker, "_active_mounts_under", lambda *a, **kw: [])
+    monkeypatch.setattr(runtime_worker, "_unmount_native_drive", lambda *a, **kw: True)
+    monkeypatch.setattr(runtime_worker, "_native_open_writes", lambda *a, **kw: False)
+    base = runtime_worker.ensure_vm_baseline(studio_root)
+
+    # 1. Normal native transfer: Step 1c saw rclone healthy, then rclone died during ComfyUI shutdown (port 5572 free).
+    monkeypatch.setattr(runtime_worker, "_local_native_sync_check", lambda _nr: (True, None))
+    monkeypatch.setattr(runtime_worker, "_check_port_free", lambda _p: True)
+
+    exec_root1 = studio_root / "teardown-rclone-dead"
+    exec_root1.mkdir()
+    res1 = runtime_worker.run_teardown(
+        {
+            "from_pool": "native",
+            "to_pool": "creation",
+            "expected_baseline_digest": base["digest"],
+            "allow_mock_gpu": True,
+        },
+        exec_root1,
+        home_dir=fake_home,
+    )
+    assert res1["state"] == "aborted_unsynced"
+    assert res1["cleaned"] is False
+    assert res1["error_code"] == "native_unsynced_data"
+    assert res1["teardown_report"]["reason"] == "rclone_exited_before_flush_check"
+    assert cache_file.is_file()
+
+    # 2. clean_native_only with cached files present and RC port free also fails closed.
+    exec_root2 = studio_root / "teardown-clean-only-cache"
+    exec_root2.mkdir()
+    res2 = runtime_worker.run_teardown(
+        {
+            "from_pool": "native",
+            "to_pool": "native",
+            "clean_native_only": True,
+            "expected_baseline_digest": base["digest"],
+            "allow_mock_gpu": True,
+        },
+        exec_root2,
+        home_dir=fake_home,
+    )
+    assert res2["state"] == "aborted_unsynced"
+    assert res2["cleaned"] is False
+    assert res2["teardown_report"]["reason"] == "rclone_rc_unavailable_with_cache"
+    assert cache_file.is_file()
+
+    # 3. Normal native transfer where rclone refuses to exit cleanly on SIGTERM also aborts and preserves cache.
+    monkeypatch.setattr(runtime_worker, "_check_port_free", lambda _p: False)
+    monkeypatch.setattr(runtime_worker, "_wait_rclone_drained", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        runtime_worker,
+        "_stop_pid_verified",
+        lambda pid, *a, **kw: False if pid == 9104 else True,
+    )
+    exec_root3 = studio_root / "teardown-rclone-hang"
+    exec_root3.mkdir()
+    res3 = runtime_worker.run_teardown(
+        {
+            "from_pool": "native",
+            "to_pool": "creation",
+            "expected_baseline_digest": base["digest"],
+            "allow_mock_gpu": True,
+        },
+        exec_root3,
+        home_dir=fake_home,
+    )
+    assert res3["state"] == "aborted_unsynced"
+    assert res3["cleaned"] is False
+    assert res3["teardown_report"]["reason"] == "rclone_stop_timeout"
+    assert cache_file.is_file()
+
+    # 4. clean_native_only when rclone never started (no rclone-state.json, no mount, no vfs-cache files) cleans cleanly.
+    shutil.rmtree(native_dir)
+    native_dir.mkdir(parents=True)
+    (native_dir / "partial-clone.txt").write_text("residual", encoding="utf-8")
+    monkeypatch.setattr(runtime_worker, "_stop_pid_verified", lambda *a, **kw: True)
+    monkeypatch.setattr(runtime_worker, "_check_port_free", lambda _p: True)
+    exec_root4 = studio_root / "teardown-clean-only-early"
+    exec_root4.mkdir()
+    res4 = runtime_worker.run_teardown(
+        {
+            "from_pool": "native",
+            "to_pool": "native",
+            "clean_native_only": True,
+            "expected_baseline_digest": base["digest"],
+            "allow_mock_gpu": True,
+        },
+        exec_root4,
+        home_dir=fake_home,
+    )
+    assert res4["state"] == "completed"
+    assert res4["cleaned"] is True
+    assert not native_dir.exists()

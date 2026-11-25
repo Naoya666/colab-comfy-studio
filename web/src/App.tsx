@@ -57,12 +57,14 @@ import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft
 import {
   applyFixedPromptsToParams,
   collectActiveLoraTriggerWords,
+  createFixedPromptSyncer,
   defaultFixedPromptConfig,
+  fixedPromptStorageKey,
   normalizeFixedPromptConfig,
   readCachedFixedPrompts,
   restoreFromHistoricalJob,
-  writeCachedFixedPrompts,
   type FixedPromptConfig,
+  type FixedPromptSyncer,
   type PromptComposition,
 } from './lib/fixed-prompts';
 import {
@@ -237,9 +239,14 @@ export default function App() {
   const [fixedPromptsSyncing, setFixedPromptsSyncing] = useState(false);
   const fixedPromptsRef = useRef(fixedPrompts);
   fixedPromptsRef.current = fixedPrompts;
-  const fixedPromptDirtyRef = useRef<{ projectId: string; workflowId: string; config: FixedPromptConfig } | null>(null);
-  const fixedPromptTimerRef = useRef<number | null>(null);
-  const fixedPromptRevisionRef = useRef(0);
+  const fixedPromptSyncRef = useRef<FixedPromptSyncer | null>(null);
+  if (!fixedPromptSyncRef.current) {
+    fixedPromptSyncRef.current = createFixedPromptSyncer({
+      save: saveGpuFixedPrompts,
+      onSyncingChange: setFixedPromptsSyncing,
+    });
+  }
+  const fixedPromptTimersRef = useRef<Map<string, number>>(new Map());
   const [workflowDependencyState, setWorkflowDependencyState] = useState<{ workflowId: string; record: DependencyRecord } | null>(null);
   const [libraryModelsCatalog, setLibraryModelsCatalog] = useState<LibraryModel[] | null>(null);
 
@@ -254,23 +261,26 @@ export default function App() {
   }, []);
 
   const flushFixedPrompts = useCallback(async (
-    override?: { projectId: string; workflowId: string; config: FixedPromptConfig },
+    override?: { projectId: string; workflowId: string },
   ) => {
-    if (fixedPromptTimerRef.current !== null) {
-      window.clearTimeout(fixedPromptTimerRef.current);
-      fixedPromptTimerRef.current = null;
+    const syncer = fixedPromptSyncRef.current;
+    if (!syncer) return;
+    if (override) {
+      if (!override.projectId || !override.workflowId) return;
+      const key = fixedPromptStorageKey(override.projectId, override.workflowId);
+      const timer = fixedPromptTimersRef.current.get(key);
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        fixedPromptTimersRef.current.delete(key);
+      }
+      await syncer.flush(override.projectId, override.workflowId);
+      return;
     }
-    const target = override ?? fixedPromptDirtyRef.current;
-    if (!target || !target.projectId || !target.workflowId) return;
-    if (fixedPromptDirtyRef.current === target) fixedPromptDirtyRef.current = null;
-    setFixedPromptsSyncing(true);
-    try {
-      await saveGpuFixedPrompts(target.projectId, target.workflowId, target.config);
-    } catch {
-      /* Local cache keeps edits; next save retries sync. */
-    } finally {
-      setFixedPromptsSyncing(false);
+    for (const timer of fixedPromptTimersRef.current.values()) {
+      window.clearTimeout(timer);
     }
+    fixedPromptTimersRef.current.clear();
+    await syncer.flushAll();
   }, []);
 
   const updateFixedPrompts = useCallback((
@@ -280,26 +290,28 @@ export default function App() {
     const pid = opts.projectId ?? currentProjectId.current;
     const wid = opts.workflowId ?? workflowIdRef.current;
     const normalized = normalizeFixedPromptConfig(next);
-    fixedPromptRevisionRef.current += 1;
     if (pid === currentProjectId.current && wid === workflowIdRef.current) {
       setFixedPrompts(normalized);
       fixedPromptsRef.current = normalized;
     }
     if (!pid || !wid) return;
-    writeCachedFixedPrompts(pid, wid, normalized);
-    const dirty = { projectId: pid, workflowId: wid, config: normalized };
-    fixedPromptDirtyRef.current = dirty;
-    if (fixedPromptTimerRef.current !== null) {
-      window.clearTimeout(fixedPromptTimerRef.current);
-      fixedPromptTimerRef.current = null;
+    const syncer = fixedPromptSyncRef.current;
+    if (!syncer) return;
+    syncer.markDirty(pid, wid, normalized);
+    const key = fixedPromptStorageKey(pid, wid);
+    const existingTimer = fixedPromptTimersRef.current.get(key);
+    if (existingTimer !== undefined) {
+      window.clearTimeout(existingTimer);
+      fixedPromptTimersRef.current.delete(key);
     }
     if (opts.immediate) {
-      void flushFixedPrompts(dirty);
+      void flushFixedPrompts({ projectId: pid, workflowId: wid });
     } else {
-      fixedPromptTimerRef.current = window.setTimeout(() => {
-        fixedPromptTimerRef.current = null;
-        void flushFixedPrompts();
+      const timer = window.setTimeout(() => {
+        fixedPromptTimersRef.current.delete(key);
+        void flushFixedPrompts({ projectId: pid, workflowId: wid });
       }, 400);
+      fixedPromptTimersRef.current.set(key, timer);
     }
   }, [flushFixedPrompts]);
 
@@ -552,31 +564,36 @@ export default function App() {
     if (previous.workflowId && previous.projectId && draftReady.current === `${previous.projectId}:${previous.workflowId}`) {
       writeWorkflowDraft(previous.projectId, previous.workflowId, paramsRef.current);
     }
+    const syncer = fixedPromptSyncRef.current;
     if (
-      fixedPromptDirtyRef.current
-      && (fixedPromptDirtyRef.current.projectId !== projectId || fixedPromptDirtyRef.current.workflowId !== workflowId)
+      syncer
+      && previous.projectId
+      && previous.workflowId
+      && (previous.projectId !== projectId || previous.workflowId !== workflowId)
+      && syncer.getPending(previous.projectId, previous.workflowId)
     ) {
-      void flushFixedPrompts(fixedPromptDirtyRef.current);
+      void flushFixedPrompts({ projectId: previous.projectId, workflowId: previous.workflowId });
     }
     const carried = sameProject && previous.workflowId && previous.workflowId !== workflowId ? carriedDraft(paramsRef.current) : null;
     draftLocation.current = { projectId, workflowId };
     let alive = true;
     const requestWorkflow = workflowId;
     const requestProject = projectId;
+    const pendingFixed = syncer?.getPending(requestProject, requestWorkflow)?.config ?? null;
     const cachedFixed = readCachedFixedPrompts(requestProject, requestWorkflow);
-    const optimisticFixed = cachedFixed ?? defaultFixedPromptConfig();
+    const optimisticFixed = pendingFixed ?? cachedFixed ?? defaultFixedPromptConfig();
     setFixedPrompts(optimisticFixed);
     fixedPromptsRef.current = optimisticFixed;
-    const loadRevision = fixedPromptRevisionRef.current;
+    const loadVersion = syncer?.keyVersion(requestProject, requestWorkflow) ?? 0;
     setLoading('schema');
     Promise.all([
       getGpuWorkflowSchema(requestWorkflow),
       getGpuFixedPrompts(requestProject, requestWorkflow).catch(() => null),
     ]).then(([next, remoteFixed]) => {
       if (!alive) return;
-      const loadedFixed = remoteFixed
-        ? normalizeFixedPromptConfig(remoteFixed)
-        : (cachedFixed ?? defaultFixedPromptConfig());
+      const pendingBeforeApply = syncer?.getPending(requestProject, requestWorkflow)?.config ?? null;
+      const loadedFixed = pendingBeforeApply
+        ?? (remoteFixed ? normalizeFixedPromptConfig(remoteFixed) : (cachedFixed ?? defaultFixedPromptConfig()));
       const pendingReuse = pendingReuseRef.current;
       if (pendingReuse && pendingReuse.workflowId === requestWorkflow) {
         pendingReuseRef.current = null;
@@ -611,10 +628,13 @@ export default function App() {
       setManifest(next);
       draftReady.current = `${requestProject}:${requestWorkflow}`;
       setParams(mergeWorkflowDraft(next, saved, forced ? null : carried));
-      if (fixedPromptRevisionRef.current === loadRevision) {
-        setFixedPrompts(loadedFixed);
-        fixedPromptsRef.current = loadedFixed;
-        writeCachedFixedPrompts(requestProject, requestWorkflow, loadedFixed);
+      if (syncer && syncer.keyVersion(requestProject, requestWorkflow) === loadVersion) {
+        const resolved = syncer.resolveLoaded(requestProject, requestWorkflow, remoteFixed);
+        setFixedPrompts(resolved.config);
+        fixedPromptsRef.current = resolved.config;
+        if (resolved.hasPending && remoteFixed !== null) {
+          void flushFixedPrompts({ projectId: requestProject, workflowId: requestWorkflow });
+        }
       }
     }).catch((cause) => alive && setError(`参数 schema：${apiMessage(cause)}`)).finally(() => alive && setLoading(''));
     return () => { alive = false; };
@@ -622,7 +642,7 @@ export default function App() {
 
   useEffect(() => {
     const flushOnLeave = () => {
-      if (fixedPromptDirtyRef.current) void flushFixedPrompts(fixedPromptDirtyRef.current);
+      void flushFixedPrompts();
     };
     window.addEventListener('pagehide', flushOnLeave);
     return () => window.removeEventListener('pagehide', flushOnLeave);
@@ -984,8 +1004,8 @@ export default function App() {
         resolvedAccountId = decision.accountId;
         resolvedInstanceId = decision.instanceId;
       }
-      if (fixedPromptDirtyRef.current) {
-        void flushFixedPrompts(fixedPromptDirtyRef.current);
+      if (fixedPromptSyncRef.current?.getPending(projectId, workflowId)) {
+        void flushFixedPrompts({ projectId, workflowId });
       }
       const { promptKey, negativePromptKey } = promptKeysOf(manifest);
       const composed = applyFixedPromptsToParams(params, fixedPromptsRef.current, promptKey, negativePromptKey);

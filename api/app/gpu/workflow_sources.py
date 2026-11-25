@@ -192,7 +192,10 @@ def extract_png_workflow(data: bytes) -> dict:
             try:
                 original_text = payload.decode("utf-8")
             except UnicodeDecodeError:
-                original_text = payload.decode("cp1252")
+                try:
+                    original_text = payload.decode("cp1252")
+                except UnicodeDecodeError:
+                    original_text = payload.decode("latin-1")
             metadata.append({"keyword": key, "text": original_text})
             if key in {"workflow", "prompt", "parameters"}:
                 if key in texts:

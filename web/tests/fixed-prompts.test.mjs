@@ -30,6 +30,7 @@ const {
   collectActiveLoraTriggerWords,
   summarizeFixedPrompts,
   defaultFixedPromptConfig,
+  createFixedPromptSyncer,
   promptCompositionRows,
 } = await import('data:text/javascript;base64,' + Buffer.from(bundled.outputFiles[0].text).toString('base64'));
 
@@ -228,4 +229,106 @@ test('summarizeFixedPrompts and promptCompositionRows produce accurate labels', 
     '本次正面提示词',
     '固定负面提示词（后置）',
   ]);
+});
+
+test('createFixedPromptSyncer preserves unsynced edits across failed PUT, workflow switch, stale GET, and concurrent edits', async () => {
+  const cachedMap = new Map();
+  const pendingMap = new Map();
+  const keyOf = (pid, wid) => `${pid}:${wid}`;
+  const storage = {
+    readCached: (pid, wid) => cachedMap.get(keyOf(pid, wid)) ?? null,
+    writeCached: (pid, wid, cfg) => cachedMap.set(keyOf(pid, wid), cfg),
+    readPending: (pid, wid) => pendingMap.get(keyOf(pid, wid)) ?? null,
+    writePending: (pid, wid, cfg) => pendingMap.set(keyOf(pid, wid), cfg),
+    clearPending: (pid, wid) => pendingMap.delete(keyOf(pid, wid)),
+  };
+
+  let failNextA = true;
+  const savedCalls = [];
+  const syncingStates = [];
+  const syncer = createFixedPromptSyncer({
+    storage,
+    onSyncingChange: (val) => syncingStates.push(val),
+    save: async (pid, wid, cfg) => {
+      savedCalls.push({ pid, wid, text: cfg.positive.text });
+      if (wid === 'wfA' && failNextA) {
+        throw new Error('network error');
+      }
+    },
+  });
+
+  const editedA = {
+    positive: { enabled: true, text: 'local_unsynced_edit', position: 'prefix', separator: 'comma' },
+    negative: { enabled: true, text: '', position: 'prefix', separator: 'comma' },
+  };
+  syncer.markDirty('p1', 'wfA', editedA);
+
+  // 1. PUT fails -> pending state must stay preserved in both memory and storage.
+  const ok1 = await syncer.flush('p1', 'wfA');
+  assert.equal(ok1, false);
+  assert.equal(syncer.getPending('p1', 'wfA')?.config.positive.text, 'local_unsynced_edit');
+  assert.equal(pendingMap.get('p1:wfA')?.positive.text, 'local_unsynced_edit');
+  assert.deepEqual(syncingStates, [true, false]);
+
+  // 2. User switches to wfB and edits/saves wfB -> must not clear wfA pending edit.
+  const editedB = {
+    positive: { enabled: true, text: 'wfB_text', position: 'prefix', separator: 'comma' },
+    negative: { enabled: true, text: '', position: 'prefix', separator: 'comma' },
+  };
+  syncer.markDirty('p1', 'wfB', editedB);
+  assert.equal(await syncer.flush('p1', 'wfB'), true);
+  assert.equal(syncer.getPending('p1', 'wfB'), null);
+  assert.equal(syncer.getPending('p1', 'wfA')?.config.positive.text, 'local_unsynced_edit');
+
+  // 3. User switches back to wfA and GET succeeds with stale server value -> MUST preserve local unsynced edit!
+  const staleServerA = {
+    positive: { enabled: true, text: 'stale_server_value', position: 'prefix', separator: 'comma' },
+    negative: { enabled: true, text: '', position: 'prefix', separator: 'comma' },
+  };
+  const loadedAfterSwitch = syncer.resolveLoaded('p1', 'wfA', staleServerA);
+  assert.equal(loadedAfterSwitch.hasPending, true);
+  assert.equal(loadedAfterSwitch.config.positive.text, 'local_unsynced_edit');
+  assert.equal(cachedMap.get('p1:wfA')?.positive.text, 'local_unsynced_edit');
+
+  // 4. Retry PUT now succeeds -> pending cleared, subsequent GET uses server value cleanly.
+  failNextA = false;
+  assert.equal(await syncer.flush('p1', 'wfA'), true);
+  assert.equal(syncer.getPending('p1', 'wfA'), null);
+  assert.equal(pendingMap.has('p1:wfA'), false);
+
+  const freshServerA = {
+    positive: { enabled: true, text: 'fresh_server_value', position: 'prefix', separator: 'comma' },
+    negative: { enabled: true, text: '', position: 'prefix', separator: 'comma' },
+  };
+  const loadedClean = syncer.resolveLoaded('p1', 'wfA', freshServerA);
+  assert.equal(loadedClean.hasPending, false);
+  assert.equal(loadedClean.config.positive.text, 'fresh_server_value');
+
+  // 5. Newer edit during an in-flight PUT must NOT be cleared when the older PUT completes.
+  let resolveFirstPut;
+  const concurrentSyncer = createFixedPromptSyncer({
+    storage,
+    save: () => new Promise((resolve) => {
+      if (!resolveFirstPut) {
+        resolveFirstPut = resolve;
+      } else {
+        resolve();
+      }
+    }),
+  });
+  concurrentSyncer.markDirty('p1', 'wfA', {
+    positive: { enabled: true, text: 'rev1', position: 'prefix', separator: 'comma' },
+    negative: { enabled: true, text: '', position: 'prefix', separator: 'comma' },
+  });
+  const firstFlush = concurrentSyncer.flush('p1', 'wfA');
+  concurrentSyncer.markDirty('p1', 'wfA', {
+    positive: { enabled: true, text: 'rev2', position: 'prefix', separator: 'comma' },
+    negative: { enabled: true, text: '', position: 'prefix', separator: 'comma' },
+  });
+  resolveFirstPut();
+  await firstFlush;
+  assert.equal(concurrentSyncer.getPending('p1', 'wfA')?.config.positive.text, 'rev2');
+  assert.equal(concurrentSyncer.resolveLoaded('p1', 'wfA', staleServerA).config.positive.text, 'rev2');
+  await concurrentSyncer.flush('p1', 'wfA');
+  assert.equal(concurrentSyncer.getPending('p1', 'wfA'), null);
 });
