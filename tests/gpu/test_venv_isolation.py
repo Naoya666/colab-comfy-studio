@@ -492,3 +492,32 @@ def test_domain_venv_installs_pip_shims_and_disables_colab_uv_system_python(tmp_
     assert purity["site_snapshot_ok"] is False
     assert any("comfyui_frontend_package" in p for p in (purity.get("site_diff") or {}).get("added", []))
     assert any("comfyui_frontend_package" in e for e in purity["errors"])
+
+
+def test_wait_rclone_drained_allows_transient_writeback_and_fails_closed_on_stuck_or_error(tmp_path, monkeypatch):
+    """Post-stop rclone check waits briefly for 5s write-back flush of closed logs, but fails closed on errors/timeout."""
+    mount_dir = tmp_path / "drive"
+    mount_dir.mkdir()
+    monkeypatch.setattr(runtime_worker, "_native_open_writes", lambda _m: False)
+    monkeypatch.setattr(runtime_worker, "_RCLONE_DRAIN_POLL_INTERVAL_SECONDS", 0.01)
+
+    # 1. Transient upload queue (e.g. comfyui_8188.log closed on SIGTERM) drains cleanly.
+    seq = iter(["rclone_uploads_queued:1", "rclone_uploads_in_progress:1", None])
+    monkeypatch.setattr(runtime_worker, "_local_rclone_unsynced_reason", lambda: next(seq))
+    assert runtime_worker._wait_rclone_drained(mount_dir, timeout=1.0) is None
+
+    # 2. Hard rclone error fails immediately without waiting out timeout.
+    calls = 0
+
+    def _err():
+        nonlocal calls
+        calls += 1
+        return "rclone_errored_files:1"
+
+    monkeypatch.setattr(runtime_worker, "_local_rclone_unsynced_reason", _err)
+    assert runtime_worker._wait_rclone_drained(mount_dir, timeout=1.0) == "rclone_errored_files:1"
+    assert calls == 1
+
+    # 3. Persistent upload queue past budget fails closed.
+    monkeypatch.setattr(runtime_worker, "_local_rclone_unsynced_reason", lambda: "rclone_uploads_queued:3")
+    assert runtime_worker._wait_rclone_drained(mount_dir, timeout=0.05) == "rclone_uploads_queued:3"

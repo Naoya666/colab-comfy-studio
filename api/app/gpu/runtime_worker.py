@@ -3464,6 +3464,38 @@ def _local_rclone_unsynced_reason() -> str | None:
     return None
 
 
+_RCLONE_POST_STOP_DRAIN_TIMEOUT_SECONDS = 30.0
+_RCLONE_DRAIN_POLL_INTERVAL_SECONDS = 0.5
+
+
+def _wait_rclone_drained(mount_dir: Path, *, timeout: float | None = None) -> str | None:
+    """Wait up to ``timeout`` seconds for rclone --vfs-write-back (5s) flush to drain.
+
+    Stopping ComfyUI closes its open diagnostic log on the FUSE mount, which briefly queues
+    1 small write-back upload in rclone. Wait for transient uploads to drain cleanly while
+    failing closed immediately on open external writes, rclone errors, out-of-space, or timeout.
+    """
+    budget = _RCLONE_POST_STOP_DRAIN_TIMEOUT_SECONDS if timeout is None else max(0.0, float(timeout))
+    deadline = time.monotonic() + budget
+    last_reason: str | None = None
+    while True:
+        if _native_open_writes(mount_dir):
+            return "open_writes_on_drive"
+        try:
+            rc_reason = _local_rclone_unsynced_reason()
+        except Exception as exc:
+            return f"rclone_rc_probe_failed:{type(exc).__name__}"
+        if rc_reason is None:
+            return None
+        if rc_reason.startswith(("rclone_errored_files", "rclone_out_of_space")):
+            return rc_reason
+        last_reason = rc_reason
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return last_reason
+        time.sleep(min(_RCLONE_DRAIN_POLL_INTERVAL_SECONDS, remaining))
+
+
 def _local_native_sync_check(native_root: Path) -> tuple[bool, str | None]:
     """Local loopback verification after stopping cloudflared & watchdog, before touching ComfyUI/rclone."""
     mount_dir = native_root / "drive"
@@ -3710,10 +3742,7 @@ def run_teardown(payload: dict, root: Path, *, home_dir: Path | None = None, mou
                         report={"reason": "open_writes_on_drive"},
                     )
                 if not _check_port_free(5572):
-                    try:
-                        rc_reason = _local_rclone_unsynced_reason()
-                    except Exception as exc:
-                        rc_reason = f"rclone_rc_probe_failed:{type(exc).__name__}"
+                    rc_reason = _wait_rclone_drained(mount_dir, timeout=15.0)
                     if rc_reason:
                         return _fail(
                             "native_unsynced_data",
@@ -3757,12 +3786,10 @@ def run_teardown(payload: dict, root: Path, *, home_dir: Path | None = None, mou
                 _stop_pid_verified(pid, sid, grace_seconds=10.0)
             steps_log.append("stopped_native_comfy")
 
-            # 1f) Re-check rclone upload queue right before stopping rclone
+            # 1f) Wait for rclone --vfs-write-back (5s) flush of files closed when ComfyUI exits
+            # (e.g. comfyui_8188.log), failing closed if any upload/error remains before stopping rclone.
             if not _check_port_free(5572):
-                try:
-                    rc_reason = _local_rclone_unsynced_reason()
-                except Exception as exc:
-                    rc_reason = f"rclone_rc_probe_failed:{type(exc).__name__}"
+                rc_reason = _wait_rclone_drained(native_root / "drive")
                 if rc_reason:
                     return _fail(
                         "native_unsynced_data",
