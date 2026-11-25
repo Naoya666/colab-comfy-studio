@@ -49,6 +49,7 @@ _GATEWAY_OWNED_RESPONSE_HEADERS = {
     "access-control-expose-headers",
     "access-control-max-age",
 }
+_LOOPBACK_STUDIO_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 class _NoStoreCookieJar(http.cookiejar.CookieJar):
@@ -102,8 +103,58 @@ def clean_headers(headers, *, request=False):
     connection = set(headers.get("connection", "").lower().replace(" ", "").split(","))
     return [(k, v) for k, v in headers.multi_items()
             if k.lower() not in HOP | connection
-            and not (request and (k.lower() in PRIVATE or k.lower().startswith(("cf-", "sec-websocket", "x-studio-restart-", "x-studio-model-"))))
+            and not (request and (k.lower() in PRIVATE or k.lower().startswith((
+                "cf-", "sec-fetch-", "sec-websocket", "x-studio-restart-", "x-studio-model-",
+            ))))
             and not (not request and k.lower() in _GATEWAY_OWNED_RESPONSE_HEADERS)]
+
+
+def _effective_port(parsed) -> int | None:
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None:
+        return port
+    scheme = parsed.scheme.lower()
+    if scheme == "http":
+        return 80
+    if scheme == "https":
+        return 443
+    return None
+
+
+def _is_allowed_handoff_origin(origin: str, site_url: str) -> bool:
+    clean_origin = (origin or "").strip().rstrip("/")
+    clean_site = (site_url or "").strip().rstrip("/")
+    if not clean_origin or not clean_site:
+        return False
+    parsed_origin = urlsplit(clean_origin)
+    parsed_site = urlsplit(clean_site)
+    origin_scheme = parsed_origin.scheme.lower()
+    site_scheme = parsed_site.scheme.lower()
+    if origin_scheme not in {"http", "https"} or origin_scheme != site_scheme:
+        return False
+    if (
+        not parsed_origin.hostname
+        or parsed_origin.username
+        or parsed_origin.password
+        or parsed_origin.path
+        or parsed_origin.query
+        or parsed_origin.fragment
+    ):
+        return False
+    if not parsed_site.hostname:
+        return False
+    origin_port = _effective_port(parsed_origin)
+    site_port = _effective_port(parsed_site)
+    if origin_port is None or origin_port != site_port:
+        return False
+    origin_host = parsed_origin.hostname.lower()
+    site_host = parsed_site.hostname.lower()
+    if origin_host == site_host:
+        return True
+    return site_host in _LOOPBACK_STUDIO_HOSTS and origin_host in _LOOPBACK_STUDIO_HOSTS
 
 
 def identity(headers, cookies, *, native_url: str | None = None):
@@ -212,7 +263,7 @@ class NativeGateway:
             if scope["path"] == "/_studio/session":
                 if entry != "host" or not native_url:
                     raise APIError("NOT_FOUND", "接口不存在", 404)
-                if request.method != "POST" or headers.get("origin", "").rstrip("/") != settings.site_url.rstrip("/"):
+                if request.method != "POST" or not _is_allowed_handoff_origin(headers.get("origin", ""), settings.site_url):
                     raise APIError("CSRF_ORIGIN", "请从 Studio 打开原生 ComfyUI", 403)
                 chunks: list[bytes] = []
                 total_len = 0
@@ -243,7 +294,7 @@ class NativeGateway:
                                       "iat": now, "exp": now + 43200})
                 response = RedirectResponse("/", status_code=303)
                 is_https = native_url.startswith("https://")
-                response.set_cookie("studio_native", token, max_age=43200, secure=is_https, httponly=True, samesite="strict")
+                response.set_cookie("studio_native", token, max_age=43200, secure=is_https, httponly=True, samesite="lax")
                 response.headers["Cache-Control"] = "no-store"
                 return await response(scope, receive, send)
 

@@ -148,6 +148,7 @@ def test_browser_login_cookie_writes_and_csrf(proxy, monkeypatch):
         r = c.post("/_studio/session", data={"ticket": ticket}, headers={"Origin": settings.site_url}, follow_redirects=False)
         assert r.status_code == 303 and r.headers["location"] == "/"
         assert "HttpOnly" in r.headers["set-cookie"] and "Secure" in r.headers["set-cookie"]
+        assert "samesite=lax" in r.headers["set-cookie"].lower()
         assert "internal-secret" not in r.text
         assert c.post("/prompt", json={}, headers={"Origin": settings.native_comfy_url}).status_code == 200
         assert c.post("/prompt", json={}, headers={"Origin": "https://evil.example"}).status_code == 403
@@ -2355,3 +2356,193 @@ def test_mcp_tunnel_skips_kernel_get_when_known_and_recreates_on_ws_404(monkeypa
         assert len(ws_urls) == 2 and "/api/kernels/k-new/" in ws_urls[1]
 
 
+def test_clean_headers_strips_sec_fetch_for_upstream_while_preserving_local_checks(proxy, monkeypatch):
+    cleaned = dict(
+        native_proxy.clean_headers(
+            httpx.Headers(
+                [
+                    ("Accept", "text/html"),
+                    ("User-Agent", "Mozilla/5.0"),
+                    ("Sec-CH-UA", '"Chromium";v="130"'),
+                    ("Sec-Fetch-Site", "cross-site"),
+                    ("Sec-Fetch-Mode", "navigate"),
+                    ("Sec-Fetch-Dest", "document"),
+                    ("Sec-Fetch-User", "?1"),
+                ]
+            ),
+            request=True,
+        )
+    )
+    cleaned_lower = {k.lower(): v for k, v in cleaned.items()}
+    assert "accept" in cleaned_lower and "user-agent" in cleaned_lower and "sec-ch-ua" in cleaned_lower
+    assert not any(k.startswith("sec-fetch-") for k in cleaned_lower)
+
+    upstream_headers = []
+
+    async def handler(req):
+        upstream_headers.append({k.lower(): v for k, v in req.headers.items()})
+        if "sec-fetch-site" in req.headers:
+            return httpx.Response(403)
+        return httpx.Response(200, stream=BytesStream(b"ok"), headers={"Content-Type": "text/plain"})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(
+        native_proxy.httpx,
+        "AsyncClient",
+        lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+    ws_seen_headers = []
+
+    class Upstream:
+        subprotocol = None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def send(self, _message):
+            pass
+
+    @asynccontextmanager
+    async def fake_connect(url, **kwargs):
+        ws_seen_headers.append([k.lower() for k, _ in kwargs["additional_headers"]])
+        yield Upstream()
+
+    monkeypatch.setattr(native_proxy, "connect", fake_connect)
+
+    now = int(time.time())
+    session_cookie = sign_session(
+        {"uid": "owner", "aud": settings.native_comfy_url, "purpose": "native-session", "iat": now, "exp": now + 60}
+    )
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        c.cookies.set("studio_native", session_cookie)
+        # Authenticated cross-site top-level navigation succeeds and strips Sec-Fetch-* upstream.
+        resp = c.get(
+            "/",
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-User": "?1",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.text == "ok"
+        assert upstream_headers and not any(k.startswith("sec-fetch-") for k in upstream_headers[-1])
+
+        # Local gateway CSRF check on sensitive GET control endpoints still sees raw Sec-Fetch-Site.
+        reboot = c.get("/manager/reboot", headers={"Sec-Fetch-Site": "cross-site"})
+        assert reboot.status_code == 403
+        assert reboot.json()["error"] == "CSRF_ORIGIN"
+
+        # WebSocket upstream handshake also strips Sec-Fetch-*.
+        with c.websocket_connect(
+            "wss://comfy.example.test/ws?clientId=sec-fetch-check",
+            headers={
+                "Authorization": "Bearer api-test-token",
+                "Origin": settings.native_comfy_url,
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "websocket",
+            },
+        ):
+            pass
+        assert ws_seen_headers and not any(k.startswith("sec-fetch-") for k in ws_seen_headers[-1])
+
+
+def test_handoff_allows_loopback_origin_equivalence_and_rejects_mismatches(proxy, monkeypatch):
+    def make_ticket(aud: str, idx: int) -> str:
+        now = int(time.time())
+        return sign_session(
+            {"uid": "owner", "aud": aud, "purpose": "native-handoff", "jti": f"jti-{idx}", "iat": now, "exp": now + 60}
+        )
+
+    upstream_headers = []
+
+    async def handler(req):
+        upstream_headers.append({k.lower(): v for k, v in req.headers.items()})
+        return httpx.Response(200, stream=BytesStream(b"native-ui"), headers={"Content-Type": "text/html"})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(
+        native_proxy.httpx,
+        "AsyncClient",
+        lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+    # 1. Public HTTPS site_url must NOT accept loopback origins.
+    with TestClient(proxy, base_url=settings.native_comfy_url) as c:
+        for idx, bad_origin in enumerate(
+            ("http://127.0.0.1:8788", "http://localhost:8788", "https://localhost", "https://127.0.0.1")
+        ):
+            r = c.post(
+                "/_studio/session",
+                data={"ticket": make_ticket(settings.native_comfy_url, idx)},
+                headers={"Origin": bad_origin},
+                follow_redirects=False,
+            )
+            assert r.status_code == 403, bad_origin
+
+    # 2. Local loopback site_url allows equivalent loopback hosts on the same scheme & port.
+    local_native = "http://comfy.localhost:8788"
+    monkeypatch.setattr(settings, "native_comfy_url", local_native)
+    monkeypatch.setattr(settings, "site_url", "http://localhost:8788")
+
+    with TestClient(proxy, base_url=local_native) as c:
+        for idx, ok_origin in enumerate(("http://127.0.0.1:8788", "http://localhost:8788", "http://[::1]:8788")):
+            r = c.post(
+                "/_studio/session",
+                data={"ticket": make_ticket(local_native, 100 + idx)},
+                headers={"Origin": ok_origin},
+                follow_redirects=False,
+            )
+            assert r.status_code == 303 and r.headers["location"] == "/", ok_origin
+            set_cookie = r.headers["set-cookie"]
+            assert "httponly" in set_cookie.lower()
+            assert "samesite=lax" in set_cookie.lower()
+            assert "secure" not in set_cookie.lower()
+
+        # Simulate browser following the cross-site 303 redirect with SameSite=Lax cookie + Sec-Fetch-Site: cross-site.
+        follow = c.get(
+            "/",
+            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"},
+        )
+        assert follow.status_code == 200
+        assert follow.text == "native-ui"
+        assert upstream_headers and not any(k.startswith("sec-fetch-") for k in upstream_headers[-1])
+
+        # Reject wrong port, wrong scheme, *.localhost subdomains, malformed/foreign origins.
+        for idx, bad_origin in enumerate(
+            (
+                "http://127.0.0.1:8789",
+                "https://127.0.0.1:8788",
+                "http://comfy.localhost:8788",
+                "http://evil.localhost:8788",
+                "http://127.0.0.1:8788/path",
+                "http://user@127.0.0.1:8788",
+                "http://127.0.0.1:notaport",
+                "http://evil.example:8788",
+                "null",
+                "",
+            )
+        ):
+            r = c.post(
+                "/_studio/session",
+                data={"ticket": make_ticket(local_native, 200 + idx)},
+                headers={"Origin": bad_origin},
+                follow_redirects=False,
+            )
+            assert r.status_code == 403, bad_origin
+
+    # 3. Reverse loopback direction: SITE_URL uses 127.0.0.1 and browser opens localhost.
+    monkeypatch.setattr(settings, "site_url", "http://127.0.0.1:8788")
+    with TestClient(proxy, base_url=local_native) as c:
+        r = c.post(
+            "/_studio/session",
+            data={"ticket": make_ticket(local_native, 300)},
+            headers={"Origin": "http://localhost:8788"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/"
