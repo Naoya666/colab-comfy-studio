@@ -7,6 +7,7 @@ or logs source URLs (which may contain temporary query signatures).
 from __future__ import annotations
 
 import json
+import math
 import re
 import struct
 import zlib
@@ -101,6 +102,26 @@ def normalize_workflow_url(raw_url: str) -> tuple[str, str | None, str | None]:
             return original_url, url, "已自动将 Civitai 缩略图链接切换为原图地址以尝试保留工作流元数据"
 
     return url, None, None
+
+
+def _loads_workflow_json(raw: str) -> tuple[object, bool]:
+    """Parse workflow JSON while converting non-standard NaN/Infinity or overflowing floats to None."""
+    had_non_finite = False
+
+    def _replace_constant(_token: str) -> None:
+        nonlocal had_non_finite
+        had_non_finite = True
+        return None
+
+    def _parse_float(token: str) -> float | None:
+        nonlocal had_non_finite
+        value = float(token)
+        if not math.isfinite(value):
+            had_non_finite = True
+            return None
+        return value
+
+    return json.loads(raw, parse_constant=_replace_constant, parse_float=_parse_float), had_non_finite
 
 
 def _inflate_bounded(payload: bytes, limit: int) -> bytes:
@@ -226,7 +247,7 @@ def extract_png_workflow(data: bytes) -> dict:
         if key not in texts:
             continue
         try:
-            value = json.loads(texts[key])
+            value, had_non_finite = _loads_workflow_json(texts[key])
             if not isinstance(value, dict):
                 raise ValueError("必须为 JSON 对象")
             if key == "workflow":
@@ -250,6 +271,8 @@ def extract_png_workflow(data: bytes) -> dict:
             ):
                 raise ValueError("不是 API prompt 工作流")
             result[key] = value
+            if had_non_finite:
+                result["warnings"].append(f"{key} 包含非标准数值（NaN/Infinity），已自动转换为 null")
         except ValueError as exc:
             result["warnings"].append(f"{key} 无效：{exc}")
 
@@ -431,7 +454,7 @@ def fetch_workflow_source(http: SourceHTTP, raw_url: str) -> dict:
         }
 
     try:
-        parsed = json.loads(data.decode("utf-8-sig"))
+        parsed, had_non_finite = _loads_workflow_json(data.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise ModelError("链接返回的 JSON 格式无效") from exc
     if not isinstance(parsed, dict):
@@ -442,6 +465,7 @@ def fetch_workflow_source(http: SourceHTTP, raw_url: str) -> dict:
         "source_name": source_name,
         "source_host": source_host,
         **({"note": note} if note else {}),
+        **({"warnings": ["JSON 包含非标准数值（NaN/Infinity），已自动转换为 null"]} if had_non_finite else {}),
         "payload": parsed,
     }
 

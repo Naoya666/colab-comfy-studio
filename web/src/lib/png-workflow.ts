@@ -14,6 +14,107 @@ export type ExtractedWorkflow = {
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const utf8 = (v: Uint8Array) => new TextDecoder('utf-8', { fatal: true }).decode(v);
 const ascii = (v: Uint8Array) => Array.from(v, c => String.fromCharCode(c)).join('');
+const isIdentChar = (code: number) =>
+  (code >= 48 && code <= 57)
+  || (code >= 65 && code <= 90)
+  || (code >= 97 && code <= 122)
+  || code === 95
+  || code === 36;
+
+function sanitizeNonFiniteNumbers(root: unknown): boolean {
+  if (!root || typeof root !== 'object') return false;
+  let changed = false;
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (Array.isArray(current)) {
+      for (let i = 0; i < current.length; i++) {
+        const item = current[i];
+        if (typeof item === 'number' && !Number.isFinite(item)) {
+          current[i] = null;
+          changed = true;
+        } else if (item && typeof item === 'object') {
+          stack.push(item);
+        }
+      }
+    } else if (current && typeof current === 'object') {
+      const record = current as Record<string, unknown>;
+      for (const key of Object.keys(record)) {
+        const item = record[key];
+        if (typeof item === 'number' && !Number.isFinite(item)) {
+          record[key] = null;
+          changed = true;
+        } else if (item && typeof item === 'object') {
+          stack.push(item);
+        }
+      }
+    }
+  }
+  return changed;
+}
+
+/**
+ * Parse workflow JSON while replacing non-standard Python/ComfyUI numeric
+ * literals (NaN, Infinity, -Infinity) or overflowing floats with null.
+ */
+export function parseWorkflowJson(raw: string): { value: unknown; sanitizedNonFinite: boolean } {
+  let value: unknown;
+  let sanitizedNonFinite = false;
+  try {
+    value = JSON.parse(raw);
+  } catch (initialError) {
+    const parts: string[] = [];
+    let lastFlush = 0;
+    let i = 0;
+    let changed = false;
+    const len = raw.length;
+    while (i < len) {
+      const ch = raw[i];
+      if (ch === '"') {
+        i += 1;
+        while (i < len) {
+          const c = raw[i];
+          if (c === '\\') {
+            i += 2;
+          } else if (c === '"') {
+            i += 1;
+            break;
+          } else {
+            i += 1;
+          }
+        }
+        continue;
+      }
+      const prevOk = i === 0 || !isIdentChar(raw.charCodeAt(i - 1));
+      if (prevOk) {
+        let matchLen = 0;
+        if (raw.startsWith('NaN', i)) matchLen = 3;
+        else if (raw.startsWith('Infinity', i)) matchLen = 8;
+        else if (raw.startsWith('-Infinity', i)) matchLen = 9;
+        if (matchLen > 0) {
+          const after = i + matchLen;
+          const nextOk = after >= len || !isIdentChar(raw.charCodeAt(after));
+          if (nextOk) {
+            parts.push(raw.slice(lastFlush, i), 'null');
+            lastFlush = after;
+            i = after;
+            changed = true;
+            continue;
+          }
+        }
+      }
+      i += 1;
+    }
+    if (!changed) throw initialError;
+    parts.push(raw.slice(lastFlush));
+    value = JSON.parse(parts.join(''));
+    sanitizedNonFinite = true;
+  }
+  if (sanitizeNonFiniteNumbers(value)) {
+    sanitizedNonFinite = true;
+  }
+  return { value, sanitizedNonFinite };
+}
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
@@ -111,12 +212,13 @@ export async function extractPng(bytes: Uint8Array): Promise<ExtractedWorkflow> 
   for (const key of ['workflow', 'prompt'] as const) {
     if (!texts.has(key)) continue;
     try {
-      const value: unknown = JSON.parse(texts.get(key)!);
+      const { value, sanitizedNonFinite } = parseWorkflowJson(texts.get(key)!);
       if (!object(value)) throw new Error('必须为 JSON 对象');
       if (key === 'workflow') {
         if (!Array.isArray(value.nodes) || !value.nodes.every(n => object(n) && (typeof n.id === 'number' || typeof n.id === 'string') && typeof n.type === 'string') || (value.links !== undefined && !Array.isArray(value.links))) throw new Error('不是可视化节点工作流');
       } else if (!Object.keys(value).length || !Object.values(value).every(n => object(n) && typeof n.class_type === 'string' && object(n.inputs))) throw new Error('不是 API prompt 工作流');
       result[key] = value;
+      if (sanitizedNonFinite) result.warnings.push(`${key} 包含非标准数值（NaN/Infinity），已自动转换为 null`);
     } catch (e) { result.warnings.push(`${key} 无效：${e instanceof Error ? e.message : 'JSON 格式错误'}`); }
   }
   if (!result.workflow && !result.prompt) {

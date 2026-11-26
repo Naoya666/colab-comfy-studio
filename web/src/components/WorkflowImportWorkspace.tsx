@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Copy, Download, Globe, Image as ImageIcon, RefreshCw, Upload, X } from 'lucide-react';
 import { ApiError, apiMessage, fetchWorkflowFromUrl, type WorkflowVersionConflictDetail } from '../lib/gpu-api';
-import { extractPng, MAX_IMAGE, type ExtractedWorkflow } from '../lib/png-workflow';
+import { extractPng, MAX_IMAGE, parseWorkflowJson, type ExtractedWorkflow } from '../lib/png-workflow';
 import {
   applyBundleIdentityOverride,
   classifyWorkflowJson,
@@ -173,7 +173,7 @@ export function WorkflowImportWorkspace({
       const text = await file.text();
       let parsed: unknown;
       try {
-        parsed = JSON.parse(text);
+        parsed = parseWorkflowJson(text).value;
       } catch {
         throw new Error('JSON 格式错误，请检查文件内容');
       }
@@ -196,7 +196,7 @@ export function WorkflowImportWorkspace({
     try {
       let parsed: unknown;
       try {
-        parsed = JSON.parse(text);
+        parsed = parseWorkflowJson(text).value;
       } catch {
         setError('JSON 格式错误，请检查粘贴内容');
         return false;

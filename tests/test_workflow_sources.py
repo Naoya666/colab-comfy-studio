@@ -426,3 +426,103 @@ def test_http_workflows_fetch_url_conservative_policy_and_png_roundtrip(http_cli
     app.dependency_overrides[current_user] = lambda: {"id": "wf-url-owner", "role": "user"}
     r_forbidden = c.post("/api/gpu/workflows/fetch-url", json={"url": "https://files.example.com/bundle.json"})
     assert r_forbidden.status_code == 403
+
+
+def test_non_finite_floats_in_png_and_remote_json_are_sanitized_for_json_response(http_client, monkeypatch):
+    from app.gpu import model_dependencies as deps
+
+    c, _repo = http_client
+
+    raw_visual = (
+        '{"nodes":['
+        '{"id":1,"type":"UNETLoader","pos":[NaN,-Infinity],"size":[1e500,200],'
+        '"widgets_values":["flux_dev_fp8.safetensors","fp8_e4m3fn"],"title":"keep NaN Infinity text"},'
+        '{"id":2,"type":"LoraLoader","widgets_values":["style.safetensors",NaN,Infinity]}'
+        '],"links":[]}'
+    )
+    raw_prompt = (
+        '{"1":{"class_type":"UNETLoader","inputs":{"unet_name":"flux_dev_fp8.safetensors","weight_dtype":"fp8_e4m3fn","note":"literal NaN"}},'
+        '"2":{"class_type":"LoraLoader","inputs":{"lora_name":"style.safetensors","strength_model":NaN,"strength_clip":-Infinity}},'
+        '"3":{"class_type":"Power Lora Loader (rgthree)","inputs":{"lora_1":{"on":true,"lora":"detail.safetensors","strength":NaN,"strengthTwo":0.5}}}}'
+    )
+    nan_png = _make_png(_png_text("workflow", raw_visual), _png_text("prompt", raw_prompt))
+
+    # 1. Pure-Python PNG extraction replaces NaN/Infinity/1e500 with None while keeping strings intact
+    extracted = extract_png_workflow(nan_png)
+    assert extracted["workflow"]["nodes"][0]["pos"] == [None, None]
+    assert extracted["workflow"]["nodes"][0]["size"] == [None, 200]
+    assert extracted["workflow"]["nodes"][0]["title"] == "keep NaN Infinity text"
+    assert extracted["prompt"]["1"]["inputs"]["note"] == "literal NaN"
+    assert extracted["prompt"]["2"]["inputs"]["strength_model"] is None
+    assert extracted["prompt"]["2"]["inputs"]["strength_clip"] is None
+    assert extracted["prompt"]["3"]["inputs"]["lora_1"]["strength"] is None
+    assert extracted["prompt"]["3"]["inputs"]["lora_1"]["strengthTwo"] == 0.5
+    assert any("workflow 包含非标准数值" in w for w in extracted["warnings"])
+    assert any("prompt 包含非标准数值" in w for w in extracted["warnings"])
+    json.dumps(extracted, allow_nan=False)
+
+    # 2. Direct scan() on unsanitized in-memory Python floats still never emits non-finite strengths
+    direct_scanned = deps.scan({
+        "api_graph": {
+            "2": {
+                "class_type": "LoraLoader",
+                "inputs": {"lora_name": "style.safetensors", "strength_model": float("nan"), "strength_clip": float("inf")},
+            },
+            "3": {
+                "class_type": "Power Lora Loader (rgthree)",
+                "inputs": {"lora_1": {"on": True, "lora": "detail.safetensors", "strength": float("nan"), "strengthTwo": 0.5}},
+            },
+        }
+    })
+    json.dumps(direct_scanned, allow_nan=False)
+    by_node = {d["node_id"]: d for d in direct_scanned}
+    assert by_node["2"]["strengths"] == {}
+    assert by_node["2"]["required"] is True
+    assert by_node["3"]["strengths"] == {"lora_1.strengthTwo": 0.5}
+    assert by_node["3"]["required"] is True
+
+    # 3. HTTP endpoints return 200 JSONResponse (allow_nan=False) for both remote PNG and remote JSON
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/nan.png":
+            return httpx.Response(200, content=nan_png, headers={"content-type": "image/png"})
+        if request.url.path == "/nan.json":
+            return httpx.Response(200, content=raw_visual.encode("utf-8"), headers={"content-type": "application/json"})
+        return httpx.Response(404)
+
+    monkeypatch.setattr(
+        "app.gpu.model_library.SourceHTTP",
+        lambda tokens=None: _mock_http(handler, tokens=tokens),
+    )
+
+    r_fetch = c.post("/api/gpu/workflows/fetch-url", json={"url": "https://cdn.example.com/nan.png"})
+    assert r_fetch.status_code == 200, r_fetch.text
+    fetch_ext = r_fetch.json()["data"]["extraction"]
+    assert fetch_ext["workflow"]["nodes"][0]["pos"] == [None, None]
+    assert fetch_ext["prompt"]["2"]["inputs"]["strength_model"] is None
+
+    r_import = c.post(
+        "/api/gpu/workflows/import",
+        json={
+            "workflow_key": "nan-png-demo",
+            "image_extraction": {
+                "workflow": fetch_ext["workflow"],
+                "prompt": fetch_ext["prompt"],
+                "metadata": fetch_ext["metadata"],
+            },
+        },
+    )
+    assert r_import.status_code == 201, r_import.text
+    assert r_import.json()["data"]["state"] == "draft"
+
+    r_inspect_png = c.post("/api/gpu/model-library/inspect-workflow", json={"url": "https://cdn.example.com/nan.png"})
+    assert r_inspect_png.status_code == 200, r_inspect_png.text
+    inspect_png = r_inspect_png.json()["data"]
+    refs_png = {d["reference"] for d in inspect_png["dependencies"]}
+    assert {"flux_dev_fp8.safetensors", "style.safetensors", "detail.safetensors"}.issubset(refs_png)
+    assert any("非标准数值" in w for w in inspect_png["warnings"])
+
+    r_inspect_json = c.post("/api/gpu/model-library/inspect-workflow", json={"url": "https://cdn.example.com/nan.json"})
+    assert r_inspect_json.status_code == 200, r_inspect_json.text
+    inspect_json = r_inspect_json.json()["data"]
+    assert any(d["reference"] == "flux_dev_fp8.safetensors" for d in inspect_json["dependencies"])
+    assert any("非标准数值" in w for w in inspect_json["warnings"])

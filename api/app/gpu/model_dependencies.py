@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 from pathlib import PurePosixPath
@@ -464,6 +465,10 @@ def _apply_hint_metadata(dep, candidates):
         dep["expected_size"] = next(iter(sizes))
 
 
+def _is_finite_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def scan(workflow, *, node_types=None, include_hints=False):
     graph = workflow.get("api_graph") or (workflow.get("image_extraction") or {}).get("prompt")
     visual = (workflow.get("image_extraction") or {}).get("workflow") or workflow.get("editable_graph") or {}
@@ -509,7 +514,7 @@ def scan(workflow, *, node_types=None, include_hints=False):
             for field, value in inputs.items():
                 if re.fullmatch(r"lora_\d+", field) and isinstance(value, dict):
                     strengths = {f"{field}.{key}": value[key] for key in ("strength", "strengthTwo")
-                                 if isinstance(value.get(key), (int, float))}
+                                 if _is_finite_number(value.get(key))}
                     active = value.get("on") is not False and any(v != 0 for v in strengths.values())
                     append(node_id, node_type, f"{field}.lora", value.get("lora"), "loras", not bypassed and active,
                            bypassed=bypassed, enabled_field=f"{field}.on", strengths=strengths)
@@ -517,15 +522,17 @@ def scan(workflow, *, node_types=None, include_hints=False):
         rule = mapping.get(node_type, {})
         for field, category in rule.items():
             required = not bypassed
+            lora_strengths = {}
             if category == "loras":
                 strength_keys = ("strength_model", "strength_clip")
                 if node_type == "Lora Loader Stack (rgthree)" and re.fullmatch(r"lora_\d+", field):
                     strength_keys = (f"strength_{field.split('_', 1)[1]}",)
-                strengths = [inputs[k] for k in strength_keys if k in inputs]
-                if strengths and all(isinstance(v, (int, float)) and v == 0 for v in strengths):
+                raw_strengths = [inputs[k] for k in strength_keys if k in inputs]
+                if raw_strengths and all(_is_finite_number(v) and v == 0 for v in raw_strengths):
                     required = False
+                lora_strengths = {k: inputs[k] for k in strength_keys if _is_finite_number(inputs.get(k))}
             append(node_id, node_type, field, inputs.get(field), category, required,
-                   bypassed=bypassed, strengths={k: v for k, v in inputs.items() if k in (strength_keys if category == "loras" else ())})
+                   bypassed=bypassed, strengths=lora_strengths)
         if node_type in {"CLIPTextEncode", "CLIPTextEncodeSDXL"}:
             for field in ("text", "text_g", "text_l"):
                 if isinstance(inputs.get(field), str):

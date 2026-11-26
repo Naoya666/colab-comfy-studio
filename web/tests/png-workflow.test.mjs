@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import { transform } from 'esbuild';
 const { code } = await transform(readFileSync('src/lib/png-workflow.ts', 'utf8'), { loader: 'ts', format: 'esm' });
-const { extractPng, crc32 } = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'));
+const { extractPng, parseWorkflowJson, crc32 } = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'));
 const workflow = { nodes: [{ id: 1, type: 'CustomLoader', widgets_values: ['模型.safetensors'] }], links: [] };
 const prompt = { '1': { class_type: 'CustomLoader', inputs: { ckpt_name: '模型.safetensors' } } };
 function chunk(kind, payload) {
@@ -59,3 +59,39 @@ test('decompression bomb and oversized image are bounded', async () => {
   await assert.rejects(extractPng(new Uint8Array(32 * 1024 * 1024 + 1)), /32 MiB/);
 });
 test('duplicate metadata is ambiguous', async () => await assert.rejects(extractPng(png(text('prompt', prompt), text('prompt', prompt))), /重复/));
+test('parseWorkflowJson sanitizes non-standard NaN/Infinity/overflowing floats while keeping strings intact', () => {
+  const raw = '{"a":NaN,"b":Infinity,"c":-Infinity,"d":1e500,"e":-1e500,"str":"keep \\"NaN\\" and Infinity -Infinity","arr":[NaN,1,-Infinity]}';
+  const { value, sanitizedNonFinite } = parseWorkflowJson(raw);
+  assert.equal(sanitizedNonFinite, true);
+  assert.deepEqual(value, {
+    a: null,
+    b: null,
+    c: null,
+    d: null,
+    e: null,
+    str: 'keep "NaN" and Infinity -Infinity',
+    arr: [null, 1, null],
+  });
+
+  const clean = parseWorkflowJson('{"str":"NaN Infinity -Infinity","n":1.5}');
+  assert.equal(clean.sanitizedNonFinite, false);
+  assert.deepEqual(clean.value, { str: 'NaN Infinity -Infinity', n: 1.5 });
+
+  for (const bad of ['{NaN: 1}', '{"a": NaNfoo}', '{"a": -NaN}', '{"a": +Infinity}', '{"a": 1-Infinity}']) {
+    assert.throws(() => parseWorkflowJson(bad), SyntaxError);
+  }
+});
+test('extractPng tolerates ComfyUI PNG metadata containing NaN/Infinity and emits warnings', async () => {
+  const rawWf = '{"nodes":[{"id":1,"type":"CustomLoader","pos":[NaN,-Infinity],"size":[1e500,100],"widgets_values":["模型.safetensors"],"title":"literal NaN"}],"links":[]}';
+  const rawPrompt = '{"1":{"class_type":"CustomLoader","inputs":{"ckpt_name":"模型.safetensors","cfg":NaN,"strength":Infinity,"note":"keep Infinity"}}}';
+  const result = await extractPng(png(text('workflow', rawWf), text('prompt', rawPrompt)));
+  assert.deepEqual(result.workflow.nodes[0].pos, [null, null]);
+  assert.deepEqual(result.workflow.nodes[0].size, [null, 100]);
+  assert.equal(result.workflow.nodes[0].title, 'literal NaN');
+  assert.equal(result.prompt['1'].inputs.cfg, null);
+  assert.equal(result.prompt['1'].inputs.strength, null);
+  assert.equal(result.prompt['1'].inputs.note, 'keep Infinity');
+  assert.deepEqual(result.model_files, ['模型.safetensors']);
+  assert.ok(result.warnings.some((w) => w.includes('workflow 包含非标准数值')));
+  assert.ok(result.warnings.some((w) => w.includes('prompt 包含非标准数值')));
+});

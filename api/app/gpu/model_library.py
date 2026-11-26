@@ -368,6 +368,7 @@ class ModelLibrary:
                     "prompt": extracted.get("prompt"),
                 }
             else:
+                extra_warnings = list(fetched.get("warnings") or [])
                 inspect_payload = fetched["payload"]
             result = deps.inspect_workflow(inspect_payload, self.models())
             if extra_warnings:

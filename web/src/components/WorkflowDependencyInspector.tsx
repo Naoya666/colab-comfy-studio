@@ -31,7 +31,7 @@ import {
   type StoredInspectorState,
   type WorkflowInspectResult,
 } from '../lib/model-library';
-import { extractPng, MAX_IMAGE } from '../lib/png-workflow';
+import { extractPng, MAX_IMAGE, parseWorkflowJson } from '../lib/png-workflow';
 import { validateWorkflowUrlInput } from '../lib/workflow-import';
 import { DependencyCard } from './ModelDependencyItem';
 import { WorkflowSourceDropzone } from './WorkflowSourceDropzone';
@@ -536,11 +536,15 @@ export function WorkflowDependencyInspector({
         return;
       }
       const text = await file.text();
-      const parsed: unknown = JSON.parse(text);
+      const { value: parsed, sanitizedNonFinite } = parseWorkflowJson(text);
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error('JSON 根节点必须是对象');
       }
-      await runInspect(parsed as Record<string, unknown>, file.name);
+      await runInspect(
+        parsed as Record<string, unknown>,
+        file.name,
+        sanitizedNonFinite ? ['JSON 包含非标准数值（NaN/Infinity），已自动转换为 null'] : [],
+      );
     } catch (cause) {
       setError(cause instanceof SyntaxError ? 'JSON 格式错误，请检查文件内容' : apiMessage(cause));
     }
@@ -550,11 +554,15 @@ export function WorkflowDependencyInspector({
     if (!text.trim()) return false;
     setError('');
     try {
-      const parsed: unknown = JSON.parse(text);
+      const { value: parsed, sanitizedNonFinite } = parseWorkflowJson(text);
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error('JSON 根节点必须是对象');
       }
-      return await runInspect(parsed as Record<string, unknown>, '粘贴的工作流 JSON');
+      return await runInspect(
+        parsed as Record<string, unknown>,
+        '粘贴的工作流 JSON',
+        sanitizedNonFinite ? ['JSON 包含非标准数值（NaN/Infinity），已自动转换为 null'] : [],
+      );
     } catch (cause) {
       setError(cause instanceof SyntaxError ? 'JSON 格式错误，请检查粘贴内容' : apiMessage(cause));
       return false;
