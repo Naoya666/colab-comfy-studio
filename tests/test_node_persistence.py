@@ -899,3 +899,81 @@ async def test_install_runs_boot_scan_asynchronously_without_blocking_import(set
     with pytest.raises(asyncio.CancelledError):
         await tasks[0]
 
+
+def test_pip_check_ignores_unrelated_system_packages_but_fails_closed_for_venv_and_protected(tmp_path, monkeypatch):
+    venv = tmp_path / 'venv'
+    vsite = venv / 'lib' / 'python3.13' / 'site-packages'
+    vsite.mkdir(parents=True)
+    for dist_name, version in (('ultralytics', '8.3.162'), ('pillow', '13.0.0'), ('numpy', '2.5.5')):
+        info = vsite / f'{dist_name}-{version}.dist-info'
+        info.mkdir()
+        (info / 'METADATA').write_text(f'Metadata-Version: 2.1\nName: {dist_name}\nVersion: {version}\n')
+
+    # 1. System-only Colab conflicts (not in venv, not protected) are ignored
+    monkeypatch.setattr(
+        p.subprocess,
+        'run',
+        lambda *a, **kw: SimpleNamespace(
+            returncode=1,
+            stdout=(
+                'holidays 0.108 has requirement python-dateutil<3,>=2.9.0.post0, but you have python-dateutil 4.0.0.\n'
+                'gradio 6.31.0 has requirement pillow<13.0,>=8.0, but you have pillow 13.0.0.\n'
+                'numba 0.64.0 has requirement numpy<2.5,>=1.22, but you have numpy 2.5.5.\n'
+            ),
+            stderr='',
+        ),
+    )
+    ok, detail = p._run_pip_check(str(venv / 'bin' / 'python'), {}, venv)
+    assert ok is True and detail == ''
+
+    # 2. Conflict on a package installed in the domain venv MUST fail
+    monkeypatch.setattr(
+        p.subprocess,
+        'run',
+        lambda *a, **kw: SimpleNamespace(
+            returncode=1,
+            stdout=(
+                'holidays 0.108 has requirement python-dateutil<3, but you have python-dateutil 4.0.0.\n'
+                'ultralytics 8.3.162 requires opencv-python, which is not installed.\n'
+            ),
+            stderr='',
+        ),
+    )
+    ok, detail = p._run_pip_check(str(venv / 'bin' / 'python'), {}, venv)
+    assert ok is False and 'ultralytics' in detail and 'holidays' not in detail
+
+    # 3. Conflict on a protected GPU package MUST fail even when installed in system site-packages
+    monkeypatch.setattr(
+        p.subprocess,
+        'run',
+        lambda *a, **kw: SimpleNamespace(
+            returncode=1,
+            stdout='torch 2.14.1 has requirement sympy>=1.13, but you have sympy 1.12.\n',
+            stderr='',
+        ),
+    )
+    ok, detail = p._run_pip_check(str(venv / 'bin' / 'python'), {}, venv)
+    assert ok is False and 'torch' in detail
+
+    # 4. Unparseable error / traceback MUST fail closed
+    monkeypatch.setattr(
+        p.subprocess,
+        'run',
+        lambda *a, **kw: SimpleNamespace(returncode=1, stdout='', stderr='Traceback (most recent call last):\nRuntimeError: boom\n'),
+    )
+    ok, detail = p._run_pip_check(str(venv / 'bin' / 'python'), {}, venv)
+    assert ok is False and 'Traceback' in detail
+
+    # 5. Without venv_dir, fail closed even for system packages
+    monkeypatch.setattr(
+        p.subprocess,
+        'run',
+        lambda *a, **kw: SimpleNamespace(
+            returncode=1,
+            stdout='holidays 0.108 has requirement python-dateutil<3, but you have python-dateutil 4.0.0.\n',
+            stderr='',
+        ),
+    )
+    ok, detail = p._run_pip_check('python', {}, None)
+    assert ok is False and 'holidays' in detail
+

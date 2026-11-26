@@ -176,7 +176,7 @@ def dependencies(body, explicit, *, visual=False, trusted=False, node_types=None
     for dep in deps.scan({"api_graph": selected, "editable_graph": visual_metadata}, node_types=node_types):
         if dep.get("bypassed") or dep["status"] == "manual_review":
             continue
-        if dep.get("enabled_field") and not dep.get("required", True):
+        if (dep.get("enabled_field") or dep.get("disabled_by_switch")) and not dep.get("required", True):
             continue
         if dep["node_type"] == "VAELoader" and dep["reference"] in {
             "pixel_space", "taesd", "taesdxl", "taesd3", "taef1", "taef2", "taeqi2_1",

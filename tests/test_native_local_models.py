@@ -852,3 +852,78 @@ async def test_drive_workflows_list_save_delete_and_prepare_by_ref(local, monkey
     }))
     assert ok_del.status == 200
     assert not (tmp_path / "drive/native-comfy/warmup/tavern_api.json").exists()
+
+
+def test_cr_lora_stack_dependencies_scanned_in_api_and_visual_modes():
+    from app.gpu import model_dependencies as deps
+
+    prompt = {
+        "83": {
+            "class_type": "CR LoRA Stack",
+            "inputs": {
+                "switch_1": "On",
+                "lora_name_1": "style_a.safetensors",
+                "model_weight_1": 0.63,
+                "clip_weight_1": 0.45,
+                "switch_2": "Off",
+                "lora_name_2": "switched_off.safetensors",
+                "model_weight_2": 1.0,
+                "clip_weight_2": 1.0,
+                "switch_3": "On",
+                "lora_name_3": "zero_weight.safetensors",
+                "model_weight_3": 0.0,
+                "clip_weight_3": 0.0,
+            },
+        },
+        "80": {
+            "class_type": "CR LoRA Stack",
+            "inputs": {
+                "lora_stack": ["83", 0],
+                "switch_1": "On",
+                "lora_name_1": "style_b.safetensors",
+                "model_weight_1": 0.35,
+                "clip_weight_1": 0.16,
+                "switch_2": "Off",
+                "lora_name_2": "None",
+                "model_weight_2": 0.5,
+                "clip_weight_2": 0.5,
+                "switch_3": "Off",
+                "lora_name_3": "None",
+                "model_weight_3": 0.2,
+                "clip_weight_3": 0.2,
+            },
+        },
+    }
+    found = {(d["node_id"], d["field"]): d for d in deps.scan({"api_graph": prompt})}
+    assert set(found) == {("83", "lora_name_1"), ("83", "lora_name_2"), ("83", "lora_name_3"), ("80", "lora_name_1")}
+    assert found[("83", "lora_name_1")]["required"] is True
+    assert found[("83", "lora_name_1")]["strengths"] == {"model_weight_1": 0.63, "clip_weight_1": 0.45}
+    assert found[("83", "lora_name_2")]["required"] is False and found[("83", "lora_name_2")]["disabled_by_switch"] is True
+    assert found[("83", "lora_name_3")]["required"] is False
+    assert found[("80", "lora_name_1")]["required"] is True
+
+    # Native local-mode preparation includes active slots and skips explicitly switched-off slots
+    prepared = list(native_models.dependencies({"prompt": prompt}, []))
+    prepared_names = {(item["category"], item["name"]) for item in prepared}
+    assert ("loras", "style_a.safetensors") in prepared_names
+    assert ("loras", "style_b.safetensors") in prepared_names
+    assert ("loras", "switched_off.safetensors") not in prepared_names
+
+    # Visual workflow widget-array decoding works without object_info
+    visual = {
+        "nodes": [{
+            "id": 83,
+            "type": "CR LoRA Stack",
+            "mode": 0,
+            "widgets_values": [
+                "On", "style_a.safetensors", 0.63, 0.45,
+                "Off", "switched_off.safetensors", 1.0, 1.0,
+                "On", "None", 0.5, 0.42,
+            ],
+        }],
+        "links": [],
+    }
+    vis_found = {d["field"]: d for d in deps.scan({"editable_graph": visual})}
+    assert set(vis_found) == {"lora_name_1", "lora_name_2"}
+    assert vis_found["lora_name_1"]["required"] is True
+    assert vis_found["lora_name_2"]["required"] is False and vis_found["lora_name_2"]["disabled_by_switch"] is True

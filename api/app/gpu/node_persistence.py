@@ -731,6 +731,71 @@ def _resolve_manager_cli(comfy, venv_dir: Path | None = None):
     return manager_cli(comfy)
 
 
+_PIP_CHECK_CONFLICT_RE = re.compile(
+    r'^([A-Za-z0-9][A-Za-z0-9._-]*)\s+\S+\s+(?:has requirement\b|requires\b|is not supported\b)'
+)
+
+
+def _norm_dist_name(name: str) -> str:
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def _is_protected_dist(name: str) -> bool:
+    norm = _norm_dist_name(name)
+    return norm in {'torch', 'torchvision', 'torchaudio', 'triton'} or norm.startswith('nvidia-')
+
+
+def _venv_dist_names(venv_dir: Path | None) -> set[str]:
+    from importlib.metadata import distributions
+    vsites = _venv_site_candidates(venv_dir)
+    if not vsites:
+        return set()
+    names: set[str] = set()
+    for dist in distributions(path=[str(s) for s in vsites]):
+        raw = dist.metadata.get('Name') if dist.metadata else None
+        if isinstance(raw, str) and raw.strip():
+            names.add(_norm_dist_name(raw.strip()))
+    return names
+
+
+def _run_pip_check(py_bin: str, env: dict, venv_dir: Path | None, *, timeout: int | None = None) -> tuple[bool, str]:
+    kwargs = {'env': env, 'capture_output': True, 'text': True}
+    if timeout is not None:
+        kwargs['timeout'] = timeout
+    check = subprocess.run([py_bin, '-m', 'pip', 'check'], **kwargs)
+    if check.returncode == 0:
+        return True, ''
+    raw_output = (check.stdout or '') + (check.stderr or '')
+    venv_pkgs = _venv_dist_names(venv_dir)
+    if not venv_pkgs:
+        return False, raw_output
+    fatal: list[str] = []
+    ignored_system: list[str] = []
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = _PIP_CHECK_CONFLICT_RE.match(stripped)
+        if not match:
+            fatal.append(stripped)
+            continue
+        pkg = _norm_dist_name(match.group(1))
+        if pkg in venv_pkgs or _is_protected_dist(pkg):
+            fatal.append(stripped)
+        else:
+            ignored_system.append(stripped)
+    if fatal:
+        return False, '\n'.join(fatal)
+    if not ignored_system:
+        return False, raw_output or 'pip check exited non-zero without diagnostics'
+    print(
+        f'[studio-native] Ignored {len(ignored_system)} unrelated system-site pip check conflict(s): '
+        + '; '.join(ignored_system[:5]),
+        flush=True,
+    )
+    return True, ''
+
+
 def protect_environment(root):
     """Pip constraints inherited by Manager and ordinary install.py subprocesses."""
     from importlib.metadata import distributions
@@ -1157,10 +1222,10 @@ class Persistence:
             for entry in vsite.iterdir():
                 if _is_protected_site_top_name(entry.name, vsite):
                     raise RuntimeError(f'Plugin installer overrode protected package in venv: {entry.name}')
-        check = subprocess.run([py_bin, '-m', 'pip', 'check'], env=env, capture_output=True, text=True)
-        if check.returncode:
+        pip_ok, pip_detail = _run_pip_check(py_bin, env, vdir)
+        if not pip_ok:
             error = {'plugins': [p['path'] for p in plugins], 'error': 'Python dependency compatibility check failed',
-                     'detail': SECRET.sub(b'[redacted]', (check.stdout + check.stderr).encode()).decode(errors='replace')[-3000:]}
+                     'detail': SECRET.sub(b'[redacted]', pip_detail.encode()).decode(errors='replace')[-3000:]}
             atomic(self.root / 'plugin-errors.json', error)
             raise RuntimeError(error['error'] + ': ' + error['detail'])
         atomic(self.root / 'plugin-dependencies.json', {'key': key})
@@ -1793,9 +1858,9 @@ def try_restore_env_cache(
             vbin = str(resolved_venv / 'bin')
             parts = [p for p in check_env.get('PATH', '').split(os.pathsep) if p and p != vbin]
             check_env['PATH'] = os.pathsep.join([vbin, *parts])
-        check = subprocess.run([py_bin, '-m', 'pip', 'check'], env=check_env, capture_output=True, text=True, timeout=60)
-        if check.returncode != 0:
-            raise RuntimeError('env-cache failed pip check')
+        pip_ok, pip_detail = _run_pip_check(py_bin, check_env, resolved_venv, timeout=60)
+        if not pip_ok:
+            raise RuntimeError('env-cache failed pip check: ' + pip_detail[:500])
         print(
             f'[studio-native] Restored native env-cache: {key} '
             f'({len(installed_top)} site entries, {len(installed_overlay)} overlay files)',
