@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .model_library import external_source
-from .model_sources import SHA, ModelError, https_url, normalize_hf_repo_type
+from .model_sources import CIVITAI_HOSTS, SHA, ModelError, https_url, normalize_hf_repo_type
 
 _SEMVER_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
@@ -58,7 +58,7 @@ def _is_civitai_url(url: str | None) -> bool:
     if not url:
         return False
     host = (urlsplit(url).hostname or "").lower()
-    return host == "civitai.com" or host.endswith(".civitai.com")
+    return any(host == domain or host.endswith(f".{domain}") for domain in CIVITAI_HOSTS)
 
 
 def _civitai_url_from_identity(identity: dict[str, Any] | None) -> str | None:

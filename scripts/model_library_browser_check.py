@@ -52,7 +52,7 @@ async def main():
         await page.screenshot(path='/tmp/phase3-model-library-mobile.png',full_page=True)
         assert not errors, errors
         assert not any('/api/gpu/jobs' in url and method == 'POST' for method,url in calls)
-        assert not any('googleapis.com' in url or 'civitai.com' in url or 'huggingface.co' in url for _,url in calls)
+        assert not any('googleapis.com' in url or 'civitai.com' in url or 'civitai.red' in url or 'huggingface.co' in url for _,url in calls)
         print(json.dumps({"catalog_add_search_edit":True,"queue_cancel":True,"masked_credentials":True,
                           "mobile_desktop_no_overflow":True,"real_provider_requests":0,"page_errors":errors}))
         await browser.close()

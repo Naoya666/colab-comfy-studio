@@ -118,10 +118,11 @@ async def test_external_priority_and_hash_checked_drive_fallback(local, tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["civitai.com", "civitai.red"])
 @pytest.mark.parametrize("external_ok", [True, False])
-async def test_catalogued_civitai_upscale_uses_external_source_or_drive(local, tmp_path, external_ok):
+async def test_catalogued_civitai_upscale_uses_external_source_or_drive(local, tmp_path, host, external_ok):
     name = "example.pth"
-    url = "https://civitai.com/api/download/models/123"
+    url = f"https://{host}/api/download/models/123"
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("archive/data.pkl", b"\x80\x02ctorch\nFloatStorage\n.")
@@ -133,17 +134,19 @@ async def test_catalogued_civitai_upscale_uses_external_source_or_drive(local, t
         "drive_file_id": "known-file-id", "drive_account_id": "drive-account",
     }
     catalog = native.local_catalog(SimpleNamespace(list=lambda *_: [model]), "owner")
+    assert catalog[0]["source"]["kind"] == "civitai"
 
     def handler(req):
-        host = req.headers["host"]
-        if host == "civitai.com":
+        req_host = req.headers["host"]
+        if req_host == host:
+            assert req.headers["authorization"] == "Bearer civ-key"
             return media(weight) if external_ok else httpx.Response(403)
-        if host == "oauth2.googleapis.com":
+        if req_host == "oauth2.googleapis.com":
             return httpx.Response(200, json={"access_token": "drive-token", "expires_in": 3600})
-        assert host == "www.googleapis.com"
+        assert req_host == "www.googleapis.com"
         return media(weight)
 
-    models = local(handler, catalog, drive_auth={"drive-account": {}})
+    models = local(handler, catalog, drive_auth={"drive-account": {}}, tokens={"civitai": "civ-key"})
     prompt = {"1": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": name}}}
     [result] = await models.submit({"prompt": prompt})[1]
     assert result["state"] == "ready"

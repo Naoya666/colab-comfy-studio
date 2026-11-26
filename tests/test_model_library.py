@@ -9,7 +9,15 @@ from app.config import settings
 from app.db import Store
 from app.gpu import model_dependencies as deps
 from app.gpu.model_library import ModelLibrary, ModelTransfer, transfer_lock
-from app.gpu.model_sources import ModelError, SourceHTTP, Sources, filename, https_url, public_addresses
+from app.gpu.model_sources import (
+    ModelError,
+    SourceHTTP,
+    Sources,
+    filename,
+    https_url,
+    public_addresses,
+    validate_controlled_upscale_source,
+)
 from app.gpu.registry import Registry
 from app.gpu.repository import Repository
 from app.gpu.runtime_worker import _restore_weights
@@ -1195,3 +1203,108 @@ def test_search_with_warnings_tolerates_single_upstream_failure():
     both_down = Sources(source_http(lambda _r: httpx.Response(503)))
     with pytest.raises(ModelError):
         both_down.search_with_warnings("krea2")
+
+
+def test_civitai_red_resolution_auth_redirect_file_filter_and_hash_fallback(caplog):
+    version = {
+        "id": 3270971,
+        "modelId": 2771337,
+        "name": "v2.0",
+        "baseModel": "Krea 2",
+        "trainedWords": [],
+        "model": {"name": "Z3ZZ4 Krea 2", "type": "LORA"},
+        "files": [
+            {
+                "id": 3154864,
+                "name": "z3zz4-k2-5_c1-st6000.safetensors",
+                "sizeKB": 229180.23,
+                "hashes": {"SHA256": HASH},
+                "downloadUrl": "https://civitai.red/api/download/models/3270971?fileId=3154864",
+            },
+            {
+                "id": 3154865,
+                "name": "alt.safetensors",
+                "sizeKB": 1024,
+                "hashes": {},
+                "downloadUrl": "https://civitai.red/api/download/models/3270971?fileId=3154865",
+            },
+        ],
+    }
+    model_payload = {
+        "id": 2771337,
+        "name": "Z3ZZ4 Krea 2",
+        "type": "LORA",
+        "modelVersions": [version],
+    }
+    seen_requests = []
+
+    def handler(request):
+        seen_requests.append((request.headers["host"], request.url.path, request.headers.get("authorization")))
+        host = request.headers["host"]
+        if host == "civitai.red" and request.url.path == "/api/v1/model-versions/3270971":
+            return httpx.Response(200, json=version)
+        if host == "civitai.red" and request.url.path == "/api/v1/models/2771337":
+            return httpx.Response(200, json=model_payload)
+        if host == "civitai.com" and request.url.path == f"/api/v1/model-versions/by-hash/{HASH}":
+            return httpx.Response(404)
+        if host == "civitai.red" and request.url.path == f"/api/v1/model-versions/by-hash/{HASH}":
+            return httpx.Response(200, json=version)
+        if host == "civitai.red" and request.url.path == "/api/download/models/3270971":
+            return httpx.Response(
+                307,
+                headers={"location": "https://r2.cloudflarestorage.example/model.safetensors?X-Amz-Signature=secret-sig"},
+            )
+        if host == "r2.cloudflarestorage.example":
+            return httpx.Response(200, content=DATA)
+        return httpx.Response(404)
+
+    http = source_http(handler, {"civitai": "red-secret"})
+    sources = Sources(http)
+
+    # 1. Model page URL with modelVersionId and tracking query params
+    page_files = sources.resolve({
+        "url": "https://civitai.red/models/2771337?modelVersionId=3270971&utm_source=chatgpt.com",
+    })
+    assert len(page_files) == 2
+    assert page_files[0]["source"] == "civitai"
+    assert page_files[0]["filename"] == "z3zz4-k2-5_c1-st6000.safetensors"
+    assert page_files[0]["source_url"] == "https://civitai.red/models/2771337?modelVersionId=3270971"
+    assert page_files[0]["download_url"] == "https://civitai.red/api/download/models/3270971?fileId=3154864"
+
+    # 2. Download API URL with fileId narrows to the exact file instead of falling back to generic HTTPS
+    dl_files = sources.resolve({"url": "https://civitai.red/api/download/models/3270971?fileId=3154864"})
+    assert len(dl_files) == 1
+    assert dl_files[0]["source"] == "civitai"
+    assert dl_files[0]["filename"] == "z3zz4-k2-5_c1-st6000.safetensors"
+    assert dl_files[0]["source_identity"] == {"model_id": 2771337, "version_id": 3270971, "file_id": 3154864}
+
+    with pytest.raises(ModelError, match="文件 ID"):
+        sources.resolve({"url": "https://civitai.red/api/download/models/3270971?fileId=bad"})
+
+    # 3. www.civitai.red model page without modelVersionId normalizes to civitai.red
+    www_files = sources.resolve({"url": "https://www.civitai.red/models/2771337"})
+    assert len(www_files) == 2
+    assert www_files[0]["source_url"] == "https://civitai.red/models/2771337?modelVersionId=3270971"
+
+    # 4. Hash lookup falls back to civitai.red when civitai.com returns 404
+    by_hash = sources.resolve({"sha256": HASH})
+    assert len(by_hash) == 1
+    assert by_hash[0]["source_url"] == "https://civitai.red/models/2771337?modelVersionId=3270971"
+
+    # 5. Auth header is sent on initial hop to civitai.red and stripped on redirect to R2
+    seen_requests.clear()
+    with caplog.at_level("DEBUG"):
+        with http.stream("https://civitai.red/api/download/models/3270971?fileId=3154864") as response:
+            assert response.read() == DATA
+    assert seen_requests == [
+        ("civitai.red", "/api/download/models/3270971", "Bearer red-secret"),
+        ("r2.cloudflarestorage.example", "/model.safetensors", None),
+    ]
+    assert "secret-sig" not in caplog.text
+
+    # 6. Spoofed domains are never treated as Civitai
+    spoofed = sources.resolve({"url": "https://evil-civitai.red/models/2771337/fake.safetensors"})
+    assert spoofed[0]["source"] == "https"
+    validate_controlled_upscale_source("https://civitai.red/api/download/models/3270971", source="civitai")
+    with pytest.raises(ModelError):
+        validate_controlled_upscale_source("https://evil-civitai.red/api/download/models/3270971", source="civitai")

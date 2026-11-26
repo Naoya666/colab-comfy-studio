@@ -168,6 +168,9 @@ test('safeRelativePathFor, shortHash, and sourceHostLabel helpers behave safely'
   assert.equal(shortHash('0123456789abcdef0123456789abcdef'), '0123456789…abcdef');
   assert.equal(sourceHostLabel('https://huggingface.co/org/repo'), 'Hugging Face');
   assert.equal(sourceHostLabel('https://civitai.com/models/123'), 'Civitai');
+  assert.equal(sourceHostLabel('https://civitai.red/models/2771337?modelVersionId=3270971'), 'Civitai');
+  assert.equal(sourceHostLabel('https://www.civitai.red/api/download/models/3270971'), 'Civitai');
+  assert.equal(sourceHostLabel('https://evil-civitai.red/models/1'), 'evil-civitai.red');
 });
 
 test('sessionStorage persistence retains workflow inspect state across tab switches and clears cleanly', () => {

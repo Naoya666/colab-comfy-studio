@@ -851,6 +851,7 @@ def runtime_secrets(repo, job):
 def local_catalog(repo, owner):
     from .accounts import AccountService
     from .model_library import external_source
+    from .model_sources import CIVITAI_HOSTS, is_civitai_host
 
     default = AccountService.default_account_id(owner)
     result = []
@@ -858,9 +859,9 @@ def local_catalog(repo, owner):
         binding = external_source(row)
         if row.get("state") != "ready" and not binding:
             continue
-        if binding and urlsplit(binding["download_url"]).hostname == "civitai.com" and (
+        if binding and (urlsplit(binding["download_url"]).hostname or "").lower() in CIVITAI_HOSTS and (
             row.get("source") == "civitai"
-            or ("external_source" in row and urlsplit(binding.get("url") or "").hostname == "civitai.com")
+            or ("external_source" in row and is_civitai_host(urlsplit(binding.get("url") or "").hostname))
         ):
             # Only the server-resolved catalog can grant Civitai provenance.
             binding = {**binding, "kind": "civitai"}

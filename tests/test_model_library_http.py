@@ -270,3 +270,60 @@ def test_catalog_items_include_workflow_reference_counts(client):
     assert items[m1["id"]]["managed_file"] is True
     assert items[m2["id"]]["reference_count"] == 0
     assert items[m2["id"]]["managed_file"] is False
+
+
+def test_http_civitai_red_resolve_and_add_roundtrip(client, monkeypatch):
+    import hashlib
+
+    import httpx
+    from app.gpu.model_sources import SourceHTTP
+
+    c, _repo = client
+    digest = hashlib.sha256(b"civitai-red-lora").hexdigest()
+
+    def handler(request):
+        assert request.headers["host"] == "civitai.red"
+        assert request.url.path == "/api/v1/model-versions/3270971"
+        return httpx.Response(200, json={
+            "id": 3270971,
+            "modelId": 2771337,
+            "name": "v2.0",
+            "baseModel": "Krea 2",
+            "trainedWords": [],
+            "model": {"name": "Z3ZZ4 Krea 2", "type": "LORA"},
+            "files": [
+                {
+                    "id": 3154864,
+                    "name": "z3zz4-k2-5_c1-st6000.safetensors",
+                    "sizeKB": 229180.23,
+                    "hashes": {"SHA256": digest},
+                    "downloadUrl": "https://civitai.red/api/download/models/3270971?fileId=3154864",
+                }
+            ],
+        })
+
+    monkeypatch.setattr(
+        "app.gpu.model_library.SourceHTTP",
+        lambda tokens=None: SourceHTTP(tokens, client=httpx.Client(transport=httpx.MockTransport(handler)), resolver=lambda _h: ["8.8.8.8"]),
+    )
+
+    for url in (
+        "https://civitai.red/api/download/models/3270971?fileId=3154864",
+        "https://civitai.red/models/2771337?modelVersionId=3270971&utm_source=chatgpt.com",
+    ):
+        resolved = c.post("/api/gpu/model-library/resolve", json={"url": url, "model_type": "loras"})
+        assert resolved.status_code == 200, resolved.text
+        files = resolved.json()["data"]["files"]
+        assert len(files) == 1
+        choice = files[0]
+        assert choice["source"] == "civitai"
+        assert choice["filename"] == "z3zz4-k2-5_c1-st6000.safetensors"
+        assert choice["source_url"] == "https://civitai.red/models/2771337?modelVersionId=3270971"
+        assert choice["download_url"] == "https://civitai.red/api/download/models/3270971?fileId=3154864"
+
+        created = c.post("/api/gpu/model-library", json=choice)
+        assert created.status_code == 201, created.text
+        row = created.json()["data"]
+        assert row["source"] == "civitai"
+        assert row["filename"] == "z3zz4-k2-5_c1-st6000.safetensors"
+        assert row["expected_sha256"] == digest

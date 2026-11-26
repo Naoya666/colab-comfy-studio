@@ -26,6 +26,7 @@ import httpx
 SHA = re.compile(r"^[a-fA-F0-9]{64}$")
 SAFE_EXTENSIONS = {".safetensors", ".gguf", ".onnx"}
 CONTROLLED_UPSCALE_EXTENSIONS = {".pt", ".pth"}
+CIVITAI_HOSTS = frozenset({"civitai.com", "civitai.red"})
 PYTORCH_LEGACY_MAGIC = 0x1950A86A20F9469CFC6C
 MAX_PICKLE_ENTRY_BYTES = 64 * 1024 * 1024
 TRUSTED_UPSCALE_GITHUB_OWNERS = frozenset({
@@ -126,6 +127,20 @@ def is_controlled_upscale_extension(value: str) -> bool:
     return isinstance(value, str) and PurePosixPath(value).suffix.lower() in CONTROLLED_UPSCALE_EXTENSIONS
 
 
+def normalize_civitai_host(host: str | None) -> str | None:
+    """Return the canonical Civitai host ('civitai.com' or 'civitai.red') for supported domains."""
+    lower = (host or "").strip().lower()
+    if lower in CIVITAI_HOSTS:
+        return lower
+    if lower.startswith("www.") and lower[4:] in CIVITAI_HOSTS:
+        return lower[4:]
+    return None
+
+
+def is_civitai_host(host: str | None) -> bool:
+    return normalize_civitai_host(host) is not None
+
+
 def trusted_upscale_github_owners() -> frozenset[str]:
     extra = {
         item.strip().lower()
@@ -173,7 +188,7 @@ def validate_controlled_upscale_source(url: str | None, *, source: str | None = 
         if release and release[0].lower() in trusted_upscale_github_owners():
             return
         raise ModelError("未授权的 GitHub .pt/.pth 来源；upscale_models 仅允许受信任上游项目的 Release 发布文件")
-    if source == "civitai" and host == "civitai.com":
+    if source == "civitai" and host in CIVITAI_HOSTS:
         return
     if host in trusted_upscale_hosts():
         return
@@ -497,7 +512,7 @@ class SourceHTTP:
                 headers["Range"] = f"bytes={offset}-"
                 if validator:
                     headers["If-Range"] = validator
-            source = {"huggingface.co": "huggingface", "civitai.com": "civitai"}.get(host)
+            source = "huggingface" if host == "huggingface.co" else ("civitai" if host in CIVITAI_HOSTS else None)
             if host == initial_host and source and self.tokens.get(source):
                 headers["Authorization"] = "Bearer " + self.tokens[source]
             if host == initial_host == "www.googleapis.com" and drive_token:
@@ -559,7 +574,8 @@ class Sources:
     def __init__(self, http):
         self.http = http
 
-    def civitai_version(self, version):
+    def civitai_version(self, version, *, host: str = "civitai.com"):
+        civitai_host = normalize_civitai_host(host) or "civitai.com"
         model = version.get("model") or {}
         model_type = CIVITAI_TYPES.get(model.get("type"), "unknown")
         allowed = SAFE_EXTENSIONS | CONTROLLED_UPSCALE_EXTENSIONS if model_type == "upscale_models" else SAFE_EXTENSIONS
@@ -571,7 +587,7 @@ class Sources:
             result.append({"display_name": model.get("name") or version.get("name"), "filename": f["name"],
                            "model_type": model_type,
                            "architecture": version.get("baseModel") or "unknown", "source": "civitai",
-                           "source_url": f"https://civitai.com/models/{version.get('modelId')}?modelVersionId={version['id']}",
+                           "source_url": f"https://{civitai_host}/models/{version.get('modelId')}?modelVersionId={version['id']}",
                            "download_url": https_url(f["downloadUrl"]),
                            "expected_sha256": digest.lower() if isinstance(digest, str) and SHA.fullmatch(digest) else None,
                            "expected_size": None,  # sizeKB is rounded, not an exact byte count
@@ -654,8 +670,13 @@ class Sources:
             value = body["sha256"]
             if not isinstance(value, str) or not SHA.fullmatch(value):
                 raise ModelError("Hash 来源查询需要完整 SHA-256，不能把短 Hash 当作 SHA-256")
-            version = self.http.json("https://civitai.com/api/v1/model-versions/by-hash/" + value)
-            return [f for f in self.civitai_version(version) if f["expected_sha256"] == value.lower()]
+            try:
+                version = self.http.json("https://civitai.com/api/v1/model-versions/by-hash/" + value)
+                host = "civitai.com"
+            except SourceNotFound:
+                version = self.http.json("https://civitai.red/api/v1/model-versions/by-hash/" + value)
+                host = "civitai.red"
+            return [f for f in self.civitai_version(version, host=host) if f["expected_sha256"] == value.lower()]
         if body.get("repo_id"):
             repo = body["repo_id"]
             return self.huggingface(
@@ -668,19 +689,30 @@ class Sources:
         url = normalize_source_url(body.get("url") or "")
         p = urlsplit(url)
         parts = [unquote(seg) for seg in p.path.split("/") if seg != ""]
-        if p.hostname == "civitai.com":
+        civitai_host = normalize_civitai_host(p.hostname)
+        if civitai_host:
             query = parse_qs(p.query)
             version_id = (query.get("modelVersionId") or [None])[0]
+            file_id = None
             if parts[:3] == ["api", "download", "models"] and len(parts) == 4:
                 version_id = parts[3]
+                file_id = (query.get("fileId") or [None])[0]
             if version_id:
                 if not str(version_id).isdigit():
                     raise ModelError("Civitai 版本 ID 无效")
-                return self.civitai_version(self.http.json("https://civitai.com/api/v1/model-versions/" + str(version_id)))
+                files = self.civitai_version(
+                    self.http.json(f"https://{civitai_host}/api/v1/model-versions/{version_id}"),
+                    host=civitai_host,
+                )
+                if file_id is not None:
+                    if not str(file_id).isdigit():
+                        raise ModelError("Civitai 文件 ID 无效")
+                    files = [f for f in files if str(f["source_identity"].get("file_id")) == str(file_id)]
+                return files
             if len(parts) >= 2 and parts[0] == "models" and parts[1].isdigit():
-                model = self.http.json("https://civitai.com/api/v1/models/" + parts[1])
+                model = self.http.json(f"https://{civitai_host}/api/v1/models/{parts[1]}")
                 return [f for v in model.get("modelVersions") or []
-                        for f in self.civitai_version({**v, "model": model, "modelId": model["id"]})]
+                        for f in self.civitai_version({**v, "model": model, "modelId": model["id"]}, host=civitai_host)]
             raise ModelError("请提供 Civitai 模型页面或指定版本链接")
         if p.hostname == "huggingface.co":
             return self._hf_resolve_url(url, model_type=requested_type)

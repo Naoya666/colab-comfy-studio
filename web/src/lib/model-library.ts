@@ -604,7 +604,10 @@ export function sourceHostLabel(url: string, explicitSource?: string): string {
   try {
     const host = new URL(url).hostname.toLowerCase();
     if (host === 'huggingface.co' || host.endsWith('.huggingface.co')) return 'Hugging Face';
-    if (host === 'civitai.com' || host.endsWith('.civitai.com')) return 'Civitai';
+    if (
+      host === 'civitai.com' || host.endsWith('.civitai.com')
+      || host === 'civitai.red' || host.endsWith('.civitai.red')
+    ) return 'Civitai';
     if (host === 'github.com' || host.endsWith('.github.com')) return 'GitHub';
     return host;
   } catch {

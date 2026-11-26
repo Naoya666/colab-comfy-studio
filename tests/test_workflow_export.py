@@ -635,3 +635,23 @@ def test_prepare_dependencies_civitai_requires_exact_file_id_when_sha256_missing
     finally:
         lib.close()
         store.engine.dispose()
+
+
+def test_workflow_export_recognizes_civitai_red_urls():
+    from app.gpu.workflow_export import _is_civitai_url, sanitize_import_model
+
+    assert _is_civitai_url("https://civitai.com/models/123")
+    assert _is_civitai_url("https://civitai.red/models/2771337?modelVersionId=3270971")
+    assert _is_civitai_url("https://www.civitai.red/api/download/models/3270971")
+    assert not _is_civitai_url("https://evil-civitai.red/models/2771337")
+
+    imported = sanitize_import_model(
+        {
+            "display_name": "Red LoRA",
+            "source": "https://civitai.red/models/2771337?modelVersionId=3270971",
+        },
+        "red-lora",
+    )
+    assert imported is not None
+    assert imported["source_kind"] == "civitai"
+    assert imported["source"] == "https://civitai.red/models/2771337?modelVersionId=3270971"
