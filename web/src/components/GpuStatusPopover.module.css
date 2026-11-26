@@ -1,0 +1,508 @@
+.wrapper {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+/* ───────── 顶栏触发按钮 ───────── */
+.trigger {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 36px;
+  min-width: 36px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--card);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.trigger:hover {
+  border-color: var(--text);
+  background: var(--card-2);
+}
+
+.trigger[aria-expanded="true"] {
+  border-color: var(--text);
+  background: var(--card-2);
+}
+
+.trigger[data-tone="live"],
+.trigger[data-tone="retrying"] {
+  border-color: var(--line-strong);
+  border-color: color-mix(in srgb, var(--workspace-accent) 46%, var(--line));
+}
+
+.trigger[data-tone="retained"],
+.trigger[data-tone="warning"] {
+  border-color: var(--warning-line);
+}
+
+.trigger[data-tone="danger"] {
+  border-color: var(--danger-line);
+}
+
+.triggerText {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.triggerChevron {
+  color: var(--muted);
+  transition: transform 0.16s ease;
+}
+
+.trigger[aria-expanded="true"] .triggerChevron {
+  transform: rotate(180deg);
+  color: var(--text);
+}
+
+.triggerIcon {
+  color: var(--text-2);
+}
+
+.trigger[data-tone="live"] .triggerIcon,
+.trigger[data-tone="retrying"] .triggerIcon {
+  color: var(--workspace-accent);
+}
+
+.trigger[data-tone="retained"] .triggerIcon,
+.trigger[data-tone="warning"] .triggerIcon {
+  color: var(--warning);
+}
+
+.trigger[data-tone="danger"] .triggerIcon {
+  color: var(--danger);
+}
+
+/* ───────── 语义状态圆点 ───────── */
+.dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+
+.dot[data-tone="idle"],
+.dot[data-tone="offline"] {
+  background: transparent;
+  border: 1.5px solid var(--muted);
+}
+
+.dot[data-tone="live"],
+.dot[data-tone="retrying"] {
+  background: var(--workspace-accent);
+}
+
+.dot[data-tone="retained"],
+.dot[data-tone="warning"] {
+  background: var(--warning);
+}
+
+.dot[data-tone="danger"] {
+  background: var(--danger);
+}
+
+.dot[data-pulsing="true"] {
+  box-shadow: 0 0 0 3px var(--line-strong);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--workspace-accent) 28%, transparent);
+  animation: pulseStatusDot 1.6s ease-in-out infinite;
+}
+
+@keyframes pulseStatusDot {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.92);
+  }
+}
+
+/* 移动端窄屏紧凑态：只保留图标 + 右上角状态点，防止挤压顶栏 */
+.dot.mobileCornerDot {
+  display: none;
+}
+
+@media (max-width: 519px) {
+  .trigger {
+    width: 36px;
+    padding: 0;
+    gap: 0;
+    background: transparent;
+  }
+
+  .triggerText,
+  .triggerChevron,
+  .dot.triggerInlineDot {
+    display: none;
+  }
+
+  .dot.mobileCornerDot {
+    display: block;
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 6px;
+    height: 6px;
+  }
+}
+
+@media (min-width: 520px) and (max-width: 799px) {
+  .triggerText {
+    max-width: 112px;
+  }
+}
+
+@media (min-width: 800px) {
+  .wrapper {
+    margin-left: 6px;
+  }
+
+  .trigger {
+    padding: 0 11px;
+    border-color: var(--line);
+  }
+}
+
+/* ───────── 桌面端锚定浮层（Portal 挂至 body，避免被顶栏层叠上下文裁剪） ───────── */
+.popover {
+  position: fixed;
+  top: 64px;
+  right: 24px;
+  z-index: 62;
+  width: min(352px, calc(100vw - 24px));
+  max-height: calc(100dvh - 88px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  background: var(--card);
+  color: var(--text);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+  animation: popoverDrop 0.16s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes popoverDrop {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ───────── 浮层内部结构（桌面端 & 移动端共用） ───────── */
+.panelBody {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.panelHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.panelTitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.94rem;
+  font-weight: 650;
+  color: var(--text);
+  min-width: 0;
+}
+
+.closeBtn {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+}
+
+.closeBtn:hover {
+  background: var(--card-2);
+  color: var(--text);
+}
+
+/* 核心状态横幅 */
+.banner {
+  display: grid;
+  gap: 4px;
+  padding: 11px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--card-2);
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.banner[data-tone="live"],
+.banner[data-tone="retrying"] {
+  background: var(--card-2);
+  background: color-mix(in srgb, var(--workspace-accent) 12%, var(--card-2));
+  border-color: var(--line-strong);
+  border-color: color-mix(in srgb, var(--workspace-accent) 36%, var(--line));
+}
+
+.banner[data-tone="retained"],
+.banner[data-tone="warning"] {
+  background: var(--warning-bg);
+  border-color: var(--warning-line);
+}
+
+.banner[data-tone="danger"] {
+  background: var(--card-2);
+  background: color-mix(in srgb, var(--danger) 10%, var(--card-2));
+  border-color: var(--danger-line);
+}
+
+.bannerText {
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.bannerSub {
+  font-size: 0.76rem;
+  color: var(--text-2);
+}
+
+/* 进度条 */
+.progressTrack {
+  position: relative;
+  height: 4px;
+  width: 100%;
+  border-radius: var(--r-full);
+  background: var(--card-3);
+  overflow: hidden;
+}
+
+.progressFill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-full);
+  background: var(--workspace-accent);
+  transition: width 0.3s ease;
+}
+
+.progressFill[data-tone="retained"],
+.progressFill[data-tone="warning"] {
+  background: var(--warning);
+}
+
+.progressFill[data-tone="danger"] {
+  background: var(--danger);
+}
+
+.progressFill[data-tone="offline"] {
+  background: var(--text-2);
+}
+
+.progressTrack[data-indeterminate="true"] .progressFill {
+  width: 36%;
+  animation: slideProgress 1.35s ease-in-out infinite;
+}
+
+@keyframes slideProgress {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
+/* 精简 KV 列表 */
+.kvList {
+  margin: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.kvRow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
+.kvRow dt {
+  color: var(--muted);
+  flex: none;
+  font-weight: 400;
+}
+
+.kvRow dd {
+  margin: 0;
+  color: var(--text);
+  font-weight: 600;
+  text-align: right;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.kvRow dd[data-tone="muted"] {
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.kvRow dd[data-tone="accent"] {
+  color: var(--workspace-accent);
+}
+
+.kvRow dd[data-tone="warning"] {
+  color: var(--warning);
+}
+
+.kvRow dd[data-tone="danger"] {
+  color: var(--danger);
+}
+
+/* 多实例在线摘要列表（仅 >=2 台时渲染） */
+.instanceList {
+  list-style: none;
+  margin: 0;
+  padding: 8px 10px;
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+
+.instanceItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.76rem;
+  min-width: 0;
+}
+
+.instanceLeft {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.instanceLeft strong {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.instancePool {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.instanceRight {
+  color: var(--text-2);
+  white-space: nowrap;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 底部双快捷按钮 */
+.actionRow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.actionRow button {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 10px;
+  font-size: 0.83rem;
+}
+
+/* 底部同步说明 */
+.footerNote {
+  font-size: 0.74rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+/* 移动端底部抽屉 */
+.sheetBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 65;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: var(--overlay);
+  animation: fadeBackdrop 0.15s ease;
+}
+
+.sheet {
+  width: 100%;
+  max-width: var(--col);
+  max-height: 82dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 18px 16px calc(18px + var(--safe-b));
+  border: 1px solid var(--line-strong);
+  border-bottom: 0;
+  border-radius: 20px 20px 0 0;
+  background: var(--card);
+  color: var(--text);
+  animation: riseSheet 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes fadeBackdrop {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes riseSheet {
+  from {
+    transform: translateY(24px);
+    opacity: 0;
+  }
+}

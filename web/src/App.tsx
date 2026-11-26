@@ -5,6 +5,8 @@ import { CreatePanel } from './pages/CreatePage';
 import { CreateResults } from './components/CreateResults';
 import { LoginScreen } from './components/LoginScreen';
 import { MoveProjectDialog, NewProjectDialog, ProjectSheet } from './components/ProjectDialogs';
+import { GpuStatusPopover } from './components/GpuStatusPopover';
+import type { GpuStatusActionTarget } from './lib/gpu-status-summary';
 import type { JobClearRequest } from './pages/JobsPage';
 import { useGalleryState, type GallerySource } from './hooks/useGalleryState';
 
@@ -78,7 +80,7 @@ import {
 } from './lib/model-library';
 import { useDesktopLayout } from './lib/desktop-layout';
 import { useBodyScrollLock } from './lib/modal-scroll-lock';
-import { parameterKey, parameterList, readableState } from './lib/ui-helpers';
+import { parameterKey, parameterList } from './lib/ui-helpers';
 import { useSmartPoll } from './lib/smart-poll';
 import { formatHashRoute, parseHashRoute, type AssetsSubTab, type MainTab } from './lib/route-state';
 import {
@@ -150,6 +152,8 @@ export default function App() {
   } | null>(null);
   const [showProjectSheet, setShowProjectSheet] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
+  const [showGpuStatus, setShowGpuStatus] = useState(false);
+  const lastStatusRefreshRef = useRef(0);
   const currentProjectId = useRef(projectId);
   currentProjectId.current = projectId;
 
@@ -341,14 +345,14 @@ export default function App() {
   const galleryOutputs = (tab === '创作' || tab === '作品')
     ? jobs.flatMap((job) => job.output_asset_ids || []).join(',')
     : '';
-  const activeInstance = instances.find((instance) => instance.provider === 'colab' && !instance.runtime_deleted
-    && instanceIdOf(instance) === runtimeChoice.instanceId)
-    || instances.find((instance) => instance.provider === 'colab' && !instance.runtime_deleted
-      && ['ready', 'busy', 'retained_idle', 'allocating', 'preparing', 'transferring'].includes(instance.state || ''));
   const detailRevision = jobs.find((job) => job.id === detailId)?.updated_at;
 
   const activeJobsCount = useMemo(
     () => jobs.filter((j) => !isSystemJob(j) && !terminalStates.has(String(j.state || '').toLowerCase())).length,
+    [jobs],
+  );
+  const hasAnyActiveJob = useMemo(
+    () => jobs.some((j) => !terminalStates.has(String(j.state || '').toLowerCase())),
     [jobs],
   );
   const hasActiveInstances = useMemo(
@@ -540,7 +544,7 @@ export default function App() {
 
   useSmartPoll(refreshResources, {
     enabled: loggedIn,
-    active: hasActiveInstances || activeJobsCount > 0 || tab === '算力',
+    active: hasActiveInstances || hasAnyActiveJob || tab === '算力',
     activeMs: 5000,
     idleMs: 25000,
   });
@@ -697,7 +701,7 @@ export default function App() {
 
   useSmartPoll(refreshJobs, {
     enabled: loggedIn,
-    active: activeJobsCount > 0,
+    active: hasAnyActiveJob,
     activeMs: 4000,
     idleMs: 25000,
   });
@@ -1323,10 +1327,10 @@ export default function App() {
   }
 
   const keyStateRef = useRef({
-    gs, detailId, tab, moveDialog, confirm, showProjectSheet, showNewProject,
+    gs, detailId, tab, moveDialog, confirm, showProjectSheet, showNewProject, showGpuStatus,
   });
   keyStateRef.current = {
-    gs, detailId, tab, moveDialog, confirm, showProjectSheet, showNewProject,
+    gs, detailId, tab, moveDialog, confirm, showProjectSheet, showNewProject, showGpuStatus,
   };
 
   useEffect(() => {
@@ -1343,9 +1347,10 @@ export default function App() {
         else if (state.confirm) setConfirm(null);
         else if (state.showNewProject) setShowNewProject(false);
         else if (state.showProjectSheet) setShowProjectSheet(false);
+        else if (state.showGpuStatus) setShowGpuStatus(false);
         else if (state.gs.activeViewerItem) state.gs.closeViewers();
         else if (state.detailId && state.tab === '任务') setDetailId('');
-      } else if (!typing && state.gs.activeViewerItem && !state.moveDialog && !state.confirm && !state.gs.confirmDeleteViewer && !state.gs.confirmDeleteNative && !state.showNewProject && !state.showProjectSheet) {
+      } else if (!typing && state.gs.activeViewerItem && !state.moveDialog && !state.confirm && !state.gs.confirmDeleteViewer && !state.gs.confirmDeleteNative && !state.showNewProject && !state.showProjectSheet && !state.showGpuStatus) {
         if (e.key === 'ArrowLeft') { e.preventDefault(); state.gs.stepActiveViewer(-1); }
         else if (e.key === 'ArrowRight') { e.preventDefault(); state.gs.stepActiveViewer(1); }
       }
@@ -1375,12 +1380,40 @@ export default function App() {
   }
 
   function navigate(next: MainTab) {
+    setShowGpuStatus(false);
     if (next === tab) return;
     gs.closeViewers();
     gs.setPendingRouteAssetId('');
     setDetailId('');
     setTab(next);
     window.scrollTo(0, 0);
+  }
+
+  function toggleGpuStatus() {
+    setShowGpuStatus((curr) => {
+      const next = !curr;
+      if (next) {
+        const now = Date.now();
+        if (now - lastStatusRefreshRef.current >= 3000) {
+          lastStatusRefreshRef.current = now;
+          void refreshResources();
+          void refreshJobs();
+          void refreshUsage().catch(() => {});
+        }
+      }
+      return next;
+    });
+  }
+
+  function handleGpuStatusAction(action: GpuStatusActionTarget) {
+    if (action.kind === 'job') {
+      openJobFromViewer(action.jobId);
+      return;
+    }
+    if (action.kind === 'compute') navigate('算力');
+    else if (action.kind === 'native') navigate('原生 ComfyUI');
+    else if (action.kind === 'jobs') navigate('任务');
+    else if (action.kind === 'gallery') navigate('作品');
   }
 
   function jumpToTransfer(target: TransferFocusTarget) {
@@ -1470,15 +1503,27 @@ export default function App() {
             type="button"
             aria-label="切换项目"
             title={activeProject ? `当前创作保存项目：${projectOptionLabel(activeProject, projects)}（点击切换与管理）` : '选择与管理项目'}
-            onClick={() => setShowProjectSheet(true)}
+            onClick={() => { setShowGpuStatus(false); setShowProjectSheet(true); }}
           >
             <Folder size={15} strokeWidth={1.6} aria-hidden />
             <span>{activeProject ? projectOptionLabel(activeProject, projects) : '选择项目'}</span>
             <ChevronDown size={14} strokeWidth={1.6} aria-hidden />
           </button>
-          <button className="iconButton" type="button" aria-label="新建项目" title="新建项目" onClick={() => setShowNewProject(true)}>
+          <button className="iconButton" type="button" aria-label="新建项目" title="新建项目" onClick={() => { setShowGpuStatus(false); setShowNewProject(true); }}>
             <Plus size={18} strokeWidth={1.6} aria-hidden />
           </button>
+          <GpuStatusPopover
+            open={showGpuStatus}
+            desktop={desktop}
+            settings={settings}
+            instances={instances}
+            jobs={jobs}
+            usage={usage}
+            workflows={workflows}
+            onToggle={toggleGpuStatus}
+            onClose={() => setShowGpuStatus(false)}
+            onAction={handleGpuStatusAction}
+          />
           <button
             className="iconButton mobileSettings"
             type="button"
@@ -1487,18 +1532,6 @@ export default function App() {
             onClick={() => navigate('设置')}
           >
             <SettingsIcon size={18} strokeWidth={1.6} aria-hidden />
-          </button>
-          <button
-            className="desktopGpu projectChip"
-            type="button"
-            onClick={() => navigate('算力')}
-            title="查看算力"
-            data-online={Boolean(activeInstance && ['ready', 'busy', 'retained_idle'].includes(activeInstance.state || ''))}
-          >
-            <Cpu size={15} strokeWidth={1.6} aria-hidden />
-            <span>{settings?.offline_mode ? '离线演示' : activeInstance
-              ? `${activeInstance.gpu_reported || 'Colab GPU'} · ${readableState(activeInstance.state)}`
-              : '无活动 GPU'}</span>
           </button>
         </div>
       </header>

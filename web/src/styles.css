@@ -168,6 +168,7 @@ svg { flex: none; }
   .brand { gap: 6px; }
   .brandText strong { font-size: 0.82rem; }
   .brandText small { display: none; }
+  .projectChip { max-width: min(112px, 29vw); padding: 0 8px; }
 }
 .topbarActions { display: flex; align-items: center; gap: 6px; flex: none; }
 
@@ -209,7 +210,6 @@ svg { flex: none; }
 }
 .bottomNav button > span:not(.tabBadge) { overflow-wrap: anywhere; text-align: center; }
 .bottomNav button[aria-current="page"] { color: var(--text); background: var(--card-2); }
-.desktopGpu.projectChip { display: none; }
 .tabBadge {
   position: absolute; top: 2px; right: calc(50% - 22px);
   min-width: 16px; height: 16px; padding: 0 4px; border-radius: var(--r-full);
@@ -358,9 +358,6 @@ details.foldable[open] > summary::after { transform: rotate(-135deg) translateY(
   .topbarActions { gap: 8px; }
   .projectChip { max-width: 230px; }
   .mobileSettings.iconButton { display: none; }
-  .desktopGpu.projectChip { display: inline-flex; margin-left: 10px; border-color: var(--line); background: var(--card); }
-  .desktopGpu[data-online="true"] svg { color: var(--workspace-accent); }
-  .desktopGpu:hover { border-color: var(--line-strong); }
   .bottomNav {
     grid-column: 1;
     grid-row: 2;
