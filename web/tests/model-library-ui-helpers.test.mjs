@@ -10,9 +10,16 @@ const bundled = await build({
         computeCategorySlots,
         displayModelTitles,
         findCatalogDuplicates,
+        formatModelCreatedFull,
+        formatModelCreatedShort,
+        MODEL_SORT_STORAGE_KEY,
         orderedTypeSegments,
         planBatchDeletion,
+        pruneSessionAddedModels,
+        readStoredModelSortMode,
+        recordSessionAddedModels,
         sortModels,
+        writeStoredModelSortMode,
       } from './src/lib/model-library.ts';
     `,
     resolveDir: fileURLToPath(new URL('..', import.meta.url)),
@@ -31,9 +38,16 @@ const {
   computeCategorySlots,
   displayModelTitles,
   findCatalogDuplicates,
+  formatModelCreatedFull,
+  formatModelCreatedShort,
+  MODEL_SORT_STORAGE_KEY,
   orderedTypeSegments,
   planBatchDeletion,
+  pruneSessionAddedModels,
+  readStoredModelSortMode,
+  recordSessionAddedModels,
   sortModels,
+  writeStoredModelSortMode,
 } = await import('data:text/javascript;base64,' + Buffer.from(bundled.outputFiles[0].text).toString('base64'));
 
 test('orderedTypeSegments and computeCategorySlots produce matching deterministic slots', () => {
@@ -222,4 +236,92 @@ test('planBatchDeletion handles active tasks, unmanaged fallback, shared Drive f
   const indexPlan = planBatchDeletion(selected, all, tasks, 'remove_index');
   assert.equal(indexPlan.reclaimableBytes, 0);
   assert.ok(indexPlan.deletable.every((d) => d.deletePhysical === false));
+});
+
+test('sortModels in created_desc pins active items on top and orders the rest by newest created_at', () => {
+  const items = [
+    { id: 'old-ready', display_name: 'Old Ready', filename: 'old.safetensors', model_type: 'checkpoints', architecture: 'SDXL', state: 'ready', size: 9000, created_at: '2026-11-20T08:00:00+00:00' },
+    { id: 'new-ready', display_name: 'New Small LoRA', filename: 'lora.safetensors', model_type: 'loras', architecture: 'FLUX', state: 'ready', size: 50, created_at: '2026-11-26T10:00:00+00:00' },
+    { id: 'mid-failed', display_name: 'Mid Failed', filename: 'fail.safetensors', model_type: 'vae', architecture: 'unknown', state: 'failed', size: 300, created_at: '2026-11-24T12:00:00+00:00' },
+    { id: 'active-old', display_name: 'Active Retried', filename: 'act1.safetensors', model_type: 'loras', architecture: 'FLUX', state: 'downloading', size: 100, created_at: '2026-11-18T00:00:00+00:00' },
+    { id: 'active-new', display_name: 'Active Fresh', filename: 'act2.safetensors', model_type: 'loras', architecture: 'FLUX', state: 'pending', size: 100, created_at: '2026-11-26T11:00:00+00:00' },
+    { id: 'no-date-b', display_name: 'Undated B', filename: 'b.safetensors', model_type: 'loras', architecture: 'unknown', state: 'ready', size: 200 },
+    { id: 'no-date-a', display_name: 'Undated A', filename: 'a.safetensors', model_type: 'loras', architecture: 'unknown', state: 'ready', size: 200, created_at: 'invalid-date' },
+  ];
+  const tasks = [
+    { id: 't1', model_id: 'active-old', state: 'downloading', bytes: 10, total: 100 },
+    { id: 't2', model_id: 'active-new', state: 'pending', bytes: 0, total: 100 },
+  ];
+
+  assert.deepEqual(
+    sortModels(items, tasks, 'created_desc').map((m) => m.id),
+    ['active-new', 'active-old', 'new-ready', 'mid-failed', 'old-ready', 'no-date-a', 'no-date-b'],
+  );
+});
+
+test('readStoredModelSortMode and writeStoredModelSortMode persist valid choices and fall back safely', () => {
+  const bag = new Map();
+  const fakeStorage = {
+    getItem: (key) => (bag.has(key) ? bag.get(key) : null),
+    setItem: (key, val) => { bag.set(key, String(val)); },
+  };
+
+  assert.equal(readStoredModelSortMode(fakeStorage), 'smart');
+
+  writeStoredModelSortMode('created_desc', fakeStorage);
+  assert.equal(bag.get(MODEL_SORT_STORAGE_KEY), 'created_desc');
+  assert.equal(readStoredModelSortMode(fakeStorage), 'created_desc');
+
+  bag.set(MODEL_SORT_STORAGE_KEY, 'unknown_mode');
+  assert.equal(readStoredModelSortMode(fakeStorage), 'smart');
+
+  const throwingStorage = {
+    getItem() { throw new Error('denied'); },
+    setItem() { throw new Error('quota'); },
+  };
+  assert.equal(readStoredModelSortMode(throwingStorage), 'smart');
+  assert.doesNotThrow(() => writeStoredModelSortMode('created_desc', throwingStorage));
+});
+
+test('formatModelCreatedShort and formatModelCreatedFull format local dates cleanly', () => {
+  const now = new Date(2026, 10, 26, 22, 50, 0);
+  const today = new Date(2026, 10, 26, 9, 5, 8);
+  const yesterday = new Date(2026, 10, 25, 18, 30, 0);
+  const earlierThisYear = new Date(2026, 8, 3, 7, 45, 0);
+  const lastYear = new Date(2025, 11, 31, 23, 59, 0);
+
+  assert.equal(formatModelCreatedShort(today.toISOString(), now.getTime()), '今天 09:05');
+  assert.equal(formatModelCreatedShort(yesterday.toISOString(), now.getTime()), '昨天 18:30');
+  assert.equal(formatModelCreatedShort(earlierThisYear.toISOString(), now.getTime()), '09-03 07:45');
+  assert.equal(formatModelCreatedShort(lastYear.toISOString(), now.getTime()), '2025-12-31');
+  assert.equal(formatModelCreatedShort('', now.getTime()), '');
+  assert.equal(formatModelCreatedShort('not-a-date', now.getTime()), '');
+
+  assert.equal(formatModelCreatedFull(today.toISOString()), '2026-11-26 09:05:08');
+  assert.equal(formatModelCreatedFull(null), '');
+});
+
+test('recordSessionAddedModels tracks sequential and batch additions with deduplication and race-safe pruning', () => {
+  const m1 = { id: 'm1', display_name: 'First LoRA', filename: 'first.safetensors' };
+  const m2 = { id: 'm2', display_name: 'Second VAE', filename: 'vae.safetensors' };
+  const m3 = { id: 'm3', display_name: 'Third UNet', filename: 'unet.safetensors' };
+
+  let list = recordSessionAddedModels([], [m1], 100);
+  list = recordSessionAddedModels(list, [m2], 200);
+  assert.deepEqual(list.map((e) => e.modelId), ['m2', 'm1']);
+
+  // Batch add containing a new item and a re-added duplicate puts batch at front without duplicates
+  list = recordSessionAddedModels(list, [m3, m1], 300);
+  assert.deepEqual(list.map((e) => e.modelId), ['m3', 'm1', 'm2']);
+
+  // Stale poll missing newly added m3 (not yet in seenCatalogIds) must NOT prune m3
+  const seen = new Set(['m1', 'm2']);
+  const staleCatalog = new Set(['m1', 'm2']);
+  const afterStale = pruneSessionAddedModels(list, staleCatalog, seen);
+  assert.equal(afterStale, list);
+
+  // Once m3 has been observed in catalog, deleting m2 prunes only m2
+  seen.add('m3');
+  const afterDelete = pruneSessionAddedModels(list, new Set(['m1', 'm3']), seen);
+  assert.deepEqual(afterDelete.map((e) => e.modelId), ['m3', 'm1']);
 });

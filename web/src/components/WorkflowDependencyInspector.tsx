@@ -432,6 +432,7 @@ export function WorkflowDependencyInspector({
   onClose,
   onRefreshLibrary,
   onLocateModel,
+  onModelsAdded,
 }: {
   open: boolean;
   fileName: string;
@@ -444,6 +445,7 @@ export function WorkflowDependencyInspector({
   onClose: () => void;
   onRefreshLibrary: () => Promise<void>;
   onLocateModel: (model: LibraryModel) => void;
+  onModelsAdded?: (models: LibraryModel[]) => void;
 }) {
   const [showDropzone, setShowDropzone] = useState(!result);
   const [busy, setBusy] = useState(false);
@@ -725,6 +727,7 @@ export function WorkflowDependencyInspector({
                   refresh={onRefreshLibrary}
                   onLibraryModelImported={(depId, model) => {
                     onStateChange({ importedMap: { ...importedMap, [depId]: model.id } });
+                    onModelsAdded?.([model]);
                   }}
                   onLocateLibraryModel={onLocateModel}
                 />
@@ -745,6 +748,7 @@ export function WorkflowDependencyInspector({
             nextMap[item.depId] = item.model.id;
           }
           onStateChange({ importedMap: nextMap });
+          onModelsAdded?.(created.map((item) => item.model));
           await onRefreshLibrary();
         }}
       />

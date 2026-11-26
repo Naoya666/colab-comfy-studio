@@ -18,16 +18,23 @@ import {
   bytesLabel,
   computeCategorySlots,
   displayModelTitles,
+  formatModelCreatedFull,
+  formatModelCreatedShort,
   libraryApi,
   modelStatus,
   planBatchDeletion,
+  pruneSessionAddedModels,
+  readStoredModelSortMode,
   readStoredWorkflowInspect,
+  recordSessionAddedModels,
   sortModels,
+  writeStoredModelSortMode,
   writeStoredWorkflowInspect,
   type Catalog,
   type LibraryModel,
   type ModelSortMode,
   type ModelTask,
+  type SessionAddedModel,
 } from '../lib/model-library';
 import { useSmartPoll } from '../lib/smart-poll';
 import { ConfirmDialog } from '../components/Feedback';
@@ -72,12 +79,13 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
   const [architectureFilter, setArchitectureFilter] = useState('');
   const [stateFilter, setStateFilter] = useState('');
   const [unreferencedOnly, setUnreferencedOnly] = useState(false);
-  const [sortMode, setSortMode] = useState<ModelSortMode>('smart');
+  const [sortMode, setSortMode] = useState<ModelSortMode>(() => readStoredModelSortMode());
   const [detailId, setDetailId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [openMenuUp, setOpenMenuUp] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [sessionAdded, setSessionAdded] = useState<SessionAddedModel[]>([]);
   const [batchDeleteMode, setBatchDeleteMode] = useState<'remove_index' | 'delete_file' | null>(null);
   const [singleDeleteTarget, setSingleDeleteTarget] = useState<{ model: LibraryModel; deleteFile: boolean } | null>(null);
   const [error, setError] = useState('');
@@ -85,6 +93,20 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
   const [progress, setProgress] = useState('');
   const [inspector, setInspector] = useState(() => readStoredWorkflowInspect());
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const seenCatalogIdsRef = useRef<Set<string>>(new Set());
+
+  const updateSortMode = useCallback((next: ModelSortMode | ((curr: ModelSortMode) => ModelSortMode)) => {
+    setSortMode((curr) => {
+      const resolved = typeof next === 'function' ? next(curr) : next;
+      writeStoredModelSortMode(resolved);
+      return resolved;
+    });
+  }, []);
+
+  const recordAddedModels = useCallback((added: LibraryModel[]) => {
+    if (!added.length) return;
+    setSessionAdded((curr) => recordSessionAddedModels(curr, added));
+  }, []);
 
   const updateInspector = useCallback((patch: Partial<typeof inspector>) => {
     setInspector((curr) => {
@@ -107,10 +129,11 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
   const hasActiveTasks = tasks.some((t) => ACTIVE_MODEL_STATES.has(t.state));
   useSmartPoll(refresh, { enabled: true, active: hasActiveTasks, activeMs: 3000, idleMs: 30000 });
 
-  // Prune selection when catalog changes (e.g. models deleted).
+  // Prune selection and session queue when catalog changes (e.g. models deleted).
   useEffect(() => {
     if (!catalog) return;
     const valid = new Set(catalog.items.map((m) => m.id));
+    for (const id of valid) seenCatalogIdsRef.current.add(id);
     setSelectedIds((prev) => {
       let changed = false;
       const next = new Set<string>();
@@ -120,6 +143,7 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
       }
       return changed ? next : prev;
     });
+    setSessionAdded((prev) => pruneSessionAddedModels(prev, valid, seenCatalogIdsRef.current));
   }, [catalog]);
 
   // Close row overflow menu on outside tap/click or Escape.
@@ -168,6 +192,11 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
     });
   }, [allItems]);
 
+  const modelById = useMemo(
+    () => new Map(allItems.map((m) => [m.id, m])),
+    [allItems],
+  );
+
   const taskByModelId = useMemo(() => {
     const map = new Map<string, ModelTask>();
     for (const t of tasks) {
@@ -178,6 +207,51 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
     }
     return map;
   }, [tasks]);
+
+  const sessionAddedView = useMemo(() => {
+    let ready = 0;
+    let active = 0;
+    let failed = 0;
+    let other = 0;
+    const items = sessionAdded.map((entry) => {
+      const model = modelById.get(entry.modelId);
+      const task = taskByModelId.get(entry.modelId);
+      const hasActiveTask = Boolean(task && ACTIVE_MODEL_STATES.has(task.state));
+      const isActive = hasActiveTask || Boolean(model && ACTIVE_MODEL_STATES.has(model.state));
+      const effectiveState = hasActiveTask && task ? task.state : (model?.state || 'pending');
+      const title = model ? displayModelTitles(model).primary : entry.fallbackTitle;
+      const pct = hasActiveTask && task?.total && task.total > 0
+        ? Math.min(100, Math.round((task.bytes / task.total) * 100))
+        : null;
+      const baseLabel = COMPACT_STATUS_LABEL[effectiveState] || modelStatus[effectiveState] || effectiveState;
+      const showPct = pct !== null && (effectiveState === 'downloading' || effectiveState === 'uploading' || effectiveState === 'verifying');
+      const statusLabel = showPct ? `${baseLabel} ${pct}%` : baseLabel;
+      const tone = isActive
+        ? 'active'
+        : effectiveState === 'ready'
+          ? 'ready'
+          : (effectiveState === 'failed' || effectiveState === 'missing')
+            ? 'danger'
+            : 'warn';
+      if (isActive) active += 1;
+      else if (effectiveState === 'ready') ready += 1;
+      else if (effectiveState === 'failed' || effectiveState === 'missing') failed += 1;
+      else other += 1;
+      return {
+        modelId: entry.modelId,
+        model,
+        title,
+        statusLabel,
+        tone,
+      };
+    });
+    const summaryParts: string[] = [];
+    if (ready > 0) summaryParts.push(`${ready} 已就绪`);
+    if (active > 0) summaryParts.push(`${active} 进行中`);
+    if (failed > 0) summaryParts.push(`${failed} 失败`);
+    if (other > 0) summaryParts.push(`${other} 待处理`);
+    return { items, summaryParts };
+  }, [sessionAdded, modelById, taskByModelId]);
 
   const visibleItems = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -374,6 +448,7 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
     const t = taskByModelId.get(m.id);
     return Boolean(m.drive_file_id) && !(t && ACTIVE_MODEL_STATES.has(t.state));
   }).length;
+  const renderNowMs = Date.now();
 
   return (
     <div className={styles.stack}>
@@ -425,6 +500,7 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
         onClose={() => updateInspector({ open: false })}
         onRefreshLibrary={refresh}
         onLocateModel={locateModel}
+        onModelsAdded={recordAddedModels}
       />
 
       <ModelStorageBreakdown
@@ -448,6 +524,50 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
             <X size={14} aria-hidden />
           </button>
         </div>
+      )}
+      {sessionAddedView.items.length > 0 && (
+        <section className={styles.modelSessionQueue} aria-label="本次已入库模型记录" role="status">
+          <div className={styles.modelSessionQueueHead}>
+            <div className={styles.modelSessionQueueSummary}>
+              <strong>本次已加入队列（{sessionAddedView.items.length} 个）</strong>
+              {sessionAddedView.summaryParts.length > 0 && (
+                <span className="muted small">{sessionAddedView.summaryParts.join(' · ')}</span>
+              )}
+            </div>
+            <button
+              type="button"
+              className={styles.modelSessionClearBtn}
+              aria-label="清空本次入库记录"
+              onClick={() => setSessionAdded([])}
+            >
+              清空
+            </button>
+          </div>
+          <div className={styles.modelSessionChipList}>
+            {sessionAddedView.items.map((item) => (
+              <button
+                key={item.modelId}
+                type="button"
+                className={styles.modelSessionChip}
+                data-tone={item.tone}
+                disabled={!item.model}
+                title={`${item.title} · ${item.statusLabel}${item.model ? '（点击查看详情）' : ''}`}
+                onClick={() => {
+                  if (!item.model) return;
+                  if (visibleItems.some((m) => m.id === item.model!.id)) {
+                    setDetailId(item.model.id);
+                  } else {
+                    locateModel(item.model);
+                  }
+                }}
+              >
+                <i className={styles.modelSessionDot} aria-hidden />
+                <span className={styles.modelSessionChipName}>{item.title}</span>
+                <span className={styles.modelSessionChipState}>{item.statusLabel}</span>
+              </button>
+            ))}
+          </div>
+        </section>
       )}
 
       {/* Unified Compact Asset Table Card */}
@@ -586,9 +706,10 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
                 aria-label="排序方式"
                 className={styles.miniSelect}
                 value={sortMode}
-                onChange={(e) => setSortMode(e.target.value as ModelSortMode)}
+                onChange={(e) => updateSortMode(e.target.value as ModelSortMode)}
               >
                 <option value="smart">默认排序（体积 ↓）</option>
+                <option value="created_desc">按入库时间（最新优先）</option>
                 <option value="size_desc">按体积降序</option>
                 <option value="name_asc">按名称 A-Z</option>
                 <option value="status">按状态优先</option>
@@ -655,7 +776,7 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
                 <button
                   type="button"
                   className={styles.modelSortColBtn}
-                  onClick={() => setSortMode((curr) => (curr === 'size_desc' ? 'smart' : 'size_desc'))}
+                  onClick={() => updateSortMode((curr) => (curr === 'size_desc' ? 'smart' : 'size_desc'))}
                 >
                   体积{sortMode === 'size_desc' || sortMode === 'smart' ? ' ↓' : ''}
                 </button>
@@ -686,6 +807,8 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
                       ? 'danger'
                       : 'warn';
                 const canDeleteFile = Boolean(m.drive_file_id && m.managed_file && !isActive);
+                const createdShort = formatModelCreatedShort(m.created_at, renderNowMs);
+                const createdFull = formatModelCreatedFull(m.created_at);
 
                 return (
                   <div
@@ -731,10 +854,15 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
                           </span>
                         )}
                       </div>
-                      {(titles.secondary || m.external_source?.status === 'unverified') && (
+                      {(titles.secondary || createdShort || m.external_source?.status === 'unverified') && (
                         <div className={styles.modelSubLine}>
                           {titles.secondary && (
                             <span className={styles.modelSubPath} title={titles.secondary}>{titles.secondary}</span>
+                          )}
+                          {createdShort && (
+                            <span className={styles.modelSubTime} title={createdFull ? `入库时间：${createdFull}` : undefined}>
+                              {createdShort} 入库
+                            </span>
                           )}
                           {m.external_source?.status === 'unverified' && (
                             <span className={styles.modelSubWarn}>来源待验证</span>
@@ -970,8 +1098,9 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
         defaultType={category || undefined}
         models={allItems}
         onClose={() => setAddOpen(false)}
-        onAdded={async (_model, msg) => {
-          setProgress(msg);
+        onAdded={async (model) => {
+          recordAddedModels([model]);
+          setProgress('');
           await refresh();
         }}
         onLocateModel={locateModel}

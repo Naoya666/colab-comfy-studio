@@ -16,6 +16,7 @@ import {
   ACTIVE_MODEL_STATES,
   bytesLabel,
   displayModelTitles,
+  formatModelCreatedFull,
   libraryApi,
   modelStatus,
   shortHash,
@@ -417,6 +418,8 @@ export function ModelDetailDrawer({
               )}
               <dt>来源与版本</dt>
               <dd>{activeModel.source || '未知'}{activeModel.version_name ? ` · ${activeModel.version_name}` : ''}</dd>
+              <dt>入库时间</dt>
+              <dd>{formatModelCreatedFull(activeModel.created_at) || '未知'}</dd>
               <dt>外部来源</dt>
               <dd>
                 {activeModel.external_source

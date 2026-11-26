@@ -23,6 +23,8 @@ export interface LibraryModel {
   original_source_url?: string | null;
   download_url?: string | null;
   version_name?: string;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface ModelTask {
@@ -276,7 +278,125 @@ export const modelStatus: Record<string, string> = {
   manual_review: '节点待确认',
 };
 
-export type ModelSortMode = 'smart' | 'size_desc' | 'name_asc' | 'status';
+export type ModelSortMode = 'smart' | 'created_desc' | 'size_desc' | 'name_asc' | 'status';
+
+export const MODEL_SORT_STORAGE_KEY = 'studio-model-library-sort-mode-v1';
+
+const VALID_MODEL_SORT_MODES = new Set<ModelSortMode>([
+  'smart',
+  'created_desc',
+  'size_desc',
+  'name_asc',
+  'status',
+]);
+
+export function readStoredModelSortMode(storage?: Pick<Storage, 'getItem'> | null): ModelSortMode {
+  try {
+    const store = storage === undefined
+      ? (typeof localStorage !== 'undefined' ? localStorage : null)
+      : storage;
+    const saved = store?.getItem(MODEL_SORT_STORAGE_KEY);
+    if (saved && VALID_MODEL_SORT_MODES.has(saved as ModelSortMode)) {
+      return saved as ModelSortMode;
+    }
+    return 'smart';
+  } catch {
+    return 'smart';
+  }
+}
+
+export function writeStoredModelSortMode(
+  mode: ModelSortMode,
+  storage?: Pick<Storage, 'setItem'> | null,
+): void {
+  try {
+    const store = storage === undefined
+      ? (typeof localStorage !== 'undefined' ? localStorage : null)
+      : storage;
+    store?.setItem(MODEL_SORT_STORAGE_KEY, mode);
+  } catch {
+    // Ignore restricted storage environments.
+  }
+}
+
+export interface SessionAddedModel {
+  modelId: string;
+  fallbackTitle: string;
+  addedAt: number;
+}
+
+export function recordSessionAddedModels(
+  current: SessionAddedModel[],
+  added: Pick<LibraryModel, 'id' | 'display_name' | 'filename' | 'relative_path'>[],
+  nowMs = Date.now(),
+): SessionAddedModel[] {
+  if (!added.length) return current;
+  const fresh: SessionAddedModel[] = [];
+  const seen = new Set<string>();
+  for (const model of added) {
+    if (!model.id || seen.has(model.id)) continue;
+    seen.add(model.id);
+    const fallbackTitle = displayModelTitles(model).primary || model.filename || model.id;
+    fresh.push({ modelId: model.id, fallbackTitle, addedAt: nowMs });
+  }
+  if (!fresh.length) return current;
+  return [...fresh, ...current.filter((item) => !seen.has(item.modelId))];
+}
+
+export function pruneSessionAddedModels(
+  current: SessionAddedModel[],
+  catalogIds: ReadonlySet<string>,
+  seenCatalogIds: ReadonlySet<string>,
+): SessionAddedModel[] {
+  if (!current.length) return current;
+  let changed = false;
+  const next: SessionAddedModel[] = [];
+  for (const item of current) {
+    // Only drop entries already observed in the catalog before deletion so a stale poll
+    // returning before the post-add refresh cannot wipe out a newly queued model.
+    if (!catalogIds.has(item.modelId) && seenCatalogIds.has(item.modelId)) {
+      changed = true;
+      continue;
+    }
+    next.push(item);
+  }
+  return changed ? next : current;
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+export function formatModelCreatedFull(value?: string | null): string {
+  if (!value) return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+export function formatModelCreatedShort(value?: string | null, nowMs = Date.now()): string {
+  if (!value) return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  const now = new Date(nowMs);
+  const timePart = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const isSameDay = (a: Date, b: Date) => (
+    a.getFullYear() === b.getFullYear()
+    && a.getMonth() === b.getMonth()
+    && a.getDate() === b.getDate()
+  );
+  if (isSameDay(d, now)) {
+    return `今天 ${timePart}`;
+  }
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (isSameDay(d, yesterday)) {
+    return `昨天 ${timePart}`;
+  }
+  if (d.getFullYear() === now.getFullYear()) {
+    return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${timePart}`;
+  }
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
 
 export interface TypeSegment {
   type: string;
@@ -328,8 +448,18 @@ export function displayModelTitles(
   };
 }
 
+function isActiveModel(model: LibraryModel, activeTaskIds: Set<string>): boolean {
+  return activeTaskIds.has(model.id) || ACTIVE_MODEL_STATES.has(model.state);
+}
+
+function modelCreatedTimestamp(model: Pick<LibraryModel, 'created_at'>): number {
+  if (!model.created_at) return Number.NEGATIVE_INFINITY;
+  const parsed = Date.parse(model.created_at);
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+}
+
 function modelPriorityRank(model: LibraryModel, activeTaskIds: Set<string>): number {
-  if (activeTaskIds.has(model.id) || ACTIVE_MODEL_STATES.has(model.state)) return 0;
+  if (isActiveModel(model, activeTaskIds)) return 0;
   if (model.state === 'failed' || model.state === 'missing') return 1;
   if (model.state === 'unverified') return 2;
   return 3;
@@ -343,6 +473,14 @@ export function sortModels(items: LibraryModel[], tasks: ModelTask[], mode: Mode
       if (rankDiff !== 0) return rankDiff;
       const sizeDiff = (b.size || 0) - (a.size || 0);
       if (sizeDiff !== 0) return sizeDiff;
+      return displayModelTitles(a).primary.localeCompare(displayModelTitles(b).primary);
+    }
+    if (mode === 'created_desc') {
+      const activeDiff = (isActiveModel(a, activeTaskIds) ? 0 : 1) - (isActiveModel(b, activeTaskIds) ? 0 : 1);
+      if (activeDiff !== 0) return activeDiff;
+      const ta = modelCreatedTimestamp(a);
+      const tb = modelCreatedTimestamp(b);
+      if (ta !== tb) return tb > ta ? 1 : -1;
       return displayModelTitles(a).primary.localeCompare(displayModelTitles(b).primary);
     }
     if (mode === 'size_desc') {
