@@ -2545,3 +2545,292 @@ def test_handoff_allows_loopback_origin_equivalence_and_rejects_mismatches(proxy
             follow_redirects=False,
         )
         assert r.status_code == 303 and r.headers["location"] == "/"
+
+
+def test_native_idle_deadline_syncs_on_writes_busy_and_restart(tmp_path, monkeypatch):
+    from app.db import Store
+    from app.gpu import native_restart
+    from app.gpu.compute import GpuConfig
+    from app.gpu.instances import InstanceService
+    from app.gpu.repository import Repository
+
+    store = Store(f"sqlite:///{tmp_path / 'native-idle-sync.db'}")
+    repo = Repository(store)
+    svc = InstanceService(repo)
+    t0 = 1_795_000_000.0
+    hard = t0 + 720 * 60.0
+    initial_idle = t0 + 120 * 60.0
+
+    inst = repo.create(
+        "instances",
+        "owner",
+        {
+            "state": "retained_idle",
+            "instance_pool": "native",
+            "provider": "colab",
+            "account_id": "acc-1",
+            "lease_id": "lease-sync",
+            "native_comfy": True,
+            "native_ready": True,
+            "retain_idle_minutes": 120.0,
+            "idle_deadline_at": initial_idle,
+            "hard_deadline_at": hard,
+            "manual_stop_requested": False,
+        },
+        record_id="inst-sync",
+    )
+    lease = repo.create(
+        "leases",
+        "owner",
+        {
+            "state": "idle",
+            "provider": "colab",
+            "account_id": "acc-1",
+            "owner_job_id": "job-sync",
+            "instance_id": inst["id"],
+            "native_comfy": True,
+            "native_ready": True,
+            "native_last_busy": t0,
+            "native_idle_minutes": 120,
+            "idle_deadline_at": initial_idle,
+            "deadline_epoch": hard,
+            "hard_deadline_at": hard,
+            "runtime_id": "rt-sync",
+            "request_id": "req-sync",
+        },
+        record_id="lease-sync",
+    )
+
+    now_val = [t0 + 600.0]
+    monkeypatch.setattr(native.time, "time", lambda: now_val[0])
+    monkeypatch.setattr(native_restart.time, "time", lambda: now_val[0])
+    monkeypatch.setattr(native.GpuConfig, "from_env", lambda: GpuConfig(real_enabled=False))
+    monkeypatch.setattr(native, "keepalive_lease", lambda *a, **kw: None)
+
+    # 1. begin_write (e.g. POST /prompt) advances both lease and instance idle_deadline_at
+    native.begin_write(repo, lease, write_id="w-1")
+    expected_w1 = now_val[0] + 120 * 60.0
+    assert repo.get("leases", lease["id"], "owner")["idle_deadline_at"] == pytest.approx(expected_w1)
+    assert repo.get("instances", inst["id"], "owner")["idle_deadline_at"] == pytest.approx(expected_w1)
+    assert svc.get("owner", inst["id"])["idle_deadline_at"] == pytest.approx(expected_w1)
+    assert svc.list("owner")[0]["idle_deadline_at"] == pytest.approx(expected_w1)
+
+    # 2. update_write(finished=True) advances idle_deadline_at to request completion
+    now_val[0] += 45.0
+    native.update_write(repo, repo.get("leases", lease["id"], "owner"), "w-1", finished=True)
+    expected_w2 = now_val[0] + 120 * 60.0
+    assert repo.get("leases", lease["id"], "owner")["idle_deadline_at"] == pytest.approx(expected_w2)
+    assert repo.get("instances", inst["id"], "owner")["idle_deadline_at"] == pytest.approx(expected_w2)
+
+    # 3. protect_lease seeing confirmed queue busy advances idle_deadline_at
+    now_val[0] += 90.0
+    monkeypatch.setattr(native, "busy_state_for", lambda *a, **kw: ("busy", "queue"))
+    assert native.protect_lease(repo, repo.get("leases", lease["id"], "owner"), clock=lambda: now_val[0], check_remote=False)
+    expected_busy = now_val[0] + 120 * 60.0
+    assert repo.get("leases", lease["id"], "owner")["idle_deadline_at"] == pytest.approx(expected_busy)
+    assert repo.get("instances", inst["id"], "owner")["idle_deadline_at"] == pytest.approx(expected_busy)
+
+    # 4. Restart completion refreshes idle_deadline_at
+    now_val[0] += 120.0
+    op = {"id": "rst-1", "instance_id": inst["id"], "phase": "recovering", "created_at": now_val[0] - 20.0}
+    repo.update("leases", lease["id"], {"native_restart": op}, "owner")
+    native_restart._save(repo, repo.get("leases", lease["id"], "owner"), op, phase="succeeded")
+    expected_restart = now_val[0] + 120 * 60.0
+    assert repo.get("leases", lease["id"], "owner")["idle_deadline_at"] == pytest.approx(expected_restart)
+    assert repo.get("instances", inst["id"], "owner")["idle_deadline_at"] == pytest.approx(expected_restart)
+
+    # 5. Clamped to session hard deadline when activity approaches max_runtime_minutes
+    now_val[0] = hard - 15 * 60.0
+    assert native.protect_lease(repo, repo.get("leases", lease["id"], "owner"), clock=lambda: now_val[0], check_remote=False)
+    assert repo.get("leases", lease["id"], "owner")["idle_deadline_at"] == pytest.approx(hard)
+    assert repo.get("instances", inst["id"], "owner")["idle_deadline_at"] == pytest.approx(hard)
+    assert svc.get("owner", inst["id"])["idle_deadline_at"] == pytest.approx(hard)
+    store.engine.dispose()
+
+
+def test_native_idle_deadline_read_fallback_and_skip_clock_bump(tmp_path, monkeypatch):
+    from app.db import Store
+    from app.gpu.compute import GpuConfig
+    from app.gpu.instances import InstanceService
+    from app.gpu.repository import Repository
+
+    store = Store(f"sqlite:///{tmp_path / 'native-idle-fallback.db'}")
+    repo = Repository(store)
+    svc = InstanceService(repo)
+    t0 = 1_795_000_000.0
+    hard = t0 + 720 * 60.0
+    stale_idle = t0 + 120 * 60.0
+    later_activity = t0 + 900.0
+
+    # Simulate an existing live instance whose stored idle_deadline_at is stale, while lease has newer activity
+    inst = repo.create(
+        "instances",
+        "owner",
+        {
+            "state": "retained_idle",
+            "instance_pool": "native",
+            "provider": "colab",
+            "account_id": "acc-1",
+            "lease_id": "lease-legacy",
+            "native_comfy": True,
+            "native_ready": True,
+            "retain_idle_minutes": 120.0,
+            "idle_deadline_at": stale_idle,
+            "hard_deadline_at": hard,
+        },
+        record_id="inst-legacy",
+    )
+    repo.create(
+        "leases",
+        "owner",
+        {
+            "state": "idle",
+            "provider": "colab",
+            "account_id": "acc-1",
+            "owner_job_id": "job-legacy",
+            "instance_id": inst["id"],
+            "native_comfy": True,
+            "native_ready": True,
+            "native_last_busy": later_activity,
+            "native_last_write": later_activity - 5.0,
+            "native_idle_minutes": 120,
+            "idle_deadline_at": stale_idle,
+            "deadline_epoch": hard,
+            "hard_deadline_at": hard,
+        },
+        record_id="lease-legacy",
+    )
+    expected_live = later_activity + 120 * 60.0
+    assert svc.get("owner", inst["id"])["idle_deadline_at"] == pytest.approx(expected_live)
+    assert svc.list("owner")[0]["idle_deadline_at"] == pytest.approx(expected_live)
+
+    # Auto-recovered idle instance: background model_preparation/plugins must NOT bump idle_deadline_at
+    inherited_idle = t0 + 30 * 60.0
+    inst_rec = repo.create(
+        "instances",
+        "owner",
+        {
+            "state": "retained_idle",
+            "instance_pool": "native",
+            "provider": "colab",
+            "account_id": "acc-1",
+            "lease_id": "lease-rec",
+            "native_comfy": True,
+            "native_ready": True,
+            "retain_idle_minutes": 120.0,
+            "idle_deadline_at": inherited_idle,
+            "hard_deadline_at": hard,
+        },
+        record_id="inst-rec",
+    )
+    lease_rec = repo.create(
+        "leases",
+        "owner",
+        {
+            "state": "idle",
+            "provider": "colab",
+            "account_id": "acc-1",
+            "owner_job_id": "job-rec",
+            "instance_id": inst_rec["id"],
+            "native_comfy": True,
+            "native_ready": True,
+            "native_last_busy": inherited_idle - 120 * 60.0,
+            "native_idle_minutes": 120,
+            "idle_deadline_at": inherited_idle,
+            "deadline_epoch": hard,
+            "hard_deadline_at": hard,
+        },
+        record_id="lease-rec",
+    )
+    monkeypatch.setattr(native.GpuConfig, "from_env", lambda: GpuConfig(real_enabled=False))
+    monkeypatch.setattr(native, "keepalive_lease", lambda *a, **kw: None)
+    monkeypatch.setattr(native, "busy_state_for", lambda *a, **kw: ("busy", "model_preparation"))
+    assert native.protect_lease(repo, lease_rec, clock=lambda: t0 + 600.0, check_remote=False)
+    assert repo.get("leases", lease_rec["id"], "owner")["idle_deadline_at"] == pytest.approx(inherited_idle)
+    assert repo.get("instances", inst_rec["id"], "owner")["idle_deadline_at"] == pytest.approx(inherited_idle)
+    assert svc.get("owner", inst_rec["id"])["idle_deadline_at"] == pytest.approx(inherited_idle)
+
+    # Unreachable tunnel ("unknown") retains conservatively without extending idle_deadline_at
+    monkeypatch.setattr(native, "busy_state_for", lambda *a, **kw: ("unknown", "unreachable"))
+    assert native.protect_lease(repo, repo.get("leases", lease_rec["id"], "owner"), clock=lambda: t0 + 900.0, check_remote=False)
+    assert repo.get("leases", lease_rec["id"], "owner")["idle_deadline_at"] == pytest.approx(inherited_idle)
+    assert repo.get("instances", inst_rec["id"], "owner")["idle_deadline_at"] == pytest.approx(inherited_idle)
+    store.engine.dispose()
+
+
+def test_watchdog_cleans_unprotected_native_lease_even_with_future_idle_deadline(tmp_path, monkeypatch):
+    from app.db import Store
+    from app.gpu.compute import GpuConfig
+    from app.gpu.repository import Repository
+    from app.gpu.scheduler import Scheduler
+
+    store = Store(f"sqlite:///{tmp_path / 'native-watchdog-drain.db'}")
+    repo = Repository(store)
+    t0 = 1_795_000_000.0
+    future_idle = t0 + 120 * 60.0
+    hard = t0 + 720 * 60.0
+
+    repo.create("jobs", "owner", {"state": "completed", "provider": "mock", "snapshot": {"native_comfy": True}}, record_id="job-wd")
+    repo.create(
+        "instances",
+        "owner",
+        {
+            "state": "retained_idle",
+            "instance_pool": "native",
+            "provider": "mock",
+            "account_id": "acc-1",
+            "lease_id": "lease-wd",
+            "native_comfy": True,
+            "native_ready": True,
+            "retain_idle_minutes": 120.0,
+            "idle_deadline_at": future_idle,
+            "hard_deadline_at": hard,
+        },
+        record_id="inst-wd",
+    )
+    repo.create(
+        "leases",
+        "owner",
+        {
+            "state": "idle",
+            "provider": "mock",
+            "account_id": "acc-1",
+            "owner_job_id": "job-wd",
+            "instance_id": "inst-wd",
+            "runtime_id": "rt-wd",
+            "request_id": "req-wd",
+            "handle": {"runtime_id": "rt-wd", "request_id": "req-wd"},
+            "native_comfy": True,
+            "native_ready": True,
+            "native_last_busy": t0,
+            "native_idle_minutes": 120,
+            "idle_deadline_at": future_idle,
+            "deadline_epoch": hard,
+            "hard_deadline_at": hard,
+        },
+        record_id="lease-wd",
+    )
+
+    cleaned = []
+
+    class FakeProvider:
+        def inspect(self, handle):
+            return {"deleted": False}
+
+        def delete(self, handle):
+            cleaned.append(handle)
+            return {"deleted": True}
+
+    monkeypatch.setattr(native, "protect_lease", lambda *a, **kw: False)
+    sched = Scheduler(
+        repo,
+        provider_factory=lambda job: FakeProvider(),
+        clock=lambda: t0 + 60.0,
+        config=GpuConfig(enabled=True, real_enabled=False),
+    )
+    result = sched.watchdog()
+    assert result["recovered"] >= 1
+    assert cleaned
+    assert repo.get("leases", "lease-wd", "owner")["state"] == "deleted"
+    assert repo.get("instances", "inst-wd", "owner")["state"] == "deleted"
+    store.engine.dispose()

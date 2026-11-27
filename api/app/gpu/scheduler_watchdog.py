@@ -571,6 +571,7 @@ class SchedulerWatchdogMixin:
                 continue
             if instance and instance.get("state") == "transferring" and not lease.get("force_stop"):
                 continue
+            native_unprotected = False
             if lease.get("native_ready") and not lease.get("force_stop"):
                 from .native import protect_lease
                 if protect_lease(
@@ -581,8 +582,21 @@ class SchedulerWatchdogMixin:
                     provider_factory=self.provider_factory,
                 ):
                     continue
-            stopping = (bool(instance and (instance.get("manual_stop_requested") or instance.get("state") in {"releasing", "cleanup_pending"}))
-                        or (lease.get("native_comfy") and lease.get("cu_fuse") == "soft_daily_limit"))
+                native_unprotected = True
+            stopping = (
+                native_unprotected
+                or bool(lease.get("force_stop") or lease.get("native_draining"))
+                or bool(
+                    instance
+                    and (
+                        instance.get("manual_stop_requested")
+                        or instance.get("force_stop")
+                        or instance.get("native_draining")
+                        or instance.get("state") in {"releasing", "cleanup_pending"}
+                    )
+                )
+                or (lease.get("native_comfy") and lease.get("cu_fuse") == "soft_daily_limit")
+            )
             if lease.get('state')=='idle' and not stopping and self.clock()<min(
                     float(lease.get('idle_deadline_at') or 0),float(lease.get('deadline_epoch') or 0)):
                 from .instances import POOL_CREATION, POOL_EPHEMERAL, POOL_NATIVE, instance_pool_of

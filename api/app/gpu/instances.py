@@ -2987,10 +2987,45 @@ class InstanceService:
         )
         return result
 
+    def _with_live_native_idle(self, session, item: dict) -> dict:
+        if (
+            instance_pool_of(item) != POOL_NATIVE
+            or item.get("native_bootstrap_failed")
+            or item.get("runtime_deleted")
+            or item.get("state") in {"deleted", "releasing", "cleanup_pending", "quarantined"}
+        ):
+            return item
+        lease_id = item.get("lease_id")
+        if not lease_id:
+            return item
+        lease_row = self._find(session, "leases", lease_id, item.get("owner_id"))
+        if lease_row is None:
+            return item
+        from . import native
+
+        lease_dict = self._dict_fast(lease_row)
+        if lease_dict.get("native_idle_minutes") is None and item.get("retain_idle_minutes") is None:
+            owner_id = item.get("owner_id")
+            for job_field in ("native_bootstrap_job_id", "owner_job_id"):
+                job_id = lease_dict.get(job_field)
+                if not job_id:
+                    continue
+                job_row = self._find(session, "jobs", job_id, owner_id)
+                if job_row is None:
+                    continue
+                policy_idle = ((job_row.data or {}).get("execution_policy") or {}).get("retain_idle_minutes")
+                if policy_idle is not None:
+                    lease_dict["native_idle_minutes"] = policy_idle
+                    break
+        live_idle = native.effective_idle_deadline(lease_dict, instance=item)
+        if live_idle is not None:
+            item["idle_deadline_at"] = live_idle
+        return item
+
     def get(self, owner, id):
         with self.store.db_lock(), self.store.Session() as session:
             row = self._find(session, "instances", id, owner)
-            return None if row is None else self.public(self._dict_fast(row))
+            return None if row is None else self.public(self._with_live_native_idle(session, self._dict_fast(row)))
 
     def list(self, owner, state=None):
         model = self._model("instances")
@@ -3000,7 +3035,7 @@ class InstanceService:
                 stmt = stmt.where(model.state == state)
             stmt = stmt.order_by(model.created_at.desc(), model.id.desc())
             rows = session.scalars(stmt).all()
-            return [self.public(self._dict_fast(row)) for row in rows]
+            return [self.public(self._with_live_native_idle(session, self._dict_fast(row))) for row in rows]
 
     def clear_history(self, owner):
         with self._admission(), self._tx() as session:

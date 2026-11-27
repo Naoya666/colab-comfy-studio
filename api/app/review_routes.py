@@ -1098,7 +1098,12 @@ def _activation_instance_hints(repo: Repository, owner_id: str, manifest: Mappin
         hard = inst.get("hard_deadline_at")
         if hard is not None and now >= float(hard):
             continue
-        idle_deadline = inst.get("idle_deadline_at") or (lease or {}).get("idle_deadline_at")
+        live_native_idle = None
+        if is_native_ready:
+            from .gpu import native as native_gpu
+
+            live_native_idle = native_gpu.effective_idle_deadline(lease, instance=inst)
+        idle_deadline = live_native_idle or inst.get("idle_deadline_at") or (lease or {}).get("idle_deadline_at")
         if not is_native_ready and idle_deadline is not None and now >= float(idle_deadline):
             continue
         if pool == POOL_EPHEMERAL:

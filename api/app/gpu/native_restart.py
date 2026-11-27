@@ -154,6 +154,7 @@ def _save(repo, lease, operation, *, validate=False, check_jobs=True, **changes)
         patch = {"native_restart": result}
         if changes.get("phase") == "succeeded":
             patch["native_last_busy"] = now
+            native.sync_idle_deadline(repo, fresh, lease_patch=patch)
         repo.update("leases", fresh["id"], patch, lease["owner_id"])
         return result
 

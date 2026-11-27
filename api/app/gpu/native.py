@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -1192,6 +1193,136 @@ def native_proxy_healthy(repo, owner: str = "owner", client=None) -> bool:
         return False
 
 
+def _native_idle_minutes(lease: dict, *, repo=None, instance: dict | None = None) -> float:
+    for candidate in (
+        lease.get("native_idle_minutes"),
+        (instance or {}).get("retain_idle_minutes"),
+    ):
+        if (
+            isinstance(candidate, (int, float))
+            and not isinstance(candidate, bool)
+            and math.isfinite(float(candidate))
+            and float(candidate) > 0
+        ):
+            return float(candidate)
+    if repo is not None and hasattr(repo, "get"):
+        owner_id = lease.get("owner_id")
+        for job_field in ("native_bootstrap_job_id", "owner_job_id"):
+            job_id = lease.get(job_field)
+            if not job_id or not owner_id:
+                continue
+            try:
+                job = repo.get("jobs", job_id, owner_id)
+            except Exception:
+                job = None
+            val = ((job or {}).get("execution_policy") or {}).get("retain_idle_minutes")
+            if (
+                isinstance(val, (int, float))
+                and not isinstance(val, bool)
+                and math.isfinite(float(val))
+                and float(val) > 0
+            ):
+                return float(val)
+    return float(settings.native_comfy_idle_minutes)
+
+
+def effective_idle_deadline(
+    lease: dict | None,
+    *,
+    repo=None,
+    instance: dict | None = None,
+) -> float | None:
+    """Compute the live idle reclamation deadline for an active native ComfyUI lease."""
+    if not isinstance(lease, dict):
+        return None
+    if (
+        not lease.get("native_comfy")
+        or not lease.get("native_ready")
+        or lease.get("native_bootstrap_failed")
+        or lease.get("state") in _INACTIVE_LEASE_STATES
+    ):
+        return None
+    if isinstance(instance, dict) and (
+        instance.get("native_bootstrap_failed")
+        or instance.get("runtime_deleted")
+        or instance.get("state") in {"deleted", "releasing", "cleanup_pending", "quarantined"}
+    ):
+        return None
+    activity_candidates = [
+        float(v)
+        for v in (lease.get("native_last_busy"), lease.get("native_last_write"))
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
+    ]
+    if not activity_candidates:
+        return None
+    last = max(activity_candidates)
+    idle_minutes = _native_idle_minutes(lease, repo=repo, instance=instance)
+    deadline = last + idle_minutes * 60.0
+    hard_candidates = [
+        float(v)
+        for v in (
+            lease.get("deadline_epoch"),
+            lease.get("hard_deadline_at"),
+            (instance or {}).get("hard_deadline_at"),
+        )
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)) and float(v) > 0
+    ]
+    if hard_candidates:
+        deadline = min(deadline, min(hard_candidates))
+    return deadline
+
+
+def sync_idle_deadline(
+    repo,
+    lease: dict,
+    *,
+    instance: dict | None = None,
+    lease_patch: dict | None = None,
+) -> float | None:
+    """Keep lease and instance ``idle_deadline_at`` aligned with refreshed native activity clocks.
+
+    Caller must already hold ``dispatch_lock``.
+    """
+    owner_id = lease.get("owner_id")
+    instance_id = lease.get("instance_id")
+    inst = instance
+    if inst is None and repo is not None and hasattr(repo, "get") and instance_id and owner_id:
+        try:
+            inst = repo.get("instances", instance_id, owner_id)
+        except Exception:
+            inst = None
+    candidate_lease = {**lease, **lease_patch} if lease_patch else lease
+    new_deadline = effective_idle_deadline(candidate_lease, repo=repo, instance=inst if isinstance(inst, dict) else None)
+    if new_deadline is None:
+        return None
+    if lease_patch is not None:
+        lease_patch["idle_deadline_at"] = new_deadline
+    if (
+        repo is not None
+        and hasattr(repo, "update")
+        and isinstance(instance_id, str)
+        and instance_id
+        and owner_id
+        and isinstance(inst, dict)
+        and inst.get("id") == instance_id
+        and inst.get("lease_id") in (None, lease.get("id"))
+        and inst.get("state") not in {"deleted", "releasing", "cleanup_pending", "quarantined", "transferring"}
+        and not inst.get("manual_stop_requested")
+        and not inst.get("native_draining")
+        and not inst.get("native_bootstrap_failed")
+    ):
+        old_idle = inst.get("idle_deadline_at")
+        should_sync = (
+            not isinstance(old_idle, (int, float))
+            or isinstance(old_idle, bool)
+            or not math.isfinite(float(old_idle))
+            or abs(new_deadline - float(old_idle)) >= 1.0
+        )
+        if should_sync:
+            repo.update("instances", instance_id, {"idle_deadline_at": new_deadline}, owner_id)
+    return new_deadline
+
+
 def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_factory=None):
     """Fence idle shutdown against new uploads/prompts under the existing dispatch lock."""
     if not lease.get("native_comfy") or lease.get("force_stop"):
@@ -1258,6 +1389,7 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
                 patch = {"native_last_upstream_busy": True}
                 if not skip_clock_bump:
                     patch["native_last_busy"] = now_ts
+                    sync_idle_deadline(repo, lease, instance=instance, lease_patch=patch)
                 lease = repo.update("leases", lease["id"], patch, lease["owner_id"])
                 retained = True
             elif upstream_status == "unknown":
@@ -1322,6 +1454,7 @@ def begin_write(repo, lease, *, allow_stopping=False, timeout=2.0, write_id=None
                 }
                 if write_id:
                     patch["native_writes"] = {**active_writes(fresh, now), write_id: now}
+                sync_idle_deadline(repo, fresh, instance=instance, lease_patch=patch)
                 repo.update("leases", fresh["id"], patch, fresh["owner_id"])
                 return
         remaining = deadline - time.monotonic()
@@ -1348,9 +1481,11 @@ def update_write(repo, lease, write_id, *, finished=False):
                     writes.pop(write_id, None)
                 else:
                     writes[write_id] = now
-                repo.update("leases", lease["id"], {
+                patch = {
                     "native_writes": writes, "native_last_write": now, "native_http_heartbeat": now,
-                }, lease["owner_id"])
+                }
+                sync_idle_deadline(repo, fresh, lease_patch=patch)
+                repo.update("leases", lease["id"], patch, lease["owner_id"])
                 return
         if time.monotonic() >= deadline:
             return
