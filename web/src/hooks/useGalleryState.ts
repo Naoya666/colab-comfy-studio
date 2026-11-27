@@ -2,21 +2,27 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   apiMessage,
   BATCH_DELETE_ASSET_LIMIT,
+  BATCH_DOWNLOAD_ASSET_LIMIT,
   BATCH_MOVE_ASSET_LIMIT,
+  NATIVE_BATCH_DOWNLOAD_LIMIT,
   batchDeleteAssets,
   batchMoveAssets,
+  createBatchAssetDownload,
+  createNativeBatchDownload,
   deleteAsset,
   deleteNativeOutput,
   favoriteNativeOutput,
   getGpuGallery,
   getGpuJob,
   importNativeOutputAsReference,
+  triggerFileDownload,
   updateAsset,
   type GalleryAsset,
   type GpuJob,
   type NativeOutputAsset,
   type Project,
 } from '../lib/gpu-api';
+import type { ImageDownloadMode } from '../lib/download-prefs';
 import { projectTitleById } from '../lib/project-label';
 import type { ViewerItem } from '../components/GalleryViewer';
 import type { MainTab } from '../lib/route-state';
@@ -365,6 +371,60 @@ export function useGalleryState({
     return { removedIds: [...removedIds], error: batchError };
   }
 
+  async function batchDownloadStudio(ids: string[], mode: ImageDownloadMode) {
+    if (!ids.length) return { error: '' };
+    if (ids.length > BATCH_DOWNLOAD_ASSET_LIMIT) {
+      const msg = `单次最多打包下载 ${BATCH_DOWNLOAD_ASSET_LIMIT} 件作品，当前已选 ${ids.length} 件，请分批选择`;
+      setGalleryError(msg);
+      pushToast(msg, 'error');
+      return { error: msg };
+    }
+    setGalleryError('');
+    try {
+      const ticket = await createBatchAssetDownload(ids, mode === 'clean');
+      triggerFileDownload(ticket.download_url, ticket.filename);
+      const modeHint = mode === 'clean' && ticket.strippable_count > 0
+        ? (ticket.skipped_strip_count > 0
+          ? `（${ticket.strippable_count} 张图片已去元数据，${ticket.skipped_strip_count} 个非图片保留原文件）`
+          : '（已去除图片元数据）')
+        : '';
+      pushToast(`正在下载 ${ticket.item_count} 件作品压缩包${modeHint}`, 'success');
+      return { error: '' };
+    } catch (cause) {
+      const msg = `批量打包下载失败：${apiMessage(cause)}`;
+      setGalleryError(msg);
+      pushToast(msg, 'error');
+      return { error: msg };
+    }
+  }
+
+  async function batchDownloadNative(ids: string[], mode: ImageDownloadMode) {
+    if (!ids.length) return { error: '' };
+    if (ids.length > NATIVE_BATCH_DOWNLOAD_LIMIT) {
+      const msg = `原生 Drive 作品单次最多打包 ${NATIVE_BATCH_DOWNLOAD_LIMIT} 件，当前已选 ${ids.length} 件，请分批选择`;
+      setGalleryError(msg);
+      pushToast(msg, 'error');
+      return { error: msg };
+    }
+    setGalleryError('');
+    try {
+      const ticket = await createNativeBatchDownload(ids, mode === 'clean');
+      triggerFileDownload(ticket.download_url, ticket.filename);
+      const modeHint = mode === 'clean' && ticket.strippable_count > 0
+        ? (ticket.skipped_strip_count > 0
+          ? `（${ticket.strippable_count} 张图片已去元数据，${ticket.skipped_strip_count} 个非图片保留原文件）`
+          : '（已去除图片元数据）')
+        : '';
+      pushToast(`正在从 Drive 打包下载 ${ticket.item_count} 件原生作品${modeHint}`, 'success');
+      return { error: '' };
+    } catch (cause) {
+      const msg = `批量打包下载失败：${apiMessage(cause)}`;
+      setGalleryError(msg);
+      pushToast(msg, 'error');
+      return { error: msg };
+    }
+  }
+
   return {
     gallerySource,
     setGallerySource,
@@ -406,9 +466,11 @@ export function useGalleryState({
     remove,
     batchRemove,
     moveAssets,
+    batchDownloadStudio,
     favoriteNative,
     importNativeRef,
     removeNative,
     batchRemoveNative,
+    batchDownloadNative,
   };
 }

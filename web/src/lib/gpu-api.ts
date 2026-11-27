@@ -235,7 +235,30 @@ export interface GpuJob {
   [key: string]: unknown;
 }
 export interface GpuEvent { id?: string; state?: string; event_type?: string; message?: string; progress?: number; created_at?: string; payload?: Record<string, unknown>; [key: string]: unknown; }
-export interface GalleryAsset { id: string; project_id: string; mime: string; filename?: string; thumbnail_url?: string; download_url?: string; favorite?: boolean; gpu_job_id?: string; source_job_id?: string; batch_id?: string; workflow_key?: string; workflow_version?: string | number; gpu_reported?: string; created_at?: string; mock?: boolean; metadata?: Record<string, unknown>; [key: string]: unknown; }
+export interface GalleryAsset {
+  id: string;
+  project_id: string;
+  mime: string;
+  filename?: string;
+  thumbnail_url?: string;
+  download_url?: string;
+  favorite?: boolean;
+  gpu_job_id?: string;
+  source_job_id?: string;
+  batch_id?: string;
+  workflow_key?: string;
+  workflow_version?: string | number;
+  model_id?: string;
+  resolved_seed?: number | null;
+  prompt?: string;
+  main_prompt?: string;
+  negative_prompt?: string;
+  gpu_reported?: string;
+  created_at?: string;
+  mock?: boolean;
+  metadata?: Record<string, unknown>;
+  [key: string]: unknown;
+}
 export interface CcuSnapshot {
   alias?: string | null;
   balance?: number | null;
@@ -703,12 +726,50 @@ export const updateAsset = (id: string, favorite: boolean) => apiFetch<GalleryAs
 export const deleteAsset = (id: string) => apiFetch<void>(`/api/assets/${encodeURIComponent(id)}`, { method: 'DELETE' });
 export const BATCH_DELETE_ASSET_LIMIT = 200;
 export const BATCH_MOVE_ASSET_LIMIT = 200;
+export const BATCH_DOWNLOAD_ASSET_LIMIT = 200;
+export const NATIVE_BATCH_DOWNLOAD_LIMIT = 50;
+
+export interface BatchDownloadTicket {
+  ticket_id: string;
+  download_url: string;
+  filename: string;
+  item_count: number;
+  total_bytes: number;
+  strippable_count: number;
+  skipped_strip_count: number;
+  strip_metadata: boolean;
+  expires_at: number;
+}
+
 export const batchDeleteAssets = (assetIds: string[]) => apiFetch<{ deleted: number; ids: string[] }>('/api/assets/batch-delete', post({ asset_ids: assetIds }));
 export const batchMoveAssets = (assetIds: string[], targetProjectId: string) =>
   apiFetch<{ moved: number; ids: string[]; target_project_id: string }>('/api/assets/batch-move', post({
     asset_ids: assetIds,
     target_project_id: targetProjectId,
   }));
+export const createBatchAssetDownload = (assetIds: string[], stripMetadata = false) =>
+  apiFetch<BatchDownloadTicket>('/api/assets/batch-download', post({
+    asset_ids: assetIds,
+    strip_metadata: stripMetadata,
+  }), 30000);
+export const createNativeBatchDownload = (fileIds: string[], stripMetadata = false) =>
+  apiFetch<BatchDownloadTicket>('/api/gpu/native/outputs/batch-download', post({
+    file_ids: fileIds,
+    strip_metadata: stripMetadata,
+  }), 45000);
+
+export function triggerFileDownload(url: string, filename?: string): void {
+  if (typeof document === 'undefined') return;
+  const fullUrl = url.startsWith('http://') || url.startsWith('https://') ? url : `${API_BASE}${url}`;
+  const anchor = document.createElement('a');
+  anchor.href = fullUrl;
+  if (filename) anchor.download = filename;
+  anchor.rel = 'noreferrer';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
 
 export interface GoogleClientConfig { configured: boolean; client_id?: string; redirect_uri: string; source?: string; }
 export const getGoogleClientConfig = (accountId?: string) => apiFetch<GoogleClientConfig>(`/api/gpu/auth/google/config${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`);
@@ -1080,3 +1141,126 @@ export const cancelRecoveryPlan = (planId: string, idempotencyKey?: string) =>
     headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
     body: JSON.stringify({}),
   });
+
+export type LocalStorageCleanupAction =
+  | 'thumb_cache'
+  | 'temp_and_orphans'
+  | 'diagnostics'
+  | 'unfavorited_outputs';
+
+export interface LocalStorageDiskUsage {
+  total_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  used_percent: number;
+}
+
+export interface LocalStorageCategory {
+  key: string;
+  label: string;
+  description: string;
+  bytes: number;
+  count: number;
+  cleanable: boolean;
+}
+
+export interface LocalStorageProjectUsage {
+  project_id: string;
+  title: string;
+  total_bytes: number;
+  total_count: number;
+  favorite_bytes: number;
+  favorite_count: number;
+  unfavorited_bytes: number;
+  unfavorited_count: number;
+  reference_bytes: number;
+  reference_count: number;
+}
+
+export interface LocalStorageDatabaseInfo {
+  dialect: string;
+  supported: boolean;
+  filename?: string | null;
+  db_bytes: number;
+  wal_bytes: number;
+  shm_bytes: number;
+  total_bytes: number;
+  reclaimable_bytes: number;
+  page_size: number;
+  page_count: number;
+  freelist_count: number;
+  message?: string | null;
+}
+
+export interface LocalStorageOverview {
+  scanned_at: number;
+  disk: LocalStorageDiskUsage;
+  studio_total_bytes: number;
+  safe_reclaimable_bytes: number;
+  unfavorited_bytes: number;
+  unfavorited_count: number;
+  protected_asset_count: number;
+  missing_disk_assets: number;
+  categories: LocalStorageCategory[];
+  projects: LocalStorageProjectUsage[];
+  database: LocalStorageDatabaseInfo;
+}
+
+export interface LocalStorageCleanupPreview {
+  action: LocalStorageCleanupAction;
+  older_than_days: number | null;
+  project_id: string | null;
+  item_count: number;
+  reclaimable_bytes: number;
+  protected_skipped_count: number;
+  samples: Array<{ id?: string; name: string; bytes: number; kind?: string; created_at?: string | null }>;
+  warnings: string[];
+}
+
+export interface LocalStorageCleanupResult {
+  action: LocalStorageCleanupAction;
+  deleted_count: number;
+  freed_bytes: number;
+  skipped_count: number;
+  skipped_reasons: string[];
+  overview: LocalStorageOverview;
+}
+
+export interface SqliteVacuumResult {
+  before_bytes: number;
+  after_bytes: number;
+  freed_bytes: number;
+  reclaimable_bytes_after: number;
+  overview: LocalStorageOverview;
+}
+
+export interface SqliteSnapshotTicket {
+  ticket_id: string;
+  download_url: string;
+  filename: string;
+  estimated_bytes: number;
+  expires_at: number;
+  notice: string;
+}
+
+export const getLocalStorageOverview = (signal?: AbortSignal) =>
+  apiFetch<LocalStorageOverview>('/api/gpu/storage/local', { cache: 'no-store', signal }, 30000);
+
+export const previewLocalStorageCleanup = (body: {
+  action: LocalStorageCleanupAction;
+  older_than_days?: number;
+  project_id?: string | null;
+}) => apiFetch<LocalStorageCleanupPreview>('/api/gpu/storage/local/cleanup/preview', post(body), 30000);
+
+export const executeLocalStorageCleanup = (body: {
+  action: LocalStorageCleanupAction;
+  older_than_days?: number;
+  project_id?: string | null;
+  confirmed: true;
+}) => apiFetch<LocalStorageCleanupResult>('/api/gpu/storage/local/cleanup', post(body), 60000);
+
+export const vacuumLocalSqlite = () =>
+  apiFetch<SqliteVacuumResult>('/api/gpu/storage/local/vacuum', post({ confirmed: true }), 60000);
+
+export const createLocalSqliteSnapshot = () =>
+  apiFetch<SqliteSnapshotTicket>('/api/gpu/storage/local/snapshot', post({}), 30000);

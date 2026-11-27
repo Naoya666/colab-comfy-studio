@@ -1787,6 +1787,7 @@ export default function App() {
                   inspectedId={desktop ? gs.viewer?.id || '' : undefined}
                   onFavorite={(asset) => void gs.favorite(asset)}
                   onBatchDelete={gs.batchRemove}
+                  onBatchDownload={gs.batchDownloadStudio}
                   onRequestMove={(ids, opts) => setMoveDialog({ ids, currentProjectId: opts?.currentProjectId, onMoved: opts?.onMoved })}
                   onOpen={(asset, ordered) => {
                     gs.setViewerList(ordered || gs.projectGallery);
@@ -1808,6 +1809,7 @@ export default function App() {
                   }}
                   onFavorite={(asset) => void gs.favoriteNative(asset)}
                   onBatchDelete={gs.batchRemoveNative}
+                  onBatchDownload={gs.batchDownloadNative}
                 />
               )}
 
@@ -1939,6 +1941,8 @@ export default function App() {
           <SettingsPanel
             accounts={accounts}
             accountsLoaded={accountsLoaded}
+            projects={projects}
+            onLocalStorageMutated={gs.refreshGallery}
             onAccountsChange={setAccounts}
             onGpuOrderChange={setGpuOrder}
             settings={settings}

@@ -6,7 +6,14 @@ import {
   type NativeOutputAsset,
   type NativeOutputsPage,
 } from '../lib/gpu-api';
+import {
+  isStrippableImageMime,
+  loadImageDownloadMode,
+  saveImageDownloadMode,
+  type ImageDownloadMode,
+} from '../lib/download-prefs';
 import { bytesLabel } from '../lib/model-library';
+import { BatchZipDownloadButton } from './BatchZipDownloadButton';
 import { ConfirmDialog } from './Feedback';
 import styles from '../gpu.module.css';
 
@@ -27,6 +34,7 @@ export function NativeGalleryPanel({
   onOpen,
   onFavorite,
   onBatchDelete,
+  onBatchDownload,
 }: {
   inspectedId?: string;
   refreshToken?: number;
@@ -35,6 +43,7 @@ export function NativeGalleryPanel({
   onOpen: (asset: NativeOutputAsset, ordered: NativeOutputAsset[]) => void;
   onFavorite: (asset: NativeOutputAsset) => void;
   onBatchDelete?: (ids: string[]) => Promise<{ removedIds: string[]; error?: string }>;
+  onBatchDownload?: (ids: string[], mode: ImageDownloadMode) => Promise<{ error?: string }>;
 }) {
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
@@ -49,6 +58,8 @@ export function NativeGalleryPanel({
   const [checkedIds, setCheckedIds] = useState<Set<string>>(() => new Set());
   const [confirmBatchDelete, setConfirmBatchDelete] = useState<{ ids: string[]; title: string; description: string; error?: string } | null>(null);
   const [deletingBatch, setDeletingBatch] = useState(false);
+  const [downloadingBatch, setDownloadingBatch] = useState(false);
+  const [downloadMode, setDownloadMode] = useState<ImageDownloadMode>(() => loadImageDownloadMode());
   const seqRef = useRef(0);
 
   const load = useCallback(async (opts: { refresh?: boolean; append?: boolean; offset?: number } = {}) => {
@@ -100,10 +111,29 @@ export function NativeGalleryPanel({
       return true;
     }), [items, deletedIds, favoriteOverrides, filter]);
 
+  const visibleById = useMemo(() => new Map(visible.map((item) => [item.id, item])), [visible]);
   const activeCheckedIds = useMemo(() => {
-    const valid = new Set(visible.map((item) => item.id));
-    return [...checkedIds].filter((id) => valid.has(id));
-  }, [checkedIds, visible]);
+    return [...checkedIds].filter((id) => visibleById.has(id));
+  }, [checkedIds, visibleById]);
+  const hasStrippableSelected = useMemo(
+    () => activeCheckedIds.some((id) => isStrippableImageMime(visibleById.get(id)?.mime)),
+    [activeCheckedIds, visibleById],
+  );
+
+  function handleDownloadModeChange(next: ImageDownloadMode) {
+    setDownloadMode(next);
+    saveImageDownloadMode(next);
+  }
+
+  async function executeBatchDownload(mode: ImageDownloadMode) {
+    if (!onBatchDownload || !activeCheckedIds.length || downloadingBatch) return;
+    setDownloadingBatch(true);
+    try {
+      await onBatchDownload(activeCheckedIds, mode);
+    } finally {
+      setDownloadingBatch(false);
+    }
+  }
 
   function toggleChecked(id: string) {
     setBatchMode(true);
@@ -171,7 +201,7 @@ export function NativeGalleryPanel({
             <RefreshCw size={14} className={loading ? styles.spin : undefined} aria-hidden />
             {loading ? '读取中…' : '刷新 Drive'}
           </button>
-          {onBatchDelete && visible.length > 0 && (
+          {(onBatchDelete || onBatchDownload) && visible.length > 0 && (
             <button
               type="button"
               className={`button small ${batchMode ? '' : 'secondary'}`}
@@ -185,13 +215,13 @@ export function NativeGalleryPanel({
 
       {page?.connected && (
         <p className="muted small">
-          直读 Google Drive `native-comfy/output/`{page.account_alias ? `（${page.account_alias}）` : ''}，无需开机即可预览、收藏、导入参考素材或提取 PNG 工作流。
+          直读 Google Drive `native-comfy/output/`{page.account_alias ? `（${page.account_alias}）` : ''}，无需开机即可预览、收藏、批量打包下载、导入参考素材或提取 PNG 工作流。
         </p>
       )}
 
       {error && <p className="status error" role="alert">{error}</p>}
 
-      {batchMode && onBatchDelete && (
+      {batchMode && (onBatchDelete || onBatchDownload) && (
         <div className={styles.cleanupBar} role="toolbar" aria-label="批量管理原生作品">
           <strong>已选 {activeCheckedIds.length} 件</strong>
           <div className="actions">
@@ -217,18 +247,30 @@ export function NativeGalleryPanel({
             >
               清空选择
             </button>
-            <button
-              type="button"
-              className="button danger small"
-              disabled={!activeCheckedIds.length || deletingBatch}
-              onClick={() => setConfirmBatchDelete({
-                ids: activeCheckedIds,
-                title: `将选中的 ${activeCheckedIds.length} 件作品移入回收站？`,
-                description: '文件将移入 Google Drive 回收站，可在 Drive 回收站中恢复。',
-              })}
-            >
-              <Trash2 size={14} aria-hidden />批量移至回收站 ({activeCheckedIds.length})
-            </button>
+            {onBatchDownload && (
+              <BatchZipDownloadButton
+                count={activeCheckedIds.length}
+                hasStrippable={hasStrippableSelected}
+                busy={downloadingBatch}
+                mode={downloadMode}
+                onModeChange={handleDownloadModeChange}
+                onDownload={(mode) => void executeBatchDownload(mode)}
+              />
+            )}
+            {onBatchDelete && (
+              <button
+                type="button"
+                className="button danger small"
+                disabled={!activeCheckedIds.length || deletingBatch}
+                onClick={() => setConfirmBatchDelete({
+                  ids: activeCheckedIds,
+                  title: `将选中的 ${activeCheckedIds.length} 件作品移入回收站？`,
+                  description: '文件将移入 Google Drive 回收站，可在 Drive 回收站中恢复。',
+                })}
+              >
+                <Trash2 size={14} aria-hidden />批量移至回收站 ({activeCheckedIds.length})
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -248,6 +290,16 @@ export function NativeGalleryPanel({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
+            {query && (
+              <button
+                type="button"
+                className={styles.searchClear}
+                aria-label="清空搜索"
+                onClick={() => setQuery('')}
+              >
+                <X size={14} aria-hidden />
+              </button>
+            )}
           </label>
 
           <div className={styles.filterBar}>

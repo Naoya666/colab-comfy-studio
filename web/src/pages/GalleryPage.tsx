@@ -4,9 +4,17 @@ import {
   Layers, CheckSquare, X, FileJson, RefreshCw, Workflow, Folder, FolderInput,
 } from 'lucide-react';
 import { assetUrl, type GalleryAsset, type GpuWorkflow, type Project } from '../lib/gpu-api';
+import {
+  isStrippableImageMime,
+  loadImageDownloadMode,
+  saveImageDownloadMode,
+  type ImageDownloadMode,
+} from '../lib/download-prefs';
+import { galleryPromptPreview, matchesGalleryQuery } from '../lib/gallery-search';
 import { groupGalleryAssets, isDiagnosticAsset } from '../lib/history-grouping';
 import { projectOptionLabel, projectTitleById } from '../lib/project-label';
 import { workflowTitle } from '../lib/workflow-copy';
+import { BatchZipDownloadButton } from '../components/BatchZipDownloadButton';
 import { ConfirmDialog } from '../components/Feedback';
 import styles from '../gpu.module.css';
 
@@ -31,6 +39,7 @@ export function GalleryPanel({
   onRefresh,
   onFavorite,
   onBatchDelete,
+  onBatchDownload,
   onRequestMove,
   onOpen,
   onReuse,
@@ -48,6 +57,7 @@ export function GalleryPanel({
   onRefresh?: () => void;
   onFavorite: (asset: GalleryAsset) => void;
   onBatchDelete: (ids: string[]) => Promise<{ removedIds: string[]; error?: string }>;
+  onBatchDownload?: (ids: string[], mode: ImageDownloadMode) => Promise<{ error?: string }>;
   onRequestMove?: (ids: string[], opts?: { currentProjectId?: string; onMoved?: (movedIds: string[]) => void }) => void;
   onOpen: (asset: GalleryAsset, ordered?: GalleryAsset[]) => void;
   onReuse?: (asset: GalleryAsset) => void;
@@ -66,6 +76,8 @@ export function GalleryPanel({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [confirmBatchDelete, setConfirmBatchDelete] = useState<{ ids: string[]; title: string; description: string; error?: string } | null>(null);
   const [deletingBatch, setDeletingBatch] = useState(false);
+  const [downloadingBatch, setDownloadingBatch] = useState(false);
+  const [downloadMode, setDownloadMode] = useState<ImageDownloadMode>(() => loadImageDownloadMode());
 
   const workflowByKey = useMemo(() => {
     const map = new Map<string, GpuWorkflow>();
@@ -124,7 +136,6 @@ export function GalleryPanel({
   );
 
   const filtered = useMemo(() => {
-    const needle = query.toLowerCase();
     return gallery.filter((asset) => {
       const isDiag = isDiagnosticAsset(asset);
       if (isDiag && !showDiagnostics) return false;
@@ -135,10 +146,7 @@ export function GalleryPanel({
       if (filter === 'favorite' && !asset.favorite) return false;
       if (filter === 'unfavorited' && asset.favorite) return false;
       if (activeWorkflowFilter && asset.workflow_key !== activeWorkflowFilter) return false;
-      if (!needle) return true;
-      const wfName = workflowLabel(asset.workflow_key);
-      const projName = getProjectTitle(asset.project_id);
-      return `${asset.filename || ''} ${asset.source_job_id || ''} ${asset.workflow_key || ''} ${wfName} ${projName}`.toLowerCase().includes(needle);
+      return matchesGalleryQuery(asset, query, workflowLabel(asset.workflow_key), getProjectTitle(asset.project_id));
     });
   }, [gallery, filter, activeWorkflowFilter, query, showDiagnostics, workflowLabel, getProjectTitle]);
 
@@ -155,6 +163,25 @@ export function GalleryPanel({
     () => [...checkedIds].filter((id) => galleryById.has(id)),
     [checkedIds, galleryById],
   );
+  const hasStrippableSelected = useMemo(
+    () => activeCheckedIds.some((id) => isStrippableImageMime(galleryById.get(id)?.mime)),
+    [activeCheckedIds, galleryById],
+  );
+
+  function handleDownloadModeChange(next: ImageDownloadMode) {
+    setDownloadMode(next);
+    saveImageDownloadMode(next);
+  }
+
+  async function executeBatchDownload(mode: ImageDownloadMode) {
+    if (!onBatchDownload || !activeCheckedIds.length || downloadingBatch) return;
+    setDownloadingBatch(true);
+    try {
+      await onBatchDownload(activeCheckedIds, mode);
+    } finally {
+      setDownloadingBatch(false);
+    }
+  }
 
   function toggleChecked(ids: string[]) {
     setBatchMode(true);
@@ -306,9 +333,15 @@ export function GalleryPanel({
                 wfName ? `${wfName}${versionTag ? ` ${versionTag}` : ''}` : '',
                 asset.filename || asset.id,
               ].filter(Boolean).join(' · ');
+              const promptPreview = galleryPromptPreview(asset, query);
               return (
                 <>
                   <strong title={fullTitle}>{primary}</strong>
+                  {promptPreview && (
+                    <span className={styles.tilePrompt} title={asset.prompt || promptPreview}>
+                      {promptPreview}
+                    </span>
+                  )}
                   <small className="muted" title={secondary}>{secondary}</small>
                 </>
               );
@@ -411,6 +444,16 @@ export function GalleryPanel({
                 <FolderInput size={14} aria-hidden />移动到项目 ({activeCheckedIds.length})
               </button>
             )}
+            {onBatchDownload && (
+              <BatchZipDownloadButton
+                count={activeCheckedIds.length}
+                hasStrippable={hasStrippableSelected}
+                busy={downloadingBatch}
+                mode={downloadMode}
+                onModeChange={handleDownloadModeChange}
+                onDownload={(mode) => void executeBatchDownload(mode)}
+              />
+            )}
             <button
               type="button"
               className="button danger small"
@@ -429,8 +472,28 @@ export function GalleryPanel({
 
       <label className={styles.searchBox}>
         <Search size={17} strokeWidth={1.6} aria-hidden />
-        <input aria-label="搜索作品" placeholder="搜索作品（文件名、工作流、任务编号）" value={query} onChange={(e) => { setQuery(e.target.value); setLimit(24); }} />
+        <input
+          aria-label="搜索作品"
+          placeholder="搜索提示词、负面词、模型、Seed、工作流、文件名…"
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setLimit(24); }}
+        />
+        {query && (
+          <button
+            type="button"
+            className={styles.searchClear}
+            aria-label="清空搜索"
+            onClick={() => { setQuery(''); setLimit(24); }}
+          >
+            <X size={14} aria-hidden />
+          </button>
+        )}
       </label>
+      {query.trim() && (
+        <p className="muted small" role="status">
+          关键词「{query.trim()}」匹配 {filtered.length} 件作品（支持空格分隔多关键词同时匹配提示词与参数）
+        </p>
+      )}
 
       <div className={styles.filterBar}>
         <div className={styles.chipRow}>

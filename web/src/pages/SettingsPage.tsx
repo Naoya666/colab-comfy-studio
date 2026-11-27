@@ -1,7 +1,8 @@
 import { ModelSourceSettings, ModelStorageSettings } from '../components/ModelLibrarySettings';
+import { LocalStorageGovernance } from '../components/LocalStorageGovernance';
 import { useEffect, useState } from 'react';
 import { Settings, ChevronLeft, Monitor, Moon, Sun, Plug, LogOut } from 'lucide-react';
-import type { GpuSettings, GpuSpecKey, GpuUsage } from '../lib/gpu-api';
+import type { GpuSettings, GpuSpecKey, GpuUsage, Project } from '../lib/gpu-api';
 import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
 import { AccountDirectory, type GpuAccount } from '../components/AccountDirectory';
 import { GpuOrderSettings } from '../components/GpuOrderSettings';
@@ -31,7 +32,7 @@ export function ThemePicker() {
 }
 
 export function SettingsPanel({
-  settings, usage, canEditGuard, desktop = false, focusSection = null, onFocusHandled, error, accounts = [], accountsLoaded = false, onAccountsChange, onGpuOrderChange, onLogout, onBack,
+  settings, usage, canEditGuard, desktop = false, focusSection = null, onFocusHandled, error, accounts = [], accountsLoaded = false, projects = [], onLocalStorageMutated, onAccountsChange, onGpuOrderChange, onLogout, onBack,
 }: {
   settings: GpuSettings | null;
   usage?: GpuUsage | null;
@@ -44,6 +45,8 @@ export function SettingsPanel({
   onBack?: () => void;
   accounts?: GpuAccount[];
   accountsLoaded?: boolean;
+  projects?: Project[];
+  onLocalStorageMutated?: () => void;
   onAccountsChange?: (accounts: GpuAccount[]) => void;
   onGpuOrderChange?: (orderedSpecs: GpuSpecKey[]) => void;
 }) {
@@ -107,6 +110,14 @@ export function SettingsPanel({
 
       <ModelStorageSettings id="settings-model-storage" defaultOpen={focusSection === 'model-storage'} accounts={accountsLoaded ? accounts : undefined} />
       <ModelSourceSettings id="settings-model-source" defaultOpen={focusSection === 'model-storage'} />
+
+      <div className={styles.workspaceWide}>
+        <LocalStorageGovernance
+          canEdit={canEditGuard}
+          projects={projects}
+          onMutated={onLocalStorageMutated}
+        />
+      </div>
 
       <Card
         className={styles.workspaceWide}

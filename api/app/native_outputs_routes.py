@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import zipfile
 from urllib.parse import quote
 
 import httpx
@@ -12,7 +13,19 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from .common import APIError, current_user, ok
+from .batch_zip import (
+    NATIVE_BATCH_ZIP_MAX_BYTES,
+    NATIVE_BATCH_ZIP_MAX_ITEMS,
+    STREAM_CHUNK_BYTES,
+    build_zip_archive_filename,
+    create_download_ticket,
+    load_download_ticket,
+    open_zip_spool,
+    spooled_file_streaming_response,
+    unique_zip_entry_name,
+    write_zip_bytes_entry,
+)
+from .common import APIError, current_user, get_store, ok
 from .config import settings
 from .gpu import native_outputs
 from .image_metadata import (
@@ -85,6 +98,190 @@ async def list_outputs(
         subfolder=subfolder,
     )
     return ok(result, request)
+
+
+def _validate_native_batch_items(items: list[dict], *, strip_metadata: bool) -> tuple[int, int]:
+    total_bytes = 0
+    strippable_count = 0
+    for item in items:
+        mime = str(item.get("mime") or "")
+        size = int(item.get("size") or 0)
+        strippable = is_strippable_image_mime(mime)
+        if strippable:
+            strippable_count += 1
+            if strip_metadata and size > settings.max_upload_bytes:
+                raise APIError("PAYLOAD_TOO_LARGE", "存在超过大小限制的图片，无法去除元数据后打包", 413)
+        total_bytes += max(0, size)
+        if total_bytes > NATIVE_BATCH_ZIP_MAX_BYTES:
+            raise APIError(
+                "PAYLOAD_TOO_LARGE",
+                f"所选原生作品总大小超过单次打包上限（{NATIVE_BATCH_ZIP_MAX_BYTES // (1024 * 1024)} MB），请分批下载",
+                413,
+            )
+    return total_bytes, strippable_count
+
+
+@router.post("/batch-download")
+async def create_native_batch_download_ticket(
+    body: dict,
+    request: Request,
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
+    if not isinstance(body, dict):
+        raise APIError("VALIDATION_ERROR", "请求体格式无效")
+    raw_ids = body.get("file_ids")
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or len(raw_ids) > NATIVE_BATCH_ZIP_MAX_ITEMS
+        or any(not isinstance(fid, str) or not fid.strip() for fid in raw_ids)
+    ):
+        raise APIError("VALIDATION_ERROR", f"请提供 1~{NATIVE_BATCH_ZIP_MAX_ITEMS} 个待下载的原生作品编号")
+    raw_strip = body.get("strip_metadata", False)
+    if not isinstance(raw_strip, bool):
+        raise APIError("VALIDATION_ERROR", "strip_metadata 必须为布尔值")
+    strip_metadata = raw_strip
+    unique_ids = list(dict.fromkeys(fid.strip() for fid in raw_ids))
+
+    def _resolve():
+        items, storage, owns = native_outputs.resolve_output_items(request.app.state.repo, user["id"], unique_ids)
+        try:
+            return items
+        finally:
+            if owns and storage._owns_client:
+                storage.client.close()
+
+    items = await asyncio.to_thread(_resolve)
+    total_bytes, strippable_count = _validate_native_batch_items(items, strip_metadata=strip_metadata)
+    effective_strip = strip_metadata and strippable_count > 0
+    filename = build_zip_archive_filename("native-gallery", strip_metadata=effective_strip)
+    ticket = await asyncio.to_thread(
+        create_download_ticket,
+        st,
+        user["id"],
+        "native_batch_zip",
+        {
+            "file_ids": [item["id"] for item in items],
+            "strip_metadata": strip_metadata,
+            "filename": filename,
+        },
+    )
+    ticket_id = ticket["ticket_id"]
+    return ok(
+        {
+            "ticket_id": ticket_id,
+            "download_url": f"/api/gpu/native/outputs/batch-download/{ticket_id}",
+            "filename": filename,
+            "item_count": len(items),
+            "total_bytes": total_bytes,
+            "strippable_count": strippable_count,
+            "skipped_strip_count": len(items) - strippable_count if strip_metadata else 0,
+            "strip_metadata": strip_metadata,
+            "expires_at": ticket["expires_at"],
+        },
+        request,
+    )
+
+
+@router.get("/batch-download/{ticket_id}")
+async def download_native_batch_zip(
+    ticket_id: str,
+    request: Request,
+    user=Depends(current_user),
+    st=Depends(get_store),
+):
+    payload = await asyncio.to_thread(load_download_ticket, st, user["id"], ticket_id, "native_batch_zip")
+    strip_metadata = bool(payload.get("strip_metadata", False))
+    file_ids = payload.get("file_ids")
+    if not isinstance(file_ids, list) or not file_ids or len(file_ids) > NATIVE_BATCH_ZIP_MAX_ITEMS:
+        raise APIError("DOWNLOAD_TICKET_INVALID", "下载票据内容无效", 404)
+    filename = str(payload.get("filename") or build_zip_archive_filename("native-gallery", strip_metadata=strip_metadata))
+
+    def _resolve_and_token():
+        items, storage, owns = native_outputs.resolve_output_items(request.app.state.repo, user["id"], file_ids)
+        try:
+            token = storage.google.access_token("drive")
+            base_url = storage.base_url
+            return items, token, base_url
+        finally:
+            if owns and storage._owns_client:
+                storage.client.close()
+
+    items, token, base_url = await asyncio.to_thread(_resolve_and_token)
+    _validate_native_batch_items(items, strip_metadata=strip_metadata)
+
+    client, owns_client = _get_stream_client(request.app)
+    spool = open_zip_spool()
+    running_bytes = 0
+    used_lower: set[str] = set()
+    try:
+        with zipfile.ZipFile(spool, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for item in items:
+                fid = item["id"]
+                mime = str(item.get("mime") or "")
+                strippable = is_strippable_image_mime(mime)
+                arcname = unique_zip_entry_name(
+                    item.get("filename"),
+                    used_lower,
+                    strip_metadata=strip_metadata,
+                    strippable=strippable,
+                    subfolder=str(item.get("subfolder") or ""),
+                    fallback=fid,
+                )
+                url = f"{base_url}/files/{quote(fid, safe='')}?alt=media"
+                req = client.build_request(
+                    "GET",
+                    url,
+                    headers={"Authorization": "Bearer " + token, "Accept-Encoding": "identity"},
+                )
+                try:
+                    upstream = await client.send(req, stream=True)
+                except httpx.HTTPError as exc:
+                    raise APIError("DRIVE_STREAM_FAILED", "连接 Google Drive 批量读取失败", 502, True) from exc
+                try:
+                    if upstream.status_code != 200:
+                        status = upstream.status_code
+                        raise APIError(
+                            "DRIVE_STREAM_FAILED",
+                            f"读取 Drive 原生作品失败（HTTP {status}）",
+                            502 if status >= 500 else status,
+                        )
+                    if strip_metadata and strippable:
+                        buf = bytearray()
+                        async for chunk in upstream.aiter_bytes(STREAM_CHUNK_BYTES):
+                            buf.extend(chunk)
+                            running_bytes += len(chunk)
+                            if len(buf) > settings.max_upload_bytes:
+                                raise APIError("PAYLOAD_TOO_LARGE", "图片超过大小限制，无法去除元数据", 413)
+                            if running_bytes > NATIVE_BATCH_ZIP_MAX_BYTES:
+                                raise APIError("PAYLOAD_TOO_LARGE", "所选原生作品总大小超过单次打包上限，请分批下载", 413)
+                        try:
+                            cleaned = await asyncio.to_thread(strip_image_metadata, bytes(buf), mime)
+                        except ImageMetadataStripError as exc:
+                            raise APIError("IMAGE_METADATA_STRIP_FAILED", f"去除图片元数据失败：{exc}", 422) from exc
+                        write_zip_bytes_entry(zf, arcname, cleaned)
+                    else:
+                        info = zipfile.ZipInfo(filename=arcname)
+                        info.compress_type = zipfile.ZIP_STORED
+                        with zf.open(info, "w") as dst:
+                            async for chunk in upstream.aiter_bytes(STREAM_CHUNK_BYTES):
+                                running_bytes += len(chunk)
+                                if running_bytes > NATIVE_BATCH_ZIP_MAX_BYTES:
+                                    raise APIError("PAYLOAD_TOO_LARGE", "所选原生作品总大小超过单次打包上限，请分批下载", 413)
+                                dst.write(chunk)
+                except httpx.HTTPError as exc:
+                    raise APIError("DRIVE_STREAM_FAILED", "读取 Google Drive 文件流失败", 502, True) from exc
+                finally:
+                    await upstream.aclose()
+    except BaseException:
+        spool.close()
+        raise
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    return spooled_file_streaming_response(spool, filename=filename, media_type="application/zip")
 
 
 @router.patch("/{file_id}")

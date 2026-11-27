@@ -253,3 +253,45 @@ test('project default, batch asset move, and optional project_id queries match b
   assert.equal(lastRequest().url, '/api/gpu/workflows/wf%2F1/export');
   assert.equal(lastRequest().init.method, undefined);
 });
+
+test('batch ZIP download and local storage governance clients match backend contract', async () => {
+  let result = await jsonBody(api.createBatchAssetDownload(['a1', 'a2'], true));
+  assert.equal(result.request.url, '/api/assets/batch-download');
+  assert.equal(result.request.init.method, 'POST');
+  assert.deepEqual(result.body, { asset_ids: ['a1', 'a2'], strip_metadata: true });
+
+  requests = [];
+  result = await jsonBody(api.createNativeBatchDownload(['f1', 'f2'], false));
+  assert.equal(result.request.url, '/api/gpu/native/outputs/batch-download');
+  assert.equal(result.request.init.method, 'POST');
+  assert.deepEqual(result.body, { file_ids: ['f1', 'f2'], strip_metadata: false });
+
+  requests = [];
+  await api.getLocalStorageOverview();
+  assert.equal(lastRequest().url, '/api/gpu/storage/local');
+  assert.equal(lastRequest().init.method, undefined);
+
+  requests = [];
+  result = await jsonBody(api.previewLocalStorageCleanup({ action: 'unfavorited_outputs', older_than_days: 30, project_id: 'p1' }));
+  assert.equal(result.request.url, '/api/gpu/storage/local/cleanup/preview');
+  assert.equal(result.request.init.method, 'POST');
+  assert.deepEqual(result.body, { action: 'unfavorited_outputs', older_than_days: 30, project_id: 'p1' });
+
+  requests = [];
+  result = await jsonBody(api.executeLocalStorageCleanup({ action: 'thumb_cache', confirmed: true }));
+  assert.equal(result.request.url, '/api/gpu/storage/local/cleanup');
+  assert.equal(result.request.init.method, 'POST');
+  assert.deepEqual(result.body, { action: 'thumb_cache', confirmed: true });
+
+  requests = [];
+  result = await jsonBody(api.vacuumLocalSqlite());
+  assert.equal(result.request.url, '/api/gpu/storage/local/vacuum');
+  assert.equal(result.request.init.method, 'POST');
+  assert.deepEqual(result.body, { confirmed: true });
+
+  requests = [];
+  result = await jsonBody(api.createLocalSqliteSnapshot());
+  assert.equal(result.request.url, '/api/gpu/storage/local/snapshot');
+  assert.equal(result.request.init.method, 'POST');
+  assert.deepEqual(result.body, {});
+});

@@ -522,20 +522,37 @@ def resolve_output_item(
     drive: DriveStorage | None = None,
 ) -> tuple[dict[str, Any], DriveStorage, bool]:
     """Verify that file_id resides inside AI-Studio/<owner>/native-comfy/output/."""
-    if not FILE_ID_RE.fullmatch(file_id or ""):
-        raise APIError("INVALID_FILE_ID", "无效的原生作品文件 ID", 400)
+    items, storage, owns = resolve_output_items(repo, owner_id, [file_id], drive=drive)
+    return items[0], storage, owns
+
+
+def resolve_output_items(
+    repo,
+    owner_id: str,
+    file_ids: list[str],
+    *,
+    drive: DriveStorage | None = None,
+) -> tuple[list[dict[str, Any]], DriveStorage, bool]:
+    """Verify that every file_id resides inside AI-Studio/<owner>/native-comfy/output/."""
+    if not file_ids:
+        raise APIError("INVALID_FILE_ID", "请至少指定一个原生作品文件 ID", 422)
+    for fid in file_ids:
+        if not isinstance(fid, str) or not FILE_ID_RE.fullmatch(fid or ""):
+            raise APIError("INVALID_FILE_ID", "无效的原生作品文件 ID", 400)
     storage, account_id, account_alias, owns = _open_drive(repo, owner_id, drive=drive)
     try:
         items, _, _ = _scan_output_tree(storage, owner_id, account_id, account_alias, force_refresh=False)
-        match = next((row for row in items if row["id"] == file_id), None)
-        if match is None:
+        by_id = {row["id"]: row for row in items}
+        missing = [fid for fid in file_ids if fid not in by_id]
+        if missing:
             items, _, _ = _scan_output_tree(storage, owner_id, account_id, account_alias, force_refresh=True)
-            match = next((row for row in items if row["id"] == file_id), None)
-        if match is None:
+            by_id = {row["id"]: row for row in items}
+            missing = [fid for fid in file_ids if fid not in by_id]
+        if missing:
             if owns and storage._owns_client:
                 storage.client.close()
             raise APIError("NOT_FOUND", "原生作品不存在或不在 native-comfy/output 目录内", 404)
-        return match, storage, owns
+        return [by_id[fid] for fid in file_ids], storage, owns
     except BaseException:
         if owns and storage._owns_client:
             storage.client.close()

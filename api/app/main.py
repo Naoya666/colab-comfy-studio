@@ -66,6 +66,7 @@ from .project_routes import router as project_router
 from .recovery_routes import router as recovery_router
 from .review_routes import router as review_router
 from .security import sign_session
+from .storage_routes import router as local_storage_router
 
 
 def usage(st, owner):
@@ -157,7 +158,15 @@ async def security_context(request, call_next):
 
 
 _NON_COMPRESSIBLE_PREFIXES = ("image/", "video/", "audio/")
-_NON_COMPRESSIBLE_TYPES = frozenset({"application/octet-stream", "text/event-stream"})
+_NON_COMPRESSIBLE_TYPES = frozenset(
+    {
+        "application/octet-stream",
+        "text/event-stream",
+        "application/zip",
+        "application/gzip",
+        "application/x-sqlite3",
+    }
+)
 
 
 def _accepts_gzip(header_value: str) -> bool:
@@ -1184,6 +1193,7 @@ app.include_router(compute_router)
 app.include_router(review_router)
 app.include_router(oauth_config_router)
 app.include_router(model_library_router)
+app.include_router(local_storage_router)
 app.include_router(assets_router)
 
 

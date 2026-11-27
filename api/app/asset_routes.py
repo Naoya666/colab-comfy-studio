@@ -6,12 +6,25 @@ import asyncio
 import io
 import re
 import uuid
+import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 from PIL import Image
 
+from .batch_zip import (
+    STUDIO_BATCH_ZIP_MAX_BYTES,
+    STUDIO_BATCH_ZIP_MAX_ITEMS,
+    build_zip_archive_filename,
+    create_download_ticket,
+    load_download_ticket,
+    open_zip_spool,
+    spooled_file_streaming_response,
+    unique_zip_entry_name,
+    write_zip_bytes_entry,
+    write_zip_file_entry,
+)
 from .common import APIError, current_user, get_store, ok, own
 from .config import settings
 from .gpu.repository import Repository
@@ -29,6 +42,88 @@ gallery_router = APIRouter()
 assets_router = APIRouter()
 
 _SAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9_-]+")
+_PROMPT_KEY_RE = re.compile(r"prompt|caption", re.IGNORECASE)
+_NEGATIVE_KEY_RE = re.compile(r"(?:^|_)negative(?:_prompt)?$", re.IGNORECASE)
+_MAX_GALLERY_PROMPT_LEN = 2000
+_MAX_GALLERY_MAIN_PROMPT_LEN = 1000
+_MAX_GALLERY_NEGATIVE_LEN = 1000
+
+
+def _clean_prompt_str(value, max_len: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    return text[:max_len]
+
+
+def _pick_prompt_from_params(params: dict) -> tuple[str, str]:
+    positive = ""
+    negative = ""
+    if not isinstance(params, dict):
+        return positive, negative
+    if isinstance(params.get("prompt"), str) and params["prompt"].strip():
+        positive = params["prompt"].strip()
+    if isinstance(params.get("negative_prompt"), str) and params["negative_prompt"].strip():
+        negative = params["negative_prompt"].strip()
+    for key, val in params.items():
+        if not isinstance(val, str) or not val.strip():
+            continue
+        k = str(key)
+        if not negative and _NEGATIVE_KEY_RE.search(k):
+            negative = val.strip()
+        elif not positive and _PROMPT_KEY_RE.search(k) and "negative" not in k.lower():
+            positive = val.strip()
+    return positive, negative
+
+
+def _extract_job_search_fields(job: dict) -> dict:
+    """Extract compact prompt/model/seed metadata for gallery search without exposing internal handles."""
+    snapshot = job.get("snapshot") if isinstance(job.get("snapshot"), dict) else {}
+    resolved_params = snapshot.get("resolved_params") if isinstance(snapshot.get("resolved_params"), dict) else {}
+    raw_params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    comp = job.get("prompt_composition") if isinstance(job.get("prompt_composition"), dict) else {}
+    comp_pos = comp.get("positive") if isinstance(comp.get("positive"), dict) else {}
+    comp_neg = comp.get("negative") if isinstance(comp.get("negative"), dict) else {}
+
+    pos, neg = _pick_prompt_from_params(resolved_params)
+    raw_pos, raw_neg = _pick_prompt_from_params(raw_params)
+    if not pos:
+        pos = raw_pos
+    if not neg:
+        neg = raw_neg
+
+    main_prompt = _clean_prompt_str(comp_pos.get("main"), _MAX_GALLERY_MAIN_PROMPT_LEN)
+    if not pos and main_prompt:
+        pos = main_prompt
+    if not neg:
+        neg = _clean_prompt_str(comp_neg.get("main"), _MAX_GALLERY_NEGATIVE_LEN)
+
+    out: dict = {}
+    clean_pos = _clean_prompt_str(pos, _MAX_GALLERY_PROMPT_LEN)
+    clean_neg = _clean_prompt_str(neg, _MAX_GALLERY_NEGATIVE_LEN)
+    if clean_pos:
+        out["prompt"] = clean_pos
+    if main_prompt:
+        out["main_prompt"] = main_prompt
+    if clean_neg:
+        out["negative_prompt"] = clean_neg
+
+    model_id = job.get("model_id")
+    if isinstance(model_id, str) and model_id.strip():
+        out["model_id"] = model_id.strip()
+
+    seed = job.get("resolved_seed")
+    if seed is None:
+        seed = resolved_params.get("seed")
+    if seed is None:
+        seed = raw_params.get("seed")
+    if isinstance(seed, (int, float)) and not isinstance(seed, bool):
+        out["resolved_seed"] = int(seed)
+    elif isinstance(seed, str) and seed.strip().lstrip("-").isdigit():
+        out["resolved_seed"] = int(seed.strip())
+    return out
 
 
 def _etag_matches(header: str | None, etag: str) -> bool:
@@ -100,6 +195,9 @@ def gallery(
                 item["gpu_reported"] = job["gpu_reported"]
             if job.get("provider") == "mock" and item.get("mock") is None:
                 item["mock"] = True
+            for field_key, field_val in _extract_job_search_fields(job).items():
+                if item.get(field_key) is None:
+                    item[field_key] = field_val
         result.append(item)
     return ok(result, request)
 
@@ -132,6 +230,141 @@ async def upload_asset(
     content = await file.read(settings.max_upload_bytes + 1)
     saved = await asyncio.to_thread(save_asset, st, user["id"], project_id, content, file.filename or "upload.bin")
     return ok(public_asset(saved), request, 201)
+
+
+def _resolve_studio_batch_assets(
+    st,
+    user: dict,
+    raw_ids,
+    *,
+    strip_metadata: bool = False,
+) -> tuple[list[tuple[dict, Path, int]], int, int]:
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or len(raw_ids) > STUDIO_BATCH_ZIP_MAX_ITEMS
+        or any(not isinstance(item, str) or not item.strip() for item in raw_ids)
+    ):
+        raise APIError("VALIDATION_ERROR", f"请提供 1~{STUDIO_BATCH_ZIP_MAX_ITEMS} 个待下载的素材编号")
+    unique_ids = list(dict.fromkeys(item.strip() for item in raw_ids))
+    asset_map = st.get_many("assets", unique_ids, user["id"]) if hasattr(st, "get_many") else {}
+    assets = [asset_map[aid] if aid in asset_map else own(st, "assets", aid, user) for aid in unique_ids]
+    resolved: list[tuple[dict, Path, int]] = []
+    total_bytes = 0
+    strippable_count = 0
+    for asset in assets:
+        path = asset_path(asset)
+        try:
+            file_size = path.stat().st_size
+        except FileNotFoundError as exc:
+            raise APIError("NOT_FOUND", f"素材文件不存在：{asset.get('filename') or asset['id']}", 404) from exc
+        mime = str(asset.get("mime") or "")
+        strippable = is_strippable_image_mime(mime)
+        if strippable:
+            strippable_count += 1
+            if strip_metadata and file_size > settings.max_upload_bytes:
+                raise APIError("PAYLOAD_TOO_LARGE", "存在超过大小限制的图片，无法去除元数据后打包", 413)
+        total_bytes += file_size
+        if total_bytes > STUDIO_BATCH_ZIP_MAX_BYTES:
+            raise APIError(
+                "PAYLOAD_TOO_LARGE",
+                f"所选文件总大小超过单次打包上限（{STUDIO_BATCH_ZIP_MAX_BYTES // (1024 * 1024)} MB），请分批下载",
+                413,
+            )
+        resolved.append((asset, path, file_size))
+    return resolved, total_bytes, strippable_count
+
+
+def _build_studio_batch_zip(
+    resolved: list[tuple[dict, Path, int]],
+    *,
+    strip_metadata: bool,
+):
+    spool = open_zip_spool()
+    try:
+        used_lower: set[str] = set()
+        with zipfile.ZipFile(spool, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for asset, path, _ in resolved:
+                mime = str(asset.get("mime") or "")
+                strippable = is_strippable_image_mime(mime)
+                arcname = unique_zip_entry_name(
+                    asset.get("filename"),
+                    used_lower,
+                    strip_metadata=strip_metadata,
+                    strippable=strippable,
+                    fallback=str(asset.get("id") or "asset"),
+                )
+                if strip_metadata and strippable:
+                    try:
+                        cleaned = strip_image_metadata(path.read_bytes(), mime)
+                    except ImageMetadataStripError as exc:
+                        raise APIError("IMAGE_METADATA_STRIP_FAILED", f"去除图片元数据失败：{exc}", 422) from exc
+                    write_zip_bytes_entry(zf, arcname, cleaned)
+                else:
+                    write_zip_file_entry(zf, arcname, path)
+        return spool
+    except BaseException:
+        spool.close()
+        raise
+
+
+@assets_router.post("/api/assets/batch-download")
+def create_batch_download_ticket(body: dict, request: Request, user=Depends(current_user), st=Depends(get_store)):
+    if not isinstance(body, dict):
+        raise APIError("VALIDATION_ERROR", "请求体格式无效")
+    raw_strip = body.get("strip_metadata", False)
+    if not isinstance(raw_strip, bool):
+        raise APIError("VALIDATION_ERROR", "strip_metadata 必须为布尔值")
+    strip_metadata = raw_strip
+    resolved, total_bytes, strippable_count = _resolve_studio_batch_assets(
+        st,
+        user,
+        body.get("asset_ids"),
+        strip_metadata=strip_metadata,
+    )
+    effective_strip = strip_metadata and strippable_count > 0
+    filename = build_zip_archive_filename("studio-gallery", strip_metadata=effective_strip)
+    ticket = create_download_ticket(
+        st,
+        user["id"],
+        "studio_batch_zip",
+        {
+            "asset_ids": [asset["id"] for asset, _, _ in resolved],
+            "strip_metadata": strip_metadata,
+            "filename": filename,
+        },
+    )
+    ticket_id = ticket["ticket_id"]
+    return ok(
+        {
+            "ticket_id": ticket_id,
+            "download_url": f"/api/assets/batch-download/{ticket_id}",
+            "filename": filename,
+            "item_count": len(resolved),
+            "total_bytes": total_bytes,
+            "strippable_count": strippable_count,
+            "skipped_strip_count": len(resolved) - strippable_count if strip_metadata else 0,
+            "strip_metadata": strip_metadata,
+            "expires_at": ticket["expires_at"],
+        },
+        request,
+    )
+
+
+@assets_router.get("/api/assets/batch-download/{ticket_id}")
+async def download_batch_zip(ticket_id: str, user=Depends(current_user), st=Depends(get_store)):
+    payload = await asyncio.to_thread(load_download_ticket, st, user["id"], ticket_id, "studio_batch_zip")
+    strip_metadata = bool(payload.get("strip_metadata", False))
+    filename = str(payload.get("filename") or build_zip_archive_filename("studio-gallery", strip_metadata=strip_metadata))
+    resolved, _, _ = await asyncio.to_thread(
+        _resolve_studio_batch_assets,
+        st,
+        user,
+        payload.get("asset_ids"),
+        strip_metadata=strip_metadata,
+    )
+    spool = await asyncio.to_thread(_build_studio_batch_zip, resolved, strip_metadata=strip_metadata)
+    return spooled_file_streaming_response(spool, filename=filename, media_type="application/zip")
 
 
 @assets_router.get("/api/assets/{asset_id}/download")

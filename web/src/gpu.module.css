@@ -344,8 +344,22 @@
 /* ───── 筛选/搜索/列表 ───── */
 .searchBox { display: flex; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--card); color: var(--muted); }
 .searchBox:focus-within { border-color: var(--text); }
-.searchBox input { border: 0; background: transparent; padding: 0; min-height: 42px; }
+.searchBox input { border: 0; background: transparent; padding: 0; min-height: 42px; flex: 1; min-width: 0; }
 .searchBox input:focus { border: 0; }
+.searchClear {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-full);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  flex: none;
+}
+.searchClear:hover { background: var(--card-2); color: var(--text); }
 .filterBar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; min-width: 0; }
 .chipRow { display: flex; gap: 8px; flex-wrap: wrap; min-width: 0; max-width: 100%; }
 .chip { display: inline-flex; align-items: center; gap: 4px; flex: none; white-space: nowrap; max-width: 100%; min-height: 34px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: var(--r-full); background: transparent; color: var(--text-2); font-size: 0.84rem; }
@@ -389,6 +403,13 @@
 .tileMeta > div { display: grid; gap: 1px; min-width: 0; line-height: 1.3; }
 .tileMeta strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.82rem; font-weight: 600; }
 .tileMeta small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.7rem; }
+.tilePrompt {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.72rem;
+  color: var(--text-2);
+}
 .starBtn { display: grid; place-items: center; width: 38px; height: 38px; flex: none; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--muted); }
 .starBtn[data-on="true"] { color: var(--text); }
 .floatBar {
@@ -4782,9 +4803,14 @@
   gap: 10px;
   width: 100%;
   padding: 8px 10px;
+  border: 0;
   border-radius: 8px;
+  background: transparent;
   color: var(--text);
+  font: inherit;
+  text-align: left;
   text-decoration: none;
+  cursor: pointer;
   transition: background 0.1s ease;
 }
 .splitDownloadOption:hover,
@@ -4816,4 +4842,28 @@
   height: 18px;
   flex: none;
   color: var(--text);
+}
+
+/* 本地存储治理操作栏 */
+.localStorageQuickActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.localStorageAgeRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.localStorageAgeControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-width: 0;
 }
