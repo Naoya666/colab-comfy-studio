@@ -32,10 +32,12 @@ except ImportError:  # Standalone Colab bootstrap.
 RULES = {
     "CheckpointLoaderSimple": {"ckpt_name": "checkpoints"},
     "CheckpointLoader": {"ckpt_name": "checkpoints"},
+    "Checkpoint Loader with Name (Image Saver)": {"ckpt_name": "checkpoints"},
     "LoraLoader": {"lora_name": "loras"}, "LoraLoaderModelOnly": {"lora_name": "loras"},
     "Lora Loader Stack (rgthree)": {f"lora_{i:02d}": "loras" for i in range(1, 5)},
     "CR LoRA Stack": {f"lora_name_{i}": "loras" for i in range(1, 4)},
     "VAELoader": {"vae_name": "vae"}, "UNETLoader": {"unet_name": "diffusion_models"},
+    "UNet loader with Name (Image Saver)": {"unet_name": "diffusion_models"},
     "DiffusionModelLoader": {"unet_name": "diffusion_models"},
     "UnetLoaderGGUF": {"unet_name": "diffusion_models"},
     "CLIPLoader": {"clip_name": "text_encoders"},
@@ -46,11 +48,13 @@ RULES = {
     "ControlNetLoader": {"control_net_name": "controlnet"},
     "DiffControlNetLoader": {"control_net_name": "controlnet"},
     "UpscaleModelLoader": {"model_name": "upscale_models"},
+    "CR Upscale Image": {"upscale_model": "upscale_models"},
 }
 # Only schemas with known stable widget order are decoded without object_info.
 WIDGETS = {
     "CheckpointLoaderSimple": ["ckpt_name"],
     "CheckpointLoader": ["config_name", "ckpt_name"],
+    "Checkpoint Loader with Name (Image Saver)": ["ckpt_name"],
     "LoraLoader": ["lora_name", "strength_model", "strength_clip"],
     "LoraLoaderModelOnly": ["lora_name", "strength_model"],
     "Lora Loader Stack (rgthree)": [
@@ -64,6 +68,7 @@ WIDGETS = {
     ],
     "VAELoader": ["vae_name"],
     "UNETLoader": ["unet_name", "weight_dtype"],
+    "UNet loader with Name (Image Saver)": ["unet_name", "weight_dtype"],
     "DiffusionModelLoader": ["unet_name", "weight_dtype"],
     "UnetLoaderGGUF": ["unet_name"],
     "CLIPLoader": ["clip_name", "type", "device"],
@@ -74,11 +79,18 @@ WIDGETS = {
     "ControlNetLoader": ["control_net_name"],
     "DiffControlNetLoader": ["control_net_name"],
     "UpscaleModelLoader": ["model_name"],
+    "CR Upscale Image": [
+        "upscale_model", "mode", "rescale_factor", "resize_width",
+        "resampling_method", "supersample", "rounding_modulus",
+    ],
     "CLIPTextEncode": ["text"],
     "CLIPTextEncodeSDXL": ["width", "height", "crop_w", "crop_h", "target_width", "target_height", "text_g", "text_l"],
 }
 _WIDGET_PRIMITIVES = {"COMBO", "INT", "FLOAT", "STRING", "BOOLEAN"}
 _POWER_LORA_LOADERS = {"Power Lora Loader (rgthree)", "Power Lora Loader"}
+_LORA_MANAGER_LOADERS = {"Lora Loader (LoraManager)", "Lora Stacker (LoraManager)"}
+_LORA_TAG_RE = re.compile(r"<lora:([^:<>]+):([^<>]+)>")
+_STEM_WEIGHT_EXTS = (".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx")
 _WEIGHT_FILE_RE = re.compile(r"\.(?:safetensors|gguf|onnx|pt|pth|ckpt|bin)$", re.I)
 _HINT_LOADER_RE = re.compile(
     r"(?:load|lora|checkpoint|ckpt|unet|diffusion|vae|clip|controlnet|upscale|gguf|model|adapter|pulid|instantid|embedding|facerestore|reactor|animatediff)",
@@ -284,6 +296,13 @@ def _visual_node_inputs(node, node_types, *, allowed_types=None, link_values=Non
     elif node_type in _POWER_LORA_LOADERS and isinstance(values, list):
         lora_rows = [item for item in values if isinstance(item, dict) and "lora" in item]
         inputs = {f"lora_{idx}": item for idx, item in enumerate(lora_rows, 1)}
+    elif node_type in _LORA_MANAGER_LOADERS and isinstance(values, list):
+        lora_rows = next(
+            (item for item in values if isinstance(item, list) and all(isinstance(row, dict) for row in item)),
+            [],
+        )
+        text_val = next((item for item in values if isinstance(item, str)), "")
+        inputs = {"text": text_val, "loras": lora_rows}
     elif isinstance(values, list):
         fields = _widget_fields(node_type, node_types, allowed_types=allowed_types)
         if not fields and isinstance(node.get("inputs"), list):
@@ -471,6 +490,46 @@ def _apply_hint_metadata(dep, candidates):
         dep["expected_size"] = next(iter(sizes))
 
 
+def _strip_weight_ext(name: str) -> str:
+    lower = name.lower()
+    for ext in _STEM_WEIGHT_EXTS:
+        if lower.endswith(ext):
+            return name[: -len(ext)]
+    return name
+
+
+def _lora_manager_items(inputs: dict) -> list[dict]:
+    raw = inputs.get("loras")
+    if isinstance(raw, dict) and isinstance(raw.get("__value__"), list):
+        items = raw["__value__"]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+    structured = [item for item in items if isinstance(item, dict) and isinstance(item.get("name"), str)]
+    if structured:
+        return structured
+    text = inputs.get("text")
+    if not isinstance(text, str) or "<lora:" not in text:
+        return []
+    parsed = []
+    for match in _LORA_TAG_RE.finditer(text):
+        name = match.group(1).strip()
+        if not name:
+            continue
+        parts = [p.strip() for p in match.group(2).split(":")]
+        entry = {"name": name, "active": True}
+        try:
+            if parts and parts[0]:
+                entry["strength"] = float(parts[0])
+            if len(parts) > 1 and parts[1]:
+                entry["clipStrength"] = float(parts[1])
+        except ValueError:
+            pass
+        parsed.append(entry)
+    return parsed
+
+
 def _is_finite_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -524,6 +583,30 @@ def scan(workflow, *, node_types=None, include_hints=False):
                     active = value.get("on") is not False and any(v != 0 for v in strengths.values())
                     append(node_id, node_type, f"{field}.lora", value.get("lora"), "loras", not bypassed and active,
                            bypassed=bypassed, enabled_field=f"{field}.on", strengths=strengths)
+            continue
+        if node_type in _LORA_MANAGER_LOADERS:
+            for idx, item in enumerate(_lora_manager_items(inputs), 1):
+                name = item["name"].strip()
+                strengths = {
+                    f"loras.{idx}.{key}": item[key]
+                    for key in ("strength", "clipStrength")
+                    if _is_finite_number(item.get(key))
+                }
+                active = item.get("active", True) is not False and (
+                    not strengths or any(v != 0 for v in strengths.values())
+                )
+                append(
+                    node_id,
+                    node_type,
+                    f"loras.{idx}.name",
+                    name,
+                    "loras",
+                    not bypassed and active,
+                    bypassed=bypassed,
+                    enabled_field=f"loras.{idx}.active",
+                    match_stem=True,
+                    strengths=strengths,
+                )
             continue
         rule = mapping.get(node_type, {})
         for field, category in rule.items():
@@ -659,7 +742,13 @@ def scan(workflow, *, node_types=None, include_hints=False):
 
         # Fallback 2: weight filename clues inside unrecognized loader nodes.
         for node_id, node_type, inputs, bypassed in nodes:
-            if not node_type or node_type in mapping or node_type in _POWER_LORA_LOADERS or node_type in _NON_MODEL_NODE_TYPES:
+            if (
+                not node_type
+                or node_type in mapping
+                or node_type in _POWER_LORA_LOADERS
+                or node_type in _LORA_MANAGER_LOADERS
+                or node_type in _NON_MODEL_NODE_TYPES
+            ):
                 continue
             if not _HINT_LOADER_RE.search(node_type):
                 continue
@@ -753,8 +842,17 @@ def match(dependencies, models, previous=()):
             model = sorted(exact, key=lambda m: m.get("state") != "ready")[0]
             dep.update(model_id=model["id"], status="matched" if model.get("state") == "ready" else model.get("state", "pending"))
         else:
-            dep["candidates"] = [m["id"] for m in models if _type_compatible(dep["model_type"], m.get("model_type"))
-                                 and PurePosixPath(dep["reference"]).name == m.get("filename")]
+            ref_name = PurePosixPath(dep["reference"]).name
+            ref_stem = _strip_weight_ext(ref_name) if dep.get("match_stem") else None
+            dep["candidates"] = [
+                m["id"]
+                for m in models
+                if _type_compatible(dep["model_type"], m.get("model_type"))
+                and (
+                    ref_name == m.get("filename")
+                    or (ref_stem is not None and _strip_weight_ext(m.get("filename") or "") == ref_stem)
+                )
+            ]
             dep["status"] = "needs_confirmation" if dep["candidates"] else "unresolved"
     return dependencies
 
@@ -905,7 +1003,7 @@ def set_input(inputs, path, value):
 
 def target_for(dep, model=None):
     reference = relative_path(dep["reference"])
-    if dep.get("embedding") and not PurePosixPath(reference).suffix and model:
+    if (dep.get("embedding") or dep.get("match_stem")) and not reference.lower().endswith(_STEM_WEIGHT_EXTS) and model:
         reference += PurePosixPath(model["filename"]).suffix
     return f"{directories()[dep['model_type']]}/{reference}"
 
@@ -964,7 +1062,7 @@ def approved_alternates(repo, owner, workflow):
     def skeleton(row):
         graph = copy.deepcopy(row.get("api_graph") or {})
         for d in scan(row):
-            if d.get("embedding") or d.get("status") == "manual_review":
+            if d.get("embedding") or d.get("match_stem") or d.get("status") == "manual_review":
                 continue
             inputs = graph.get(d["node_id"], {}).get("inputs")
             if isinstance(inputs, dict):

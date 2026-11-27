@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -185,7 +186,7 @@ def dependencies(body, explicit, *, visual=False, trusted=False, node_types=None
         yield {"category": category_for(dep["model_type"]), "name": dep["reference"],
                "url": dep.get("source_hint"), "sha256": dep.get("expected_sha256"), "size": dep.get("expected_size"),
                "conflict": dep.get("source_conflict") or dep.get("source_error"),
-               "embedding": dep.get("embedding", False)}
+               "embedding": dep.get("embedding", False), "match_stem": dep.get("match_stem", False)}
     if not isinstance(explicit, list) or len(explicit) > 256:
         raise ModelError("显式依赖必须为至多 256 项的数组")
     for item in explicit:
@@ -242,6 +243,7 @@ class LocalModels:
         self._rw_loop = None
         self._rw_state = None
         self.handoffs = 0
+        self.lora_generation = 0
 
     def _rw_lock_state(self):
         loop = asyncio.get_running_loop()
@@ -759,14 +761,27 @@ class LocalModels:
         if len(hashes) > 1 or len(sizes) > 1 or len(drive_ids) > 1 or len(md5s) > 1:
             raise ModelError("同一路径声明了不同模型身份，请指定唯一版本")
         digest, size = next(iter(hashes), None), next(iter(sizes), None)
+        stem_match = any(item.get("embedding") or item.get("match_stem") for item in entries)
+        match_stem_only = any(item.get("match_stem") for item in entries)
+        name_stem = deps._strip_weight_ext(name) if stem_match else None
         matches = []
         for row in catalog:
             row_category, paths = registered_paths(row)
             if row_category != category:
                 continue
             alias = row.get("drive_file_id") and row["drive_file_id"] + "-" + row["filename"]
-            if (name in paths or (alias and name == alias)
-                    or (dep.get("embedding") and any(str(Path(p).with_suffix("")) == name for p in paths))):
+            if (
+                name in paths
+                or (alias and name == alias)
+                or (
+                    stem_match
+                    and any(
+                        deps._strip_weight_ext(p) == name_stem
+                        or (match_stem_only and "/" not in name_stem and deps._strip_weight_ext(Path(p).name) == name_stem)
+                        for p in paths
+                    )
+                )
+            ):
                 matches.append(row)
         candidates = [row for row in matches if (not digest or row.get("sha256") in {digest, None})
                       and (not size or row.get("size") in {size, None})]
@@ -804,13 +819,24 @@ class LocalModels:
         row = next(iter(verified or candidates), {})
         digest = digest or row.get("sha256") or (drive or {}).get("sha256")
         size = size or row.get("size") or (drive or {}).get("size")
-        if dep.get("embedding") and row and not Path(name).suffix:
-            name += Path(row["filename"]).suffix
+        if stem_match and row:
+            _, row_paths = registered_paths(row)
+            if name not in row_paths:
+                exact_stem = next((p for p in sorted(row_paths) if deps._strip_weight_ext(p) == name_stem), None)
+                if exact_stem is None and match_stem_only and "/" not in name_stem:
+                    exact_stem = next(
+                        (p for p in sorted(row_paths) if deps._strip_weight_ext(Path(p).name) == name_stem),
+                        None,
+                    )
+                if exact_stem is not None:
+                    name = exact_stem
+                elif not name.lower().endswith(deps._STEM_WEIGHT_EXTS):
+                    name += Path(row["filename"]).suffix
         target = self.target(category, name)
         directories = [deps.directories()[category], *(alias for alias, canonical in ALIASES.items() if canonical == category)]
         names = [name]
-        if dep.get("embedding") and not Path(name).suffix:
-            names += [name + suffix for suffix in (".safetensors", ".pt", ".bin")]
+        if stem_match and not name.lower().endswith(deps._STEM_WEIGHT_EXTS):
+            names += [name + suffix for suffix in (".safetensors", ".pt", ".bin", ".ckpt")]
         available = {self.target(category, candidate, directory=directory)
                      for directory in directories for candidate in names
                      if (self.model_dir / directory / candidate).is_file()}
@@ -1030,6 +1056,13 @@ class LocalModels:
             os.link(scratch, target.name, dst_dir_fd=parent, follow_symlinks=False)
         finally:
             os.close(parent)
+        try:
+            rel_parts = target.relative_to(self.model_dir).parts
+            if rel_parts and category_for(rel_parts[0]) == "loras":
+                with self._state_lock:
+                    self.lora_generation += 1
+        except ValueError:
+            pass
 
     @staticmethod
     def check_unpinned_format(path, suffix, size):
@@ -1620,11 +1653,32 @@ def install(server, root, folder_paths, node_types):
             raise ModelError("多个创作模型绑定到了原生 ComfyUI 的同一文件")
         return selected
 
+    synced_lora_generation = 0
+
     def refresh():
         folder_paths.filename_list_cache.clear()
         helper = getattr(folder_paths, "cache_helper", None)
         if helper:
             helper.clear()
+
+    async def refresh_lora_manager():
+        nonlocal synced_lora_generation
+        target_generation = local.lora_generation
+        if target_generation == synced_lora_generation:
+            return
+        for mod in list(sys.modules.values()):
+            reg = getattr(mod, "ServiceRegistry", None)
+            getter = getattr(reg, "get_lora_scanner", None)
+            if callable(getter):
+                try:
+                    scanner = await getter()
+                    if scanner is not None and callable(getattr(scanner, "get_cached_data", None)):
+                        await scanner.get_cached_data(force_refresh=True)
+                        synced_lora_generation = target_generation
+                except Exception:
+                    LOG.warning("Failed to refresh LoRA Manager cache after model preparation", exc_info=True)
+                return
+        synced_lora_generation = target_generation
 
     async def json_body(request):
         try:
@@ -1839,6 +1893,7 @@ def install(server, root, folder_paths, node_types):
                     problem = model_problem("、".join(f"{r['category']}/{r['name']} · {r.get('error') or r.get('state')}" for r in failed)[:3000])
                     return web.json_response({**problem, "models": rows}, status=422)
             refresh()
+            await refresh_lora_manager()
             local.handoffs += 1
             try:
                 return await handler(request)

@@ -927,3 +927,204 @@ def test_cr_lora_stack_dependencies_scanned_in_api_and_visual_modes():
     assert set(vis_found) == {"lora_name_1", "lora_name_2"}
     assert vis_found["lora_name_1"]["required"] is True
     assert vis_found["lora_name_2"]["required"] is False and vis_found["lora_name_2"]["disabled_by_switch"] is True
+
+
+def test_image_saver_cr_upscale_and_lora_manager_dependencies_scanned_in_api_and_visual_modes():
+    from app.gpu import model_dependencies as deps
+
+    prompt = {
+        "111": {
+            "class_type": "UNet loader with Name (Image Saver)",
+            "inputs": {"unet_name": "MiaoMiao Harem _Anima_Base_net.safetensors", "weight_dtype": "default"},
+        },
+        "138": {
+            "class_type": "Checkpoint Loader with Name (Image Saver)",
+            "inputs": {"ckpt_name": "oneObsession_v21Anime.safetensors"},
+        },
+        "48": {
+            "class_type": "CR Upscale Image",
+            "inputs": {"image": ["143", 0], "upscale_model": "4x-AnimeSharp.pth", "mode": "rescale"},
+        },
+        "77": {
+            "class_type": "Lora Loader (LoraManager)",
+            "inputs": {
+                "model": ["107", 0],
+                "clip": ["107", 1],
+                "text": "<lora:anima-base-1-painterly-v2:0.30> <lora:Yujin Hare v1:0.20>",
+                "loras": {
+                    "__value__": [
+                        {"name": "anima-base-1-painterly-v2", "strength": 0.3, "clipStrength": 0.3, "active": True},
+                        {"name": "Yujin Hare v1", "strength": 0.2, "clipStrength": 0.2, "active": True},
+                        {"name": "disabled_style", "strength": 0.5, "clipStrength": 0.5, "active": False},
+                        {"name": "zero_style", "strength": 0.0, "clipStrength": 0.0, "active": True},
+                    ],
+                },
+            },
+        },
+        "78": {
+            "class_type": "Lora Loader (LoraManager)",
+            "inputs": {
+                "model": ["107", 0],
+                "text": "<lora:anima-turbo-lora-v0.2:0.70:0.70>",
+                "loras": {"__value__": []},
+            },
+        },
+    }
+    found = {(d["node_id"], d["reference"]): d for d in deps.scan({"api_graph": prompt})}
+    assert found[("111", "MiaoMiao Harem _Anima_Base_net.safetensors")]["model_type"] == "diffusion_models"
+    assert found[("138", "oneObsession_v21Anime.safetensors")]["model_type"] == "checkpoints"
+    assert found[("48", "4x-AnimeSharp.pth")]["model_type"] == "upscale_models"
+    assert found[("77", "anima-base-1-painterly-v2")]["required"] is True
+    assert found[("77", "anima-base-1-painterly-v2")]["match_stem"] is True
+    assert found[("77", "Yujin Hare v1")]["required"] is True
+    assert found[("77", "disabled_style")]["required"] is False
+    assert found[("77", "zero_style")]["required"] is False
+    assert found[("78", "anima-turbo-lora-v0.2")]["required"] is True
+
+    prepared = list(native_models.dependencies({"prompt": prompt}, []))
+    prepared_set = {(item["category"], item["name"], item.get("match_stem", False)) for item in prepared}
+    assert ("diffusion_models", "MiaoMiao Harem _Anima_Base_net.safetensors", False) in prepared_set
+    assert ("checkpoints", "oneObsession_v21Anime.safetensors", False) in prepared_set
+    assert ("upscale_models", "4x-AnimeSharp.pth", False) in prepared_set
+    assert ("loras", "anima-base-1-painterly-v2", True) in prepared_set
+    assert ("loras", "Yujin Hare v1", True) in prepared_set
+    assert ("loras", "anima-turbo-lora-v0.2", True) in prepared_set
+    assert all(name not in {"disabled_style", "zero_style"} for _, name, _ in prepared_set)
+
+    # Visual workflow decoding works without object_info
+    visual = {
+        "nodes": [
+            {"id": 111, "type": "UNet loader with Name (Image Saver)", "mode": 0, "widgets_values": ["MiaoMiao Harem _Anima_Base_net.safetensors", "default"]},
+            {"id": 138, "type": "Checkpoint Loader with Name (Image Saver)", "mode": 0, "widgets_values": ["oneObsession_v21Anime.safetensors"]},
+            {"id": 48, "type": "CR Upscale Image", "mode": 0, "widgets_values": ["4x-AnimeSharp.pth", "rescale", 2, 1024, "nearest", "true", 8]},
+            {
+                "id": 77,
+                "type": "Lora Loader (LoraManager)",
+                "mode": 0,
+                "widgets_values": [
+                    {"version": 1, "textWidgetName": "text"},
+                    "<lora:anima-base-1-painterly-v2:0.30>",
+                    [
+                        {"name": "anima-base-1-painterly-v2", "strength": 0.3, "active": True, "clipStrength": 0.3},
+                        {"name": "inactive_lora", "strength": 0.4, "active": False, "clipStrength": 0.4},
+                    ],
+                ],
+            },
+        ],
+        "links": [],
+    }
+    vis_found = {(d["node_id"], d["reference"]): d for d in deps.scan({"editable_graph": visual})}
+    assert vis_found[("111", "MiaoMiao Harem _Anima_Base_net.safetensors")]["model_type"] == "diffusion_models"
+    assert vis_found[("138", "oneObsession_v21Anime.safetensors")]["model_type"] == "checkpoints"
+    assert vis_found[("48", "4x-AnimeSharp.pth")]["model_type"] == "upscale_models"
+    assert vis_found[("77", "anima-base-1-painterly-v2")]["required"] is True
+    assert vis_found[("77", "inactive_lora")]["required"] is False
+
+
+@pytest.mark.asyncio
+async def test_lora_manager_stem_resolution_object_info_and_scanner_refresh(local, tmp_path, monkeypatch):
+    import types
+
+    lora_bytes = b"\x08\x00\x00\x00\x00\x00\x00\x00" + b'{"t":{"data_offsets":[0,4]}}' + b"1234"
+    lora_sha = hashlib.sha256(lora_bytes).hexdigest()
+    unet_bytes = b"\x08\x00\x00\x00\x00\x00\x00\x00" + b'{"u":{"data_offsets":[0,4]}}' + b"5678"
+    unet_sha = hashlib.sha256(unet_bytes).hexdigest()
+    ckpt_bytes = b"\x08\x00\x00\x00\x00\x00\x00\x00" + b'{"c":{"data_offsets":[0,4]}}' + b"9012"
+    ckpt_sha = hashlib.sha256(ckpt_bytes).hexdigest()
+    up_bytes = b"PK\x03\x04dummy"
+    up_sha = hashlib.sha256(up_bytes).hexdigest()
+
+    catalog = [
+        {"model_type": "loras", "filename": "anima-turbo-lora-v0.2.safetensors", "relative_path": "anima-turbo-lora-v0.2.safetensors",
+         "sha256": lora_sha, "size": len(lora_bytes), "source": {"kind": "huggingface", "status": "verified", "download_url": "https://huggingface.co/org/repo/resolve/main/anima-turbo-lora-v0.2.safetensors"}},
+        {"model_type": "diffusion_models", "filename": "MiaoMiao Harem _Anima_Base_net.safetensors", "relative_path": "MiaoMiao Harem _Anima_Base_net.safetensors",
+         "sha256": unet_sha, "size": len(unet_bytes), "source": {"kind": "civitai", "status": "verified", "download_url": "https://civitai.com/api/download/models/2967371"}},
+        {"model_type": "checkpoints", "filename": "oneObsession_v21Anime.safetensors", "relative_path": "oneObsession_v21Anime.safetensors",
+         "sha256": ckpt_sha, "size": len(ckpt_bytes), "source": {"kind": "huggingface", "status": "verified", "download_url": "https://huggingface.co/org/repo/resolve/main/oneObsession_v21Anime.safetensors"}},
+        {"model_type": "upscale_models", "filename": "4x-AnimeSharp.pth", "relative_path": "4x-AnimeSharp.pth",
+         "sha256": up_sha, "size": len(up_bytes), "source": {"kind": "huggingface", "status": "verified", "download_url": "https://huggingface.co/org/repo/resolve/main/4x-AnimeSharp.pth"}},
+    ]
+
+    def response(payload, status=200):
+        return SimpleNamespace(status=status, content_type="application/json", body=json.dumps(payload).encode())
+
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(web=SimpleNamespace(
+        middleware=lambda fn: fn, json_response=response, HTTPNotFound=RuntimeError,
+    )))
+
+    class FakeRoutes:
+        def __init__(self):
+            self.map = {}
+        def get(self, p):
+            return lambda fn: self.map.__setitem__(("GET", p), fn) or fn
+        def post(self, p):
+            return lambda fn: self.map.__setitem__(("POST", p), fn) or fn
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir(exist_ok=True)
+    (tmp_path / "local-model-config.json").write_text(json.dumps({"catalog": catalog, "channel": "internal-channel"}))
+    models = local(lambda _: media(lora_bytes), catalog)
+    monkeypatch.setattr(native_models, "LocalModels", lambda *args, **kwargs: models)
+
+    server = SimpleNamespace(routes=FakeRoutes(), app=SimpleNamespace(middlewares=[]))
+    fp = SimpleNamespace(
+        models_dir=str(models_dir),
+        folder_names_and_paths={
+            "checkpoints": ([str(models_dir / "checkpoints")], {".safetensors"}),
+            "diffusion_models": ([str(models_dir / "diffusion_models")], {".safetensors"}),
+            "loras": ([str(models_dir / "loras")], {".safetensors"}),
+            "upscale_models": ([str(models_dir / "upscale_models")], {".pth", ".pt", ".safetensors"}),
+        },
+        filename_list_cache={},
+        add_model_folder_path=lambda cat, p, is_default=False: None,
+    )
+    installed = native_models.install(server, tmp_path, fp, {})
+    middleware = server.app.middlewares[-1]
+
+    # 1. Verify stem resolution in plan() works even when stem contains dots like v0.2
+    target, plan = installed.plan([{"category": "loras", "name": "anima-turbo-lora-v0.2", "match_stem": True}], catalog)
+    assert target == models_dir / "loras" / "anima-turbo-lora-v0.2.safetensors"
+    assert plan["sha256"] == lora_sha
+
+    # 2. Verify /object_info injects model library names into the 3 new combo-based custom loaders
+    oi_payload = {
+        "UNet loader with Name (Image Saver)": {"input": {"required": {"unet_name": [[]]}}},
+        "Checkpoint Loader with Name (Image Saver)": {"input": {"required": {"ckpt_name": [[]]}}},
+        "CR Upscale Image": {"input": {"required": {"upscale_model": [[]]}}},
+    }
+    req_oi = SimpleNamespace(method="GET", path="/object_info", headers={})
+    resp_oi = await middleware(req_oi, lambda _r: asyncio.sleep(0, result=response(oi_payload)))
+    injected = json.loads(resp_oi.body)
+    assert "MiaoMiao Harem _Anima_Base_net.safetensors" in injected["UNet loader with Name (Image Saver)"]["input"]["required"]["unet_name"][0]
+    assert "oneObsession_v21Anime.safetensors" in injected["Checkpoint Loader with Name (Image Saver)"]["input"]["required"]["ckpt_name"][0]
+    assert "4x-AnimeSharp.pth" in injected["CR Upscale Image"]["input"]["required"]["upscale_model"][0]
+
+    # 3. Verify publishing a LoRA increments lora_generation and triggers LoRA Manager scanner refresh on /prompt
+    refresh_calls = []
+    class FakeScanner:
+        async def get_cached_data(self, force_refresh=False):
+            refresh_calls.append(force_refresh)
+    class FakeRegistry:
+        @classmethod
+        async def get_lora_scanner(cls):
+            return FakeScanner()
+    fake_mod = types.ModuleType("custom_nodes.comfyui-lora-manager.py.services.service_registry")
+    fake_mod.ServiceRegistry = FakeRegistry
+    monkeypatch.setitem(sys.modules, fake_mod.__name__, fake_mod)
+
+    scratch = installed.partials / "test-lora.partial"
+    scratch.write_bytes(lora_bytes)
+    installed.publish(scratch, models_dir / "loras" / "anima-turbo-lora-v0.2.safetensors")
+    scratch.unlink()
+    assert installed.lora_generation == 1
+
+    prompt_body = {"prompt": {"1": {"class_type": "SaveImage", "inputs": {}}}}
+    async def fake_json():
+        return prompt_body
+    req_prompt = SimpleNamespace(method="POST", path="/prompt", headers={}, json=fake_json)
+    await middleware(req_prompt, lambda _r: asyncio.sleep(0, result=response({"prompt_id": "p1"})))
+    assert refresh_calls == [True]
+    # Second prompt with no new LoRA downloads does not rescan unnecessarily
+    await middleware(req_prompt, lambda _r: asyncio.sleep(0, result=response({"prompt_id": "p2"})))
+    assert refresh_calls == [True]
+
