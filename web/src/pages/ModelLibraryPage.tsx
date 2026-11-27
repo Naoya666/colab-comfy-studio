@@ -8,6 +8,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Settings,
   ShieldCheck,
   Trash2,
   X,
@@ -40,6 +41,7 @@ import { useSmartPoll } from '../lib/smart-poll';
 import { ConfirmDialog } from '../components/Feedback';
 import { ModelAddDialog } from '../components/ModelAddDialog';
 import { ModelDetailDrawer } from '../components/ModelDetailDrawer';
+import { ModelLibrarySettingsDialog, type ModelStorageAccountOption } from '../components/ModelLibrarySettings';
 import { ModelStorageBreakdown } from '../components/ModelStorageBreakdown';
 import { WorkflowDependencyInspector } from '../components/WorkflowDependencyInspector';
 import styles from '../gpu.module.css';
@@ -69,9 +71,9 @@ const COMPACT_STATUS_LABEL: Record<string, string> = {
   cancelled: '已取消',
 };
 
-export { ModelSourceSettings, ModelStorageSettings } from '../components/ModelLibrarySettings';
+export { ModelLibrarySettingsDialog, ModelSourceSettings, ModelStorageSettings } from '../components/ModelLibrarySettings';
 
-export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => void }) {
+export function ModelLibraryPage({ accounts }: { accounts?: ModelStorageAccountOption[] } = {}) {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [tasks, setTasks] = useState<ModelTask[]>([]);
   const [query, setQuery] = useState('');
@@ -82,6 +84,7 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
   const [sortMode, setSortMode] = useState<ModelSortMode>(() => readStoredModelSortMode());
   const [detailId, setDetailId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [openMenuUp, setOpenMenuUp] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -473,11 +476,14 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
             <Plus size={14} strokeWidth={2} aria-hidden />
             添加模型
           </button>
-          {onOpenSettings && (
-            <button className="button ghost small" type="button" onClick={onOpenSettings}>
-              存储与下载源设置
-            </button>
-          )}
+          <button
+            className="button ghost small"
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+          >
+            <Settings size={14} strokeWidth={1.8} aria-hidden />
+            存储与下载源设置
+          </button>
           <button className="button secondary small" type="button" disabled={busy} onClick={() => void runAction(refresh)}>
             刷新
           </button>
@@ -1104,6 +1110,12 @@ export function ModelLibraryPage({ onOpenSettings }: { onOpenSettings?: () => vo
           await refresh();
         }}
         onLocateModel={locateModel}
+      />
+
+      <ModelLibrarySettingsDialog
+        open={settingsOpen}
+        accounts={accounts}
+        onClose={() => setSettingsOpen(false)}
       />
 
       <ModelDetailDrawer

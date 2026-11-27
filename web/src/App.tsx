@@ -115,7 +115,6 @@ export default function App() {
   const [tab, setTab] = useState<MainTab>(initialRoute.tab);
   const [assetsSubTab, setAssetsSubTab] = useState<AssetsSubTab>(initialRoute.assetsSubTab);
   const [creationApiOpen, setCreationApiOpen] = useState(initialRoute.creationApiOpen);
-  const [settingsFocusSection, setSettingsFocusSection] = useState<'model-storage' | null>(null);
   const [focusTransferTarget, setFocusTransferTarget] = useState<TransferFocusTarget | null>(null);
   const [adminRole, setAdminRole] = useState(false);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -1920,7 +1919,7 @@ export default function App() {
                 />
               </>
             ) : (
-              <ModelLibraryPage onOpenSettings={() => { setSettingsFocusSection('model-storage'); navigate('设置'); }} />
+              <ModelLibraryPage accounts={accountsLoaded ? accounts : undefined} />
             )}
           </section>
         )}
@@ -1949,8 +1948,6 @@ export default function App() {
             usage={usage}
             canEditGuard={adminRole}
             desktop={desktop}
-            focusSection={settingsFocusSection}
-            onFocusHandled={() => setSettingsFocusSection(null)}
             error={error}
             onLogout={() => {
               sessionStorage.removeItem('colab-gpu-studio-token');

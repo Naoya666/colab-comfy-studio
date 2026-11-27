@@ -238,7 +238,7 @@ svg { flex: none; }
 .button.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
 .button.ghost:hover:not(:disabled) { background: var(--card-2); }
 
-.field { display: grid; gap: 6px; min-width: 0; }
+.field { display: grid; gap: 6px; min-width: 0; align-content: start; }
 .field > label, .field > .label { font-size: 0.8rem; color: var(--text-2); }
 input, select, textarea {
   width: 100%; min-height: 42px; padding: 8px 12px;

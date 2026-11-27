@@ -4491,6 +4491,7 @@
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 12px;
+  align-items: start;
 }
 .retryInlineNote {
   font-size: 0.84rem;
@@ -4922,4 +4923,59 @@
   gap: 10px;
   padding-top: 10px;
   border-top: 1px dashed var(--line);
+}
+.tgFieldCol {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  align-content: start;
+}
+
+/* 模型库存储与下载源设置弹窗 */
+.modelSettingsDialog {
+  max-width: min(600px, calc(100vw - 32px));
+}
+.modelSettingsSection {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.modelSettingsSectionHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.modelSettingsSectionHead h3 {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.94rem;
+  font-weight: 620;
+}
+.modelSourceList {
+  display: grid;
+  gap: 12px;
+}
+.modelSourceItem {
+  display: grid;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.modelSourceItem:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.modelSourceHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.86rem;
+  font-weight: 560;
 }

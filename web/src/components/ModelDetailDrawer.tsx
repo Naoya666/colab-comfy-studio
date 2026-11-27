@@ -474,7 +474,7 @@ export function ModelDetailDrawer({
                     onChange={(e) => setExternalSource(e.target.value)}
                   />
                 </label>
-                <p className="muted small">可填写无凭据的 HTTPS 来源链接，凭据在「设置 › 模型下载源凭据」中配置。留空并保存可解除绑定。</p>
+                <p className="muted small">可填写无凭据的 HTTPS 来源链接，凭据可在模型库「存储与下载源设置」中配置。留空并保存可解除绑定。</p>
                 <div className="actions">
                   <button
                     type="button"

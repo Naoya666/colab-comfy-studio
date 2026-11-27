@@ -1,6 +1,5 @@
-import { ModelSourceSettings, ModelStorageSettings } from '../components/ModelLibrarySettings';
 import { LocalStorageGovernance } from '../components/LocalStorageGovernance';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Settings, ChevronLeft, Monitor, Moon, Sun, Plug, LogOut } from 'lucide-react';
 import type { GpuSettings, GpuSpecKey, GpuUsage, Project } from '../lib/gpu-api';
 import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
@@ -33,14 +32,12 @@ export function ThemePicker() {
 }
 
 export function SettingsPanel({
-  settings, usage, canEditGuard, desktop = false, focusSection = null, onFocusHandled, error, accounts = [], accountsLoaded = false, projects = [], onLocalStorageMutated, onAccountsChange, onGpuOrderChange, onLogout, onBack,
+  settings, usage, canEditGuard, desktop = false, error, accounts = [], accountsLoaded = false, projects = [], onLocalStorageMutated, onAccountsChange, onGpuOrderChange, onLogout, onBack,
 }: {
   settings: GpuSettings | null;
   usage?: GpuUsage | null;
   canEditGuard: boolean;
   desktop?: boolean;
-  focusSection?: 'model-storage' | null;
-  onFocusHandled?: () => void;
   error: string;
   onLogout: () => void;
   onBack?: () => void;
@@ -54,15 +51,6 @@ export function SettingsPanel({
   const [oauthConfigured, setOauthConfigured] = useState(false);
   const [oauthOpen, setOauthOpen] = useState(false);
   const [orderedSpecs, setOrderedSpecs] = useState<GpuSpecKey[] | undefined>(undefined);
-
-  useEffect(() => {
-    if (focusSection !== 'model-storage') return;
-    const frame = window.requestAnimationFrame(() => {
-      document.getElementById('settings-model-storage')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      onFocusHandled?.();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [focusSection, onFocusHandled]);
 
   return (
     <div className={`${styles.stack} ${styles.workspaceGrid}`}>
@@ -112,9 +100,6 @@ export function SettingsPanel({
       <div className={styles.workspaceWide}>
         <TelegramSettings canEdit={canEditGuard} />
       </div>
-
-      <ModelStorageSettings id="settings-model-storage" defaultOpen={focusSection === 'model-storage'} accounts={accountsLoaded ? accounts : undefined} />
-      <ModelSourceSettings id="settings-model-source" defaultOpen={focusSection === 'model-storage'} />
 
       <div className={styles.workspaceWide}>
         <LocalStorageGovernance

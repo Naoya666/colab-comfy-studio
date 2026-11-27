@@ -289,29 +289,31 @@ export function TelegramSettings({ canEdit }: { canEdit: boolean }) {
           </label>
 
           <div className={styles.retryFieldsRow}>
-            <label className="field">
-              Bot Token
-              <input
-                type="password"
-                autoComplete="new-password"
-                disabled={!canEdit || busy}
-                value={botTokenInput}
-                placeholder={
-                  saved.bot_token_configured && !clearToken
-                    ? `已加密保存（${saved.bot_token_hint || '****'}），留空保持不变`
-                    : '从 @BotFather 获取，如 123456789:ABCdef...'
-                }
-                onChange={(e) => {
-                  setBotTokenInput(e.target.value);
-                  if (clearToken) setClearToken(false);
-                  setStatus('');
-                }}
-              />
+            <div className={styles.tgFieldCol}>
+              <label className="field">
+                Bot Token
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  disabled={!canEdit || busy}
+                  value={botTokenInput}
+                  placeholder={
+                    saved.bot_token_configured && !clearToken
+                      ? `已加密保存（${saved.bot_token_hint || '****'}），留空保持不变`
+                      : '从 @BotFather 获取，如 123456789:ABCdef...'
+                  }
+                  onChange={(e) => {
+                    setBotTokenInput(e.target.value);
+                    if (clearToken) setClearToken(false);
+                    setStatus('');
+                  }}
+                />
+              </label>
               {canEdit && saved.bot_token_configured && !clearToken && !botTokenInput && (
                 <button
                   type="button"
                   className="button ghost small"
-                  style={{ justifySelf: 'start', marginTop: 4 }}
+                  style={{ justifySelf: 'start' }}
                   disabled={busy}
                   onClick={() => {
                     setClearToken(true);
@@ -323,7 +325,7 @@ export function TelegramSettings({ canEdit }: { canEdit: boolean }) {
                 </button>
               )}
               {clearToken && <span className="muted small">保存后将清除已存 Bot Token。</span>}
-            </label>
+            </div>
 
             <label className="field">
               Chat ID
