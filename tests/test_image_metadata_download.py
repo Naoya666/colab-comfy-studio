@@ -179,6 +179,80 @@ def test_strip_jpeg_losslessly_removes_exif_xmp_com_iptc_and_keeps_icc(progressi
         assert not clean_im.getexif()
 
 
+@pytest.mark.parametrize("orientation,expected_size", [(6, (4, 8)), (8, (4, 8)), (3, (8, 4)), (1, (8, 4))])
+def test_strip_jpeg_preserves_exif_orientation_and_strips_sensitive_tags(orientation: int, expected_size: tuple[int, int]):
+    from PIL import ImageOps
+
+    # Build an 8x4 asymmetric JPEG with EXIF Orientation + sensitive EXIF/XMP/COM tags.
+    img = Image.new("RGB", (8, 4), (10, 20, 30))
+    img.putpixel((0, 0), (250, 10, 10))
+    img.putpixel((7, 3), (10, 250, 10))
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    exif[0x010E] = json.dumps({"workflow": "secret-exif-workflow"})
+    exif[0x010F] = "SecretCameraMake"
+    exif[0x0131] = "SecretSoftware"
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95, exif=exif.tobytes())
+    raw = buf.getvalue()
+    # Also attach COM and XMP segments.
+    com_payload = b"secret-jpeg-comment"
+    com_seg = b"\xff\xfe" + struct.pack(">H", len(com_payload) + 2) + com_payload
+    xmp_payload = b"http://ns.adobe.com/xap/1.0/\x00<x:xmpmeta>secret-orient-xmp</x:xmpmeta>"
+    xmp_seg = b"\xff\xe1" + struct.pack(">H", len(xmp_payload) + 2) + xmp_payload
+    raw_with_meta = raw[:2] + com_seg + xmp_seg + raw[2:]
+
+    cleaned = strip_image_metadata(raw_with_meta, "image/jpeg")
+    assert b"secret-exif-workflow" not in cleaned
+    assert b"SecretCameraMake" not in cleaned
+    assert b"SecretSoftware" not in cleaned
+    assert b"secret-jpeg-comment" not in cleaned
+    assert b"secret-orient-xmp" not in cleaned
+
+    with Image.open(io.BytesIO(raw_with_meta)) as orig_im, Image.open(io.BytesIO(cleaned)) as clean_im:
+        # Raw DCT pixels remain bit-for-bit identical (lossless).
+        assert orig_im.size == clean_im.size == (8, 4)
+        assert orig_im.tobytes() == clean_im.tobytes()
+
+        # Visual display orientation and transposed pixels match original exactly.
+        orig_disp = ImageOps.exif_transpose(orig_im)
+        clean_disp = ImageOps.exif_transpose(clean_im)
+        assert orig_disp.size == clean_disp.size == expected_size
+        assert orig_disp.tobytes() == clean_disp.tobytes()
+
+        # Only minimal Orientation tag is kept when orientation != 1; empty EXIF when orientation == 1.
+        clean_exif = dict(clean_im.getexif())
+        if orientation == 1:
+            assert clean_exif == {}
+        else:
+            assert clean_exif == {0x0112: orientation}
+
+
+def test_strip_jpeg_extracts_orientation_from_little_endian_exif():
+    from PIL import ImageOps
+
+    img = Image.new("RGB", (8, 4), (40, 80, 120))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    raw = buf.getvalue()
+    # Craft a little-endian ("II") EXIF APP1 payload with Orientation=6 and extra ImageDescription tag.
+    le_payload = (
+        b"Exif\x00\x00"
+        b"II"
+        + struct.pack("<HI", 42, 8)
+        + struct.pack("<H", 1)
+        + struct.pack("<HHIHH", 0x0112, 3, 1, 6, 0)
+        + struct.pack("<I", 0)
+    )
+    app1_seg = b"\xff\xe1" + struct.pack(">H", len(le_payload) + 2) + le_payload
+    raw_le = raw[:2] + app1_seg + raw[2:]
+
+    cleaned = strip_image_metadata(raw_le, "image/jpeg")
+    with Image.open(io.BytesIO(cleaned)) as clean_im:
+        assert dict(clean_im.getexif()) == {0x0112: 6}
+        assert ImageOps.exif_transpose(clean_im).size == (4, 8)
+
+
 @pytest.mark.parametrize("animated,alpha", [(False, False), (False, True), (True, False)])
 def test_strip_webp_losslessly_removes_exif_xmp_and_preserves_frames_and_alpha(animated: bool, alpha: bool):
     raw = _make_webp_with_metadata(animated=animated, alpha=alpha)

@@ -23,7 +23,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy import update as sql_update
 
 from .config import settings
 from .db import SettingRow, TelegramNotificationRow, utc_isoformat, utcnow
@@ -537,57 +538,61 @@ def enqueue_in_tx(
     """Enqueue a Telegram notification inside an active SQLAlchemy session (zero network I/O)."""
     if not owner_id or event_key not in EVENT_META:
         return None
+    # Flush prior business writes before opening a SAVEPOINT so a notification
+    # failure rolls back only the notification write and never poisons the outer TX.
+    session.flush()
     try:
-        cfg = load_config_in_tx(session, owner_id)
-        if not cfg["enabled"] or not cfg.get("encrypted_bot_token") or not cfg.get("chat_id"):
-            return None
-        if not cfg["events"].get(event_key, DEFAULT_EVENT_FLAGS.get(event_key, False)):
-            return None
+        with session.begin_nested():
+            cfg = load_config_in_tx(session, owner_id)
+            if not cfg["enabled"] or not cfg.get("encrypted_bot_token") or not cfg.get("chat_id"):
+                return None
+            if not cfg["events"].get(event_key, DEFAULT_EVENT_FLAGS.get(event_key, False)):
+                return None
 
-        ts = float(time.time() if now is None else now)
-        now_dt = datetime.fromtimestamp(ts, timezone.utc)
-        norm_dedupe = str(dedupe_key)[:190] if dedupe_key else None
-        if _should_skip_dedupe_in_tx(session, owner_id, norm_dedupe, cooldown_seconds, now_dt):
-            return None
+            ts = float(time.time() if now is None else now)
+            now_dt = datetime.fromtimestamp(ts, timezone.utc)
+            norm_dedupe = str(dedupe_key)[:190] if dedupe_key else None
+            if _should_skip_dedupe_in_tx(session, owner_id, norm_dedupe, cooldown_seconds, now_dt):
+                return None
 
-        priority = EVENT_META[event_key]["priority"]
-        text = format_message(
-            event_key,
-            title,
-            lines,
-            link_url=link_url,
-            link_label=link_label,
-            now=ts,
-        )
-        row_id = uuid.uuid4().hex
-        payload = {
-            "event_key": event_key,
-            "priority": priority,
-            "title": sanitize_text(title, max_len=160),
-            "text": text,
-            "dedupe_key": norm_dedupe,
-            "attempts": 0,
-            "max_attempts": MAX_DELIVERY_ATTEMPTS,
-            "next_attempt_at": ts,
-            "last_error": None,
-            "sent_at": None,
-            "telegram_message_id": None,
-            "disable_notification": priority == "P2",
-        }
-        row = TelegramNotificationRow(
-            id=row_id,
-            owner_id=owner_id,
-            project_id=project_id,
-            state="pending",
-            dedupe_key=norm_dedupe,
-            version=0,
-            data=payload,
-            created_at=now_dt,
-            updated_at=now_dt,
-        )
-        session.add(row)
-        session.flush()
-        return {"id": row_id, "state": "pending", **payload}
+            priority = EVENT_META[event_key]["priority"]
+            text = format_message(
+                event_key,
+                title,
+                lines,
+                link_url=link_url,
+                link_label=link_label,
+                now=ts,
+            )
+            row_id = uuid.uuid4().hex
+            payload = {
+                "event_key": event_key,
+                "priority": priority,
+                "title": sanitize_text(title, max_len=160),
+                "text": text,
+                "dedupe_key": norm_dedupe,
+                "attempts": 0,
+                "max_attempts": MAX_DELIVERY_ATTEMPTS,
+                "next_attempt_at": ts,
+                "last_error": None,
+                "sent_at": None,
+                "telegram_message_id": None,
+                "disable_notification": priority == "P2",
+            }
+            row = TelegramNotificationRow(
+                id=row_id,
+                owner_id=owner_id,
+                project_id=project_id,
+                state="pending",
+                dedupe_key=norm_dedupe,
+                version=0,
+                data=payload,
+                created_at=now_dt,
+                updated_at=now_dt,
+            )
+            session.add(row)
+            session.flush()
+            return {"id": row_id, "state": "pending", **payload}
     except Exception as exc:  # noqa: BLE001 - notification must never break business TX
         log.warning("telegram enqueue_in_tx failed event=%s: %s", event_key, type(exc).__name__)
         return None
@@ -826,26 +831,51 @@ def dispatch_pending(
     store = _base_store(store_or_repo)
     ts = float(time.time() if now is None else now)
 
+    # Reclaim stuck 'sending' rows BEFORE claiming so an otherwise idle queue
+    # never leaves crashed deliveries permanently wedged or blocking dedupe keys.
+    _reclaim_stuck_sending(store, ts)
+
+    due_expr = func.coalesce(TelegramNotificationRow.data["next_attempt_at"].as_float(), 0.0)
+    now_dt = datetime.fromtimestamp(ts, timezone.utc)
     claimed: list[dict[str, Any]] = []
     with store.db_lock(), store.Session.begin() as session:
         store.begin_immediate(session)
-        rows = session.scalars(
+        stmt = (
             select(TelegramNotificationRow)
-            .where(TelegramNotificationRow.state == "pending")
+            .where(
+                TelegramNotificationRow.state == "pending",
+                due_expr <= ts,
+            )
             .order_by(TelegramNotificationRow.created_at.asc())
-            .limit(max_batch * 2)
-        ).all()
+            .limit(max_batch)
+        )
+        if store.engine.dialect.name != "sqlite":
+            stmt = stmt.with_for_update(skip_locked=True)
+        rows = session.scalars(stmt).all()
         for row in rows:
             data = copy.deepcopy(row.data or {})
             next_at = float(data.get("next_attempt_at") or 0.0)
             if next_at > ts:
                 continue
-            row.state = "sending"
+            cur_version = int(row.version or 0)
             data["state"] = "sending"
             data["last_attempt_at"] = ts
-            row.data = data
-            row.version = int(row.version or 0) + 1
-            row.updated_at = utcnow()
+            res = session.execute(
+                sql_update(TelegramNotificationRow)
+                .where(
+                    TelegramNotificationRow.id == row.id,
+                    TelegramNotificationRow.state == "pending",
+                    TelegramNotificationRow.version == cur_version,
+                )
+                .values(
+                    state="sending",
+                    data=data,
+                    version=cur_version + 1,
+                    updated_at=now_dt,
+                )
+            )
+            if res.rowcount != 1:
+                continue
             claimed.append({"id": row.id, "owner_id": row.owner_id, "data": data})
             if len(claimed) >= max_batch:
                 break
@@ -944,8 +974,6 @@ def dispatch_pending(
         if owns_client:
             http_client.close()
 
-    # Best-effort reclaim of stuck 'sending' rows (e.g., if worker crashed mid-send > 120s ago).
-    _reclaim_stuck_sending(store, ts)
     return stats
 
 
@@ -964,28 +992,42 @@ def _finalize_delivery(store, row_id: str, owner_id: str, *, state: str, patch: 
 
 def _reclaim_stuck_sending(store, ts: float) -> None:
     cutoff = datetime.fromtimestamp(ts - 120.0, timezone.utc)
+    now_dt = datetime.fromtimestamp(ts, timezone.utc)
     try:
         with store.db_lock(), store.Session.begin() as session:
             store.begin_immediate(session)
-            stuck = session.scalars(
-                select(TelegramNotificationRow).where(
-                    TelegramNotificationRow.state == "sending",
-                    TelegramNotificationRow.updated_at < cutoff,
-                )
-            ).all()
+            stmt = select(TelegramNotificationRow).where(
+                TelegramNotificationRow.state == "sending",
+                TelegramNotificationRow.updated_at < cutoff,
+            )
+            if store.engine.dialect.name != "sqlite":
+                stmt = stmt.with_for_update(skip_locked=True)
+            stuck = session.scalars(stmt).all()
             for row in stuck:
                 data = copy.deepcopy(row.data or {})
+                cur_version = int(row.version or 0)
                 attempts = int(data.get("attempts") or 0) + 1
                 max_attempts = int(data.get("max_attempts") or MAX_DELIVERY_ATTEMPTS)
                 if attempts < max_attempts:
-                    row.state = "pending"
-                    data.update(state="pending", attempts=attempts, next_attempt_at=ts + 15.0)
+                    next_state = "pending"
+                    data.update(state="pending", attempts=attempts, next_attempt_at=ts)
                 else:
-                    row.state = "failed"
+                    next_state = "failed"
                     data.update(state="failed", attempts=attempts, last_error="发送进程中断超时")
-                row.data = data
-                row.version = int(row.version or 0) + 1
-                row.updated_at = datetime.fromtimestamp(ts, timezone.utc)
+                session.execute(
+                    sql_update(TelegramNotificationRow)
+                    .where(
+                        TelegramNotificationRow.id == row.id,
+                        TelegramNotificationRow.state == "sending",
+                        TelegramNotificationRow.version == cur_version,
+                    )
+                    .values(
+                        state=next_state,
+                        data=data,
+                        version=cur_version + 1,
+                        updated_at=now_dt,
+                    )
+                )
     except Exception:  # noqa: BLE001
         pass
 

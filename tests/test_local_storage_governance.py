@@ -387,3 +387,113 @@ def test_local_storage_memory_sqlite_reports_unsupported_for_vacuum_and_snapshot
         assert r_snap.status_code == 409
         assert r_snap.json()["error"]["code"] == "SQLITE_ONLY"
     mem_store.engine.dispose()
+
+
+def test_orphan_cleanup_protects_concurrent_upload_and_committed_artifact(file_db_client, monkeypatch):
+    from app import local_storage
+
+    client, store, data_dir, headers, _user_headers = file_db_client
+    png_raw = _make_png_with_workflow_and_color()
+    proj = store.create("projects", "owner", {"title": "并发上传保护"})
+
+    # Seed a true stray orphan file.
+    stray = data_dir / "assets" / "owner" / proj["id"] / "true-orphan.png"
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_bytes(b"ORPHAN" * 16)
+
+    # Seed a committed artifact asset stored under assets/artifacts/<id>.data (terminal execution).
+    artifacts_dir = data_dir / "assets" / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    committed_aid = "f" * 32
+    (artifacts_dir / f"{committed_aid}.json").write_text(
+        json.dumps({"owner_id": "owner", "execution_id": "exec-finished"})
+    )
+    (artifacts_dir / f"{committed_aid}.data").write_bytes(png_raw)
+    committed_asset = store.create(
+        "assets",
+        "owner",
+        {
+            "filename": "committed.png",
+            "mime": "image/png",
+            "storage_key": f"artifacts/{committed_aid}.data",
+            "size": len(png_raw),
+            "favorite": False,
+            "source_job_id": "job-done",
+        },
+        project_id=proj["id"],
+        record_id=committed_aid,
+    )
+
+    # Simulate a normal upload occurring right between DB snapshot and disk scan.
+    uploaded_holder: list[dict] = []
+    orig_iter = local_storage._iter_regular_files
+
+    def racing_iter(root):
+        if not uploaded_holder and root == (data_dir / "assets" / "owner").resolve():
+            uploaded_holder.append(save_asset(store, "owner", proj["id"], png_raw, "concurrent-ref.png"))
+        return orig_iter(root)
+
+    monkeypatch.setattr(local_storage, "_iter_regular_files", racing_iter)
+
+    res = client.post(
+        "/api/gpu/storage/local/cleanup",
+        json={"action": "temp_and_orphans", "confirmed": True},
+        headers=headers,
+    )
+    assert res.status_code == 200, res.text
+    assert len(uploaded_holder) == 1
+    concurrent_asset = uploaded_holder[0]
+
+    # Concurrent upload and committed artifact must BOTH remain intact on disk and in DB.
+    assert store.get("assets", concurrent_asset["id"], "owner") is not None
+    assert asset_path(concurrent_asset).is_file()
+    assert store.get("assets", committed_asset["id"], "owner") is not None
+    assert (artifacts_dir / f"{committed_aid}.data").is_file()
+    # True stray orphan is still cleaned up.
+    assert not stray.exists()
+
+
+def test_unfavorited_cleanup_protects_uploading_job_outputs_via_source_job_id(file_db_client):
+    client, store, _data_dir, headers, _user_headers = file_db_client
+    repo = Repository(store)
+    png_raw = _make_png_with_workflow_and_color()
+    proj = store.create("projects", "owner", {"title": "上传中任务保护"})
+
+    uploading_job = repo.create(
+        "jobs",
+        "owner",
+        {
+            "project_id": proj["id"],
+            "state": "uploading",
+            "execution_id": "exec-uploading-1",
+            "output_asset_ids": [],
+        },
+        project_id=proj["id"],
+    )
+    in_flight_out = save_asset(
+        store,
+        "owner",
+        proj["id"],
+        png_raw,
+        "in-flight.png",
+        source_job_id=uploading_job["id"],
+    )
+
+    p_res = client.post(
+        "/api/gpu/storage/local/cleanup/preview",
+        json={"action": "unfavorited_outputs", "older_than_days": 0, "project_id": proj["id"]},
+        headers=headers,
+    )
+    assert p_res.status_code == 200, p_res.text
+    assert p_res.json()["data"]["item_count"] == 0
+    assert p_res.json()["data"]["protected_skipped_count"] == 1
+
+    c_res = client.post(
+        "/api/gpu/storage/local/cleanup",
+        json={"action": "unfavorited_outputs", "older_than_days": 0, "project_id": proj["id"], "confirmed": True},
+        headers=headers,
+    )
+    assert c_res.status_code == 200, c_res.text
+    assert c_res.json()["data"]["deleted_count"] == 0
+    assert store.get("assets", in_flight_out["id"], "owner") is not None
+    assert asset_path(in_flight_out).is_file()

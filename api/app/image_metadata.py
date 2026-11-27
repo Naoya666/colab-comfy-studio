@@ -2,7 +2,7 @@
 
 Supports PNG, JPEG, WebP, and GIF without decoding or re-encoding image pixels:
 - PNG: allowlists image/color/animation chunks and removes tEXt, zTXt, iTXt, eXIf, tIME, and private chunks.
-- JPEG: removes COM, APP1 (EXIF/XMP), APP13 (IPTC/Photoshop), and other non-color APP segments while keeping JFIF, ICC_PROFILE, and Adobe color transform markers.
+- JPEG: removes COM, APP1 (EXIF/XMP), APP13 (IPTC/Photoshop), and other non-color APP segments while keeping JFIF, ICC_PROFILE, Adobe color transform markers, and a minimal synthetic EXIF Orientation tag when needed (values 2..8).
 - WebP: removes EXIF, XMP, and unknown RIFF chunks while preserving ICCP/ALPH/ANIM/ANMF and updating/simplifying VP8X flags.
 - GIF: removes Comment and non-loop Application extensions (such as XMP) while keeping frames and animation timing.
 """
@@ -171,6 +171,50 @@ def _strip_png(data: bytes) -> bytes:
     return bytes(out)
 
 
+def _extract_jpeg_exif_orientation(payload: bytes) -> int | None:
+    """Return EXIF Orientation (2..8) from an APP1 Exif payload, or None if upright/absent."""
+    if not payload.startswith(b"Exif\x00\x00"):
+        return None
+    tiff = payload[6:]
+    if len(tiff) < 8:
+        return None
+    byte_order = tiff[:2]
+    if byte_order == b"II":
+        endian = "<"
+    elif byte_order == b"MM":
+        endian = ">"
+    else:
+        return None
+    magic, ifd0 = struct.unpack_from(endian + "HI", tiff, 2)
+    if magic != 42 or ifd0 < 8 or ifd0 + 2 > len(tiff):
+        return None
+    entry_count = struct.unpack_from(endian + "H", tiff, ifd0)[0]
+    for i in range(min(entry_count, 512)):
+        entry_off = ifd0 + 2 + i * 12
+        if entry_off + 12 > len(tiff):
+            break
+        tag, field_type, count = struct.unpack_from(endian + "HHI", tiff, entry_off)
+        if tag == 0x0112 and field_type == 3 and count == 1:
+            orientation = struct.unpack_from(endian + "H", tiff, entry_off + 8)[0]
+            if 2 <= orientation <= 8:
+                return orientation
+            return None
+    return None
+
+
+def _build_minimal_orientation_exif_segment(orientation: int) -> bytes:
+    """Build a minimal synthetic APP1 EXIF segment carrying only the Orientation tag."""
+    payload = (
+        b"Exif\x00\x00"
+        b"MM"
+        + struct.pack(">HI", 42, 8)
+        + struct.pack(">H", 1)
+        + struct.pack(">HHIHH", 0x0112, 3, 1, orientation, 0)
+        + struct.pack(">I", 0)
+    )
+    return b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+
+
 def _strip_jpeg(data: bytes) -> bytes:
     total = len(data)
     if total < 4 or data[:2] != b"\xff\xd8":
@@ -180,6 +224,7 @@ def _strip_jpeg(data: bytes) -> bytes:
     offset = 2
     saw_sos = False
     saw_eoi = False
+    emitted_orientation = False
 
     while offset < total:
         if data[offset] != 0xFF:
@@ -244,6 +289,13 @@ def _strip_jpeg(data: bytes) -> bytes:
         elif 0xE0 <= marker <= 0xEF:  # APP0..APP15
             if marker == 0xE0:
                 keep = payload.startswith(b"JFIF\x00")
+            elif marker == 0xE1:
+                keep = False
+                if not emitted_orientation:
+                    orientation = _extract_jpeg_exif_orientation(payload)
+                    if orientation is not None:
+                        out.extend(_build_minimal_orientation_exif_segment(orientation))
+                        emitted_orientation = True
             elif marker == 0xE2:
                 keep = payload.startswith(b"ICC_PROFILE\x00")
             elif marker == 0xEE:

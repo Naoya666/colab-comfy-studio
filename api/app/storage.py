@@ -77,13 +77,25 @@ def save_asset(store, owner_id, project_id, content, filename, source_job_id=Non
     target = asset_path(row)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".partial")
-    tmp.write_bytes(content)
-    tmp.replace(target)
-    with target.open("rb") as verify_fh:
-        actual_sha = hashlib.file_digest(verify_fh, "sha256").hexdigest()
-    if actual_sha != row["sha256"]:
-        raise OSError("素材落盘校验失败")
-    return store.create("assets", owner_id, row, project_id=project_id)
+    try:
+        tmp.write_bytes(content)
+        with tmp.open("rb") as verify_fh:
+            actual_sha = hashlib.file_digest(verify_fh, "sha256").hexdigest()
+        if actual_sha != row["sha256"]:
+            raise OSError("素材落盘校验失败")
+        created = store.create("assets", owner_id, row, project_id=project_id)
+        try:
+            tmp.replace(target)
+        except BaseException:
+            try:
+                store.delete("assets", created["id"], owner_id)
+            except Exception:
+                pass
+            raise
+        return created
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def read_asset(asset):

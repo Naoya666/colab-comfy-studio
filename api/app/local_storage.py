@@ -169,7 +169,22 @@ def _sqlite_storage_info(st) -> dict[str, Any]:
     }
 
 
-def _collect_active_protections(st, owner_id: str, known_asset_ids: set[str]) -> dict[str, set[str]]:
+def _load_known_asset_paths(st, owner_id: str) -> set[Path]:
+    known: set[Path] = set()
+    for asset in st.list("assets", owner_id):
+        try:
+            known.add(asset_path(asset))
+        except ValueError:
+            continue
+    return known
+
+
+def _collect_active_protections(
+    st,
+    owner_id: str,
+    known_asset_ids: set[str],
+    raw_assets: list[dict] | None = None,
+) -> dict[str, set[str]]:
     repo = Repository(st)
     active_job_ids: set[str] = set()
     active_execution_ids: set[str] = set()
@@ -203,6 +218,16 @@ def _collect_active_protections(st, owner_id: str, known_asset_ids: set[str]) ->
         state = str(execution.get("state") or "").lower()
         if state not in _TERMINAL_EXECUTION_STATES:
             active_execution_ids.add(str(execution["id"]))
+
+    if raw_assets is not None:
+        for asset in raw_assets:
+            aid = str(asset.get("id") or "")
+            if not aid or aid not in known_asset_ids:
+                continue
+            src_job_id = str(asset.get("source_job_id") or asset.get("gpu_job_id") or "")
+            exec_id = str(asset.get("execution_id") or "")
+            if (src_job_id and src_job_id in active_job_ids) or (exec_id and exec_id in active_execution_ids):
+                protected_asset_ids.add(aid)
 
     try:
         for task in repo.list_by_states("model_downloads", ACTIVE_MODEL_DOWNLOAD_STATES):
@@ -258,9 +283,10 @@ def _scan_temp_and_orphans(
     active_scratch_names: set[str],
     *,
     now: float,
+    st=None,
 ) -> dict[str, Any]:
-    orphan_files: list[tuple[Path, int]] = []
-    artifact_files: list[tuple[Path, int]] = []
+    orphan_candidates: list[tuple[Path, Path, int]] = []
+    artifact_candidates: list[tuple[str, Path, Path, int]] = []
     scratch_dirs: list[tuple[Path, int, int]] = []  # (dir_path, bytes, file_count)
 
     # 1. Orphan files under assets/<owner_id> (including stale .partial files)
@@ -274,7 +300,7 @@ def _scan_temp_and_orphans(
             continue
         if fp.name.endswith(".partial") and (now - mtime) < _PARTIAL_GRACE_SECONDS:
             continue
-        orphan_files.append((fp, size))
+        orphan_candidates.append((fp, resolved, size))
 
     # 2. Reclaimable artifacts under assets/artifacts (owned by owner_id and not active)
     artifacts_root = (settings.data_dir / "assets" / "artifacts").resolve()
@@ -294,12 +320,31 @@ def _scan_temp_and_orphans(
             if exec_id and exec_id in active_execution_ids:
                 continue
             key = entry.stem
+            data_candidate = (artifacts_root / f"{key}.data").resolve()
+            if data_candidate in known_asset_paths:
+                continue
             for suffix in (".data", ".tmp", ".json"):
                 candidate = artifacts_root / f"{key}{suffix}"
                 if candidate.is_file() and not candidate.is_symlink():
                     sz, ok_flag = _safe_stat_size(candidate)
                     if ok_flag:
-                        artifact_files.append((candidate, sz))
+                        artifact_candidates.append((exec_id, data_candidate, candidate, sz))
+
+    # Re-confirm against DB AFTER disk scan so concurrent uploads are never classified as orphans.
+    fresh_known = _load_known_asset_paths(st, owner_id) if (st is not None and (orphan_candidates or artifact_candidates)) else known_asset_paths
+    orphan_files: list[tuple[Path, int]] = [
+        (fp, size) for fp, resolved, size in orphan_candidates if resolved not in fresh_known
+    ]
+    artifact_files: list[tuple[Path, int]] = [
+        (candidate, sz)
+        for _exec_id, data_candidate, candidate, sz in artifact_candidates
+        if data_candidate not in fresh_known
+    ]
+    artifact_meta: dict[Path, tuple[str, Path]] = {
+        candidate: (exec_id, data_candidate)
+        for exec_id, data_candidate, candidate, _sz in artifact_candidates
+        if data_candidate not in fresh_known
+    }
 
     # 3. Inactive model-scratch transfer directories
     scratch_root = Path(os.getenv("MODEL_LIBRARY_SCRATCH", str(settings.data_dir / "model-scratch"))).resolve()
@@ -330,6 +375,7 @@ def _scan_temp_and_orphans(
     return {
         "orphan_files": orphan_files,
         "artifact_files": artifact_files,
+        "artifact_meta": artifact_meta,
         "scratch_dirs": scratch_dirs,
         "total_bytes": total_bytes,
         "total_count": total_count,
@@ -342,7 +388,7 @@ def _build_local_storage_state(st, owner_id: str, *, now: float | None = None) -
     raw_projects = st.list("projects", owner_id)
     project_titles = {str(p["id"]): str(p.get("title") or p["id"]) for p in raw_projects}
     known_asset_ids = {str(a["id"]) for a in raw_assets}
-    protections = _collect_active_protections(st, owner_id, known_asset_ids)
+    protections = _collect_active_protections(st, owner_id, known_asset_ids, raw_assets)
     protected_asset_ids = protections["protected_asset_ids"]
 
     known_asset_paths: set[Path] = set()
@@ -413,6 +459,7 @@ def _build_local_storage_state(st, owner_id: str, *, now: float | None = None) -
         protections["active_execution_ids"],
         protections["active_scratch_names"],
         now=current,
+        st=st,
     )
     db_info = _sqlite_storage_info(st)
 
@@ -690,8 +737,16 @@ def execute_local_storage_cleanup(
     elif action == "temp_and_orphans":
         temp = state["temp_orphans"]
         owner_assets_root = (settings.data_dir / "assets" / owner_id).resolve()
+        fresh_known_paths = (
+            _load_known_asset_paths(st, owner_id)
+            if (temp["orphan_files"] or temp["artifact_files"])
+            else set()
+        )
         for fp, sz in temp["orphan_files"]:
             try:
+                if fp.resolve() in fresh_known_paths:
+                    skipped_count += 1
+                    continue
                 fp.unlink(missing_ok=True)
                 deleted_count += 1
                 freed_bytes += sz
@@ -699,8 +754,18 @@ def execute_local_storage_cleanup(
             except OSError:
                 skipped_count += 1
 
+        fresh_active_exec_ids = (
+            _collect_active_protections(st, owner_id, set())["active_execution_ids"]
+            if temp["artifact_files"]
+            else set()
+        )
+        artifact_meta = temp.get("artifact_meta") or {}
         for fp, sz in temp["artifact_files"]:
             try:
+                exec_id, data_candidate = artifact_meta.get(fp, ("", fp.resolve()))
+                if (exec_id and exec_id in fresh_active_exec_ids) or (data_candidate in fresh_known_paths):
+                    skipped_count += 1
+                    continue
                 fp.unlink(missing_ok=True)
                 deleted_count += 1
                 freed_bytes += sz
@@ -747,10 +812,28 @@ def execute_local_storage_cleanup(
         if protected_skipped > 0:
             skipped_reasons.append(f"已跳过 {protected_skipped} 件正被活跃任务引用的作品。")
         owner_assets_root = (settings.data_dir / "assets" / owner_id).resolve()
+        fresh_protections = (
+            _collect_active_protections(
+                st,
+                owner_id,
+                {str(a["id"]) for a, _, _ in targets},
+                [a for a, _, _ in targets],
+            )
+            if targets
+            else {"protected_asset_ids": set()}
+        )
+        fresh_protected = fresh_protections["protected_asset_ids"]
         for asset, fp, sz in targets:
             try:
-                delete_asset_file(asset)
-                _delete_asset_thumbs(asset)
+                if str(asset["id"]) in fresh_protected:
+                    skipped_count += 1
+                    continue
+                fresh_asset = st.get("assets", asset["id"], owner_id)
+                if fresh_asset is None or fresh_asset.get("favorite") is True:
+                    skipped_count += 1
+                    continue
+                delete_asset_file(fresh_asset)
+                _delete_asset_thumbs(fresh_asset)
                 st.delete("assets", asset["id"], owner_id)
                 _prune_empty_dirs(fp.parent, stop_at=owner_assets_root)
                 deleted_count += 1

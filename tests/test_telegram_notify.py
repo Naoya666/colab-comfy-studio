@@ -424,3 +424,240 @@ def test_single_job_creation_api_filter_and_model_library_helpers(tg_env):
     assert res_model is not None
     assert "2.00 GB" in res_model["text"]
 
+
+def test_enqueue_in_tx_failure_isolated_by_savepoint(tg_env):
+    from sqlalchemy import text
+
+    store, repo = tg_env
+    now = 1_700_060_400.0
+    _enable_tg(store, events={"batch_summary": True})
+
+    batch, _ = repo.create_batch(
+        "owner",
+        [{"project_id": "p1", "workflow_key": "wf/test", "workflow_version": 1, "execution_policy": {"provider": "mock"}}],
+        "batch-savepoint-idem",
+        {"mode": "batch"},
+    )
+    job_id = batch["job_ids"][0]
+
+    # Inject a deterministic DB write failure on telegram_notifications.
+    with store.engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TRIGGER fail_tg_insert BEFORE INSERT ON telegram_notifications "
+                "BEGIN SELECT RAISE(ABORT, 'injected telegram failure'); END;"
+            )
+        )
+
+    try:
+        updated_job = repo.transition_job(job_id, "owner", "completed", "done", {}, now)
+    finally:
+        with store.engine.begin() as conn:
+            conn.execute(text("DROP TRIGGER IF EXISTS fail_tg_insert"))
+
+    assert updated_job["state"] == "completed"
+    persisted_job = repo.get("jobs", job_id, "owner")
+    persisted_batch = repo.get("batches", batch["id"], "owner")
+    assert persisted_job is not None and persisted_job["state"] == "completed"
+    assert persisted_batch is not None and persisted_batch["state"] == "completed"
+    assert telegram_notify.list_recent_deliveries(store, "owner") == []
+
+
+def test_dispatch_reclaims_stuck_sending_even_when_queue_has_no_other_pending(tg_env):
+    from datetime import datetime, timezone
+
+    store, _ = tg_env
+    _enable_tg(store)
+    t0 = 1_700_100_000.0
+    stale_dt = datetime.fromtimestamp(t0 - 300.0, timezone.utc)
+
+    # Seed a single stuck 'sending' notification (no other pending messages in outbox).
+    with store.db_lock(), store.Session.begin() as session:
+        session.add(
+            TelegramNotificationRow(
+                id="stuck-retryable",
+                owner_id="owner",
+                state="sending",
+                dedupe_key="stuck:retryable",
+                version=1,
+                data={
+                    "event_key": "cu_fuse",
+                    "priority": "P0",
+                    "title": "卡死重试告警",
+                    "text": "<b>stuck alert</b>",
+                    "dedupe_key": "stuck:retryable",
+                    "attempts": 0,
+                    "max_attempts": 5,
+                    "next_attempt_at": t0 - 300.0,
+                },
+                created_at=stale_dt,
+                updated_at=stale_dt,
+            )
+        )
+        session.add(
+            TelegramNotificationRow(
+                id="stuck-exhausted",
+                owner_id="owner",
+                state="sending",
+                dedupe_key="stuck:exhausted",
+                version=1,
+                data={
+                    "event_key": "cu_fuse",
+                    "priority": "P0",
+                    "title": "卡死耗尽告警",
+                    "text": "<b>exhausted alert</b>",
+                    "dedupe_key": "stuck:exhausted",
+                    "attempts": 4,
+                    "max_attempts": 5,
+                    "next_attempt_at": t0 - 300.0,
+                },
+                created_at=stale_dt,
+                updated_at=stale_dt,
+            )
+        )
+
+    # Before dispatch, both dedupe keys are blocked by the stuck 'sending' rows.
+    assert (
+        telegram_notify.enqueue(
+            store, "owner", "cu_fuse", "新告警", [("详情", "new")], dedupe_key="stuck:exhausted", cooldown_seconds=60, now=t0
+        )
+        is None
+    )
+
+    captured: list[dict] = []
+    with _mock_tg_client(captured) as client:
+        st = telegram_notify.dispatch_pending(store, client=client, now=t0)
+
+    # stuck-retryable was reclaimed AND immediately delivered; stuck-exhausted was marked failed.
+    assert st["claimed"] == 1
+    assert st["sent"] == 1
+    assert len(captured) == 1
+    assert "stuck alert" in captured[0]["body"]["text"]
+
+    with store.db_lock(), store.Session() as session:
+        r_retry = session.get(TelegramNotificationRow, "stuck-retryable")
+        r_fail = session.get(TelegramNotificationRow, "stuck-exhausted")
+        assert r_retry is not None and r_retry.state == "sent"
+        assert r_fail is not None and r_fail.state == "failed"
+
+    # Once exhausted row is marked failed and past cooldown, new alerts with same dedupe_key succeed.
+    unblocked = telegram_notify.enqueue(
+        store, "owner", "cu_fuse", "解除阻塞告警", [("详情", "ok")], dedupe_key="stuck:exhausted", cooldown_seconds=60, now=t0
+    )
+    assert unblocked is not None
+
+
+def test_delayed_retry_backlog_does_not_starve_due_notifications(tg_env):
+    from datetime import datetime, timezone
+
+    store, _ = tg_env
+    _enable_tg(store)
+    t0 = 1_700_200_000.0
+
+    # Insert 45 older pending notifications whose next_attempt_at is in the future (> max_batch * 2 = 40).
+    with store.db_lock(), store.Session.begin() as session:
+        for idx in range(45):
+            created = datetime.fromtimestamp(t0 - 1000.0 + idx, timezone.utc)
+            session.add(
+                TelegramNotificationRow(
+                    id=f"delayed-{idx:02d}",
+                    owner_id="owner",
+                    state="pending",
+                    dedupe_key=None,
+                    version=1,
+                    data={
+                        "event_key": "cu_fuse",
+                        "priority": "P0",
+                        "title": f"延迟消息 {idx}",
+                        "text": f"delayed-{idx}",
+                        "attempts": 1,
+                        "max_attempts": 5,
+                        "next_attempt_at": t0 + 300.0,
+                    },
+                    created_at=created,
+                    updated_at=created,
+                )
+            )
+
+    # Enqueue one fresh due notification after all 45 delayed rows.
+    due_msg = telegram_notify.enqueue(
+        store, "owner", "cu_fuse", "紧急新告警", [("详情", "due-now")], now=t0
+    )
+    assert due_msg is not None
+
+    captured: list[dict] = []
+    with _mock_tg_client(captured) as client:
+        st = telegram_notify.dispatch_pending(store, max_batch=20, client=client, now=t0)
+
+    assert st["claimed"] == 1
+    assert st["sent"] == 1
+    assert len(captured) == 1
+    assert "due-now" in captured[0]["body"]["text"]
+
+
+def test_dispatch_claim_uses_for_update_skip_locked_on_postgresql_and_conditional_update(tg_env, monkeypatch):
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.orm import Session as _BaseSession
+
+    store, _ = tg_env
+    _enable_tg(store)
+    t0 = 1_700_300_000.0
+    msg = telegram_notify.enqueue(store, "owner", "cu_fuse", "PG 锁检查", [("详情", "pg")], now=t0)
+    assert msg is not None
+
+    compiled_sql: list[str] = []
+    monkeypatch.setattr(store.engine.dialect, "name", "postgresql")
+    orig_session_scalars = _BaseSession.scalars
+
+    def spy_scalars(self, statement, *args, **kwargs):
+        sql_text = str(statement.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+        compiled_sql.append(sql_text)
+        # Strip FOR UPDATE before executing against underlying SQLite test DB.
+        statement_for_sqlite = statement._clone()
+        statement_for_sqlite._for_update_arg = None
+        return orig_session_scalars(self, statement_for_sqlite, *args, **kwargs)
+
+    monkeypatch.setattr(_BaseSession, "scalars", spy_scalars)
+
+    captured: list[dict] = []
+    with _mock_tg_client(captured) as client:
+        st = telegram_notify.dispatch_pending(store, client=client, now=t0)
+
+    assert st["sent"] == 1
+    assert any("FOR UPDATE SKIP LOCKED" in sql for sql in compiled_sql)
+    assert any("next_attempt_at" in sql for sql in compiled_sql)
+
+    # Verify conditional UPDATE prevents double-claim if another worker wins between SELECT and UPDATE.
+    msg2 = telegram_notify.enqueue(store, "owner", "cu_fuse", "竞态检查", [("详情", "race")], now=t0 + 10)
+    assert msg2 is not None
+    raced = False
+
+    def racing_scalars(self, statement, *args, **kwargs):
+        nonlocal raced
+        statement_for_sqlite = statement._clone()
+        statement_for_sqlite._for_update_arg = None
+        result = orig_session_scalars(self, statement_for_sqlite, *args, **kwargs)
+        rows = result.all()
+        if not raced and any(getattr(r, "id", None) == msg2["id"] for r in rows):
+            raced = True
+            # Simulate a competing worker winning the row before our conditional UPDATE executes.
+            with store.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "UPDATE telegram_notifications SET state = 'sending', version = version + 1 WHERE id = ?",
+                    (msg2["id"],),
+                )
+
+        class _StaticResult:
+            def all(self):
+                return rows
+
+        return _StaticResult()
+
+    monkeypatch.setattr(_BaseSession, "scalars", racing_scalars)
+    captured_race: list[dict] = []
+    with _mock_tg_client(captured_race) as client:
+        st_race = telegram_notify.dispatch_pending(store, client=client, now=t0 + 10)
+
+    assert raced is True
+    assert st_race["claimed"] == 0
+    assert captured_race == []
