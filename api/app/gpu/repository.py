@@ -795,6 +795,7 @@ class Repository:
         batch=session.get(GpuBatchRow,batch_id)
         if not batch or batch.owner_id!=owner_id:
             return
+        prev_state = batch.state
         jobs=list(session.scalars(select(GpuJobRow).where(
             GpuJobRow.owner_id==owner_id,GpuJobRow.id.in_(batch.data.get('job_ids',[])))))
         counts={state:sum(job.state==state for job in jobs) for state in ('completed','failed','cancelled')}
@@ -807,6 +808,28 @@ class Repository:
         batch.data={**batch.data,'state':state,'finished_jobs':finished,'counts':counts}
         batch.version+=1
         batch.updated_at=utcnow()
+        if state in {'completed', 'partial', 'failed', 'cancelled'} and prev_state not in {'completed', 'partial', 'failed', 'cancelled'}:
+            from app import telegram_notify
+
+            wf_key = next(((j.data or {}).get('workflow_key') for j in jobs if (j.data or {}).get('workflow_key')), None)
+            elapsed = None
+            if batch.created_at is not None:
+                created = batch.created_at
+                now_dt = utcnow()
+                if created.tzinfo is None:
+                    now_dt = now_dt.replace(tzinfo=None)
+                elapsed = max(0.0, (now_dt - created).total_seconds())
+            telegram_notify.notify_batch_summary_in_tx(
+                session,
+                owner_id,
+                batch_id=batch.id,
+                batch_state=state,
+                total=len(jobs),
+                counts=counts,
+                project_id=batch.project_id,
+                workflow_key=wf_key,
+                elapsed_seconds=elapsed,
+            )
 
     def _create_batch_once(self, owner_id, jobs, idempotency_key, policy, request_body=None):
         if not isinstance(jobs, list) or not 1 <= len(jobs) <= 100:

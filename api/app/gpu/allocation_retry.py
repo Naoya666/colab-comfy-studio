@@ -653,7 +653,24 @@ def mark_succeeded(
     if job.get("account_alias_snapshot"):
         state["current_account_alias"] = job["account_alias_snapshot"]
     state["updated_at"] = now
-    return repo.update("jobs", job["id"], {"allocation_retry": state}, job.get("owner_id"))
+    updated = repo.update("jobs", job["id"], {"allocation_retry": state}, job.get("owner_id"))
+    if (int(state.get("retries_used") or 0) > 0 or int(state.get("attempt") or 1) > 1) and job.get("owner_id"):
+        from app import telegram_notify
+
+        telegram_notify.notify_allocation_retry(
+            repo,
+            job["owner_id"],
+            succeeded=True,
+            job_id=job["id"],
+            pool=job_pool(job),
+            spec=state.get("current_spec") or actual_spec,
+            account_label=state.get("current_account_alias") or state.get("current_account_id"),
+            retries_used=max(int(state.get("retries_used") or 0), int(state.get("attempt") or 1) - 1),
+            max_retries=state.get("max_retries"),
+            project_id=job.get("project_id"),
+            now=now,
+        )
+    return updated
 
 
 def mark_cancelled(
@@ -892,6 +909,21 @@ def maybe_defer_allocation_retry(
             job_row.version = int(job_row.version or 0) + 1
             job_row.updated_at = utcnow()
             _emit_event_in_tx(session, owner_id, job_row.project_id, job_row.id, job_row.state, stop_reason)
+            from app import telegram_notify
+
+            telegram_notify.notify_allocation_retry(
+                repo,
+                owner_id,
+                succeeded=False,
+                job_id=job_row.id,
+                pool=job_pool(jdata),
+                retries_used=retries_used,
+                max_retries=max_retries,
+                reason=stop_reason,
+                project_id=job_row.project_id,
+                session=session,
+                now=now,
+            )
 
         if err_kind == "global_fatal":
             reason = (
@@ -909,6 +941,20 @@ def maybe_defer_allocation_retry(
                     "code": str(err_code or "account_fatal"),
                     "reason": str(err_msg or "账号异常"),
                 }
+                if err_code != "CU_BALANCE_FLOOR_REACHED":
+                    from app import telegram_notify
+
+                    telegram_notify.notify_account_fatal(
+                        repo,
+                        owner_id,
+                        account_id=failed_acct,
+                        account_label=str(failed_alias or failed_acct),
+                        error_code=str(err_code or "account_fatal"),
+                        message=str(err_msg or "账号异常"),
+                        context="已移出本次自动抢卡候选账号池",
+                        session=session,
+                        now=now,
+                    )
             if not is_auto_account_job(jdata):
                 _abort("aborted", f"所选账号不可用或鉴权/配额受限（{err_code or 'account_fatal'}），已停止自动排队抢卡")
                 return None
@@ -1186,6 +1232,21 @@ def revalidate_before_allocation(
             job_row.version = int(job_row.version or 0) + 1
             job_row.updated_at = utcnow()
             _emit_event_in_tx(session, owner_id, job_row.project_id, job_row.id, job_row.state, stop_reason)
+            from app import telegram_notify
+
+            telegram_notify.notify_allocation_retry(
+                repo,
+                owner_id,
+                succeeded=False,
+                job_id=job_row.id,
+                pool=job_pool(jdata),
+                retries_used=int(state.get("retries_used") or 0),
+                max_retries=state.get("max_retries"),
+                reason=stop_reason,
+                project_id=job_row.project_id,
+                session=session,
+                now=now,
+            )
             return repo._row(job_row), error_code, stop_reason
 
         if global_cu_stop:

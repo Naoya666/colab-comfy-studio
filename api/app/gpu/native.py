@@ -1329,13 +1329,15 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
         return False
     identity = _lease_identity(lease)
     # Reuse one HTTP client and a single /studio_native/state fetch across plugin sync and busy probe.
+    plugin_sync_err = None
     if GpuConfig.from_env().real_enabled and sync_plugins is _default_sync_plugins and busy is _default_busy:
         state_payload = None
         with httpx.Client(timeout=15) as shared_client:
             try:
                 _, state_payload = sync_plugins(repo, lease, client=shared_client, return_state=True)
             except Exception as exc:
-                repo.update("leases", lease["id"], {"native_plugin_sync_error": type(exc).__name__}, lease["owner_id"])
+                plugin_sync_err = type(exc).__name__
+                repo.update("leases", lease["id"], {"native_plugin_sync_error": plugin_sync_err}, lease["owner_id"])
             upstream_status, busy_reason = busy_state_for(
                 repo, lease["owner_id"], client=shared_client, state_payload=state_payload
             )
@@ -1344,11 +1346,24 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
             try:
                 sync_plugins(repo, lease)
             except Exception as exc:
-                repo.update("leases", lease["id"], {"native_plugin_sync_error": type(exc).__name__}, lease["owner_id"])
+                plugin_sync_err = type(exc).__name__
+                repo.update("leases", lease["id"], {"native_plugin_sync_error": plugin_sync_err}, lease["owner_id"])
                 # Busy probe fails closed if persistence has an error or dirty files.
                 # A VPS mirror outage must not replace the last committed manifest.
                 pass
         upstream_status, busy_reason = busy_state_for(repo, lease["owner_id"])
+    if plugin_sync_err and lease.get("owner_id"):
+        from app import telegram_notify
+
+        telegram_notify.notify_native_health_alert(
+            repo,
+            lease["owner_id"],
+            lease_id=lease["id"],
+            instance_id=lease.get("instance_id"),
+            kind="plugin_sync",
+            detail=f"自定义节点归档同步失败（{plugin_sync_err}），释放实例前将阻断以防插件改动丢失",
+            now=clock(),
+        )
     upstream_busy = upstream_status != "idle"
     # An offline tunnel also reports "unknown" (conservative busy). It cannot veto reconciliation of
     # a VM already confirmed absent by Colab's independent control plane.
@@ -1386,7 +1401,7 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
                     and float(lease.get("native_last_busy") or 0) < now_ts
                     and lease.get("native_last_write") is None
                 )
-                patch = {"native_last_upstream_busy": True}
+                patch = {"native_last_upstream_busy": True, "native_unknown_since": None}
                 if not skip_clock_bump:
                     patch["native_last_busy"] = now_ts
                     sync_idle_deadline(repo, lease, instance=instance, lease_patch=patch)
@@ -1395,16 +1410,47 @@ def protect_lease(repo, lease, clock=time.time, *, check_remote=True, provider_f
             elif upstream_status == "unknown":
                 # Unreachable/errored tunnel: retain conservatively without fabricating
                 # busy evidence or extending idle clocks.
+                now_ts = clock()
+                unknown_since = lease.get("native_unknown_since")
+                patch = {}
                 if lease.get("native_last_upstream_busy") is True:
-                    lease = repo.update("leases", lease["id"], {"native_last_upstream_busy": False}, lease["owner_id"])
+                    patch["native_last_upstream_busy"] = False
+                if not isinstance(unknown_since, (int, float)):
+                    unknown_since = now_ts
+                    patch["native_unknown_since"] = now_ts
+                if patch:
+                    lease = repo.update("leases", lease["id"], patch, lease["owner_id"])
+                if now_ts - float(unknown_since) >= 600.0 and lease.get("owner_id"):
+                    from app import telegram_notify
+
+                    mins = int(round((now_ts - float(unknown_since)) / 60.0))
+                    telegram_notify.notify_native_health_alert(
+                        repo,
+                        lease["owner_id"],
+                        lease_id=lease["id"],
+                        instance_id=lease.get("instance_id"),
+                        kind="tunnel_unknown",
+                        detail=f"内部 Cloudflare 隧道已连续约 {mins} 分钟无响应",
+                        now=now_ts,
+                    )
                 retained = True
             elif clock() - float(lease.get("native_http_heartbeat") or 0) < 30:
-                if lease.get("native_last_upstream_busy") is not False:
-                    lease = repo.update("leases", lease["id"], {"native_last_upstream_busy": False}, lease["owner_id"])
+                if lease.get("native_last_upstream_busy") is not False or lease.get("native_unknown_since") is not None:
+                    lease = repo.update(
+                        "leases",
+                        lease["id"],
+                        {"native_last_upstream_busy": False, "native_unknown_since": None},
+                        lease["owner_id"],
+                    )
                 retained = True
             else:
-                if lease.get("native_last_upstream_busy") is not False:
-                    lease = repo.update("leases", lease["id"], {"native_last_upstream_busy": False}, lease["owner_id"])
+                if lease.get("native_last_upstream_busy") is not False or lease.get("native_unknown_since") is not None:
+                    lease = repo.update(
+                        "leases",
+                        lease["id"],
+                        {"native_last_upstream_busy": False, "native_unknown_since": None},
+                        lease["owner_id"],
+                    )
                 last = max(float(lease.get("native_last_busy") or 0), float(lease.get("native_last_write") or 0))
                 idle_minutes = lease.get("native_idle_minutes")
                 if idle_minutes is None:

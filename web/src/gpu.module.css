@@ -4867,3 +4867,59 @@
   gap: 8px 12px;
   min-width: 0;
 }
+
+/* Telegram 推送设置 */
+.tgGroupFieldset {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md, 12px);
+  padding: 12px 14px;
+  margin: 0;
+  display: grid;
+  gap: 10px;
+  background: var(--bg);
+}
+.tgGroupLegend {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.tgEventList {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px;
+}
+.tgEventItem {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: var(--r-sm, 8px);
+  border: 1px solid var(--line);
+  background: var(--surface, var(--bg));
+  cursor: pointer;
+  min-width: 0;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.tgEventItem[data-checked="true"] {
+  border-color: var(--line-strong);
+}
+.tgEventItem > input[type="checkbox"] {
+  margin-top: 3px;
+  flex: none;
+}
+.tgEventCopy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+.tgP2Options {
+  display: grid;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}

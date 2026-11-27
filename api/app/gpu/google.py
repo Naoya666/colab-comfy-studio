@@ -888,6 +888,18 @@ class GoogleService:
         except httpx.HTTPError as exc:
             raise GoogleOAuthError("Google OAuth刷新失败") from exc
         if response.status_code < 200 or response.status_code >= 300:
+            if response.status_code in {400, 401, 403} and self.owner_id:
+                from app import telegram_notify
+
+                telegram_notify.notify_account_fatal(
+                    self.store,
+                    self.owner_id,
+                    account_id=self.account_id,
+                    error_code=f"google_oauth_refresh_http_{response.status_code}",
+                    message=f"Google {purpose} OAuth 刷新失败（HTTP {response.status_code}），授权可能已失效或被撤销",
+                    context="请尽快在设置页面重新完成 Google 账号授权",
+                    now=self.clock(),
+                )
             raise GoogleOAuthError("Google OAuth刷新失败")
         try:
             payload = response.json()

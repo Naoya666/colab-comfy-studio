@@ -1439,10 +1439,13 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 }
                 if inherited_idle is not None:
                     inst_ready_patch["idle_deadline_at"] = inherited_idle
+                inst_cur = None
+                was_transfer_native = False
                 if job.get("instance_id"):
                     inst_cur = self._get("instances", job["instance_id"], job["owner_id"])
                     if inst_cur and isinstance(inst_cur.get("transfer_state"), dict):
                         if inst_cur["transfer_state"].get("phase") == "native_bootstrapping":
+                            was_transfer_native = True
                             inst_ready_patch["transfer_state"] = {
                                 **inst_cur["transfer_state"],
                                 "phase": "succeeded",
@@ -1450,7 +1453,7 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                                 "error_code": None,
                                 "error_message": None,
                             }
-                self._update("instances", job["instance_id"], inst_ready_patch, job["owner_id"])
+                updated_inst = self._update("instances", job["instance_id"], inst_ready_patch, job["owner_id"])
                 job = self._update("jobs", job["id"], {
                     "deadline_epoch": deadline, "hard_deadline_at": deadline,
                     "native_proxy_wait_started": None,
@@ -1459,6 +1462,38 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     "native_run_ready job=%s poll_s=%.3f ready_s=%.3f mark_ready_s=%.3f worker_completed_age_s=%s",
                     job["id"], poll_s, ready_s, time.monotonic() - t_mark0, worker_age_s,
                 )
+                from app import telegram_notify
+
+                from . import native_config
+
+                try:
+                    ncfg = native_config.resolve(self.store, job["owner_id"], use_cache=True)
+                    native_url = ncfg.native_comfy_url or None
+                except Exception:
+                    native_url = None
+                telegram_notify.notify_native_lifecycle(
+                    self.store,
+                    job["owner_id"],
+                    ready=True,
+                    job=job,
+                    instance=updated_inst or inst_cur,
+                    native_url=native_url,
+                    deadline_epoch=deadline,
+                    idle_minutes=idle_minutes,
+                    now=now_ready,
+                )
+                if was_transfer_native and isinstance(inst_cur, dict):
+                    ts_info = inst_cur.get("transfer_state") or {}
+                    telegram_notify.notify_transfer_result(
+                        self.store,
+                        job["owner_id"],
+                        succeeded=True,
+                        transfer_id=str(ts_info.get("transfer_id") or job.get("transfer_id") or job["id"]),
+                        instance_id=job.get("instance_id"),
+                        from_pool=ts_info.get("from_pool"),
+                        to_pool="native",
+                        now=now_ready,
+                    )
             job = self._note_restored(job, lease, timings or {})
         elif poll_s >= 3.0:
             logging.getLogger(__name__).info(
@@ -1817,7 +1852,54 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
             or (state == "cancelled" and (job.get("allocation_retry") or {}).get("phase") == "cancelled")
         ):
             patch.update(error_code=None, error_message=None)
-        return self._set_state(job, state, message, cleanup_next_epoch=0, **patch)
+        final_job = self._set_state(job, state, message, cleanup_next_epoch=0, **patch)
+        self._notify_terminal_job(final_job, state)
+        return final_job
+
+    def _notify_terminal_job(self, job: dict, state: str) -> None:
+        owner_id = job.get("owner_id")
+        if not owner_id or state not in {"completed", "failed"}:
+            return
+        from app import telegram_notify
+
+        from .allocation_retry import ACCOUNT_FATAL_CODES, ACCOUNT_FATAL_OUTCOMES
+
+        now = self.clock()
+        snapshot = job.get("snapshot") if isinstance(job.get("snapshot"), dict) else {}
+        if state == "failed":
+            err_code = str(job.get("error_code") or "").strip()
+            details = job.get("error_details") if isinstance(job.get("error_details"), dict) else {}
+            outcome = str(details.get("outcome") or "").strip().upper()
+            if (
+                err_code in ACCOUNT_FATAL_CODES
+                or (outcome and (outcome in ACCOUNT_FATAL_OUTCOMES or any(k in outcome for k in ("DENYLIST", "BANNED", "RESTRICTED", "QUOTA_EXCEEDED", "TOO_MANY"))))
+            ) and err_code != "CU_BALANCE_FLOOR_REACHED":
+                telegram_notify.notify_account_fatal(
+                    self.store,
+                    owner_id,
+                    account_id=job.get("account_id"),
+                    account_label=job.get("account_alias_snapshot") or job.get("account_id"),
+                    error_code=err_code or outcome,
+                    message=job.get("error_message"),
+                    context=f"任务 {str(job.get('id') or '')[:12]} 执行失败",
+                    now=now,
+                )
+            if snapshot.get("native_comfy"):
+                telegram_notify.notify_native_lifecycle(
+                    self.store,
+                    owner_id,
+                    ready=False,
+                    job=job,
+                    now=now,
+                )
+                return
+        telegram_notify.notify_single_job_result(
+            self.store,
+            owner_id,
+            job=job,
+            state=state,
+            now=now,
+        )
 
     def _inspect_runtime(self, lease: dict, claim_token: str | None = None) -> str | None:
         """Check a bound runtime independently of Comfy, retention and idle deadlines."""
@@ -2163,6 +2245,23 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                     },
                     job.get("owner_id"),
                 )
+                from app import telegram_notify
+
+                telegram_notify.enqueue(
+                    self.store,
+                    job.get("owner_id"),
+                    "instance_quarantined",
+                    "GPU 租约已进入保护隔离（清理被拒）",
+                    [
+                        ("实例 / 租约", f"{str(job.get('instance_id') or '—')[:12]} / {lease['id'][:12]}"),
+                        ("原因", "lease intent is incomplete（缺少远端清理句柄）"),
+                        ("建议", "请人工核查 Colab 运行时与实例中心状态"),
+                    ],
+                    dedupe_key=f"quarantined:lease:{lease['id']}",
+                    cooldown_seconds=1800,
+                    project_id=job.get("project_id"),
+                    now=self.clock(),
+                )
                 return self._set_state(job, "failed", "GPU cleanup was refused", error_code="gpu_cleanup_refused")
             try:
                 confirmed = False
@@ -2208,6 +2307,19 @@ class Scheduler(SchedulerInstancesMixin, SchedulerWatchdogMixin):
                 if waiting_window
                 else "GPU cleanup is pending"
             )
+            if attempts >= 3 and not waiting_window and job.get("owner_id"):
+                from app import telegram_notify
+
+                telegram_notify.notify_cleanup_failed(
+                    self.store,
+                    job["owner_id"],
+                    lease_id=lease["id"],
+                    instance_id=job.get("instance_id") or lease.get("instance_id"),
+                    account_id=job.get("account_alias_snapshot") or job.get("account_id") or lease.get("account_id"),
+                    attempts=attempts,
+                    error=error,
+                    now=self.clock(),
+                )
             if job.get("allocation_retry"):
                 from . import allocation_retry
 

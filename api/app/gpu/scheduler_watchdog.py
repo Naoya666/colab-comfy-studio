@@ -176,6 +176,19 @@ class SchedulerWatchdogMixin:
         if confirmed:
             return finish(True, attempts=attempts)
         finish(False, error or "delete not confirmed", attempts)
+        if attempts >= 3 and owner_id:
+            from app import telegram_notify
+
+            telegram_notify.notify_cleanup_failed(
+                self.store,
+                owner_id,
+                lease_id=lease["id"],
+                instance_id=instance_id,
+                account_id=lease.get("account_id"),
+                attempts=attempts,
+                error=error,
+                now=self.clock(),
+            )
         return False
 
     def _historical_orphan_evidence(self, instance: dict, lease: dict, leases: list[dict], jobs: list[dict]):

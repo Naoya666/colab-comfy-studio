@@ -156,12 +156,36 @@ def _save(repo, lease, operation, *, validate=False, check_jobs=True, **changes)
             patch["native_last_busy"] = now
             native.sync_idle_deadline(repo, fresh, lease_patch=patch)
         repo.update("leases", fresh["id"], patch, lease["owner_id"])
+        if changes.get("phase") == "succeeded" and lease.get("owner_id"):
+            from app import telegram_notify
+
+            telegram_notify.notify_native_restart_result(
+                repo,
+                lease["owner_id"],
+                succeeded=True,
+                operation_id=str(operation["id"]),
+                instance_id=operation.get("instance_id"),
+                now=now,
+            )
         return result
 
 
 def _fail(repo, lease, operation, error, *, uncertain=False):
-    return _save(repo, lease, operation, phase="failed", failed_phase=operation["phase"],
-                 error=error, retry_blocked=uncertain, probe_after=time.time() + 15)
+    result = _save(repo, lease, operation, phase="failed", failed_phase=operation["phase"],
+                   error=error, retry_blocked=uncertain, probe_after=time.time() + 15)
+    if result is not None and operation.get("phase") != "checking" and lease.get("owner_id"):
+        from app import telegram_notify
+
+        telegram_notify.notify_native_restart_result(
+            repo,
+            lease["owner_id"],
+            succeeded=False,
+            operation_id=str(operation["id"]),
+            instance_id=operation.get("instance_id"),
+            error=error,
+            uncertain=uncertain,
+        )
+    return result
 
 
 def submit(repo, owner, instance_id, key):

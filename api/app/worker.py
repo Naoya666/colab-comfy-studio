@@ -42,6 +42,24 @@ def _run_ccu_tick(store: Store) -> None:
             log.warning("ccu tick failed for owner=%s: %s", owner_id, type(exc).__name__)
 
 
+def _run_telegram_dispatch(store: Store) -> None:
+    try:
+        from .telegram_notify import dispatch_pending
+
+        dispatch_pending(store)
+    except Exception as exc:  # noqa: BLE001 - never stop the queue for notifications
+        log.warning("telegram dispatch failed: %s", type(exc).__name__)
+
+
+def _run_telegram_periodic(store: Store) -> None:
+    try:
+        from .telegram_notify import periodic_tick
+
+        periodic_tick(store)
+    except Exception as exc:  # noqa: BLE001 - never stop the queue for notifications
+        log.warning("telegram periodic tick failed: %s", type(exc).__name__)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["worker", "watchdog", "model-worker"], default="worker", nargs="?")
@@ -60,10 +78,14 @@ def main():
     repo = Repository(store)
     scheduler = Scheduler(repo)
     last_ccu_tick = 0.0
+    last_tg_dispatch = 0.0
+    last_tg_periodic = 0.0
     restart_pool = ThreadPoolExecutor(max_workers=1) if args.mode == "worker" and not args.once else None
     ccu_pool = ThreadPoolExecutor(max_workers=1) if args.mode == "worker" and not args.once else None
+    tg_pool = ThreadPoolExecutor(max_workers=1) if args.mode == "worker" and not args.once else None
     restart_future = None
     ccu_future = None
+    tg_future = None
     while running:
         advanced = False
         fast_control = env_flag("NATIVE_FAST_CONTROL_PLANE", True)
@@ -106,6 +128,29 @@ def main():
                         ccu_future = ccu_pool.submit(_run_ccu_tick, store)
                     else:
                         _run_ccu_tick(store)
+            if args.mode == "worker":
+                now_ts = time.time()
+                if tg_future is not None and tg_future.done():
+                    completed_tg, tg_future = tg_future, None
+                    try:
+                        completed_tg.result()
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("telegram background tick failed: %s", type(exc).__name__)
+                if tg_future is None and (now_ts - last_tg_dispatch >= 2.0 or now_ts - last_tg_periodic >= 60.0):
+                    run_periodic = now_ts - last_tg_periodic >= 60.0
+                    last_tg_dispatch = now_ts
+                    if run_periodic:
+                        last_tg_periodic = now_ts
+
+                    def _tg_step(do_periodic=run_periodic):
+                        if do_periodic:
+                            _run_telegram_periodic(store)
+                        _run_telegram_dispatch(store)
+
+                    if tg_pool is not None:
+                        tg_future = tg_pool.submit(_tg_step)
+                    else:
+                        _tg_step()
             advanced = bool(result.get("advanced"))
             if advanced:
                 log.info("job=%s state=%s", result.get("job_id"), result.get("state"))
@@ -120,6 +165,8 @@ def main():
         restart_pool.shutdown()
     if ccu_pool:
         ccu_pool.shutdown()
+    if tg_pool:
+        tg_pool.shutdown()
 
 
 if __name__ == "__main__":

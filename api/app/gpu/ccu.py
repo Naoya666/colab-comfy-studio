@@ -18,7 +18,14 @@ from app.config import settings
 from app.db import SettingRow
 
 from .rates import minute_rate
-from .repository import GpuCcuLedgerRow, GpuInstanceRow, GpuInstanceUsageSegmentRow, GpuJobRow, GpuLeaseRow
+from .repository import (
+    GpuAccountRow,
+    GpuCcuLedgerRow,
+    GpuInstanceRow,
+    GpuInstanceUsageSegmentRow,
+    GpuJobRow,
+    GpuLeaseRow,
+)
 from .specs import spec_key
 
 log = logging.getLogger(__name__)
@@ -360,10 +367,28 @@ def _refresh(session, row, now, **patch):
 
 
 def _seal(session, rows, now, *, all_pending=False):
+    from app import telegram_notify
+
     for row in rows:
         if row.state == "reconciling" and (all_pending or row.data["reconcile_until"] <= now):
             row.state = "closed"
             _refresh(session, row, now)
+            data = row.data or {}
+            snap = setting(session, _snapshot_key(row.owner_id, row.account_id)) if row.owner_id and row.account_id else {}
+            remaining_bal = data.get("ccu_after") if data.get("ccu_after") is not None else snap.get("balance")
+            telegram_notify.notify_instance_bill_in_tx(
+                session,
+                row.owner_id,
+                instance_id=str(row.instance_id or ""),
+                account_id=row.account_id,
+                gpu_label=data.get("gpu_label"),
+                session_kind=data.get("session_kind"),
+                duration_minutes=data.get("duration_minutes"),
+                actual_cu=data.get("actual_cu"),
+                estimated_cu=data.get("estimated_cu"),
+                remaining_balance=remaining_bal,
+                now=now,
+            )
 
 
 def _open_session(session, instance, job, lease, started_at):
@@ -531,7 +556,26 @@ def sample_and_record(repo, owner, account, source, *, sampler=None, now=None):
             key = _snapshot_key(owner, account)
             previous = setting(session, key)
             if balance is None:
-                setting(session, key, {**previous, "error": "sample_failed", "attempted_at": moment}, owner)
+                failures = int(previous.get("consecutive_failures") or 0) + 1
+                setting(
+                    session,
+                    key,
+                    {**previous, "error": "sample_failed", "attempted_at": moment, "consecutive_failures": failures},
+                    owner,
+                )
+                if failures >= 3:
+                    from app import telegram_notify
+
+                    acct_row = session.get(GpuAccountRow, account)
+                    acct_alias = (acct_row.data or {}).get("alias") if acct_row and acct_row.owner_id == owner else None
+                    telegram_notify.notify_cu_sample_failed_in_tx(
+                        session,
+                        owner,
+                        account_id=account,
+                        account_label=acct_alias or account,
+                        consecutive_failures=failures,
+                        now=moment,
+                    )
                 return None
             if moment < (previous.get("sampled_at") or 0):
                 return previous
@@ -544,7 +588,7 @@ def sample_and_record(repo, owner, account, source, *, sampler=None, now=None):
             event = "baseline" if before is None else "spend" if balance < before else "topup" if balance > before else "snapshot"
             snapshot = {
                 "sampled_at": moment, "balance": balance, "rate_hourly": _number(sample, ("rate_hourly", "rate")),
-                "assignments": _number(sample, ("assignments",)), "error": None,
+                "assignments": _number(sample, ("assignments",)), "error": None, "consecutive_failures": 0,
                 "active_instance_ids": sorted(row.instance_id for row in opened),
                 "reconciling_instance_ids": sorted(row.instance_id for row in pending),
             }
@@ -661,6 +705,20 @@ def tick_ccu(repo, owner_id, *, sampler=None, now=None):
         key = f"cu-anomalies:{owner_id}"
         anomalies = _detect(values, setting(session, key).get("items", []), moment)
         setting(session, key, {"items": anomalies}, owner_id)
+        from app import telegram_notify
+
+        for item in anomalies:
+            if item.get("resolved_at") is None and float(item.get("last_seen") or 0) - float(item.get("first_seen") or 0) >= 120.0:
+                telegram_notify.notify_leaked_runtime_in_tx(
+                    session,
+                    owner_id,
+                    account_id=str(item.get("account_id") or ""),
+                    account_label=item.get("alias"),
+                    assignments=int(item.get("assignments") or 1),
+                    balance=item.get("balance"),
+                    rate_hourly=item.get("rate"),
+                    now=moment,
+                )
         rows = _segments(session, owner_id, states=("open", "reconciling"))
         _seal(session, rows, moment)
         for row in rows:

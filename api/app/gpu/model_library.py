@@ -1139,6 +1139,19 @@ class ModelTransfer:
             cancelled = (self.lib.repo.get("model_downloads", self.task["id"], self.lib.owner) or {}).get("cancel_requested")
             self.lib.update(self.model["id"], state="failed", error=error)
             self.lib.repo.update("model_downloads", self.task["id"], {"state": "cancelled" if cancelled else "failed", "error": error}, self.lib.owner)
+            if not cancelled:
+                from app import telegram_notify
+
+                telegram_notify.notify_model_library_result(
+                    self.lib.repo,
+                    self.lib.owner,
+                    succeeded=False,
+                    task_id=str(self.task["id"]),
+                    filename=self.model.get("filename") or self.model.get("display_name"),
+                    model_type=self.model.get("model_type"),
+                    source=self.model.get("source"),
+                    error=error,
+                )
 
         finally:
             current = self.lib.repo.get("model_downloads", self.task["id"], self.lib.owner) or {}
@@ -1159,6 +1172,18 @@ class ModelTransfer:
         self.lib.repo.update("model_downloads", self.task["id"], {"state": "ready", "bytes": size, "total": size, "drive_file_id": file_id,
                              "error": None, "encrypted_upload_session": None, "upload_identity": None,
                              "upload_file_id": None}, self.lib.owner)
+        from app import telegram_notify
+
+        telegram_notify.notify_model_library_result(
+            self.lib.repo,
+            self.lib.owner,
+            succeeded=True,
+            task_id=str(self.task["id"]),
+            filename=self.model.get("filename") or self.model.get("display_name"),
+            model_type=self.model.get("model_type"),
+            size_bytes=size,
+            source=self.model.get("source"),
+        )
 
 
 _DEFAULT_HASH_FILE = ModelTransfer.hash_file

@@ -162,7 +162,33 @@ class CuGuardService:
                 return False
             with ccu.transaction(self.repo, owner) as session:
                 state = self.state_in(session, owner, initialize=True)
-                hard = {row["account_id"] for row in state["hard_tripped_accounts"]}
+                hard_rows = {row["account_id"]: row for row in state["hard_tripped_accounts"]}
+                hard = set(hard_rows.keys())
+                from app import telegram_notify
+
+                if state["soft_tripped"] and state.get("daily_message"):
+                    telegram_notify.notify_cu_fuse_in_tx(
+                        session,
+                        owner,
+                        level="soft_daily_limit",
+                        message=state["daily_message"],
+                        today_cu=state.get("today_actual_cu"),
+                        daily_limit=state.get("daily_limit_cu"),
+                        dedupe_key=f"cu_fuse_daily:{ccu.local_date(self.clock())}",
+                        now=self.clock(),
+                    )
+                for hard_aid, hard_row in hard_rows.items():
+                    telegram_notify.notify_cu_fuse_in_tx(
+                        session,
+                        owner,
+                        level="hard_balance_floor",
+                        message=state.get("message") or "账号触及余额底线硬熔断",
+                        account_label=hard_row.get("alias") or hard_aid,
+                        balance=hard_row.get("balance"),
+                        min_balance=state.get("min_balance_cu"),
+                        dedupe_key=f"cu_fuse_floor:{hard_aid}",
+                        now=self.clock(),
+                    )
                 candidates = session.scalars(select(GpuInstanceRow).where(
                     GpuInstanceRow.owner_id == owner, GpuInstanceRow.state != "deleted",
                 ).with_for_update())
@@ -251,6 +277,22 @@ class CuGuardService:
                     session.add(GpuEventRow(id=uuid.uuid4().hex, owner_id=owner, project_id=instance.project_id,
                                             state=instance.state, data={"instance_id": instance.id, "job_id": job_id,
                                             "message": message, "reason": level}, created_at=utcnow(), updated_at=utcnow()))
+                    hard_info = hard_rows.get(inst_account_id) if forced else None
+                    telegram_notify.notify_cu_fuse_in_tx(
+                        session,
+                        owner,
+                        level=level,
+                        message=message,
+                        instance_id=instance.id,
+                        account_label=(hard_info or {}).get("alias") or inst_account_id,
+                        today_cu=state.get("today_actual_cu"),
+                        daily_limit=state.get("daily_limit_cu"),
+                        balance=(hard_info or {}).get("balance"),
+                        min_balance=state.get("min_balance_cu"),
+                        native=native,
+                        dedupe_key=f"cu_fuse_inst:{level}:{instance.id}",
+                        now=self.clock(),
+                    )
         return True
 
     @staticmethod

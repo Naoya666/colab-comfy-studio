@@ -380,12 +380,15 @@ def save_plan_in_tx(session, owner_id: str, plan: dict[str, Any]) -> dict[str, A
     gid = str(plan["recovery_group_id"])
     key = plan_key(gid)
     row = session.get(SettingRow, key)
+    prev_state = None if row is None else row.state
+    prev_plan_id = None if row is None else (row.data or {}).get("plan_id")
     payload = copy.deepcopy(plan)
+    new_state = str(payload.get("state") or "scheduled")
     if row is None:
         row = SettingRow(
             id=key,
             owner_id=owner_id,
-            state=str(payload.get("state") or "scheduled"),
+            state=new_state,
             data=payload,
             version=0,
             created_at=utcnow(),
@@ -399,6 +402,19 @@ def save_plan_in_tx(session, owner_id: str, plan: dict[str, Any]) -> dict[str, A
         row.version = int(row.version or 0) + 1
         row.updated_at = utcnow()
     session.flush()
+    if (
+        (new_state == "scheduled" and (prev_state is None or prev_plan_id != payload.get("plan_id")))
+        or (new_state != prev_state and new_state in {"recovered", "exhausted", "aborted_fatal", "aborted_vps_outage"})
+    ):
+        from app import telegram_notify
+
+        telegram_notify.notify_auto_recovery_in_tx(
+            session,
+            owner_id,
+            plan=payload,
+            state=new_state,
+            now=payload.get("updated_at") or payload.get("created_at"),
+        )
     return payload
 
 

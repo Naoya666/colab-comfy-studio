@@ -15,7 +15,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import JSON, DateTime, String, create_engine, event, select, text
+from sqlalchemy import JSON, DateTime, Index, String, create_engine, event, select, text
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -75,6 +75,16 @@ ProviderCredentialRow = _entity("ProviderCredentialRow", "provider_credentials")
 CreationApiKeyRow = _entity("CreationApiKeyRow", "creation_api_keys")
 NativeApiKeyRow = _entity("NativeApiKeyRow", "native_api_keys")
 NativeApiPromptRow = _entity("NativeApiPromptRow", "native_api_prompts")
+
+
+class TelegramNotificationRow(CommonMixin, Base):
+    __tablename__ = "telegram_notifications"
+    dedupe_key: Mapped[str | None] = mapped_column(String(192), index=True, nullable=True)
+    __table_args__ = (
+        Index("ix_telegram_notifications_owner_dedupe", "owner_id", "dedupe_key"),
+    )
+
+
 MODELS.update(
     {
         "users": UserRow,
@@ -85,6 +95,7 @@ MODELS.update(
         "creation_api_keys": CreationApiKeyRow,
         "native_api_keys": NativeApiKeyRow,
         "native_api_prompts": NativeApiPromptRow,
+        "telegram_notifications": TelegramNotificationRow,
     }
 )
 

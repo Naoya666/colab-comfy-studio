@@ -67,6 +67,7 @@ from .recovery_routes import router as recovery_router
 from .review_routes import router as review_router
 from .security import sign_session
 from .storage_routes import router as local_storage_router
+from .telegram_routes import router as telegram_router
 
 
 def usage(st, owner):
@@ -1194,6 +1195,7 @@ app.include_router(review_router)
 app.include_router(oauth_config_router)
 app.include_router(model_library_router)
 app.include_router(local_storage_router)
+app.include_router(telegram_router)
 app.include_router(assets_router)
 
 

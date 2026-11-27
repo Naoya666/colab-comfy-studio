@@ -1264,3 +1264,81 @@ export const vacuumLocalSqlite = () =>
 
 export const createLocalSqliteSnapshot = () =>
   apiFetch<SqliteSnapshotTicket>('/api/gpu/storage/local/snapshot', post({}), 30000);
+
+export type TelegramPriority = 'P0' | 'P1' | 'P2';
+
+export interface TelegramEventCatalogItem {
+  key: string;
+  priority: TelegramPriority;
+  default: boolean;
+  label: string;
+  description: string;
+}
+
+export interface TelegramNotificationSettings {
+  enabled: boolean;
+  bot_token_configured: boolean;
+  bot_token_hint?: string | null;
+  chat_id: string;
+  message_thread_id?: number | null;
+  api_base_url: string;
+  events: Record<string, boolean>;
+  include_creation_api_success: boolean;
+  expiry_warn_minutes: number;
+  daily_report_hour: number;
+  drive_low_quota_percent: number;
+  updated_at?: number | null;
+  catalog: TelegramEventCatalogItem[];
+  timezone?: string;
+}
+
+export interface TelegramSettingsSaveRequest {
+  enabled: boolean;
+  bot_token?: string;
+  clear_bot_token?: boolean;
+  chat_id: string;
+  message_thread_id?: number | null;
+  api_base_url?: string;
+  events: Record<string, boolean>;
+  include_creation_api_success: boolean;
+  expiry_warn_minutes: number;
+  daily_report_hour: number;
+  drive_low_quota_percent: number;
+}
+
+export interface TelegramDeliveryItem {
+  id: string;
+  event_key?: string | null;
+  priority?: string | null;
+  title?: string | null;
+  state: 'pending' | 'sending' | 'sent' | 'failed' | 'skipped' | string;
+  attempts: number;
+  last_error?: string | null;
+  sent_at?: number | null;
+  created_at?: string | null;
+}
+
+export const getTelegramSettings = () =>
+  apiFetch<TelegramNotificationSettings>('/api/settings/telegram', { cache: 'no-store' });
+
+export const saveTelegramSettings = (body: TelegramSettingsSaveRequest) =>
+  apiFetch<TelegramNotificationSettings>('/api/settings/telegram', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+
+export const testTelegramSettings = (body?: {
+  bot_token?: string;
+  chat_id?: string;
+  message_thread_id?: number | null;
+  api_base_url?: string;
+  events?: Record<string, boolean>;
+}) =>
+  apiFetch<{ ok: boolean; message_id?: number | null; sent_at: number }>(
+    '/api/settings/telegram/test',
+    post(body || {}),
+    20000,
+  );
+
+export const getTelegramDeliveries = (limit = 20) =>
+  apiFetch<{ items: TelegramDeliveryItem[] }>(`/api/settings/telegram/deliveries?limit=${limit}`, { cache: 'no-store' });

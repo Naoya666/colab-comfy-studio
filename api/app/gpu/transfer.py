@@ -851,6 +851,19 @@ def _quarantine_instance(
                     f"【数据保护隔离】{message}（未自动销毁 GPU，请确认同步完成后再手动停止；注意持续计费风险）",
                     quarantine_reason=reason,
                 )
+            from app import telegram_notify
+
+            telegram_notify.notify_instance_quarantined_in_tx(
+                session,
+                owner_id,
+                instance_id=instance_id,
+                lease_id=lease_id,
+                reason=reason,
+                message=message,
+                pool=job.get("from_pool") or (instance_pool_of(svc._data(inst)) if inst is not None else None),
+                project_id=inst.project_id if inst is not None else job.get("project_id"),
+                now=now,
+            )
 
     patch: dict[str, Any] = {
         "error_code": error_code,
@@ -899,6 +912,21 @@ def _fail_transfer_to_releasing(
                 )
                 svc._set(inst, idata, state="releasing", expected_version=inst.version, session=session)
                 svc._emit(session, owner_id, inst.project_id, inst.id, job["id"], "releasing", message)
+            if final_state == "failed" and job.get("transfer_id"):
+                from app import telegram_notify
+
+                telegram_notify.notify_transfer_result(
+                    scheduler.store,
+                    owner_id,
+                    succeeded=False,
+                    transfer_id=str(job["transfer_id"]),
+                    instance_id=instance_id,
+                    from_pool=job.get("from_pool"),
+                    to_pool=job.get("to_pool"),
+                    reason=message,
+                    session=session,
+                    now=now,
+                )
 
     extra_fields: dict[str, Any] = {}
     if teardown_report is not None:
@@ -1142,6 +1170,19 @@ def _commit_clean_transfer(
                 job_row.data = jdata
                 job_row.version += 1
                 job_row.updated_at = utcnow()
+                from app import telegram_notify
+
+                telegram_notify.notify_transfer_result(
+                    repo,
+                    owner_id,
+                    succeeded=True,
+                    transfer_id=str(transfer_id),
+                    instance_id=instance_id,
+                    from_pool=from_pool,
+                    to_pool=to_pool,
+                    session=session,
+                    now=now,
+                )
                 return repo._row(job_row)
 
             # Branch B: -> ephemeral (10-minute smoke standby)
@@ -1194,6 +1235,19 @@ def _commit_clean_transfer(
                 job_row.data = jdata
                 job_row.version += 1
                 job_row.updated_at = utcnow()
+                from app import telegram_notify
+
+                telegram_notify.notify_transfer_result(
+                    repo,
+                    owner_id,
+                    succeeded=True,
+                    transfer_id=str(transfer_id),
+                    instance_id=instance_id,
+                    from_pool=from_pool,
+                    to_pool=to_pool,
+                    session=session,
+                    now=now,
+                )
                 return repo._row(job_row)
 
             # Branch C: -> native (single-TX atomic switch + create transferred_native_bootstrap job!)

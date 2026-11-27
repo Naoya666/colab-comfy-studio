@@ -7,6 +7,7 @@ import { GoogleOAuthSetup } from '../components/GoogleOAuthSetup';
 import { AccountDirectory, type GpuAccount } from '../components/AccountDirectory';
 import { GpuOrderSettings } from '../components/GpuOrderSettings';
 import { AllocationRetrySettings } from '../components/AllocationRetrySettings';
+import { TelegramSettings } from '../components/TelegramSettings';
 import { Card, Segmented } from '../components/ui';
 import { applyTheme, readStoredTheme, type ThemeMode } from '../lib/theme';
 import styles from '../gpu.module.css';
@@ -106,6 +107,10 @@ export function SettingsPanel({
 
       <div className={styles.workspaceWide}>
         <AllocationRetrySettings canEdit={canEditGuard} orderedSpecs={orderedSpecs} />
+      </div>
+
+      <div className={styles.workspaceWide}>
+        <TelegramSettings canEdit={canEditGuard} />
       </div>
 
       <ModelStorageSettings id="settings-model-storage" defaultOpen={focusSection === 'model-storage'} accounts={accountsLoaded ? accounts : undefined} />
