@@ -1666,18 +1666,20 @@ def install(server, root, folder_paths, node_types):
         target_generation = local.lora_generation
         if target_generation == synced_lora_generation:
             return
-        for mod in list(sys.modules.values()):
-            reg = getattr(mod, "ServiceRegistry", None)
-            getter = getattr(reg, "get_lora_scanner", None)
-            if callable(getter):
-                try:
+        for name, mod in sys.modules.copy().items():
+            if mod is None or not name.casefold().endswith("comfyui-lora-manager.py.services.service_registry"):
+                continue
+            try:
+                registry = vars(mod).get("ServiceRegistry")
+                getter = getattr(registry, "get_lora_scanner", None)
+                if callable(getter):
                     scanner = await getter()
                     if scanner is not None and callable(getattr(scanner, "get_cached_data", None)):
                         await scanner.get_cached_data(force_refresh=True)
                         synced_lora_generation = target_generation
-                except Exception:
-                    LOG.warning("Failed to refresh LoRA Manager cache after model preparation", exc_info=True)
-                return
+            except Exception:
+                LOG.warning("Failed to refresh LoRA Manager cache after model preparation", exc_info=True)
+            return
         synced_lora_generation = target_generation
 
     async def json_body(request):

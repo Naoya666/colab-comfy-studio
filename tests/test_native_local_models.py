@@ -1108,6 +1108,11 @@ async def test_lora_manager_stem_resolution_object_info_and_scanner_refresh(loca
         @classmethod
         async def get_lora_scanner(cls):
             return FakeScanner()
+    class DynamicModule(types.ModuleType):
+        def __getattr__(self, name):
+            raise RuntimeError(f"Unexpected lookup of {name}")
+
+    monkeypatch.setitem(sys.modules, "unrelated_dynamic_module", DynamicModule("unrelated_dynamic_module"))
     fake_mod = types.ModuleType("custom_nodes.comfyui-lora-manager.py.services.service_registry")
     fake_mod.ServiceRegistry = FakeRegistry
     monkeypatch.setitem(sys.modules, fake_mod.__name__, fake_mod)
@@ -1122,7 +1127,8 @@ async def test_lora_manager_stem_resolution_object_info_and_scanner_refresh(loca
     async def fake_json():
         return prompt_body
     req_prompt = SimpleNamespace(method="POST", path="/prompt", headers={}, json=fake_json)
-    await middleware(req_prompt, lambda _r: asyncio.sleep(0, result=response({"prompt_id": "p1"})))
+    queued = await middleware(req_prompt, lambda _r: asyncio.sleep(0, result=response({"prompt_id": "p1"})))
+    assert json.loads(queued.body) == {"prompt_id": "p1"}
     assert refresh_calls == [True]
     # Second prompt with no new LoRA downloads does not rescan unnecessarily
     await middleware(req_prompt, lambda _r: asyncio.sleep(0, result=response({"prompt_id": "p2"})))
