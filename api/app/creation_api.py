@@ -802,13 +802,19 @@ def object_info(node: str | None = None, store=Depends(get_store), key=Depends(a
 
 
 def model_inventory(rows):
+    from .gpu.model_dependencies import split_target_path
+
     models = {}
     for row in rows:
         manifest = row["manifest"]
         for item in manifest.get("weight_files", manifest.get("weights")) or []:
-            folder, sep, name = item.get("target", "").partition("/")
+            target = item.get("target", "")
+            folder, sep, name = target.partition("/")
             if sep:
                 models.setdefault(folder, set()).add(name)
+            split = split_target_path(target)
+            if split and split[0] != folder:
+                models.setdefault(split[0], set()).add(split[1])
     return models
 
 

@@ -119,14 +119,33 @@ def category_for(category):
     return ALIASES.get(category, category)
 
 
+def _split_model_relpath(rel_posix):
+    split = deps.split_target_path(rel_posix)
+    if split:
+        return category_for(split[0]), split[1]
+    parts = [p for p in str(rel_posix).split("/") if p]
+    if len(parts) >= 2:
+        return category_for(parts[0]), "/".join(parts[1:])
+    return None
+
+
+def _studio_reference(target):
+    normalized = relative_path(target)
+    dmap = deps.directories()
+    split = deps.split_target_path(normalized, dmap)
+    if split and "/" in dmap.get(split[0], ""):
+        return split
+    return tuple(normalized.split("/", 1))
+
+
 def registered_paths(row):
     category = category_for(row["model_type"])
     name = relative_path(row.get("relative_path") or row["filename"])
     legacy = row.get("legacy_target")
     if legacy:
-        directory, _, path = relative_path(legacy).partition("/")
-        if category_for(directory) == category and path:
-            return category, {path, name} if not row.get("relative_path") else {name}
+        split = _split_model_relpath(relative_path(legacy))
+        if split and split[0] == category and split[1]:
+            return category, {split[1], name} if not row.get("relative_path") else {name}
     return category, {name}
 
 
@@ -429,11 +448,11 @@ class LocalModels:
 
     def _record_model_used(self, target: Path, plan: dict) -> None:
         try:
-            rel_parts = target.relative_to(self.model_dir).parts
-            if len(rel_parts) < 2:
+            rel_posix = target.relative_to(self.model_dir).as_posix()
+            split = _split_model_relpath(rel_posix)
+            if not split:
                 return
-            category = category_for(rel_parts[0])
-            name = "/".join(rel_parts[1:])
+            category, name = split
             rel_key = f"{category}/{name}"
             drive = plan.get("drive") if isinstance(plan.get("drive"), dict) else {}
             sanitized = self._sanitize_source(plan.get("url"), plan.get("source_kind"))
@@ -508,13 +527,13 @@ class LocalModels:
                     if fpath.is_symlink():
                         continue
                     try:
-                        rel_parts = fpath.relative_to(self.model_dir).parts
-                        if len(rel_parts) < 2:
+                        rel_posix = fpath.relative_to(self.model_dir).as_posix()
+                        split = _split_model_relpath(rel_posix)
+                        if not split:
                             continue
-                        category = category_for(rel_parts[0])
+                        category, name = split
                         if category not in valid_categories:
                             continue
-                        name = "/".join(rel_parts[1:])
                         stat = fpath.stat()
                     except (OSError, ValueError):
                         continue
@@ -1006,7 +1025,8 @@ class LocalModels:
                 digest, md5 = self.file_hashes(scratch)
             if plan["sha256"] and digest != plan["sha256"]:
                 raise ModelError("下载文件 SHA-256 不匹配，请核对版本和来源")
-            target_category = category_for(target.relative_to(self.model_dir).parts[0])
+            split_target = _split_model_relpath(target.relative_to(self.model_dir).as_posix())
+            target_category = split_target[0] if split_target else category_for(target.relative_to(self.model_dir).parts[0])
             if is_controlled_upscale_extension(target.name):
                 validate_weight_file(scratch, target.name, written, model_type=target_category)
             elif not plan["sha256"] and not plan["md5"]:
@@ -1094,7 +1114,8 @@ class LocalModels:
             url, drive = plan["url"], plan["drive"]
             token = None
             account = self.config.get("drive_account")
-            target_category = category_for(target.relative_to(self.model_dir).parts[0])
+            split_target = _split_model_relpath(target.relative_to(self.model_dir).as_posix())
+            target_category = split_target[0] if split_target else category_for(target.relative_to(self.model_dir).parts[0])
             if url or drive:
                 filename(target.name, model_type=target_category)
             if url:
@@ -1222,7 +1243,8 @@ class LocalModels:
         async with self._activity_lock(exclusive=True) as lock_hold:
             rows = {}
             for target in [*(item["target"] for item in weights), *("loras/" + item["target"] for item in loras)]:
-                category, _, name = target.partition("/")
+                ref = _studio_reference(target)
+                category, name = ref if len(ref) == 2 else (target.partition("/")[0], target.partition("/")[2])
                 rows[(category, name)] = {"category": category, "name": name, "state": "preparing"}
             task = asyncio.current_task()
             self.current_rows[task] = rows, []
@@ -1244,7 +1266,8 @@ class LocalModels:
                 except studio_worker.WorkerError as exc:
                     raise ModelError(str(exc)) from exc
                 for record in models:
-                    category, _, name = record["target"].partition("/")
+                    ref = _studio_reference(record["target"])
+                    category, name = ref if len(ref) == 2 else (record["target"].partition("/")[0], record["target"].partition("/")[2])
                     status = {**record, "category": category, "name": name, "state": "ready"}
                     rows[(category, name)] = status
                     LOG.info("Studio model preparation %s", json.dumps(status, ensure_ascii=False))
@@ -1632,23 +1655,25 @@ def install(server, root, folder_paths, node_types):
                 if not folder.is_relative_to(models) or folder.resolve() != folder:
                     raise ModelError(f"原生 ComfyUI 的 {category} 搜索路径不在 Colab 本地模型目录内")
         selected = {}
+        dmap = deps.directories()
         for category, name in references:
             mapped = category_for(category)
             mapped = getattr(folder_paths, "map_legacy", category_for)(mapped)
-            directory = models / category
+            rel_dir = dmap[category] if category in dmap and "/" in dmap[category] else category
+            directory = models / rel_dir
             target = directory / name
             paths = folder_paths.folder_names_and_paths.get(mapped, ([], set()))[0]
             if str(directory) not in paths or not name or target.resolve() != target or not target.is_relative_to(directory):
-                raise ModelError(f"原生 ComfyUI 的搜索路径与创作模型位置不兼容：{category}/{name}")
+                raise ModelError(f"原生 ComfyUI 的搜索路径与创作模型位置不兼容：{rel_dir}/{name}")
             for folder in map(Path, paths[:paths.index(str(directory))]):
                 if not folder.is_relative_to(models):
-                    raise ModelError(f"原生 ComfyUI 有优先于创作本地模型的挂载搜索路径：{category}/{name}")
+                    raise ModelError(f"原生 ComfyUI 有优先于创作本地模型的挂载搜索路径：{rel_dir}/{name}")
                 if (folder / name).is_file():
                     target = folder / name
                     break
             if require_files and (not target.is_file() or folder_paths.get_full_path(mapped, name) != str(target)):
-                raise ModelError(f"原生 ComfyUI 未解析到创作模式的本地文件：{category}/{name}")
-            selected[f"{category}/{name}"] = target
+                raise ModelError(f"原生 ComfyUI 未解析到创作模式的本地文件：{rel_dir}/{name}")
+            selected[f"{rel_dir}/{name}"] = target
         if len(set(selected.values())) != len(selected):
             raise ModelError("多个创作模型绑定到了原生 ComfyUI 的同一文件")
         return selected
@@ -1828,7 +1853,7 @@ def install(server, root, folder_paths, node_types):
             data = await json_body(request)
             body, loras = data["workflow"], data["loras"]
             weights = studio_worker._validate_weights({"weight_files": data["weights"]})
-            references = [tuple(relative_path(item["target"]).split("/", 1)) for item in weights]
+            references = [_studio_reference(item["target"]) for item in weights]
             references.extend(("loras", relative_path(item["target"])) for item in loras)
             if any(len(reference) != 2 for reference in references):
                 raise ModelError("创作模型需要明确的类别和文件路径")
@@ -1927,13 +1952,24 @@ def install(server, root, folder_paths, node_types):
                                 item[1].get("options") if item[0] == "COMBO" and len(item) > 1 and isinstance(item[1], dict) else None
                             )
                             if isinstance(options, list):
-                                gguf = node.endswith("GGUF")
-                                key = category, gguf
-                                if key not in available:
-                                    extensions = {".gguf"} if gguf else folder_paths.folder_names_and_paths.get(
-                                        category_for(category), ([], set())
-                                    )[1]
-                                    available[key] = local.names(category, extensions)
+                                if node == "UltralyticsDetectorProvider" and field == "model_name":
+                                    key = ("ultralytics_detector", False)
+                                    if key not in available:
+                                        combined = []
+                                        for ultra_cat, prefix in (("ultralytics_bbox", "bbox/"), ("ultralytics_segm", "segm/")):
+                                            exts = folder_paths.folder_names_and_paths.get(ultra_cat, ([], set()))[1] or {".pt"}
+                                            for name in local.names(ultra_cat, exts):
+                                                prefixed = name if name.startswith(prefix) else prefix + name
+                                                combined.append(prefixed)
+                                        available[key] = sorted(set(combined))
+                                else:
+                                    gguf = node.endswith("GGUF")
+                                    key = category, gguf
+                                    if key not in available:
+                                        extensions = {".gguf"} if gguf else folder_paths.folder_names_and_paths.get(
+                                            category_for(category), ([], set())
+                                        )[1]
+                                        available[key] = local.names(category, extensions)
                                 existing = set(options)
                                 options.extend(name for name in available[key] if name not in existing)
             return web.json_response(data)

@@ -907,7 +907,7 @@ export type BatchResolvePick =
 
 export function pickUniqueResolvedFile(dep: Dependency, files: ResolvedModelFile[]): BatchResolvePick {
   if (!files.length) {
-    return { ok: false, reason: '该链接未返回受支持的模型文件（仅支持 safetensors / gguf / onnx 及受控超分 .pt/.pth）' };
+    return { ok: false, reason: '该链接未返回受支持的模型文件（仅支持 safetensors / gguf / onnx，以及受控超分 .pt/.pth 和 Ultralytics .pt）' };
   }
   if (dep.expected_sha256) {
     const expected = dep.expected_sha256.toLowerCase();
@@ -938,8 +938,12 @@ export function pickUniqueResolvedFile(dep: Dependency, files: ResolvedModelFile
 }
 
 // Drive resumable sessions are bearer capabilities. Keep them out of localStorage and logs.
-export async function uploadModel(file: File, onProgress: (sent: number) => void) {
-  const session = await libraryApi<{ upload_url: string; chunk_size: number }>('/upload-session', { filename: file.name, size: file.size });
+export async function uploadModel(file: File, onProgress: (sent: number) => void, modelType?: string) {
+  const session = await libraryApi<{ upload_url: string; chunk_size: number }>('/upload-session', {
+    filename: file.name,
+    size: file.size,
+    ...(modelType ? { model_type: modelType } : {}),
+  });
   let offset = 0;
   let result: { id?: string } = {};
   while (offset < file.size) {

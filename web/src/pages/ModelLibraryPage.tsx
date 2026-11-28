@@ -56,6 +56,8 @@ const DEFAULT_TYPES: Record<string, string> = {
   controlnet: '',
   upscale_models: '',
   embeddings: '',
+  ultralytics_bbox: '',
+  ultralytics_segm: '',
 };
 
 const COMPACT_STATUS_LABEL: Record<string, string> = {

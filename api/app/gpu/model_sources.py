@@ -26,6 +26,9 @@ import httpx
 SHA = re.compile(r"^[a-fA-F0-9]{64}$")
 SAFE_EXTENSIONS = {".safetensors", ".gguf", ".onnx"}
 CONTROLLED_UPSCALE_EXTENSIONS = {".pt", ".pth"}
+ULTRALYTICS_MODEL_TYPES = frozenset({"ultralytics_bbox", "ultralytics_segm"})
+ULTRALYTICS_PT_EXTENSIONS = {".pt"}
+CONTROLLED_PT_MODEL_TYPES = frozenset({"upscale_models"}) | ULTRALYTICS_MODEL_TYPES
 CIVITAI_HOSTS = frozenset({"civitai.com", "civitai.red"})
 PYTORCH_LEGACY_MAGIC = 0x1950A86A20F9469CFC6C
 MAX_PICKLE_ENTRY_BYTES = 64 * 1024 * 1024
@@ -39,6 +42,8 @@ TRUSTED_UPSCALE_GITHUB_OWNERS = frozenset({
     "k4yt3x",
     "umzi2",
     "sniklaus",
+    "ultralytics",
+    "bing-su",
 })
 SAFE_TORCH_PICKLE_GLOBALS = frozenset({
     ("collections", "OrderedDict"),
@@ -69,6 +74,31 @@ SAFE_TORCH_PICKLE_GLOBALS = frozenset({
     ("builtins", "slice"),
     ("builtins", "bytearray"),
 })
+SAFE_ULTRALYTICS_PICKLE_GLOBALS = frozenset({
+    ("__builtin__", "set"),
+    ("__builtin__", "frozenset"),
+    ("__builtin__", "slice"),
+    ("__builtin__", "bytearray"),
+    ("torch", "device"),
+    ("torch.nn.parameter", "Parameter"),
+    ("numpy", "dtype"),
+    ("numpy", "ndarray"),
+    ("numpy.core.multiarray", "scalar"),
+    ("numpy.core.multiarray", "_reconstruct"),
+    ("numpy._core.multiarray", "scalar"),
+    ("numpy._core.multiarray", "_reconstruct"),
+})
+SAFE_ULTRALYTICS_EXACT_MODULES = frozenset({
+    "ultralytics.nn.tasks",
+    "ultralytics.nn.modules",
+    "ultralytics.nn.modules.block",
+    "ultralytics.nn.modules.conv",
+    "ultralytics.nn.modules.head",
+    "ultralytics.nn.modules.transformer",
+    "models.yolo",
+    "models.common",
+})
+_SAFE_ATTR_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 DISALLOWED_PICKLE_OPCODES = frozenset({"INST", "OBJ", "EXT1", "EXT2", "EXT4", "PERSID"})
 HF_REPO_TYPE_ALIASES = {
     "model": "models",
@@ -119,12 +149,45 @@ def filename(value: str, *, model_type: str | None = None) -> str:
     if ext in CONTROLLED_UPSCALE_EXTENSIONS:
         if model_type == "upscale_models":
             return value
-        raise ModelError("只允许 safetensors、gguf、onnx 文件；.pt/.pth 仅允许在 upscale_models 分类下通过可信来源受控导入")
+        if model_type in ULTRALYTICS_MODEL_TYPES and ext in ULTRALYTICS_PT_EXTENSIONS:
+            return value
+        raise ModelError("只允许 safetensors、gguf、onnx 文件；.pt/.pth 仅允许在 upscale_models 分类下受控导入，.pt 亦可在 ultralytics_bbox / ultralytics_segm 分类下经安全校验后导入")
     raise ModelError("只允许 safetensors、gguf、onnx 文件；可执行或 pickle 权重需先在可信环境转换")
+
+
+def is_ultralytics_model_type(model_type: str | None) -> bool:
+    return isinstance(model_type, str) and model_type in ULTRALYTICS_MODEL_TYPES
 
 
 def is_controlled_upscale_extension(value: str) -> bool:
     return isinstance(value, str) and PurePosixPath(value).suffix.lower() in CONTROLLED_UPSCALE_EXTENSIONS
+
+
+def is_allowed_controlled_pt(value: str, model_type: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    ext = PurePosixPath(value).suffix.lower()
+    if model_type == "upscale_models":
+        return ext in CONTROLLED_UPSCALE_EXTENSIONS
+    if model_type in ULTRALYTICS_MODEL_TYPES:
+        return ext in ULTRALYTICS_PT_EXTENSIONS
+    return False
+
+
+def _is_allowed_pickle_global(mod: str, attr: str, *, model_type: str | None = None) -> bool:
+    if (mod, attr) in SAFE_TORCH_PICKLE_GLOBALS:
+        return True
+    if model_type in ULTRALYTICS_MODEL_TYPES:
+        if (mod, attr) in SAFE_ULTRALYTICS_PICKLE_GLOBALS:
+            return True
+        if _SAFE_ATTR_RE.fullmatch(attr):
+            if mod in SAFE_ULTRALYTICS_EXACT_MODULES:
+                return True
+            if mod.startswith("torch.nn.modules."):
+                tail = mod[len("torch.nn.modules."):]
+                if tail and all(_SAFE_ATTR_RE.fullmatch(seg) for seg in tail.split(".")):
+                    return True
+    return False
 
 
 def normalize_civitai_host(host: str | None) -> str | None:
@@ -195,7 +258,7 @@ def validate_controlled_upscale_source(url: str | None, *, source: str | None = 
     raise ModelError("未授权的 .pt/.pth 来源；upscale_models 受控导入仅允许 Hugging Face、受信任 GitHub Release 或管理员授权来源")
 
 
-def _inspect_pickle_stream(stream, *, expect_magic: int | None = None) -> tuple[set[tuple[str, str]], bool]:
+def _inspect_pickle_stream(stream, *, expect_magic: int | None = None, model_type: str | None = None) -> tuple[set[tuple[str, str]], bool]:
     """Statically inspect one pickle stream using pickletools without executing any code."""
     globals_seen: set[tuple[str, str]] = set()
     stack: list[str | int | None | object] = []
@@ -226,14 +289,14 @@ def _inspect_pickle_stream(stream, *, expect_magic: int | None = None) -> tuple[
                 break
             if name == "GLOBAL":
                 mod, sep, attr = str(arg).partition(" ")
-                if not sep or (mod, attr) not in SAFE_TORCH_PICKLE_GLOBALS:
+                if not sep or not _is_allowed_pickle_global(mod, attr, model_type=model_type):
                     raise ModelError(f"检测到未授权的 pickle 引用（{arg}），已拒绝导入")
                 globals_seen.add((mod, attr))
                 stack.append(None)
             elif name == "STACK_GLOBAL":
                 attr = pop_value()
                 mod = pop_value()
-                if not isinstance(mod, str) or not isinstance(attr, str) or (mod, attr) not in SAFE_TORCH_PICKLE_GLOBALS:
+                if not isinstance(mod, str) or not isinstance(attr, str) or not _is_allowed_pickle_global(mod, attr, model_type=model_type):
                     raise ModelError("检测到未授权或不可静态解析的 STACK_GLOBAL 引用，已拒绝导入")
                 globals_seen.add((mod, attr))
                 stack.append(None)
@@ -323,8 +386,8 @@ def validate_weight_file(path: Path, filename_value: str, size: int, *, model_ty
         return
 
     if ext in CONTROLLED_UPSCALE_EXTENSIONS:
-        if model_type != "upscale_models":
-            raise ModelError("仅 upscale_models 分类允许受控导入 .pt/.pth 文件")
+        if not is_allowed_controlled_pt(filename_value, model_type):
+            raise ModelError("仅 upscale_models 分类允许受控导入 .pt/.pth 文件，ultralytics_bbox / ultralytics_segm 分类允许导入经安全校验的 .pt 文件")
         if size < 16:
             raise ModelError("PyTorch 权重文件过小或已损坏，已拒绝导入")
         if prefix.startswith(b"PK\x03\x04"):
@@ -353,7 +416,7 @@ def validate_weight_file(path: Path, filename_value: str, size: int, *, model_ty
                             raw_pkl = entry_stream.read(MAX_PICKLE_ENTRY_BYTES + 1)
                             if not raw_pkl or len(raw_pkl) > MAX_PICKLE_ENTRY_BYTES:
                                 raise ModelError("PyTorch 权重元数据大小异常，已拒绝导入")
-                            _, has_tensor = _inspect_pickle_stream(io.BytesIO(raw_pkl))
+                            _, has_tensor = _inspect_pickle_stream(io.BytesIO(raw_pkl), model_type=model_type)
                             saw_tensor = saw_tensor or has_tensor
                     if not saw_tensor:
                         raise ModelError("权重文件不包含有效的 PyTorch 张量重建结构，已拒绝导入")
@@ -362,10 +425,10 @@ def validate_weight_file(path: Path, filename_value: str, size: int, *, model_ty
                 raise ModelError("PyTorch ZIP 权重文件损坏，已拒绝导入") from exc
         if prefix.startswith(b"\x80\x02"):
             with path.open("rb") as stream:
-                _inspect_pickle_stream(stream, expect_magic=PYTORCH_LEGACY_MAGIC)
-                _inspect_pickle_stream(stream)
-                _inspect_pickle_stream(stream)
-                _, has_tensor = _inspect_pickle_stream(stream)
+                _inspect_pickle_stream(stream, expect_magic=PYTORCH_LEGACY_MAGIC, model_type=model_type)
+                _inspect_pickle_stream(stream, model_type=model_type)
+                _inspect_pickle_stream(stream, model_type=model_type)
+                _, has_tensor = _inspect_pickle_stream(stream, model_type=model_type)
                 if not has_tensor:
                     raise ModelError("权重文件不包含有效的 PyTorch 张量重建结构，已拒绝导入")
                 # PyTorch _legacy_load also unpickles a 5th stream (deserialized_storage_keys)
@@ -373,7 +436,7 @@ def validate_weight_file(path: Path, filename_value: str, size: int, *, model_ty
                 pos = stream.tell()
                 if stream.read(1):
                     stream.seek(pos)
-                    _inspect_pickle_stream(stream)
+                    _inspect_pickle_stream(stream, model_type=model_type)
                 return
         raise ModelError("无效或不受支持的 PyTorch 权重文件格式（文件内容与 .pt/.pth 不匹配）")
 
@@ -574,18 +637,25 @@ class Sources:
     def __init__(self, http):
         self.http = http
 
-    def civitai_version(self, version, *, host: str = "civitai.com"):
+    def civitai_version(self, version, *, host: str = "civitai.com", requested_type: str | None = None):
         civitai_host = normalize_civitai_host(host) or "civitai.com"
         model = version.get("model") or {}
         model_type = CIVITAI_TYPES.get(model.get("type"), "unknown")
-        allowed = SAFE_EXTENSIONS | CONTROLLED_UPSCALE_EXTENSIONS if model_type == "upscale_models" else SAFE_EXTENSIONS
+        if model_type == "upscale_models":
+            allowed = SAFE_EXTENSIONS | CONTROLLED_UPSCALE_EXTENSIONS
+        elif requested_type in ULTRALYTICS_MODEL_TYPES:
+            allowed = SAFE_EXTENSIONS | ULTRALYTICS_PT_EXTENSIONS
+        else:
+            allowed = SAFE_EXTENSIONS
         result = []
         for f in version.get("files") or []:
-            if PurePosixPath(f["name"]).suffix.lower() not in allowed:
+            ext = PurePosixPath(f["name"]).suffix.lower()
+            if ext not in allowed:
                 continue
+            item_type = requested_type if (requested_type in ULTRALYTICS_MODEL_TYPES and ext in ULTRALYTICS_PT_EXTENSIONS) else model_type
             digest = (f.get("hashes") or {}).get("SHA256")
             result.append({"display_name": model.get("name") or version.get("name"), "filename": f["name"],
-                           "model_type": model_type,
+                           "model_type": item_type,
                            "architecture": version.get("baseModel") or "unknown", "source": "civitai",
                            "source_url": f"https://{civitai_host}/models/{version.get('modelId')}?modelVersionId={version['id']}",
                            "download_url": https_url(f["downloadUrl"]),
@@ -676,7 +746,7 @@ class Sources:
             except SourceNotFound:
                 version = self.http.json("https://civitai.red/api/v1/model-versions/by-hash/" + value)
                 host = "civitai.red"
-            return [f for f in self.civitai_version(version, host=host) if f["expected_sha256"] == value.lower()]
+            return [f for f in self.civitai_version(version, host=host, requested_type=requested_type) if f["expected_sha256"] == value.lower()]
         if body.get("repo_id"):
             repo = body["repo_id"]
             return self.huggingface(
@@ -703,6 +773,7 @@ class Sources:
                 files = self.civitai_version(
                     self.http.json(f"https://{civitai_host}/api/v1/model-versions/{version_id}"),
                     host=civitai_host,
+                    requested_type=requested_type,
                 )
                 if file_id is not None:
                     if not str(file_id).isdigit():
@@ -712,7 +783,7 @@ class Sources:
             if len(parts) >= 2 and parts[0] == "models" and parts[1].isdigit():
                 model = self.http.json(f"https://{civitai_host}/api/v1/models/{parts[1]}")
                 return [f for v in model.get("modelVersions") or []
-                        for f in self.civitai_version({**v, "model": model, "modelId": model["id"]}, host=civitai_host)]
+                        for f in self.civitai_version({**v, "model": model, "modelId": model["id"]}, host=civitai_host, requested_type=requested_type)]
             raise ModelError("请提供 Civitai 模型页面或指定版本链接")
         if p.hostname == "huggingface.co":
             return self._hf_resolve_url(url, model_type=requested_type)
@@ -721,10 +792,17 @@ class Sources:
         expected_size = body.get("expected_size")
         expected_sha256 = body.get("expected_sha256")
         if resolved_name and is_controlled_upscale_extension(resolved_name):
-            if requested_type not in {None, "", "unknown", "upscale_models"}:
-                raise ModelError("只允许 safetensors、gguf、onnx 文件；.pt/.pth 仅允许在 upscale_models 分类下通过可信来源受控导入")
-            validate_controlled_upscale_source(url, source="https")
-            effective_type = "upscale_models"
+            ext = PurePosixPath(resolved_name).suffix.lower()
+            if requested_type in ULTRALYTICS_MODEL_TYPES:
+                if ext not in ULTRALYTICS_PT_EXTENSIONS:
+                    raise ModelError("ultralytics_bbox / ultralytics_segm 分类仅支持 safetensors、gguf、onnx 或 .pt 文件")
+                validate_controlled_upscale_source(url, source="https")
+                effective_type = requested_type
+            elif requested_type in {None, "", "unknown", "upscale_models"}:
+                validate_controlled_upscale_source(url, source="https")
+                effective_type = "upscale_models"
+            else:
+                raise ModelError("只允许 safetensors、gguf、onnx 文件；.pt/.pth 仅允许在 upscale_models 分类下受控导入，.pt 亦可在 ultralytics_bbox / ultralytics_segm 分类下经安全校验后导入")
         gh = parse_github_release_url(url)
         if gh and (expected_size is None or expected_sha256 is None):
             gh_size, gh_sha = self._github_release_metadata(*gh)
@@ -753,14 +831,25 @@ class Sources:
                 raise SourceNotFound("仓库中未找到指定文件，请检查路径或版本（HTTP 404）")
             leaf = PurePosixPath(path).name
             if is_controlled_upscale_extension(leaf):
-                if model_type not in {None, "", "unknown", "upscale_models"}:
-                    raise ModelError("只允许 safetensors、gguf、onnx 文件；.pt/.pth 仅允许在 upscale_models 分类下通过可信来源受控导入")
-                allowed = SAFE_EXTENSIONS | CONTROLLED_UPSCALE_EXTENSIONS
+                leaf_ext = PurePosixPath(leaf).suffix.lower()
+                if model_type in ULTRALYTICS_MODEL_TYPES:
+                    if leaf_ext not in ULTRALYTICS_PT_EXTENSIONS:
+                        raise ModelError("ultralytics_bbox / ultralytics_segm 分类仅支持 safetensors、gguf、onnx 或 .pt 文件")
+                    allowed = SAFE_EXTENSIONS | ULTRALYTICS_PT_EXTENSIONS
+                elif model_type in {None, "", "unknown", "upscale_models"}:
+                    allowed = SAFE_EXTENSIONS | CONTROLLED_UPSCALE_EXTENSIONS
+                else:
+                    raise ModelError("只允许 safetensors、gguf、onnx 文件；.pt/.pth 仅允许在 upscale_models 分类下受控导入，.pt 亦可在 ultralytics_bbox / ultralytics_segm 分类下经安全校验后导入")
             else:
                 filename(leaf, model_type=model_type)
                 allowed = SAFE_EXTENSIONS
         else:
-            allowed = SAFE_EXTENSIONS | CONTROLLED_UPSCALE_EXTENSIONS if model_type == "upscale_models" else SAFE_EXTENSIONS
+            if model_type == "upscale_models":
+                allowed = SAFE_EXTENSIONS | CONTROLLED_UPSCALE_EXTENSIONS
+            elif model_type in ULTRALYTICS_MODEL_TYPES:
+                allowed = SAFE_EXTENSIONS | ULTRALYTICS_PT_EXTENSIONS
+            else:
+                allowed = SAFE_EXTENSIONS
         files = []
         for f in siblings:
             name = f.get("rfilename") or ""
@@ -780,7 +869,10 @@ class Sources:
             identity = {"repo_id": repo, "revision": commit, "filename": name}
             if repo_type != "models":
                 identity["repo_type"] = repo_type
-            item_type = "upscale_models" if ext in CONTROLLED_UPSCALE_EXTENSIONS else "unknown"
+            if ext in CONTROLLED_UPSCALE_EXTENSIONS:
+                item_type = model_type if model_type in ULTRALYTICS_MODEL_TYPES else "upscale_models"
+            else:
+                item_type = "unknown"
             files.append({"display_name": name, "filename": PurePosixPath(name).name,
                           "source": "huggingface", "source_url": download, "download_url": download,
                           "architecture": "unknown", "model_type": item_type,

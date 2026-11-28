@@ -31,6 +31,7 @@ from .model_sources import (
     hf_download_url,
     https_url,
     is_controlled_upscale_extension,
+    is_ultralytics_model_type,
     normalize_hf_repo_type,
     normalize_source_url,
     relative_path,
@@ -184,7 +185,9 @@ class ModelLibrary:
             raise ModelError("请选择模型类型（可通过 MODEL_LIBRARY_DIRECTORIES 扩展）")
         name = filename(data.get("filename"), model_type=category)
         legacy_target = relative_path(data["legacy_target"]) if data.get("legacy_target") else None
-        model_path = relative_path(data.get("relative_path") or (legacy_target.split("/", 1)[-1] if legacy_target else name))
+        legacy_split = deps.split_target_path(legacy_target) if legacy_target else None
+        legacy_rel = legacy_split[1] if legacy_split else (legacy_target.split("/", 1)[-1] if legacy_target else None)
+        model_path = relative_path(data.get("relative_path") or (legacy_rel or name))
         if PurePosixPath(model_path).name != name:
             raise ModelError("模型相对路径必须以所登记的文件名结尾")
         expected = data.get("expected_sha256")
@@ -220,7 +223,7 @@ class ModelLibrary:
         elif source == "huggingface" and "repo_type" in row["source_identity"]:
             row["source_identity"]["repo_type"] = normalize_hf_repo_type(row["source_identity"]["repo_type"])
         if source in {"drive", "upload", "legacy_cache"}:
-            if is_controlled_upscale_extension(name):
+            if is_controlled_upscale_extension(name) and not is_ultralytics_model_type(category):
                 raise ModelError("受控 .pt/.pth 超分模型仅允许通过受信任下载来源导入，禁止直接上传或导入未经验证的文件")
             file_id = data.get("drive_file_id")
             if not isinstance(file_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", file_id):
@@ -335,8 +338,8 @@ class ModelLibrary:
             return self.update(ident, state="unverified", error="Drive 文件已变化，请重新校验")
         return row
 
-    def upload_session(self, name, size, origin):
-        filename(name)
+    def upload_session(self, name, size, origin, *, model_type=None):
+        filename(name, model_type=model_type)
         if not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= max_file_bytes():
             raise ModelError("文件大小超过模型上传限制")
         folder = self.drive.model_cache()["folder_id"]
@@ -450,7 +453,7 @@ class ModelLibrary:
                     )
                     if civitai_url or expected_sha:
                         try:
-                            candidates = self.resolve({"url": civitai_url} if civitai_url else {"sha256": expected_sha})
+                            candidates = self.resolve({"url": civitai_url, "model_type": dep["model_type"]} if civitai_url else {"sha256": expected_sha, "model_type": dep["model_type"]})
                             exact = [
                                 f for f in candidates
                                 if (expected_sha and (f.get("expected_sha256") or "").lower() == expected_sha)
@@ -465,7 +468,8 @@ class ModelLibrary:
                                 exact = candidates
                             if len(exact) == 1:
                                 selected = exact[0]
-                                rel = target.split("/", 1)[-1] if "/" in target else None
+                                split = deps.split_target_path(target) if "/" in target else None
+                                rel = split[1] if split else (target.split("/", 1)[-1] if "/" in target else None)
                                 if rel and PurePosixPath(rel).name != selected["filename"]:
                                     rel = None
                                 model = self.add({
@@ -490,14 +494,15 @@ class ModelLibrary:
                     expected_sha = (dep.get("expected_sha256") or weight.get("sha256") or "").lower() or None
                     if hint_url:
                         try:
-                            candidates = self.resolve({"url": hint_url})
+                            candidates = self.resolve({"url": hint_url, "model_type": dep["model_type"]})
                             exact = [
                                 f for f in candidates
                                 if not expected_sha or (f.get("expected_sha256") or "").lower() == expected_sha
                             ]
                             if len(exact) == 1:
                                 selected = exact[0]
-                                rel = target.split("/", 1)[-1] if "/" in target else None
+                                split = deps.split_target_path(target) if "/" in target else None
+                                rel = split[1] if split else (target.split("/", 1)[-1] if "/" in target else None)
                                 if rel and PurePosixPath(rel).name != selected["filename"]:
                                     rel = None
                                 model = self.add({
@@ -522,7 +527,7 @@ class ModelLibrary:
                     continue
             if not model_id and not auto_import and (dep.get("source_hint") or dep.get("expected_sha256")):
                 try:
-                    candidates = self.resolve({"url": dep["source_hint"]} if dep.get("source_hint") else {"sha256": dep["expected_sha256"]})
+                    candidates = self.resolve({"url": dep["source_hint"], "model_type": dep["model_type"]} if dep.get("source_hint") else {"sha256": dep["expected_sha256"], "model_type": dep["model_type"]})
                     exact = [f for f in candidates if not dep.get("expected_sha256") or f.get("expected_sha256") == dep["expected_sha256"]]
                     if len(exact) == 1:
                         selected = exact[0]
@@ -572,15 +577,16 @@ class ModelLibrary:
         adopted = []
         for weight in deps.weights_of(workflow):
             target = weight.get("target") or ""
-            parts = target.split("/", 1)
-            category = parts[0]
-            if len(parts) != 2 or category not in deps.directories():
+            split = deps.split_target_path(target)
+            if not split or split[0] not in deps.directories():
                 continue
+            category = split[0]
             if any(m.get("sha256") == weight.get("sha256") and m.get("state") == "ready" for m in self.models()):
                 continue
             entry = cache.lookup(target, weight.get("sha256"), weight.get("size"))
             if entry:
                 model = self.add({"source": "legacy_cache", "drive_file_id": entry["id"], "filename": Path(target).name,
+                                  "relative_path": split[1],
                                   "model_type": category, "expected_sha256": weight.get("sha256"),
                                   "expected_size": weight.get("size")})
                 adopted.append(self.enqueue(model["id"], "verify"))
@@ -1074,7 +1080,8 @@ class ModelTransfer:
                             self.finish(other["drive_file_id"], expected, other["size"], other.get("drive_md5"), other.get("managed_file", False))
                             return
             verify_existing = self.model.get("source") in {"drive", "upload", "legacy_cache"} or self.task.get("action") == "verify"
-            if verify_existing and self.model.get("drive_file_id"):
+            if (verify_existing and self.model.get("drive_file_id")
+                    and not is_controlled_upscale_extension(self.model["filename"])):
                 remote = self.lib.metadata(self.model["drive_file_id"])
                 native_hash = remote.get("sha256Checksum")
                 if isinstance(native_hash, str) and SHA.fullmatch(native_hash) and remote.get("md5Checksum"):

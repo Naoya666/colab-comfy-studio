@@ -27,7 +27,12 @@ RCLONE_SHA256 = "7d69057e69385f6514a9684c7eaa424d972096b130284bb34dd967c4ed4f9da
 TUNNEL_METRICS_ADDR = "127.0.0.1:20241"
 CATEGORIES = ("checkpoints", "diffusion_models", "unet", "text_encoders", "clip", "vae", "loras", "controlnet",
               "embeddings", "upscale_models", "clip_vision", "style_models", "vae_approx", "diffusers",
-              "gligen", "hypernetworks", "model_patches", "audio_encoders")
+              "gligen", "hypernetworks", "model_patches", "audio_encoders",
+              "ultralytics_bbox", "ultralytics_segm")
+CATEGORY_DIRECTORIES = {
+    "ultralytics_bbox": "ultralytics/bbox",
+    "ultralytics_segm": "ultralytics/segm",
+}
 
 # A small native extension supplies a persistence/busy probe. It is not a UI extension.
 EXTENSION = '''import asyncio
@@ -737,7 +742,8 @@ def model_paths(mount):
     # JSON is valid YAML and accepted by ComfyUI's official extra-model-paths loader.
     paths = {"base_path": str(mount), "is_default": True}
     for category in CATEGORIES:
-        paths[category] = f"models/{category}\nmodels/native-index/{category}"
+        rel_dir = CATEGORY_DIRECTORIES.get(category, category)
+        paths[category] = f"models/{rel_dir}\nmodels/native-index/{rel_dir}"
     paths["diffusion_models"] += "\nmodels/unet\nmodels/native-index/unet"
     paths["text_encoders"] += "\nmodels/clip\nmodels/native-index/clip"
     return {"studio_drive": paths}
@@ -897,7 +903,7 @@ def prepare_paths(comfy, mount, *, local=False):
             backup.rename(models)
     model_root = models if local else mount / "models"
     for category in CATEGORIES:
-        path = model_root / category
+        path = model_root / CATEGORY_DIRECTORIES.get(category, category)
         if local and (path.resolve() != path or any(p.is_symlink() for p in path.rglob("*"))):
             raise RuntimeError("Local model directories must not contain symlinks")
         path.mkdir(parents=True, exist_ok=True)
@@ -951,7 +957,9 @@ def _index_models(secret, worker):
             continue
         by_category.setdefault(category, []).append(model)
     for category, cat_models in by_category.items():
-        parent = cache._folder(category, index, True)
+        parent = index
+        for segment in CATEGORY_DIRECTORIES.get(category, category).split("/"):
+            parent = cache._folder(segment, parent, True)
         existing_by_name: dict[str, list[dict]] = {}
         query = f"'{cache._q(parent)}' in parents and trashed = false"
         params = {"q": query, "pageSize": "1000", "fields": "nextPageToken,files(name,mimeType,shortcutDetails(targetId))"}

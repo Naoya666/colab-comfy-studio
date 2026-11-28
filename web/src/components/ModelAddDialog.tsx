@@ -253,7 +253,7 @@ export function ModelAddDialog({
         const pct = selectedFile.size > 0 ? Math.min(100, Math.round((sent / selectedFile.size) * 100)) : 100;
         setUploadPct(pct);
         setStatusMsg(`正在分块上传到 Drive… ${pct}%`);
-      });
+      }, type);
       const model = await libraryApi<LibraryModel>('', {
         source: 'upload',
         drive_file_id: uploadedDriveId,
@@ -359,7 +359,9 @@ export function ModelAddDialog({
             <p className="muted small">
               {type === 'upscale_models'
                 ? '超分模型（upscale_models）支持 safetensors、gguf、onnx，以及来自 Hugging Face / 受信任 GitHub Release 的受控 .pt/.pth（仅做字节与安全结构校验）。'
-                : '默认支持 safetensors、gguf、onnx；若导入超分模型 .pt/.pth，请将类型切换为 upscale_models。'}
+                : type === 'ultralytics_bbox' || type === 'ultralytics_segm'
+                  ? 'Ultralytics 模型（ultralytics_bbox / ultralytics_segm）支持经安全校验的 .pt 权重以及 safetensors、gguf、onnx，映射至 models/ultralytics/bbox/ 或 segm/。'
+                  : '默认支持 safetensors、gguf、onnx；若导入超分模型 .pt/.pth 或 Ultralytics .pt，请切换至对应分类。'}
             </p>
 
             <details className="foldable">
@@ -492,7 +494,7 @@ export function ModelAddDialog({
                 <input
                   disabled={busy}
                   type="file"
-                  accept=".safetensors,.gguf,.onnx"
+                  accept={type === 'ultralytics_bbox' || type === 'ultralytics_segm' ? '.pt,.safetensors,.gguf,.onnx' : '.safetensors,.gguf,.onnx'}
                   onChange={(e) => {
                     const f = e.target.files?.[0] || null;
                     setSelectedFile(f);

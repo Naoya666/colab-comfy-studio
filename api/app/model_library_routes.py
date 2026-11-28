@@ -96,7 +96,7 @@ def source_save(source: str, body: dict, user=Depends(current_user), st=Depends(
 @router.post("/model-library/upload-session")
 def upload_session(body: dict, user=Depends(current_user), st=Depends(get_store)):
     with library(st, user) as lib:
-        return ok(lib.upload_session(body.get("filename"), body.get("size"), settings.site_url))
+        return ok(lib.upload_session(body.get("filename"), body.get("size"), settings.site_url, model_type=body.get("model_type")))
 
 
 @router.get("/model-library/tasks")

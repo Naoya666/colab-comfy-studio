@@ -49,6 +49,7 @@ RULES = {
     "DiffControlNetLoader": {"control_net_name": "controlnet"},
     "UpscaleModelLoader": {"model_name": "upscale_models"},
     "CR Upscale Image": {"upscale_model": "upscale_models"},
+    "UltralyticsDetectorProvider": {"model_name": "ultralytics_bbox"},
 }
 # Only schemas with known stable widget order are decoded without object_info.
 WIDGETS = {
@@ -83,6 +84,7 @@ WIDGETS = {
         "upscale_model", "mode", "rescale_factor", "resize_width",
         "resampling_method", "supersample", "rounding_modulus",
     ],
+    "UltralyticsDetectorProvider": ["model_name"],
     "CLIPTextEncode": ["text"],
     "CLIPTextEncodeSDXL": ["width", "height", "crop_w", "crop_h", "target_width", "target_height", "text_g", "text_l"],
 }
@@ -93,7 +95,7 @@ _LORA_TAG_RE = re.compile(r"<lora:([^:<>]+):([^<>]+)>")
 _STEM_WEIGHT_EXTS = (".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx")
 _WEIGHT_FILE_RE = re.compile(r"\.(?:safetensors|gguf|onnx|pt|pth|ckpt|bin)$", re.I)
 _HINT_LOADER_RE = re.compile(
-    r"(?:load|lora|checkpoint|ckpt|unet|diffusion|vae|clip|controlnet|upscale|gguf|model|adapter|pulid|instantid|embedding|facerestore|reactor|animatediff)",
+    r"(?:load|lora|checkpoint|ckpt|unet|diffusion|vae|clip|controlnet|upscale|gguf|model|adapter|pulid|instantid|embedding|facerestore|reactor|animatediff|ultralytics|detector)",
     re.I,
 )
 _NON_MODEL_NODE_TYPES = {
@@ -171,7 +173,11 @@ def _is_visual_workflow(value):
 
 def _guess_model_type_from_node(node_type, field="", ref=""):
     haystack = f"{node_type or ''} {field or ''}".lower()
-    ref_lower = (ref or "").lower()
+    ref_lower = (ref or "").replace("\\", "/").lower()
+    if "ultralytics" in haystack or ref_lower.startswith(("bbox/", "segm/")):
+        if "segm" in haystack or ref_lower.startswith("segm/") or "-seg" in ref_lower or "_seg" in ref_lower:
+            return "ultralytics_segm"
+        return "ultralytics_bbox"
     if "lora" in haystack:
         return "loras"
     if "upscal" in haystack:
@@ -438,12 +444,58 @@ def _expand_visual_nodes(
 
 DIRECTORIES = {x: x for x in ("checkpoints", "loras", "vae", "diffusion_models", "text_encoders",
                               "clip_vision", "controlnet", "upscale_models", "embeddings", "latent_upscale_models")}
-DIRECTORIES.update(unet="diffusion_models", clip="text_encoders")
+DIRECTORIES.update(
+    unet="diffusion_models",
+    clip="text_encoders",
+    ultralytics_bbox="ultralytics/bbox",
+    ultralytics_segm="ultralytics/segm",
+)
+_DIRECTORY_ALIASES = {"unet": "diffusion_models", "clip": "text_encoders"}
 
 
 def directories():
     result = {**DIRECTORIES, **json.loads(os.getenv("MODEL_LIBRARY_DIRECTORIES", "{}"))}
     return {k: relative_path(v) for k, v in result.items()}
+
+
+def parse_ultralytics_reference(value: str) -> tuple[str, str] | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().replace("\\", "/")
+    if not cleaned or cleaned.lower() in _IGNORED_REFS:
+        return None
+    if cleaned.startswith("bbox/"):
+        ref = cleaned[len("bbox/"):]
+        return ("ultralytics_bbox", ref) if ref and ref.lower() not in _IGNORED_REFS else None
+    if cleaned.startswith("segm/"):
+        ref = cleaned[len("segm/"):]
+        return ("ultralytics_segm", ref) if ref and ref.lower() not in _IGNORED_REFS else None
+    lower = cleaned.lower()
+    category = "ultralytics_segm" if ("-seg" in lower or "_seg" in lower) else "ultralytics_bbox"
+    return category, cleaned
+
+
+def split_target_path(target: str, directory_map: dict[str, str] | None = None) -> tuple[str, str] | None:
+    """Split a model target like 'ultralytics/bbox/hand_yolov8s.pt' into (category, relative_name)."""
+    if not isinstance(target, str) or not target:
+        return None
+    normalized = target.strip().replace("\\", "/").removeprefix("models/").strip("/")
+    if not normalized or "/" not in normalized:
+        return None
+    dmap = directory_map if directory_map is not None else directories()
+    canonical_for = {key: _DIRECTORY_ALIASES.get(key, key) for key in dmap}
+    prefixes: dict[str, str] = {}
+    for key, rel_dir in dmap.items():
+        canon = canonical_for[key]
+        prefixes.setdefault(rel_dir, canon)
+        prefixes.setdefault(key, canon)
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        head = prefix + "/"
+        if normalized.startswith(head):
+            rest = normalized[len(head):]
+            if rest:
+                return prefixes[prefix], rest
+    return None
 
 
 def rules():
@@ -457,9 +509,12 @@ def weights_of(workflow):
 
 def _resolve_hint_category(raw_dir, directory_map, *, node_type="", field="", ref=""):
     if isinstance(raw_dir, str) and raw_dir.strip():
-        cleaned = raw_dir.strip().removeprefix("models/").strip("/")
+        cleaned = raw_dir.strip().replace("\\", "/").removeprefix("models/").strip("/")
         if cleaned in directory_map:
-            return directory_map[cleaned]
+            return _DIRECTORY_ALIASES.get(cleaned, cleaned)
+        for cat, rel_dir in directory_map.items():
+            if rel_dir == cleaned:
+                return _DIRECTORY_ALIASES.get(cat, cat)
     return _guess_model_type_from_node(node_type, field, ref)
 
 
@@ -610,6 +665,15 @@ def scan(workflow, *, node_types=None, include_hints=False):
             continue
         rule = mapping.get(node_type, {})
         for field, category in rule.items():
+            if node_type == "UltralyticsDetectorProvider" and field == "model_name":
+                raw_val = inputs.get(field)
+                parsed = parse_ultralytics_reference(raw_val)
+                if parsed:
+                    ultra_cat, ultra_ref = parsed
+                    extra = {"raw_reference": raw_val.strip().replace("\\", "/")} if raw_val.strip().replace("\\", "/") != ultra_ref else {}
+                    append(node_id, node_type, field, ultra_ref, ultra_cat, not bypassed,
+                           bypassed=bypassed, strengths={}, **extra)
+                continue
             required = not bypassed
             disabled_by_switch = False
             lora_strengths = {}
@@ -650,30 +714,38 @@ def scan(workflow, *, node_types=None, include_hints=False):
             for hint in candidates
         ]
         candidates = []
+        ref_names = {dep["reference"]}
+        if dep.get("raw_reference"):
+            ref_names.add(dep["raw_reference"])
+        expected_dir = directory_map.get(dep["model_type"])
         for hint, scoped in hints:
-            if not isinstance(hint, dict) or hint.get("name") != dep["reference"]:
+            if not isinstance(hint, dict) or hint.get("name") not in ref_names:
                 continue
             directory = hint.get("directory")
-            if not (directory is None and scoped) and (
-                not isinstance(directory, str)
-                or directory_map.get(directory.removeprefix("models/"), directory.removeprefix("models/"))
-                != directory_map.get(dep["model_type"])
-            ):
-                continue
+            if not (directory is None and scoped):
+                if not isinstance(directory, str):
+                    continue
+                cleaned_dir = directory.strip().replace("\\", "/").removeprefix("models/").strip("/")
+                hint_dir = directory_map.get(cleaned_dir, cleaned_dir)
+                if hint_dir != expected_dir and not (
+                    cleaned_dir == "ultralytics" and dep.get("raw_reference") and hint.get("name") == dep.get("raw_reference")
+                ):
+                    continue
             candidates.append(hint)
         _apply_hint_metadata(dep, candidates)
 
     if include_hints:
-        known_node_refs = {
-            (d["node_id"], d["reference"])
-            for d in dependencies
-            if d["status"] != "manual_review"
-        }
-        known_global_refs = {
-            (d["reference"], directory_map.get(d["model_type"], d["model_type"]))
-            for d in dependencies
-            if d["status"] != "manual_review"
-        }
+        known_node_refs = set()
+        known_global_refs = set()
+        for d in dependencies:
+            if d["status"] == "manual_review":
+                continue
+            known_node_refs.add((d["node_id"], d["reference"]))
+            known_global_refs.add((d["reference"], directory_map.get(d["model_type"], d["model_type"])))
+            if d.get("raw_reference"):
+                known_node_refs.add((d["node_id"], d["raw_reference"]))
+                known_global_refs.add((d["raw_reference"], "ultralytics"))
+                known_global_refs.add((d["raw_reference"], directory_map.get(d["model_type"], d["model_type"])))
         resolved_unknown_nodes = set()
 
         # Fallback 1: explicit node properties.models & top-level workflow.models metadata.
