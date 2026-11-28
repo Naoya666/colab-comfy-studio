@@ -1,0 +1,512 @@
+.summaryTrigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.summaryTitle {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.summaryPill {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line-strong);
+  font-size: 0.72rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  background: var(--bg);
+  white-space: nowrap;
+}
+
+.summaryPill[data-state='ready'] {
+  border-color: var(--line-strong);
+  border-color: color-mix(in srgb, var(--workspace-accent) 48%, var(--line));
+  color: var(--workspace-accent);
+}
+
+.summaryPill[data-state='failed'] {
+  border-color: var(--danger-line);
+  color: var(--danger);
+}
+
+.intro {
+  font-size: 0.82rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+/* 轻量嵌套折叠：避免再套一层沉重 .foldable 框 */
+.explicitDetails {
+  border: 1px dashed var(--line);
+  border-radius: var(--r-sm);
+  background: transparent;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.explicitDetails[open] {
+  border-style: solid;
+  border-color: var(--line-strong);
+  background: var(--bg);
+}
+
+.explicitSummary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  font-size: 0.8rem;
+  color: var(--text-2);
+  list-style: none;
+  user-select: none;
+}
+
+.explicitSummary::-webkit-details-marker {
+  display: none;
+}
+
+.explicitSummary:hover {
+  color: var(--text);
+}
+
+.explicitChevron {
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.explicitDetails[open] .explicitChevron {
+  transform: rotate(90deg);
+  color: var(--text);
+}
+
+.explicitBadge {
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  background: var(--card);
+}
+
+.explicitBadge[data-invalid='true'] {
+  border-color: var(--danger-line);
+  color: var(--danger);
+}
+
+.explicitBody {
+  padding: 0 10px 10px;
+}
+
+/* 操作工具栏 */
+.actionBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.stopButton {
+  margin-left: auto;
+}
+
+/* 结果容器 */
+.resultPanel {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.summaryBanner {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  background: var(--card-2);
+  border-bottom: 1px solid var(--line);
+}
+
+.summaryBanner[data-empty='true'] {
+  border-bottom: 0;
+}
+
+.summaryBanner[data-state='ready'] {
+  background: var(--card);
+  background: color-mix(in srgb, var(--workspace-accent) 7%, var(--bg));
+}
+
+.summaryBanner[data-state='failed'] {
+  background: var(--card);
+  background: color-mix(in srgb, var(--danger) 7%, var(--bg));
+}
+
+.bannerLead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.bannerLeadText {
+  overflow-wrap: anywhere;
+}
+
+.bannerMeta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.bannerChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.bannerProgress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--card-3);
+  overflow: hidden;
+}
+
+.bannerProgressFill {
+  display: block;
+  height: 100%;
+  background: var(--workspace-accent);
+  transition: width 0.28s ease;
+}
+
+.bannerProgress[data-indeterminate='true'] .bannerProgressFill {
+  width: 34%;
+  animation: indeterminateSlide 1.3s ease-in-out infinite;
+}
+
+/* 扁平紧凑列表 + 超过高度内部滚动 */
+.modelList {
+  max-height: 312px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.modelRow {
+  display: grid;
+  gap: 5px;
+  padding: 9px 12px;
+  transition: background 0.12s ease;
+}
+
+.modelRow + .modelRow {
+  border-top: 1px solid var(--line);
+}
+
+.modelRow:hover {
+  background: var(--card);
+}
+
+.modelRow[data-state='failed'] {
+  background: var(--card);
+  background: color-mix(in srgb, var(--danger) 5%, var(--bg));
+}
+
+.modelMain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stateIcon {
+  flex: none;
+  color: var(--muted);
+}
+
+.stateIcon[data-state='ready'] {
+  color: var(--workspace-accent);
+}
+
+.stateIcon[data-state='downloading'] {
+  color: var(--text);
+  animation: spin 1s linear infinite;
+}
+
+.stateIcon[data-state='failed'] {
+  color: var(--danger);
+}
+
+.catBadge {
+  flex: none;
+  min-width: 50px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--card-2);
+  color: var(--text-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.68rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  line-height: 1.5;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.catBadge[data-tone='core'] {
+  border-color: var(--line-strong);
+  background: var(--card);
+  color: var(--text);
+}
+
+.catBadge[data-tone='lora'] {
+  border-color: var(--line-strong);
+  border-color: color-mix(in srgb, var(--workspace-accent) 42%, var(--line));
+  background: var(--card-2);
+  background: color-mix(in srgb, var(--workspace-accent) 10%, var(--bg));
+  color: var(--workspace-accent);
+}
+
+.modelName {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.85rem;
+  font-weight: 550;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelDir {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.modelMeta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  font-size: 0.73rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.sourceTag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text-2);
+  font-size: 0.7rem;
+  line-height: 1.45;
+  white-space: nowrap;
+}
+
+.stateTag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--line);
+  font-size: 0.7rem;
+  line-height: 1.45;
+  white-space: nowrap;
+  color: var(--text-2);
+}
+
+.stateTag[data-state='failed'] {
+  border-color: var(--danger-line);
+  color: var(--danger);
+}
+
+.durationText {
+  min-width: 28px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.copyBtn {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  opacity: 0.65;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.modelRow:hover .copyBtn,
+.copyBtn:focus-visible,
+.copyBtn[data-copied='true'] {
+  opacity: 1;
+}
+
+.copyBtn:hover {
+  background: var(--card-2);
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.copyBtn[data-copied='true'] {
+  color: var(--workspace-accent);
+}
+
+/* 次行详情：下载进度、回退、校验提示、错误 */
+.modelSub {
+  display: grid;
+  gap: 4px;
+  padding-left: 23px;
+}
+
+.progressRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.progressTrack {
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--card-3);
+  overflow: hidden;
+}
+
+.progressFill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-full);
+  background: var(--workspace-accent);
+  transition: width 0.25s ease;
+}
+
+.progressStats {
+  flex: none;
+  font-size: 0.72rem;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.subNote {
+  font-size: 0.74rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.fallbackNote {
+  font-size: 0.74rem;
+  color: var(--warning);
+  overflow-wrap: anywhere;
+}
+
+.errorNote {
+  padding: 6px 8px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--danger-line);
+  background: var(--bg);
+  font-size: 0.75rem;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.spinIcon {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes indeterminateSlide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(310%);
+  }
+}
+
+@media (max-width: 520px) {
+  .modelList {
+    max-height: 280px;
+  }
+
+  .modelMain {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .modelName {
+    flex-basis: calc(100% - 88px);
+  }
+
+  .modelMeta {
+    padding-left: 23px;
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .copyBtn {
+    margin-left: auto;
+  }
+
+  .progressRow {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }
+
+  .progressStats {
+    text-align: right;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stateIcon[data-state='downloading'],
+  .spinIcon,
+  .bannerProgress[data-indeterminate='true'] .bannerProgressFill {
+    animation: none;
+  }
+}
